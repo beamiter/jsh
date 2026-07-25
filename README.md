@@ -209,19 +209,26 @@ agent find the largest files under target and free some space
 ```
 
 The model may only *propose* one command per turn. Every proposal shows a
-`[y] run  [e] edit  [n] reject  [q] quit` review prompt; recognized dangerous
-commands additionally require typing `RUN`. Approved commands execute through
-the normal rsh parser with output teed to the terminal, and a bounded sample
-plus the exit code is fed back as the next model turn's observation. Malformed
-model replies fail closed and never become proposals.
+`[y] run  [e] edit  [i] insert  [n] reject  [q] quit` review prompt; recognized
+dangerous commands additionally require typing `RUN`. `[i]` moves the command
+into your next editor prompt for manual review without executing it and ends
+the session. Approved commands execute through the normal rsh parser with
+output teed to the terminal, and a bounded sample plus the exit code is fed
+back as the next model turn's observation. Malformed model replies fail closed
+and never become proposals.
+
+The agent keeps its own working directory: an approved `cd` carries into the
+following turns (shown as `cwd → …`), while the interactive shell's cwd is
+never touched.
 
 Additional environment switches: `RSH_AGENT_MAX_TURNS` (default 16) bounds the
 model-turn budget, and `RSH_AGENT_AUTO_APPROVE_READONLY=1` opts in to
 auto-running only commands on a conservative read-only allowlist (`ls`,
 `git status`, …); everything else still prompts. Git branch/dirty metadata is
 attached only under the same `RSH_AI_SHARE_CONTEXT` rules as other cloud
-context. Agent commands run in a forked child, so `cd`/`export` do not change
-the interactive shell's state.
+context. Agent commands run in a forked child, so `export` and shell variables
+do not change the interactive shell's state (`cd` persists only within the
+agent session).
 
 Local context queries never send journal data over the network. Local Ollama
 may use the most recent failed execution's captured terminal output for command

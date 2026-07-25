@@ -152,6 +152,13 @@ impl Editor {
         self.vi_pending = None;
         history.reset_position();
 
+        // Review-only prefill (agent insert path): the text lands in the
+        // editor exactly like typed input and is never submitted here.
+        if let Some(prefill) = state.pending_editor_insert.take() {
+            self.buffer.push_str(&prefill);
+            self.cursor = self.buffer.len();
+        }
+
         // OSC 133;A — prompt start marker (semantic shell integration)
         if state.interactive {
             crate::osc::prompt_start();
@@ -186,7 +193,7 @@ impl Editor {
         // Compute initial suggestion for proactive recommendations on empty buffer
         // (e.g., suggest "git push" right after "git commit")
         self.update_suggestion(history, state);
-        if self.suggestion.is_some() {
+        if self.suggestion.is_some() || !self.buffer.is_empty() {
             self.repaint(state)?;
         }
 

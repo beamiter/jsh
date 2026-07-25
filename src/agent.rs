@@ -21,6 +21,7 @@ use jagent::{
     Role, SessionError,
 };
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 const DEFAULT_MAX_TURNS: u32 = 16;
 const AGENT_MAX_TOKENS: u32 = 1024;
@@ -57,6 +58,10 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
 
     let auto_readonly = env_truthy("RSH_AGENT_AUTO_APPROVE_READONLY");
     let mut protocol_retries = 0_u32;
+    // The agent's working directory persists across its own turns (each
+    // approved command starts here, and a command's `cd` carries forward)
+    // without ever changing the interactive shell's cwd.
+    let mut agent_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
 
     loop {
         match session.state() {
@@ -66,7 +71,7 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                     session.turns_used() + 1,
                     session.max_turns()
                 ));
-                let reply = match request_model(&chat, &session, share_context) {
+                let reply = match request_model(&chat, &session, share_context, &agent_cwd) {
                     Ok(reply) => reply,
                     Err(error) => {
                         let _ = session.model_failed(&error);
@@ -94,9 +99,18 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                         ) {
                             ReviewOutcome::Approved(approved) => approved,
                             ReviewOutcome::Rejected => continue,
+                            ReviewOutcome::Insert(command) => {
+                                state.pending_editor_insert = Some(command);
+                                println!(
+                                    "agent: command moved to your next prompt for manual \
+                                     review; it was not executed."
+                                );
+                                return 0;
+                            }
                             ReviewOutcome::Quit => return 0,
                         };
-                        let (exit_code, output) = run_captured(&approved.command, state);
+                        let (exit_code, output) =
+                            run_captured(&approved.command, state, &mut agent_cwd);
                         if let Err(error) =
                             session.observe(approved.proposal_id, exit_code, &output)
                         {
@@ -182,6 +196,9 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
 enum ReviewOutcome {
     Approved(ApprovedCommand),
     Rejected,
+    /// Insert-only manual review: the command text goes to the next editor
+    /// prompt without executing, and the session records the non-execution.
+    Insert(String),
     Quit,
 }
 
@@ -208,7 +225,8 @@ fn review_proposal(
         }
     }
     loop {
-        let Some(choice) = read_line("  [y] run  [e] edit  [n] reject  [q] quit > ") else {
+        let Some(choice) = read_line("  [y] run  [e] edit  [i] insert  [n] reject  [q] quit > ")
+        else {
             session.cancel();
             return ReviewOutcome::Quit;
         };
@@ -247,6 +265,12 @@ fn review_proposal(
                     }
                 }
             }
+            "i" | "insert" => match session.edit_for_manual_review(id, command) {
+                Ok(command) => return ReviewOutcome::Insert(command),
+                Err(error) => {
+                    eprintln!("  agent: {error}");
+                }
+            },
             "n" | "no" | "reject" => {
                 if let Err(error) = session.reject(id) {
                     eprintln!("agent: {error}");
@@ -280,8 +304,9 @@ fn request_model(
     chat: &ChatConfig,
     session: &AgentSession,
     share_context: bool,
+    agent_cwd: &Path,
 ) -> Result<String, String> {
-    let environment = environment_meta(share_context);
+    let environment = environment_meta(share_context, agent_cwd);
     let user_text = jagent::agent_user_prompt(&session.build_user_prompt(), &environment, None);
     let request = build_chat_request(
         chat,
@@ -333,23 +358,24 @@ fn chat_config(ai_config: &AiConfig) -> ChatConfig {
         model: ai_config.model.clone(),
         base_url: ai_config.base_url.clone(),
         max_tokens: AGENT_MAX_TOKENS,
+        // Strict JSON protocol compliance beats creativity here.
+        temperature: Some(0.0),
     }
 }
 
-fn environment_meta(share_context: bool) -> EnvironmentMeta {
+fn environment_meta(share_context: bool, cwd: &Path) -> EnvironmentMeta {
     EnvironmentMeta {
-        cwd: std::env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
+        cwd: cwd.display().to_string(),
         shell: "rsh".to_string(),
         os: std::env::consts::OS.to_string(),
-        git: if share_context { git_meta() } else { None },
+        git: if share_context { git_meta(cwd) } else { None },
     }
 }
 
-fn git_meta() -> Option<GitMeta> {
+fn git_meta(cwd: &Path) -> Option<GitMeta> {
     let branch = std::process::Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -358,6 +384,7 @@ fn git_meta() -> Option<GitMeta> {
         .filter(|branch| !branch.is_empty())?;
     let dirty = std::process::Command::new("git")
         .args(["status", "--porcelain"])
+        .current_dir(cwd)
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -374,42 +401,75 @@ fn git_meta() -> Option<GitMeta> {
 /// teeing combined stdout+stderr to the terminal while capturing a bounded
 /// copy for the observation. Interactive/TTY-dependent programs will see a
 /// pipe; the agent protocol already biases toward non-interactive commands.
-fn run_captured(command: &str, state: &mut ShellState) -> (i32, String) {
+///
+/// The command starts in `agent_cwd`, and the child reports its final working
+/// directory back over a dedicated pipe so `cd` persists across agent turns
+/// while the interactive shell's own cwd stays untouched.
+fn run_captured(command: &str, state: &mut ShellState, agent_cwd: &mut PathBuf) -> (i32, String) {
     use nix::sys::wait::{waitpid, WaitStatus};
-    use nix::unistd::{close, fork, pipe, read, ForkResult};
+    use nix::unistd::{close, fork, pipe, read, write, ForkResult};
     use std::os::unix::io::{BorrowedFd, IntoRawFd};
 
-    println!("  {}", dim(&format!("$ {command}")));
+    let shell_cwd = std::env::current_dir().unwrap_or_default();
+    if *agent_cwd == shell_cwd {
+        println!("  {}", dim(&format!("$ {command}")));
+    } else {
+        println!(
+            "  {}",
+            dim(&format!("$ {command}   (in {})", agent_cwd.display()))
+        );
+    }
     let (r, w) = match pipe() {
         Ok(fds) => (fds.0.into_raw_fd(), fds.1.into_raw_fd()),
         Err(error) => return (1, format!("[rsh: pipe failed: {error}]")),
+    };
+    let (status_r, status_w) = match pipe() {
+        Ok(fds) => (fds.0.into_raw_fd(), fds.1.into_raw_fd()),
+        Err(error) => {
+            close(r).ok();
+            close(w).ok();
+            return (1, format!("[rsh: pipe failed: {error}]"));
+        }
     };
 
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             close(r).ok();
+            close(status_r).ok();
             unsafe {
                 nix::libc::dup2(w, 1);
                 nix::libc::dup2(w, 2);
+                // Executed programs must not inherit the cwd-report pipe.
+                nix::libc::fcntl(status_w, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC);
             }
             close(w).ok();
             state.interactive = false;
-            match crate::parser::parse(command) {
+            if std::env::set_current_dir(&*agent_cwd).is_ok() {
+                state.export_var("PWD", &agent_cwd.display().to_string());
+            }
+            let code = match crate::parser::parse(command) {
                 Ok(commands) => {
                     let mut code = 0;
                     for parsed in &commands {
                         code = crate::executor::execute_complete_command(parsed, state);
                     }
-                    std::process::exit(code);
+                    code
                 }
                 Err(error) => {
                     eprintln!("rsh: parse error: {error}");
-                    std::process::exit(2);
+                    2
                 }
+            };
+            if let Ok(final_cwd) = std::env::current_dir() {
+                let bytes = final_cwd.display().to_string().into_bytes();
+                let _ = write(unsafe { BorrowedFd::borrow_raw(status_w) }, &bytes);
             }
+            close(status_w).ok();
+            std::process::exit(code);
         }
         Ok(ForkResult::Parent { child }) => {
             close(w).ok();
+            close(status_w).ok();
             let mut captured: Vec<u8> = Vec::new();
             let mut truncated = false;
             let mut buffer = [0_u8; 4096];
@@ -435,11 +495,29 @@ fn run_captured(command: &str, state: &mut ShellState) -> (i32, String) {
                 }
             }
             close(r).ok();
+            let mut reported_cwd: Vec<u8> = Vec::new();
+            loop {
+                match unsafe { read(BorrowedFd::borrow_raw(status_r), &mut buffer) } {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => reported_cwd.extend_from_slice(&buffer[..count]),
+                }
+            }
+            close(status_r).ok();
             let exit_code = match waitpid(child, None) {
                 Ok(WaitStatus::Exited(_, code)) => code,
                 Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
                 _ => 1,
             };
+            if let Ok(reported) = String::from_utf8(reported_cwd) {
+                let reported = reported.trim();
+                if !reported.is_empty() {
+                    let reported = PathBuf::from(reported);
+                    if reported != *agent_cwd && reported.is_dir() {
+                        println!("  {}", dim(&format!("cwd → {}", reported.display())));
+                        *agent_cwd = reported;
+                    }
+                }
+            }
             let mut output = String::from_utf8_lossy(&captured).to_string();
             if truncated {
                 output.push_str("\n[rsh: further output not captured]");
@@ -449,6 +527,8 @@ fn run_captured(command: &str, state: &mut ShellState) -> (i32, String) {
         Err(error) => {
             close(r).ok();
             close(w).ok();
+            close(status_r).ok();
+            close(status_w).ok();
             (1, format!("[rsh: fork failed: {error}]"))
         }
     }

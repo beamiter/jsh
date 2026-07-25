@@ -199,6 +199,10 @@ pub struct ShellState {
     /// Phase 15c: typed user functions — name → closure body. The closure
     /// captures let_vars at def time, like inline `{||...}` closures.
     pub user_typed_fns: HashMap<String, std::sync::Arc<crate::value::ClosureData>>,
+    /// Command text a builtin (the agent's insert-only review path) asks the
+    /// editor to prefill into the next prompt. Review-only: taking this never
+    /// executes anything.
+    pub pending_editor_insert: Option<String>,
 }
 
 impl ShellState {
@@ -278,6 +282,7 @@ impl ShellState {
             last_error: None,
             user_signatures: HashMap::new(),
             user_typed_fns: HashMap::new(),
+            pending_editor_insert: None,
         }
     }
 
