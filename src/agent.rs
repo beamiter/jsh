@@ -307,7 +307,13 @@ fn request_model(
     agent_cwd: &Path,
 ) -> Result<String, String> {
     let environment = environment_meta(share_context, agent_cwd);
-    let user_text = jagent::agent_user_prompt(&session.build_user_prompt(), &environment, None);
+    // Transcript observations replay real terminal output; scrub
+    // high-confidence secret shapes before anything leaves the machine.
+    let user_text = jagent::redact_secrets(&jagent::agent_user_prompt(
+        &session.build_user_prompt(),
+        &environment,
+        None,
+    ));
     let request = build_chat_request(
         chat,
         Some(&jagent::build_agent_system_prompt()),
@@ -392,8 +398,10 @@ fn git_meta(cwd: &Path) -> Option<GitMeta> {
     Some(GitMeta {
         branch,
         dirty,
-        ahead: 0,
-        behind: 0,
+        // Not computed here; None is honest ("unknown/no upstream"), while 0
+        // would claim the branch is exactly in sync.
+        ahead: None,
+        behind: None,
     })
 }
 
