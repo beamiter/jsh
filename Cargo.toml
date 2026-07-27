@@ -23,14 +23,14 @@ unicode-width = "0.2"
 crossterm = "0.29.0"
 dirs = "6.0.0"
 nix = { version = "0.31.3", features = ["process", "fs", "signal", "term"] }
-ureq = { version = "2", optional = true }
+ureq = { version = "3", optional = true }
 jagent = { git = "https://github.com/beamiter/jagent", optional = true }
 serde_yaml = "0.9"
-toml = "0.8"
-quick-xml = { version = "0.37", features = ["serialize"] }
+toml = "1.1"
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
 [[bench]]

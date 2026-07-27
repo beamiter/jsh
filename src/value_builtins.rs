@@ -4638,6 +4638,38 @@ fn http_request_over_tcp(
     Ok((status, header_rec, body_string))
 }
 
+/// Append `--query` pairs to a URL, percent-encoding anything outside the
+/// unreserved set. ureq 3 drives requests through `http::Uri`, which has no
+/// query builder of its own, so the encoding lives here.
+#[cfg(feature = "ai")]
+fn append_query(url: &str, query: &[(String, String)]) -> String {
+    let mut out = url.to_string();
+    for (idx, (k, v)) in query.iter().enumerate() {
+        let sep = if idx == 0 && !url.contains('?') {
+            '?'
+        } else {
+            '&'
+        };
+        out.push(sep);
+        push_query_encoded(&mut out, k);
+        out.push('=');
+        push_query_encoded(&mut out, v);
+    }
+    out
+}
+
+#[cfg(feature = "ai")]
+fn push_query_encoded(out: &mut String, value: &str) {
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+}
+
 #[cfg(feature = "ai")]
 fn vb_http(
     input: PipelineData,
@@ -4756,35 +4788,40 @@ fn vb_http(
             None => unreachable!(),
         }
     } else {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(10))
-            .timeout_read(std::time::Duration::from_secs(30))
-            .build();
-        let mut req = agent.request(method, &url);
-        for (k, v) in &query {
-            req = req.query(k, v);
-        }
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
+            // Surface non-2xx as an ordinary response rather than an error, so
+            // both outcomes produce the same record shape (status code captured)
+            // instead of failing the pipeline — callers can `where status >= 400`.
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        let mut builder = ureq::http::Request::builder()
+            .method(method)
+            .uri(append_query(&url, &query));
         for (k, v) in &headers {
-            req = req.set(k, v);
-        }
-        if as_json && body_bytes.is_none() {
-            // no-op — kept for symmetry with --json on POSTs
+            builder = builder.header(k.as_str(), v.as_str());
         }
         if as_json {
-            req = req.set("Content-Type", "application/json");
+            builder = builder.header("Content-Type", "application/json");
         }
 
-        let response = match body_bytes {
-            Some(b) => req.send_bytes(&b),
-            None => req.call(),
+        let response = match body_bytes.as_deref() {
+            Some(b) => builder
+                .body(b)
+                .map_err(|e| e.to_string())
+                .and_then(|req| agent.run(req).map_err(|e| e.to_string())),
+            None => builder
+                .body(())
+                .map_err(|e| e.to_string())
+                .and_then(|req| agent.run(req).map_err(|e| e.to_string())),
         };
 
-        // ureq folds non-2xx into Err(Response). We surface both as the same record
-        // shape (status code captured) rather than failing the pipeline — callers
-        // can `where status >= 400` to filter.
-        let resp = match response {
+        let mut resp = match response {
             Ok(r) => r,
-            Err(ureq::Error::Status(_, r)) => r,
             Err(e) => {
                 let msg = format!("http: request failed: {}", e);
                 eprintln!("{}", msg);
@@ -4793,14 +4830,15 @@ fn vb_http(
             }
         };
 
-        let status = resp.status() as i64;
+        let status = resp.status().as_u16() as i64;
         let mut header_rec = indexmap::IndexMap::new();
-        for name in resp.headers_names() {
-            if let Some(v) = resp.header(&name) {
-                header_rec.insert(name, Value::String(v.to_string()));
-            }
+        for (name, value) in resp.headers() {
+            header_rec.insert(
+                name.as_str().to_string(),
+                Value::String(value.to_str().unwrap_or_default().to_string()),
+            );
         }
-        let body_string = match resp.into_string() {
+        let body_string = match resp.body_mut().read_to_string() {
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("http: body read failed: {}", e);

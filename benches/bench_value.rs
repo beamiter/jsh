@@ -4,7 +4,8 @@
 /// landed in Phase 14c) and the structured builtins on synthetic
 /// tables. The intent is to track regressions to the per-iteration cost
 /// of `each` / `where` / `reduce` over large inputs.
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 use indexmap::IndexMap;
 use rsh::environment::ShellState;

@@ -229,11 +229,13 @@ fn process_request(_config: &AiConfig, _request: &AiRequest) -> AiResponse {
 
 #[cfg(feature = "ai")]
 fn ai_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout_read(std::time::Duration::from_secs(30))
-        .timeout_write(std::time::Duration::from_secs(10))
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(5)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
+        .timeout_send_body(Some(std::time::Duration::from_secs(10)))
         .build()
+        .into()
 }
 
 #[cfg(feature = "ai")]
@@ -251,13 +253,13 @@ fn call_openai(config: &AiConfig, system: &str, user: &str) -> AiResponse {
 
     let mut req = ai_agent()
         .post(&url)
-        .set("Content-Type", "application/json");
+        .header("Content-Type", "application/json");
     if let Some(ref key) = config.api_key {
-        req = req.set("Authorization", &format!("Bearer {}", key));
+        req = req.header("Authorization", &format!("Bearer {}", key));
     }
 
-    match req.send_string(&body.to_string()) {
-        Ok(resp) => match resp.into_string() {
+    match req.send(body.to_string()) {
+        Ok(mut resp) => match resp.body_mut().read_to_string() {
             Ok(text) => parse_openai_response(&text),
             Err(e) => AiResponse::Error(format!("Read error: {}", e)),
         },
@@ -279,14 +281,14 @@ fn call_anthropic(config: &AiConfig, system: &str, user: &str) -> AiResponse {
 
     let mut req = ai_agent()
         .post(&url)
-        .set("Content-Type", "application/json")
-        .set("anthropic-version", "2023-06-01");
+        .header("Content-Type", "application/json")
+        .header("anthropic-version", "2023-06-01");
     if let Some(ref key) = config.api_key {
-        req = req.set("x-api-key", key);
+        req = req.header("x-api-key", key);
     }
 
-    match req.send_string(&body.to_string()) {
-        Ok(resp) => match resp.into_string() {
+    match req.send(body.to_string()) {
+        Ok(mut resp) => match resp.body_mut().read_to_string() {
             Ok(text) => parse_anthropic_response(&text),
             Err(e) => AiResponse::Error(format!("Read error: {}", e)),
         },
@@ -310,10 +312,10 @@ fn call_ollama(config: &AiConfig, system: &str, user: &str) -> AiResponse {
 
     match ai_agent()
         .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
     {
-        Ok(resp) => match resp.into_string() {
+        Ok(mut resp) => match resp.body_mut().read_to_string() {
             Ok(text) => parse_ollama_response(&text),
             Err(e) => AiResponse::Error(format!("Read error: {}", e)),
         },

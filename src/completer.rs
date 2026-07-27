@@ -2196,7 +2196,7 @@ fn cargo_values_from_manifest(
     let Ok(content) = fs::read_to_string(manifest_path) else {
         return Vec::new();
     };
-    let Ok(manifest) = content.parse::<toml::Value>() else {
+    let Ok(manifest) = toml::from_str::<toml::Value>(&content) else {
         return Vec::new();
     };
     let root = manifest_path
@@ -2251,7 +2251,7 @@ fn cargo_values_from_manifest(
                     if let Ok(paths) = glob::glob(pattern) {
                         for path in paths.flatten() {
                             if let Ok(content) = fs::read_to_string(path) {
-                                if let Ok(value) = content.parse::<toml::Value>() {
+                                if let Ok(value) = toml::from_str::<toml::Value>(&content) {
                                     if let Some(name) = value
                                         .get("package")
                                         .and_then(|package| package.get("name"))

@@ -324,27 +324,31 @@ fn request_model(
     )
     .map_err(|error| error.to_string())?;
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout_read(std::time::Duration::from_secs(120))
-        .timeout_write(std::time::Duration::from_secs(10))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(5)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(120)))
+        .timeout_recv_body(Some(std::time::Duration::from_secs(120)))
+        .timeout_send_body(Some(std::time::Duration::from_secs(10)))
+        // Keep non-2xx as a normal response so the provider's error body can be
+        // read and reported instead of a bare status code.
+        .http_status_as_error(false)
+        .build()
+        .into();
     let mut post = agent.post(&request.url);
     for (name, value) in &request.headers {
-        post = post.set(name, value);
+        post = post.header(name, value);
     }
-    let response = post
-        .send_string(&request.body)
-        .map_err(|error| match error {
-            ureq::Error::Status(status, response) => format!(
-                "HTTP {status}: {}",
-                response.into_string().unwrap_or_default()
-            ),
-            other => other.to_string(),
-        })?;
+    let mut response = post
+        .send(request.body.as_str())
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
     let text = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|error| format!("read error: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {text}", status.as_u16()));
+    }
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("invalid response JSON: {error}"))?;
     parse_chat_response(chat.provider, &json).map_err(|error| error.to_string())
