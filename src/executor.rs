@@ -1,7 +1,7 @@
 /// AST executor: fork/exec, pipes, redirects, compound commands.
 use crate::builtins;
 use crate::environment::ShellState;
-use crate::expand::{expand_word_to_string, expand_words};
+use crate::expand::{expand_word, expand_word_to_string, expand_words};
 use crate::parser::ast::*;
 use crate::signal;
 
@@ -665,11 +665,13 @@ fn execute_command_in_pipeline_child(cmd: &Command, state: &mut ShellState) -> i
 
 fn execute_assignment(assign: &Assignment, state: &mut ShellState) {
     if let Some(ref array_words) = assign.array_value {
-        // Array assignment: arr=(a b c)
-        let values: Vec<String> = array_words
-            .iter()
-            .map(|w| expand_word_to_string(w, state))
-            .collect();
+        // Array assignment: arr=(a b c). Each element is a normal word, so an
+        // unquoted expansion inside one can split into several elements and
+        // globs expand against the filesystem.
+        let mut values: Vec<String> = Vec::new();
+        for w in array_words {
+            values.extend(expand_word(w, state));
+        }
         if assign.append {
             let arr = state.arrays.entry(assign.name.clone()).or_default();
             arr.extend(values);

@@ -7,13 +7,15 @@ use crate::value::Value;
 /// Expand a Word (Vec<WordPart>) into a list of strings.
 /// Word splitting and globbing may produce multiple strings from one Word.
 pub fn expand_word(word: &Word, state: &mut ShellState) -> Vec<String> {
-    // Check for array expansions that produce multiple words: ${arr[@]} or ${arr[*]}
-    for part in word {
-        if let WordPart::Variable(name) = part {
-            if let Some(result) = try_expand_array_split(name, state) {
-                return result;
-            }
+    // Array expansions produce one field per element: ${arr[@]} and ${arr[*]},
+    // quoted or not (only "${arr[*]}" joins into a single field).
+    if word_refs_array_at_star(word, state) {
+        let fields = expand_parts_to_fields(word, state, false);
+        // "${empty[@]}" contributes no fields at all, the same way "$@" doesn't.
+        if fields.len() == 1 && fields[0].is_empty() && array_refs_all_empty(word, state) {
+            return Vec::new();
         }
+        return fields;
     }
 
     // Check for "$@"/$@/$* which expand to multiple fields (positional params).
@@ -184,6 +186,12 @@ fn ifs_split(s: &str, mask: &[bool], state: &ShellState) -> Vec<String> {
     fields
 }
 
+/// IFS-split a string that came entirely from an unquoted expansion.
+fn ifs_split_unquoted(s: &str, state: &ShellState) -> Vec<String> {
+    let mask = vec![true; s.len()];
+    ifs_split(s, &mask, state)
+}
+
 /// Apply glob/extglob expansion to a single already-split field.
 fn glob_field(expanded: &str, state: &mut ShellState) -> Vec<String> {
     let has_extglob = state.shell_opts.extglob && crate::glob_match::contains_extglob(expanded);
@@ -234,23 +242,45 @@ fn glob_field(expanded: &str, state: &mut ShellState) -> Vec<String> {
     }
 }
 
-/// Check if a variable name refers to an array with [@] or [*] and should word-split.
-fn try_expand_array_split(name: &str, state: &mut ShellState) -> Option<Vec<String>> {
-    // ${arr[@]} or ${arr[*]} → split into individual words
-    if let Some(bracket) = name.find('[') {
-        let var_name = &name[..bracket];
-        let subscript = &name[bracket + 1..name.len().saturating_sub(1)];
-        if subscript == "@" || subscript == "*" {
-            if state.is_array(var_name) {
-                let vals = state.array_values(var_name);
-                if vals.is_empty() {
-                    return Some(Vec::new());
-                }
-                return Some(vals);
-            }
+/// Split `arr[@]` / `arr[*]` into (array name, subscript) when the name refers
+/// to an existing array.
+fn array_at_star_ref<'a>(name: &'a str, state: &ShellState) -> Option<(&'a str, &'a str)> {
+    let bracket = name.find('[')?;
+    let var_name = &name[..bracket];
+    let subscript = &name[bracket + 1..name.len().saturating_sub(1)];
+    if (subscript == "@" || subscript == "*") && state.is_array(var_name) {
+        Some((var_name, subscript))
+    } else {
+        None
+    }
+}
+
+/// Does this word reference an array as `${arr[@]}` / `${arr[*]}` (at top level
+/// or inside double quotes)?
+fn word_refs_array_at_star(word: &Word, state: &ShellState) -> bool {
+    fn walk(part: &WordPart, state: &ShellState) -> bool {
+        match part {
+            WordPart::Variable(name) => array_at_star_ref(name, state).is_some(),
+            WordPart::DoubleQuoted(parts) => parts.iter().any(|p| walk(p, state)),
+            _ => false,
         }
     }
-    None
+    word.iter().any(|p| walk(p, state))
+}
+
+/// Are all the arrays this word references via `[@]`/`[*]` empty?
+fn array_refs_all_empty(word: &Word, state: &ShellState) -> bool {
+    fn walk(part: &WordPart, state: &ShellState) -> bool {
+        match part {
+            WordPart::Variable(name) => match array_at_star_ref(name, state) {
+                Some((var_name, _)) => state.array_values(var_name).is_empty(),
+                None => true,
+            },
+            WordPart::DoubleQuoted(parts) => parts.iter().all(|p| walk(p, state)),
+            _ => true,
+        }
+    }
+    word.iter().all(|p| walk(p, state))
 }
 
 /// Does this word reference $@ or $* (top-level or inside double quotes)?
@@ -293,6 +323,25 @@ fn expand_parts_to_fields(parts: &[WordPart], state: &mut ShellState, quoted: bo
                 } else {
                     let params = state.positional_params.clone();
                     append_fields(&mut fields, params);
+                }
+            }
+            WordPart::Variable(name) if array_at_star_ref(name, state).is_some() => {
+                let (var_name, subscript) = array_at_star_ref(name, state).unwrap();
+                let vals = state.array_values(var_name);
+                if quoted {
+                    if subscript == "*" {
+                        let sep = ifs_first(state);
+                        fields.last_mut().unwrap().push_str(&vals.join(&sep));
+                    } else {
+                        append_fields(&mut fields, vals);
+                    }
+                } else {
+                    // Unquoted, each element is still subject to IFS splitting.
+                    let mut split = Vec::new();
+                    for v in &vals {
+                        split.extend(ifs_split_unquoted(v, state));
+                    }
+                    append_fields(&mut fields, split);
                 }
             }
             WordPart::DoubleQuoted(inner) => {

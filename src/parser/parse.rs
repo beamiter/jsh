@@ -52,6 +52,94 @@ fn split_for_header(s: &str) -> Vec<String> {
     parts
 }
 
+/// Split the body of an array literal (`arr=(...)`) into element words. Quoting
+/// is honored, so `("a b" c)` is two elements and not three, and `#` starting a
+/// word begins a comment as it does in bash.
+fn split_array_elements(s: &str) -> Vec<String> {
+    let mut elems = Vec::new();
+    let mut cur = String::new();
+    // Pending closers for `$( ... )` / `${ ... }`, inside which whitespace does
+    // not separate elements.
+    let mut closers: Vec<char> = Vec::new();
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                cur.push(c);
+                if let Some(c2) = chars.next() {
+                    cur.push(c2);
+                }
+            }
+            '\'' => {
+                cur.push(c);
+                for c2 in chars.by_ref() {
+                    cur.push(c2);
+                    if c2 == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' | '`' => {
+                cur.push(c);
+                while let Some(c2) = chars.next() {
+                    cur.push(c2);
+                    if c2 == '\\' {
+                        if let Some(c3) = chars.next() {
+                            cur.push(c3);
+                        }
+                    } else if c2 == c {
+                        break;
+                    }
+                }
+            }
+            '$' => {
+                cur.push(c);
+                match chars.peek() {
+                    Some(&'(') => {
+                        closers.push(')');
+                        cur.push('(');
+                        chars.next();
+                    }
+                    Some(&'{') => {
+                        closers.push('}');
+                        cur.push('{');
+                        chars.next();
+                    }
+                    _ => {}
+                }
+            }
+            '(' if !closers.is_empty() => {
+                closers.push(')');
+                cur.push(c);
+            }
+            _ if Some(&c) == closers.last() => {
+                closers.pop();
+                cur.push(c);
+            }
+            '#' if closers.is_empty() && cur.is_empty() => {
+                while let Some(&c2) = chars.peek() {
+                    if c2 == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            ' ' | '\t' | '\n' | '\r' if closers.is_empty() => {
+                if !cur.is_empty() {
+                    elems.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+
+    if !cur.is_empty() {
+        elems.push(cur);
+    }
+    elems
+}
+
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     current: SpannedToken,
@@ -343,6 +431,11 @@ impl<'a> Parser<'a> {
                 let w = w.clone();
                 words.push(parse_word_parts(&w));
                 self.advance();
+                // `[[` opens a conditional expression: everything up to the
+                // matching `]]` belongs to it, including operator characters.
+                if words.len() == 1 && w == "[[" {
+                    self.parse_conditional_words(&mut words)?;
+                }
             } else {
                 break;
             }
@@ -363,6 +456,44 @@ impl<'a> Parser<'a> {
             words,
             redirects,
         }))
+    }
+
+    /// Collect the body of a `[[ ... ]]` conditional, stopping after the closing
+    /// `]]`. Inside a conditional, `&&`, `||`, `(`, `)`, `<` and `>` are part of
+    /// the expression rather than list operators or redirections, so the
+    /// operator tokens the lexer produced are turned back into plain words for
+    /// the `[[` builtin to evaluate.
+    fn parse_conditional_words(&mut self, words: &mut Vec<Word>) -> Result<(), ParseError> {
+        loop {
+            let op = match &self.current.token {
+                Token::Word(w) => {
+                    let w = w.clone();
+                    words.push(parse_word_parts(&w));
+                    self.advance();
+                    if w == "]]" {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Token::And => "&&",
+                Token::Or => "||",
+                Token::LParen => "(",
+                Token::RParen => ")",
+                Token::RedirectIn => "<",
+                Token::RedirectOut => ">",
+                // A conditional may be continued across lines until its `]]`.
+                Token::Newline => {
+                    self.advance();
+                    continue;
+                }
+                Token::Eof => return Err(ParseError::Incomplete),
+                // Anything else cannot appear in a conditional; hand it back so
+                // the normal parse path reports it.
+                _ => return Ok(()),
+            };
+            words.push(vec![WordPart::Literal(op.to_string())]);
+            self.advance();
+        }
     }
 
     fn parse_compound_command(&mut self) -> Result<Command, ParseError> {
@@ -1171,8 +1302,8 @@ fn parse_assignment(w: &str, parser: &mut Parser) -> Result<Assignment, ParseErr
 
         // Parse any words already in the token
         if !inner.is_empty() {
-            for part in inner.split_whitespace() {
-                array_words.push(parse_word_parts(part));
+            for part in split_array_elements(&inner) {
+                array_words.push(parse_word_parts(&part));
             }
         }
 
@@ -1219,8 +1350,8 @@ fn parse_assignment(w: &str, parser: &mut Parser) -> Result<Assignment, ParseErr
     // Check for complete array literal: name=(a b c) all in one token
     if value_str.starts_with('(') && value_str.ends_with(')') {
         let inner = &value_str[1..value_str.len() - 1];
-        let array_words: Vec<Word> = inner
-            .split_whitespace()
+        let array_words: Vec<Word> = split_array_elements(inner)
+            .iter()
             .map(|s| parse_word_parts(s))
             .collect();
         parser.advance();

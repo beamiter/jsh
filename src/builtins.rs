@@ -190,6 +190,28 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         }
         "[[" => builtin_double_bracket(args, state),
         "command" => {
+            // Strip the option prefix: -v/-V describe the command instead of
+            // running it, -p only affects which PATH is searched.
+            let mut describe: Option<char> = None;
+            let mut rest = args;
+            while let Some(first) = rest.first() {
+                match first.as_str() {
+                    "-v" | "-V" => {
+                        describe = Some(first.chars().nth(1).unwrap());
+                        rest = &rest[1..];
+                    }
+                    "-p" => rest = &rest[1..],
+                    "--" => {
+                        rest = &rest[1..];
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            if let Some(mode) = describe {
+                return command_describe(rest, mode == 'V', state);
+            }
+            let args = rest;
             if args.is_empty() {
                 return 0;
             }
@@ -738,15 +760,98 @@ fn builtin_type(args: &[String], state: &mut ShellState) -> i32 {
 }
 
 fn find_in_path(cmd: &str) -> Option<String> {
+    // A name containing a slash is used as-is, never searched for in PATH.
+    if cmd.contains('/') {
+        return if is_executable_file(Path::new(cmd)) {
+            Some(cmd.to_string())
+        } else {
+            None
+        };
+    }
     if let Ok(path) = env::var("PATH") {
         for dir in path.split(':') {
+            let dir = if dir.is_empty() { "." } else { dir };
             let full = format!("{}/{}", dir, cmd);
-            if Path::new(&full).is_file() {
+            if is_executable_file(Path::new(&full)) {
                 return Some(full);
             }
         }
     }
     None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(md) => md.is_file() && md.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn is_shell_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "in"
+            | "function"
+            | "select"
+            | "time"
+            | "{"
+            | "}"
+            | "!"
+    )
+}
+
+/// `command -v NAME...` / `command -V NAME...`: report how each name would be
+/// resolved, without running it. Exit status is 1 if any name is not found.
+fn command_describe(names: &[String], verbose: bool, state: &ShellState) -> i32 {
+    let mut ret = 0;
+    for name in names {
+        // (terse form for -v, description for -V) of the first match, in the
+        // order the shell itself resolves a command name.
+        let found = if let Some(alias) = state.aliases.get(name) {
+            Some((
+                format!("alias {}='{}'", name, alias),
+                format!("{} is aliased to `{}'", name, alias),
+            ))
+        } else if is_shell_keyword(name) {
+            Some((name.clone(), format!("{} is a shell keyword", name)))
+        } else if state.functions.contains_key(name) {
+            Some((name.clone(), format!("{} is a function", name)))
+        } else if is_builtin(name) {
+            Some((name.clone(), format!("{} is a shell builtin", name)))
+        } else {
+            find_in_path(name).map(|path| (path.clone(), format!("{} is {}", name, path)))
+        };
+
+        match found {
+            Some((terse, described)) => println!("{}", if verbose { described } else { terse }),
+            None => {
+                if verbose {
+                    eprintln!("rsh: command: {}: not found", name);
+                }
+                ret = 1;
+            }
+        }
+    }
+    ret
 }
 
 /// Use bash to source a script file when rsh's parser can't handle it,
@@ -2400,7 +2505,8 @@ fn builtin_declare(args: &[String], state: &mut ShellState) -> i32 {
                     "declare -a {}=({})",
                     name,
                     arr.iter()
-                        .map(|s| format!("\"{}\"", s))
+                        .enumerate()
+                        .map(|(i, s)| format!("[{}]=\"{}\"", i, s))
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
