@@ -1,0 +1,244 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag and crate version
+        id: resolve
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          crate_version="$(sed -n '0,/^version = "/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [ "${version}" != "${crate_version}" ]; then
+            echo "::error::tag ${tag} does not match Cargo.toml version ${crate_version}"
+            exit 1
+          fi
+          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+          printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc builds are the default install: faster allocator, smaller
+          # binary. Built on 22.04 so they run on glibc 2.35 and newer.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          # Static musl builds are the portability fallback the installer
+          # picks when the host glibc is older than the gnu artifacts need.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+            musl: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          # `ring` compiles C for the musl target and needs the cross compiler
+          # by its target-specific variable name.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --all-features --locked --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/rsh"
+          banner="$("${bin}" --version)"
+          printf '%s\n' "${banner}"
+          # The installer and every jterm identify rsh by this exact banner
+          # shape, because /usr/bin/rsh is the BSD remote shell on Debian.
+          case "${banner}" in
+            "rsh ${{ needs.verify.outputs.version }}"*) ;;
+            *)
+              echo "::error::unexpected --version banner: ${banner}"
+              exit 1
+              ;;
+          esac
+          printf 'hello from %s\n' "${{ matrix.target }}" \
+            | "${bin}" -c 'cat' > /dev/null
+
+      - name: Package tarball
+        id: package
+        run: |
+          set -euo pipefail
+          name="rsh-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          staging="dist/${name}"
+          mkdir -p "${staging}"
+          cp "target/${{ matrix.target }}/release/rsh" "${staging}/rsh"
+          cp README.md CHANGELOG.md "${staging}/"
+          chmod 0755 "${staging}/rsh"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "${staging}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          printf 'name=%s\n' "${name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -l
+          for sum in *.sha256; do
+            sha256sum -c "${sum}"
+          done
+
+      - name: Generate manifest.json
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Published at a stable URL:
+          #   https://github.com/<repo>/releases/latest/download/manifest.json
+          # The installer and the jterm update check read it from there, so no
+          # API token and no rate limit are involved.
+          : > artifacts.jsonl
+          for archive in rsh-"${VERSION}"-*.tar.gz; do
+            target="${archive#rsh-${VERSION}-}"
+            target="${target%.tar.gz}"
+            jq -n \
+              --arg target "${target}" \
+              --arg file "${archive}" \
+              --arg sha256 "$(sha256sum "${archive}" | cut -d' ' -f1)" \
+              --arg url "https://github.com/${REPO}/releases/download/${TAG}/${archive}" \
+              '{target: $target, file: $file, sha256: $sha256, url: $url}' \
+              >> artifacts.jsonl
+          done
+          jq -s \
+            --arg version "${VERSION}" \
+            --arg tag "${TAG}" \
+            --arg repo "${REPO}" \
+            '{schema: 1, name: "rsh", version: $version, tag: $tag,
+              repository: $repo, artifacts: .}' \
+            artifacts.jsonl > manifest.json
+          rm artifacts.jsonl
+          cat manifest.json
+
+      - name: Stage the installer
+        run: cp scripts/install-rsh.sh dist/install-rsh.sh
+
+      - name: Extract release notes
+        id: notes
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          if awk -v v="## ${VERSION}" '
+                $0 == v { found = 1; next }
+                found && /^## / { exit }
+                found { print }
+              ' CHANGELOG.md > release-notes.md && [ -s release-notes.md ]; then
+            printf 'file=release-notes.md\n' >> "${GITHUB_OUTPUT}"
+          else
+            printf 'file=\n' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          NOTES_FILE: ${{ steps.notes.outputs.file }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber
+          else
+            if [ -n "${NOTES_FILE}" ]; then
+              gh release create "${TAG}" dist/* \
+                --title "rsh ${TAG}" --notes-file "${NOTES_FILE}" --verify-tag
+            else
+              gh release create "${TAG}" dist/* \
+                --title "rsh ${TAG}" --generate-notes --verify-tag
+            fi
+          fi

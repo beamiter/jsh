@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Publish prebuilt Linux binaries (glibc and static musl, x86_64 and aarch64)
+  from tagged releases, together with checksums and a `manifest.json` served at
+  a stable "latest" URL.
+- Added `scripts/install-rsh.sh`, the one-command install and update path. It
+  verifies checksums, checks that the new binary identifies itself as rsh,
+  swaps it in atomically, keeps the previous binary for rollback, and reports
+  when `PATH` resolves `rsh` to the BSD remote shell instead. `--check --json`
+  reports installed and latest versions for tooling, backed by a shared cache
+  at `~/.cache/rsh/update-check.json`.
+
 ## 0.2.0
 
 - Added a documented CLI contract with help, version, syntax-check, stdin,

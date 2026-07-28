@@ -28,6 +28,31 @@ local workflows, and optional AI-assisted command generation.
 
 ## Install
 
+Install or update the released binary:
+
+```sh
+curl -fsSL https://github.com/beamiter/rsh/releases/latest/download/install-rsh.sh | sh
+```
+
+The installer downloads the build for the current platform, verifies its
+checksum, and replaces the binary with `rename(2)`, so shells that are already
+running keep the version they started with. It installs next to an existing
+`rsh` when it finds one on `PATH`, and falls back to `~/.local/bin` otherwise.
+Re-running it is how you update. Useful options:
+
+```sh
+./scripts/install-rsh.sh --check          # compare installed against latest
+./scripts/install-rsh.sh --channel source # build from git instead
+./scripts/install-rsh.sh --help           # bin directory, pinned version, dry run
+```
+
+The previous binary is kept under `~/.local/state/rsh/rollback/` so a bad
+release can be undone without a network connection.
+
+> On Debian-family systems `/usr/bin/rsh` is the BSD remote shell. The installer
+> identifies binaries by their `rsh --version` banner and tells you when `PATH`
+> resolves to that one instead of this shell.
+
 Build the current checkout:
 
 ```sh
