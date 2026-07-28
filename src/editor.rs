@@ -64,6 +64,10 @@ pub struct Editor {
     last_suggestion_snapshot: Option<String>,
     last_menu_snapshot: Option<usize>,
     last_ai_error_snapshot: Option<String>,
+    /// Byte stolen from the kernel input queue by `swallow_enter_tail` that
+    /// turned out not to be part of a CR+LF Enter; replayed as typed input at
+    /// the next `read_line`.
+    pushback_byte: Option<u8>,
 }
 
 #[derive(Clone)]
@@ -132,6 +136,7 @@ impl Editor {
             last_suggestion_snapshot: None,
             last_menu_snapshot: None,
             last_ai_error_snapshot: None,
+            pushback_byte: None,
         }
     }
 
@@ -159,6 +164,16 @@ impl Editor {
             self.cursor = self.buffer.len();
         }
 
+        // Replay a byte stolen by swallow_enter_tail as if it had just been
+        // typed. Non-printable stolen bytes are dropped: they cannot be
+        // rendered into the line buffer meaningfully.
+        if let Some(b) = self.pushback_byte.take() {
+            if (0x20..0x7f).contains(&b) {
+                self.buffer.push(b as char);
+                self.cursor = self.buffer.len();
+            }
+        }
+
         // OSC 133;A — prompt start marker (semantic shell integration)
         if state.interactive {
             crate::osc::prompt_start();
@@ -179,10 +194,36 @@ impl Editor {
         terminal::enable_raw_mode()?;
         stdout().execute(event::EnableBracketedPaste).ok();
         let result = self.edit_loop(state, history);
+        if let Ok(Some(line)) = &result {
+            self.swallow_enter_tail(!line.is_empty());
+        }
         stdout().execute(event::DisableBracketedPaste).ok();
         terminal::disable_raw_mode()?;
 
         result
+    }
+
+    /// A terminal in newline mode (DECSET 20 LNM — set and abandoned by an
+    /// interrupted full-screen app) or an IME Enter commit delivers Enter as
+    /// CR+LF, sometimes split across two writes. The edit loop submits on the
+    /// CR alone; a trailing LF still in the kernel input queue would then be
+    /// read by the next process to touch stdin — enough for a script's
+    /// `read -p "Proceed? [Y/n]"` to silently auto-accept. Consume exactly one
+    /// immediately-following LF/CR here, while the terminal is still in raw
+    /// mode. A stolen byte that is not a line terminator cannot be pushed back
+    /// into the kernel queue, so it is stashed and replayed at the next prompt.
+    /// `wait` extends the probe by a few milliseconds to catch a split write;
+    /// empty submissions use a zero-timeout probe so Enter-spam stays instant.
+    fn swallow_enter_tail(&mut self, wait: bool) {
+        let window_ms = if wait { 20 } else { 0 };
+        if !matches!(Self::poll_stdin(window_ms), StdinPoll::Ready) {
+            return;
+        }
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n == 1 && b[0] != b'\n' && b[0] != b'\r' {
+            self.pushback_byte = Some(b[0]);
+        }
     }
 
     fn edit_loop(
