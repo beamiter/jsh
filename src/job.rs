@@ -170,7 +170,7 @@ impl JobTable {
             tcsetpgrp(std::io::stdin(), shell_pgid).ok();
             code
         } else {
-            eprintln!("rsh: fg: {}: no such job", id);
+            eprintln!("jsh: fg: {}: no such job", id);
             1
         }
     }
@@ -182,7 +182,7 @@ impl JobTable {
             kill(job.pid, Signal::SIGCONT).ok();
             0
         } else {
-            eprintln!("rsh: bg: {}: no such job", id);
+            eprintln!("jsh: bg: {}: no such job", id);
             1
         }
     }

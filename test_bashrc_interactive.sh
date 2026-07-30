@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Test .bashrc compatibility improvements - INTERACTIVE MODE
-# This tests that aliases and env vars are loaded when rsh starts
+# This tests that aliases and env vars are loaded when jsh starts
 
 TEST_DIR=$(mktemp -d)
 TEST_BASHRC="$TEST_DIR/.bashrc"
@@ -29,34 +29,34 @@ EOF
 echo "=== Setup ==="
 echo "Test .bashrc at: $TEST_BASHRC"
 
-RSH_BIN="./target/debug/rsh"
+JSH_BIN="./target/debug/jsh"
 
-# Helper function to test with rsh in interactive mode via echo
-test_rsh_interactive() {
+# Helper function to test with jsh in interactive mode via echo
+test_jsh_interactive() {
     local cmd="$1"
     local desc="$2"
     echo "Test: $desc"
     echo "  Command: $cmd"
 
-    # Use echo to pipe command to rsh in interactive mode
+    # Use echo to pipe command to jsh in interactive mode
     # This simulates user input in interactive shell
-    HOME="$TEST_DIR" echo "$cmd" | $RSH_BIN 2>/dev/null | grep -v "^rsh>" || echo "  Result: (no output or failed)"
+    HOME="$TEST_DIR" echo "$cmd" | $JSH_BIN 2>/dev/null | grep -v "^jsh>" || echo "  Result: (no output or failed)"
     echo ""
 }
 
-echo "=== Testing rsh interactive mode with custom .bashrc ==="
+echo "=== Testing jsh interactive mode with custom .bashrc ==="
 echo ""
 
 # Test 1: Environment variables
-test_rsh_interactive "echo \$TEST_VAR" "Environment variable TEST_VAR"
-test_rsh_interactive "echo \$MY_PATH" "Environment variable MY_PATH"
+test_jsh_interactive "echo \$TEST_VAR" "Environment variable TEST_VAR"
+test_jsh_interactive "echo \$MY_PATH" "Environment variable MY_PATH"
 
 # Test 2: Aliases
-test_rsh_interactive "type ll" "Check if alias 'll' is registered"
-test_rsh_interactive "alias" "List all aliases"
+test_jsh_interactive "type ll" "Check if alias 'll' is registered"
+test_jsh_interactive "alias" "List all aliases"
 
 # Test 3: Shell options
-test_rsh_interactive "shopt extglob" "Check extglob option"
+test_jsh_interactive "shopt extglob" "Check extglob option"
 
 # Cleanup
 rm -rf "$TEST_DIR"

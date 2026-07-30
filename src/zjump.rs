@@ -18,7 +18,7 @@ impl ZDatabase {
     pub fn load_default() -> Self {
         let path = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".rsh_z");
+            .join(".jsh_z");
         let mut db = ZDatabase {
             entries: Vec::new(),
             file_path: path,

@@ -1,11 +1,11 @@
-# rsh
+# jsh
 
-`rsh` is an experimental interactive shell that combines familiar Bash syntax
+`jsh` is an experimental interactive shell that combines familiar Bash syntax
 with typed, structured-data pipelines. It is built in Rust and includes a
 multiline editor, job control, context-aware completion, session restoration,
 local workflows, and optional AI-assisted command generation.
 
-> `rsh` implements a broad and useful subset of Bash, but it is not yet a
+> `jsh` implements a broad and useful subset of Bash, but it is not yet a
 > drop-in replacement for every Bash script. Keep `/bin/bash` as the interpreter
 > for scripts that require exact Bash behavior.
 
@@ -31,33 +31,33 @@ local workflows, and optional AI-assisted command generation.
 Install or update the released binary:
 
 ```sh
-curl -fsSL https://github.com/beamiter/rsh/releases/latest/download/install-rsh.sh | sh
+curl -fsSL https://github.com/beamiter/jsh/releases/latest/download/install-jsh.sh | sh
 ```
 
 The installer downloads the build for the current platform, verifies its
 checksum, and replaces the binary with `rename(2)`, so shells that are already
 running keep the version they started with. It installs next to an existing
-`rsh` when it finds one on `PATH`, and falls back to `~/.local/bin` otherwise.
+`jsh` when it finds one on `PATH`, and falls back to `~/.local/bin` otherwise.
 Re-running it is how you update. Useful options:
 
 ```sh
-./scripts/install-rsh.sh --check          # compare installed against latest
-./scripts/install-rsh.sh --channel source # build from git instead
-./scripts/install-rsh.sh --help           # bin directory, pinned version, dry run
+./scripts/install-jsh.sh --check          # compare installed against latest
+./scripts/install-jsh.sh --channel source # build from git instead
+./scripts/install-jsh.sh --help           # bin directory, pinned version, dry run
 ```
 
-The previous binary is kept under `~/.local/state/rsh/rollback/` so a bad
+The previous binary is kept under `~/.local/state/jsh/rollback/` so a bad
 release can be undone without a network connection.
 
-> On Debian-family systems `/usr/bin/rsh` is the BSD remote shell. The installer
-> identifies binaries by their `rsh --version` banner and tells you when `PATH`
-> resolves to that one instead of this shell.
+> The installer identifies binaries by their `jsh --version` banner, never by
+> name alone, and tells you when `PATH` resolves `jsh` to some other binary
+> instead of this shell.
 
 Build the current checkout:
 
 ```sh
 cargo build --release
-./target/release/rsh --version
+./target/release/jsh --version
 ```
 
 Or install it into Cargo's binary directory:
@@ -78,38 +78,38 @@ cargo build --release --no-default-features
 Run an interactive shell:
 
 ```sh
-rsh
+jsh
 ```
 
 Execute a command or a script:
 
 ```sh
-rsh -c 'printf "hello %s\n" world'
-rsh ./script.rsh one two
-printf 'echo from-stdin\n' | rsh
+jsh -c 'printf "hello %s\n" world'
+jsh ./script.jsh one two
+printf 'echo from-stdin\n' | jsh
 ```
 
 Use structured data without a chain of text parsers:
 
 ```sh
-rsh -c 'echo '\''[{"name":"Ada","age":36},{"name":"Lin","age":28}]'\'' \
+jsh -c 'echo '\''[{"name":"Ada","age":36},{"name":"Lin","age":28}]'\'' \
   | from-json | where age -gt 30 | select name | to-table'
 ```
 
 Files are decoded from their extension and can be converted on save:
 
 ```sh
-rsh -c 'open users.json | where {|row| [ $row.active = true ]} | save active.yaml'
+jsh -c 'open users.json | where {|row| [ $row.active = true ]} | save active.yaml'
 ```
 
 Typed functions and lazy pipelines extend the shell language:
 
 ```sh
-rsh -c 'def add a:int b:int {|a,b| $a + $b}; add 3 4'
-rsh -c 'range 1..1000000 | take 5 | each {|n| $n * $n} | to-json'
+jsh -c 'def add a:int b:int {|a,b| $a + $b}; add 3 4'
+jsh -c 'range 1..1000000 | take 5 | each {|n| $n * $n} | to-json'
 ```
 
-Discover the available commands from inside rsh:
+Discover the available commands from inside jsh:
 
 ```sh
 help
@@ -120,8 +120,8 @@ help --record where
 ## Command line
 
 ```text
-rsh [OPTIONS] [SCRIPT [ARG ...]]
-rsh [OPTIONS] -c COMMAND [NAME [ARG ...]]
+jsh [OPTIONS] [SCRIPT [ARG ...]]
+jsh [OPTIONS] -c COMMAND [NAME [ARG ...]]
 ```
 
 Important options:
@@ -138,7 +138,7 @@ Important options:
 - `--help` and `--version` report the binary's interface and version.
 
 Startup and session options are accepted for command-line consistency but take
-effect only when rsh starts its interactive editor; they do not alter `-c`,
+effect only when jsh starts its interactive editor; they do not alter `-c`,
 script, stdin, or syntax-check execution.
 
 CLI errors and syntax errors exit with status `2`. Command-not-found and
@@ -148,79 +148,79 @@ executed or read use `126`.
 ## Startup and persistent state
 
 Interactive shells import `~/.bashrc` by default for compatibility. Use
-`--rcfile ~/.rshrc` for a native rsh startup file, or `--norc` for a clean
+`--rcfile ~/.jshrc` for a native jsh startup file, or `--norc` for a clean
 session. Non-interactive `-c`, script, and stdin execution do not implicitly
 load interactive configuration or write interactive history.
 
-History is stored at `~/.rsh_history`; named session snapshots live under
-`~/.rsh/sessions`. New files are written with private permissions. History uses
+History is stored at `~/.jsh_history`; named session snapshots live under
+`~/.jsh/sessions`. New files are written with private permissions. History uses
 a newline-safe JSONL format while retaining compatibility with the previous
 tab-separated format. Session snapshots exclude process-specific variables and
 names that look like credentials, tokens, passwords, or secrets.
 
 ## Semantic commands and execution context
 
-rsh keeps the terminal as one continuous scrollback while exposing semantic
+jsh keeps the terminal as one continuous scrollback while exposing semantic
 command boundaries to terminal emulators. A compatible terminal can build a
 chronological Commands timeline, jump to the original prompt, copy a command or
 its rendered output, and offer rerun actions without imposing a block-based
 layout.
 
 The integration retains the portable OSC 133 lifecycle: `A` begins a prompt,
-`B` begins command input, `C` begins output, and `D` finishes the command. rsh
+`B` begins command input, `C` begins output, and `D` finishes the command. jsh
 adds percent-encoded, size-bounded metadata to `C` and `D`: an execution ID,
 the exact command when it fits the protocol limit, the working directory, exit
 status, and duration. Oversized commands are explicitly marked as truncated
 rather than being presented as exact. The execution ID correlates terminal
-scrollback with rsh's structured context.
+scrollback with jsh's structured context.
 
-Query that context either inside an interactive rsh or from another process:
+Query that context either inside an interactive jsh or from another process:
 
 ```sh
 context list [-n N] [--session ID] [--json]
 context show EXECUTION_ID [--json]
 context last-failed [--json]
 
-rsh context list [-n N] [--session ID] [--json]
-rsh context show EXECUTION_ID [--json]
-rsh context last-failed [--json]
+jsh context list [-n N] [--session ID] [--json]
+jsh context show EXECUTION_ID [--json]
+jsh context last-failed [--json]
 ```
 
 `list` defaults to the newest 20 records and accepts a limit from 1 to 2,000.
 It reports only output availability, truncation, and byte-count metadata;
 `show` and `last-failed` include the captured output itself when available.
 
-Execution context is separate from `~/.rsh_history`. Its append-only JSONL
-journal defaults to `$XDG_STATE_HOME/rsh/executions.jsonl`, falling back to
-`~/.local/state/rsh/executions.jsonl`. The rsh state directory is mode `0700`;
+Execution context is separate from `~/.jsh_history`. Its append-only JSONL
+journal defaults to `$XDG_STATE_HOME/jsh/executions.jsonl`, falling back to
+`~/.local/state/jsh/executions.jsonl`. The jsh state directory is mode `0700`;
 the journal and its `executions.lock` sidecar are mode `0600` and coordinated
 with `flock`. At 32 MiB the journal is compacted to the newest records, with a
 post-compaction limit of 24 MiB and 2,000 executions. Individual metadata and
 captured-output records also have hard size limits.
 
 The journal can contain sensitive commands, paths, and terminal output. Set
-`RSH_EXECUTION_JOURNAL=0` to disable disk journaling while retaining OSC
-integration for the terminal UI. Set `RSH_EXECUTION_JOURNAL_PATH` to override
+`JSH_EXECUTION_JOURNAL=0` to disable disk journaling while retaining OSC
+integration for the terminal UI. Set `JSH_EXECUTION_JOURNAL_PATH` to override
 the location; the value must be an absolute path, and a relative value is
 rejected.
 
 ## AI, explicitly opt-in
 
-AI integration is opt-in. Select a provider when starting rsh:
+AI integration is opt-in. Select a provider when starting jsh:
 
 ```sh
-RSH_AI_PROVIDER=ollama rsh
-RSH_AI_PROVIDER=openai rsh
-RSH_AI_PROVIDER=anthropic rsh
+JSH_AI_PROVIDER=ollama jsh
+JSH_AI_PROVIDER=openai jsh
+JSH_AI_PROVIDER=anthropic jsh
 ```
 
 For cloud providers, inject `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` beforehand
 through your normal secret manager or protected environment configuration; do
-not type secrets directly into a recorded command line. `RSH_AI_MODEL` and
-`RSH_AI_BASE_URL` override provider defaults. Requests include your prompt,
+not type secrets directly into a recorded command line. `JSH_AI_MODEL` and
+`JSH_AI_BASE_URL` override provider defaults. Requests include your prompt,
 OS, and current-directory path. Cloud requests do not additionally include
 recent history or Git status unless
-`RSH_AI_SHARE_CONTEXT=1` is set. Generated commands are suggestions: inspect
+`JSH_AI_SHARE_CONTEXT=1` is set. Generated commands are suggestions: inspect
 them before execution, especially when they contain destructive operations.
 
 ### Agent mode
@@ -237,7 +237,7 @@ The model may only *propose* one command per turn. Every proposal shows a
 `[y] run  [e] edit  [i] insert  [n] reject  [q] quit` review prompt; recognized
 dangerous commands additionally require typing `RUN`. `[i]` moves the command
 into your next editor prompt for manual review without executing it and ends
-the session. Approved commands execute through the normal rsh parser with
+the session. Approved commands execute through the normal jsh parser with
 output teed to the terminal, and a bounded sample plus the exit code is fed
 back as the next model turn's observation. Malformed model replies fail closed
 and never become proposals.
@@ -246,11 +246,11 @@ The agent keeps its own working directory: an approved `cd` carries into the
 following turns (shown as `cwd → …`), while the interactive shell's cwd is
 never touched.
 
-Additional environment switches: `RSH_AGENT_MAX_TURNS` (default 16) bounds the
-model-turn budget, and `RSH_AGENT_AUTO_APPROVE_READONLY=1` opts in to
+Additional environment switches: `JSH_AGENT_MAX_TURNS` (default 16) bounds the
+model-turn budget, and `JSH_AGENT_AUTO_APPROVE_READONLY=1` opts in to
 auto-running only commands on a conservative read-only allowlist (`ls`,
 `git status`, …); everything else still prompts. Git branch/dirty metadata is
-attached only under the same `RSH_AI_SHARE_CONTEXT` rules as other cloud
+attached only under the same `JSH_AI_SHARE_CONTEXT` rules as other cloud
 context. Agent commands run in a forked child, so `export` and shell variables
 do not change the interactive shell's state (`cd` persists only within the
 agent session).
@@ -258,7 +258,7 @@ agent session).
 Local context queries never send journal data over the network. Local Ollama
 may use the most recent failed execution's captured terminal output for command
 repair. Cloud providers receive execution output only when
-`RSH_AI_SHARE_CONTEXT=1` explicitly opts in; otherwise AI repair falls back to
+`JSH_AI_SHARE_CONTEXT=1` explicitly opts in; otherwise AI repair falls back to
 the command and exit status. Review journal contents before enabling cloud
 context sharing because terminal output can contain source code, paths, tokens,
 or other secrets.
@@ -266,8 +266,8 @@ or other secrets.
 ## Completion and workflows
 
 Built-in completion specifications cover Git, Cargo, npm, Docker, and kubectl.
-Additional JSON specs can be placed in `~/.rsh/completions/`. Local workflow
-definitions live in `~/.rsh/workflows/`; press `Ctrl-G` in the editor to search
+Additional JSON specs can be placed in `~/.jsh/completions/`. Local workflow
+definitions live in `~/.jsh/workflows/`; press `Ctrl-G` in the editor to search
 the workflow registry and fill its parameters.
 
 ## Development
@@ -292,7 +292,7 @@ Benchmarks are available through `cargo bench` and the comparison scripts
 - Some advanced Bash options and edge cases remain incomplete. Prefer an
   explicit Bash shebang for production scripts that depend on exact Bash
   parsing or `set -e` corner cases.
-- Structured pipeline commands are rsh extensions and are not portable to Bash.
+- Structured pipeline commands are jsh extensions and are not portable to Bash.
 - HTTP and AI features are available only in builds with the `ai` Cargo feature.
 
 Please include the smallest reproducing command, expected status, actual status,

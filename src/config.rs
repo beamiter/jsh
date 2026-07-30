@@ -1,4 +1,4 @@
-/// Config file loading: source ~/.bashrc or ~/.rshrc on startup.
+/// Config file loading: source ~/.bashrc or ~/.jshrc on startup.
 use crate::environment::{ConfigSource, ShellState};
 use crate::executor;
 use crate::parser;
@@ -8,7 +8,7 @@ use std::process::Command;
 pub fn load_config(state: &mut ShellState) {
     match state.shell_opts.config_source {
         ConfigSource::Bashrc => load_bashrc(state),
-        ConfigSource::Rshrc => load_rshrc(state),
+        ConfigSource::Jshrc => load_jshrc(state),
     }
 }
 
@@ -18,13 +18,13 @@ pub fn refresh_shell_integrations(state: &mut ShellState) {
 
 /// Load an explicitly selected startup file.
 ///
-/// Native rsh syntax is attempted first. Files using syntax that rsh cannot
+/// Native jsh syntax is attempted first. Files using syntax that jsh cannot
 /// parse are imported through the same Bash compatibility bridge as `.bashrc`.
 pub fn load_config_file(path: &Path, state: &mut ShellState) {
     source_file_lenient(path, state);
 }
 
-/// Load ~/.bashrc directly via bash, without attempting rsh parsing
+/// Load ~/.bashrc directly via bash, without attempting jsh parsing
 fn load_bashrc(state: &mut ShellState) {
     let bashrc = state.home_dir.join(".bashrc");
     if bashrc.exists() {
@@ -32,11 +32,11 @@ fn load_bashrc(state: &mut ShellState) {
     }
 }
 
-/// Load ~/.rshrc via rsh parser with bash fallback for complex scripts
-fn load_rshrc(state: &mut ShellState) {
-    let rshrc = state.home_dir.join(".rshrc");
-    if rshrc.exists() {
-        source_file_lenient(&rshrc, state);
+/// Load ~/.jshrc via jsh parser with bash fallback for complex scripts
+fn load_jshrc(state: &mut ShellState) {
+    let jshrc = state.home_dir.join(".jshrc");
+    if jshrc.exists() {
+        source_file_lenient(&jshrc, state);
     }
 }
 
@@ -92,7 +92,7 @@ shopt 2>/dev/null || true
     if let Ok(output) = std::process::Command::new("bash")
         .arg("-c")
         .arg(bash_script)
-        .arg("rsh-config")
+        .arg("jsh-config")
         .arg(path)
         .output()
     {
@@ -102,7 +102,7 @@ shopt 2>/dev/null || true
 }
 
 /// If conda is present after importing bashrc state, load its POSIX shell hook
-/// into the current rsh process so `conda activate` works interactively.
+/// into the current jsh process so `conda activate` works interactively.
 fn load_conda_hook(state: &mut ShellState) {
     let conda_cmd = state
         .get_var("CONDA_EXE")
@@ -204,7 +204,7 @@ fn parse_bash_output(output: &str, state: &mut ShellState) {
                     let opt_value = parts[parts.len() - 1];
                     let enabled = opt_value == "on";
 
-                    // Map bash shopt names to rsh ShellOpts
+                    // Map bash shopt names to jsh ShellOpts
                     match opt_name {
                         "globstar" => state.shell_opts.globstar = enabled,
                         "dotglob" => state.shell_opts.dotglob = enabled,
@@ -307,44 +307,44 @@ extglob         on"#;
     fn bash_bridge_treats_special_config_path_as_data() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("startup \"$(false)\" file");
-        std::fs::write(&path, "export RSH_SPECIAL_RC_PATH=loaded\n").expect("write rc file");
+        std::fs::write(&path, "export JSH_SPECIAL_RC_PATH=loaded\n").expect("write rc file");
 
         let mut state = ShellState::new(false);
         source_via_bash(&path, &mut state);
 
-        assert_eq!(state.get_var("RSH_SPECIAL_RC_PATH"), Some("loaded"));
-        state.unset_var("RSH_SPECIAL_RC_PATH");
+        assert_eq!(state.get_var("JSH_SPECIAL_RC_PATH"), Some("loaded"));
+        state.unset_var("JSH_SPECIAL_RC_PATH");
     }
 
     #[test]
     fn native_config_uses_program_control_flow() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let errexit_path = dir.path().join("errexit.rsh");
+        let errexit_path = dir.path().join("errexit.jsh");
         std::fs::write(
             &errexit_path,
-            "set -e; false; export RSH_AFTER_FAILED_RC=bad\n",
+            "set -e; false; export JSH_AFTER_FAILED_RC=bad\n",
         )
         .expect("write rc file");
 
         let mut state = ShellState::new(false);
         load_config_file(&errexit_path, &mut state);
         assert_eq!(state.last_exit_code, 1);
-        assert_eq!(state.get_var("RSH_AFTER_FAILED_RC"), None);
+        assert_eq!(state.get_var("JSH_AFTER_FAILED_RC"), None);
 
-        let exit_path = dir.path().join("exit.rsh");
-        std::fs::write(&exit_path, "exit 7; export RSH_AFTER_EXIT_RC=bad\n")
+        let exit_path = dir.path().join("exit.jsh");
+        std::fs::write(&exit_path, "exit 7; export JSH_AFTER_EXIT_RC=bad\n")
             .expect("write rc file");
         crate::builtins::reset_exit_request();
         load_config_file(&exit_path, &mut state);
         assert_eq!(state.last_exit_code, 7);
-        assert_eq!(state.get_var("RSH_AFTER_EXIT_RC"), None);
+        assert_eq!(state.get_var("JSH_AFTER_EXIT_RC"), None);
         assert!(crate::builtins::EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst));
 
-        let integration = parser::parse("export RSH_AFTER_PREEXISTING_EXIT=bad")
+        let integration = parser::parse("export JSH_AFTER_PREEXISTING_EXIT=bad")
             .expect("parse integration command");
         executor::execute_program(&integration, &mut state);
         assert_eq!(state.last_exit_code, 7);
-        assert_eq!(state.get_var("RSH_AFTER_PREEXISTING_EXIT"), None);
+        assert_eq!(state.get_var("JSH_AFTER_PREEXISTING_EXIT"), None);
         crate::builtins::reset_exit_request();
     }
 }

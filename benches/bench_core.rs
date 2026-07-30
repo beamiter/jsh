@@ -1,10 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
-use rsh::environment::ShellState;
-use rsh::expand::{expand_word, expand_word_to_string};
-use rsh::parser::lexer::tokenize;
-use rsh::parser::parse::{is_incomplete, parse, parse_word_parts};
+use jsh::environment::ShellState;
+use jsh::expand::{expand_word, expand_word_to_string};
+use jsh::parser::lexer::tokenize;
+use jsh::parser::parse::{is_incomplete, parse, parse_word_parts};
 
 // ---------------------------------------------------------------------------
 // Lexer benchmarks
@@ -148,7 +148,7 @@ fn bench_word_parts(c: &mut Criterion) {
     });
 
     group.bench_function("tilde", |b| {
-        b.iter(|| parse_word_parts(black_box("~/projects/rsh")))
+        b.iter(|| parse_word_parts(black_box("~/projects/jsh")))
     });
 
     group.bench_function("complex_mixed", |b| {

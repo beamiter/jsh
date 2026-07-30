@@ -1,4 +1,4 @@
-use rsh::parser::{is_incomplete, parse};
+use jsh::parser::{is_incomplete, parse};
 use std::process::Command;
 
 fn assert_incomplete(source: &str) {
@@ -68,10 +68,10 @@ fn command_mode_returns_syntax_status_two() {
         "echo <(echo",
         "echo >(echo",
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_rsh"))
+        let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
             .args(["-c", source])
             .output()
-            .expect("run rsh");
+            .expect("run jsh");
         assert_eq!(output.status.code(), Some(2), "source: {source:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("incomplete input"),

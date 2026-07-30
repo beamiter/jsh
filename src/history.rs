@@ -25,7 +25,7 @@ pub struct HistoryEntry {
 /// happen to contain JSON.
 #[derive(Deserialize, Serialize)]
 struct HistoryRecord {
-    rsh_history_version: u32,
+    jsh_history_version: u32,
     command: String,
     timestamp: u64,
     cwd: Option<String>,
@@ -34,7 +34,7 @@ struct HistoryRecord {
 impl From<&HistoryEntry> for HistoryRecord {
     fn from(entry: &HistoryEntry) -> Self {
         Self {
-            rsh_history_version: HISTORY_RECORD_VERSION,
+            jsh_history_version: HISTORY_RECORD_VERSION,
             command: entry.command.clone(),
             timestamp: entry.timestamp,
             cwd: entry.cwd.clone(),
@@ -53,7 +53,7 @@ impl History {
     pub fn new(max_size: usize) -> Self {
         let file_path = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".rsh_history");
+            .join(".jsh_history");
 
         Self::new_with_path(max_size, file_path)
     }
@@ -78,7 +78,7 @@ impl History {
     }
 
     fn load(&mut self) {
-        // Updated rsh processes coordinate through a stable sidecar lock.
+        // Updated jsh processes coordinate through a stable sidecar lock.
         // Atomic rewrites already protect readers from torn files; the lock
         // additionally keeps us from racing an append at startup.
         let _lock = self
@@ -100,7 +100,7 @@ impl History {
         }
 
         if let Ok(record) = serde_json::from_str::<HistoryRecord>(line) {
-            return (record.rsh_history_version == HISTORY_RECORD_VERSION).then_some(
+            return (record.jsh_history_version == HISTORY_RECORD_VERSION).then_some(
                 HistoryEntry {
                     command: record.command,
                     timestamp: record.timestamp,
@@ -375,7 +375,7 @@ fn append_entry(path: &Path, entry: &HistoryEntry) -> io::Result<()> {
     set_private_file_permissions(path)?;
 
     // Build the complete record first, then issue one append write. O_APPEND
-    // plus the sidecar lock prevents updated rsh processes from interleaving
+    // plus the sidecar lock prevents updated jsh processes from interleaving
     // JSON records.
     let mut record = History::format_entry(entry)?.into_bytes();
     record.push(b'\n');
@@ -537,7 +537,7 @@ mod tests {
         let on_disk = fs::read_to_string(&path).expect("history JSONL");
         assert_eq!(on_disk.lines().count(), 1);
         assert!(on_disk.contains("\\n"));
-        assert!(on_disk.contains("rsh_history_version"));
+        assert!(on_disk.contains("jsh_history_version"));
     }
 
     #[test]

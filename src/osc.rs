@@ -122,7 +122,7 @@ pub fn command_start() {
     eprint!("\x1b]133;B\x07");
 }
 
-/// Build OSC 133;C with rsh execution metadata.
+/// Build OSC 133;C with jsh execution metadata.
 fn command_output_start_packet(execution_id: &str, command: &str, cwd: &str) -> String {
     let id = percent_encode_metadata(execution_id);
     let cwd = percent_encode_metadata(bounded_prefix(cwd, MAX_OSC_CWD_BYTES));
@@ -148,7 +148,7 @@ pub fn command_output_start(execution_id: &str, command: &str, cwd: &str) {
     );
 }
 
-/// Build OSC 133;D with the standard positional exit code and rsh metadata.
+/// Build OSC 133;D with the standard positional exit code and jsh metadata.
 fn command_finished_packet(
     exit_code: i32,
     execution_id: &str,
@@ -169,12 +169,12 @@ pub fn command_finished(exit_code: i32, execution_id: &str, duration_ms: u64, cw
     );
 }
 
-// ── OSC 7770: rsh Session ID ─────────────────────────────────
+// ── OSC 7770: jsh Session ID ─────────────────────────────────
 
-/// Emit OSC 7770 to report the rsh session ID to the terminal emulator.
+/// Emit OSC 7770 to report the jsh session ID to the terminal emulator.
 /// Format: `\x1b]7770;session_id\x07`
 ///
-/// This is a custom rsh-specific OSC used by jterm4 to associate
+/// This is a custom jsh-specific OSC used by jterm4 to associate
 /// a terminal pane with a persistent session.
 pub fn report_session_id(session_id: &str) {
     eprint!("\x1b]7770;{}\x07", session_id);
@@ -207,11 +207,11 @@ mod tests {
     #[test]
     fn command_start_packet_percent_encodes_exact_metadata() {
         let packet =
-            command_output_start_packet("rsh:7;\x1b\x07", "printf 'a;b+c'\n雪", "/tmp/a;b%雪");
+            command_output_start_packet("jsh:7;\x1b\x07", "printf 'a;b+c'\n雪", "/tmp/a;b%雪");
 
         assert_eq!(
             packet,
-            "\x1b]133;C;id=rsh%3A7%3B%1B%07;cmdline_url=printf%20%27a%3Bb%2Bc%27%0A%E9%9B%AA;cwd_url=%2Ftmp%2Fa%3Bb%25%E9%9B%AA\x07"
+            "\x1b]133;C;id=jsh%3A7%3B%1B%07;cmdline_url=printf%20%27a%3Bb%2Bc%27%0A%E9%9B%AA;cwd_url=%2Ftmp%2Fa%3Bb%25%E9%9B%AA\x07"
         );
         assert_eq!(
             packet
@@ -234,15 +234,15 @@ mod tests {
     #[test]
     fn command_start_packet_omits_oversized_command() {
         let at_limit = "x".repeat(MAX_OSC_COMMAND_BYTES);
-        let included = command_output_start_packet("rsh-1", &at_limit, "/tmp");
+        let included = command_output_start_packet("jsh-1", &at_limit, "/tmp");
         assert!(included.contains(";cmdline_url="));
         assert!(!included.contains("cmd_truncated"));
 
         let over_limit = "x".repeat(MAX_OSC_COMMAND_BYTES + 1);
-        let omitted = command_output_start_packet("rsh-1", &over_limit, "/tmp");
+        let omitted = command_output_start_packet("jsh-1", &over_limit, "/tmp");
         assert_eq!(
             omitted,
-            "\x1b]133;C;id=rsh-1;cmd_truncated=1;cwd_url=%2Ftmp\x07"
+            "\x1b]133;C;id=jsh-1;cmd_truncated=1;cwd_url=%2Ftmp\x07"
         );
         assert!(!omitted.contains(&over_limit));
     }
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn packets_bound_cwd_on_a_utf8_boundary() {
         let cwd = format!("{}雪", "x".repeat(MAX_OSC_CWD_BYTES - 1));
-        let packet = command_output_start_packet("rsh-1", "true", &cwd);
+        let packet = command_output_start_packet("jsh-1", "true", &cwd);
 
         assert!(packet.ends_with(&format!(
             ";cwd_url={}\x07",
@@ -260,11 +260,11 @@ mod tests {
 
     #[test]
     fn command_finished_keeps_positional_exit_and_encodes_metadata() {
-        let packet = command_finished_packet(127, "rsh;2", 42, "/tmp/\x1b]133;A\x07");
+        let packet = command_finished_packet(127, "jsh;2", 42, "/tmp/\x1b]133;A\x07");
 
         assert_eq!(
             packet,
-            "\x1b]133;D;127;id=rsh%3B2;duration_ms=42;cwd_url=%2Ftmp%2F%1B%5D133%3BA%07\x07"
+            "\x1b]133;D;127;id=jsh%3B2;duration_ms=42;cwd_url=%2Ftmp%2F%1B%5D133%3BA%07\x07"
         );
         assert_eq!(
             packet

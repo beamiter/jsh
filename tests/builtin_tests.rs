@@ -1,5 +1,5 @@
-use rsh::builtins::{is_builtin, run_builtin};
-use rsh::environment::ShellState;
+use jsh::builtins::{is_builtin, run_builtin};
+use jsh::environment::ShellState;
 
 fn make_state() -> ShellState {
     ShellState::new(false)

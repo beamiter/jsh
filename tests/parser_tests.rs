@@ -1,5 +1,5 @@
-use rsh::parser::ast::*;
-use rsh::parser::parse;
+use jsh::parser::ast::*;
+use jsh::parser::parse;
 
 #[test]
 fn test_simple_command() {
@@ -170,7 +170,7 @@ fn test_redirect() {
 
 #[test]
 fn test_is_incomplete() {
-    use rsh::parser::is_incomplete;
+    use jsh::parser::is_incomplete;
     assert!(is_incomplete("echo 'hello"));
     assert!(is_incomplete("echo \"hello"));
     assert!(is_incomplete("echo hello |"));
@@ -182,49 +182,49 @@ fn test_is_incomplete() {
 
 #[test]
 fn test_word_parts_variable() {
-    use rsh::parser::parse_word_parts;
+    use jsh::parser::parse_word_parts;
     let parts = parse_word_parts("$HOME");
     assert!(matches!(&parts[0], WordPart::Variable(v) if v == "HOME"));
 }
 
 #[test]
 fn test_word_parts_command_sub() {
-    use rsh::parser::parse_word_parts;
+    use jsh::parser::parse_word_parts;
     let parts = parse_word_parts("$(echo hi)");
     assert!(matches!(&parts[0], WordPart::CommandSub(c) if c == "echo hi"));
 }
 
 #[test]
 fn test_word_parts_tilde() {
-    use rsh::parser::parse_word_parts;
+    use jsh::parser::parse_word_parts;
     let parts = parse_word_parts("~/foo");
     assert!(matches!(&parts[0], WordPart::Tilde(u) if u.is_empty()));
 }
 
 #[test]
 fn test_word_parts_single_quoted() {
-    use rsh::parser::parse_word_parts;
+    use jsh::parser::parse_word_parts;
     let parts = parse_word_parts("'hello world'");
     assert!(matches!(&parts[0], WordPart::SingleQuoted(s) if s == "hello world"));
 }
 
 #[test]
 fn test_word_parts_glob() {
-    use rsh::parser::parse_word_parts;
+    use jsh::parser::parse_word_parts;
     let parts = parse_word_parts("*.txt");
     assert!(matches!(&parts[0], WordPart::Glob(g) if g == "*"));
 }
 
 #[test]
 fn test_word_parts_process_sub() {
-    use rsh::parser::parse_word_parts;
+    use jsh::parser::parse_word_parts;
     let parts = parse_word_parts("<(echo hi)");
     assert!(matches!(&parts[0], WordPart::ProcessSub(c, ProcessSubKind::Input) if c == "echo hi"));
 }
 
 #[test]
 fn test_word_parts_arithmetic() {
-    use rsh::parser::parse_word_parts;
+    use jsh::parser::parse_word_parts;
     let parts = parse_word_parts("$((1+2))");
     assert!(matches!(&parts[0], WordPart::Arithmetic(e) if e == "1+2"));
 }

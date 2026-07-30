@@ -1,4 +1,4 @@
-/// Advanced keybindings and search enhancements for rsh editor
+/// Advanced keybindings and search enhancements for jsh editor
 /// Supports customizable Vi/Emacs modes and quick navigation
 use std::collections::HashMap;
 

@@ -6,19 +6,19 @@
 /// has no typed Value in `let_vars`.
 use std::process::{Command, Stdio};
 
-fn rsh_bin() -> String {
-    env!("CARGO_BIN_EXE_rsh").to_string()
+fn jsh_bin() -> String {
+    env!("CARGO_BIN_EXE_jsh").to_string()
 }
 
 fn run(script: &str) -> (String, String, i32) {
-    let child = Command::new(rsh_bin())
+    let child = Command::new(jsh_bin())
         .arg("-c")
         .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh");
+        .expect("spawn jsh");
     let out = child.wait_with_output().expect("wait");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),

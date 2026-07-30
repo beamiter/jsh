@@ -8,10 +8,10 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
 use indexmap::IndexMap;
-use rsh::environment::ShellState;
-use rsh::pipeline_data::PipelineData;
-use rsh::value::{ClosureData, Value};
-use rsh::value_builtins::VALUE_BUILTINS;
+use jsh::environment::ShellState;
+use jsh::pipeline_data::PipelineData;
+use jsh::value::{ClosureData, Value};
+use jsh::value_builtins::VALUE_BUILTINS;
 use std::collections::HashMap;
 use std::sync::Arc;
 

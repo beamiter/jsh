@@ -2475,14 +2475,14 @@ mod tests {
     fn variable_completion_never_displays_environment_values() {
         let mut state = ShellState::new(false);
         state.env_vars.insert(
-            "RSH_TEST_SECRET".to_string(),
+            "JSH_TEST_SECRET".to_string(),
             "super-secret-token".to_string(),
         );
 
-        let completions = complete_variable("RSH_TEST_SECRET", &state);
+        let completions = complete_variable("JSH_TEST_SECRET", &state);
         let secret = completions
             .iter()
-            .find(|completion| completion.text == "$RSH_TEST_SECRET")
+            .find(|completion| completion.text == "$JSH_TEST_SECRET")
             .unwrap();
         assert_eq!(secret.description.as_deref(), Some("environment variable"));
         assert!(!format!("{:?}", secret.description).contains("super-secret-token"));

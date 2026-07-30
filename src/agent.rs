@@ -2,14 +2,14 @@
 //!
 //! The model may only propose commands; every proposal goes through an
 //! explicit approval prompt (or the opt-in read-only auto-approval allowlist)
-//! before rsh executes it. Approved commands run in a forked child through the
-//! normal rsh parser/executor with stdout+stderr teed to the terminal and
+//! before jsh executes it. Approved commands run in a forked child through the
+//! normal jsh parser/executor with stdout+stderr teed to the terminal and
 //! captured as the bounded observation for the next model turn.
 //!
-//! Configuration reuses the `RSH_AI_*` environment contract from `crate::ai`,
+//! Configuration reuses the `JSH_AI_*` environment contract from `crate::ai`,
 //! plus:
-//! - `RSH_AGENT_MAX_TURNS` — model-turn budget (default 16)
-//! - `RSH_AGENT_AUTO_APPROVE_READONLY` — auto-run commands accepted by
+//! - `JSH_AGENT_MAX_TURNS` — model-turn budget (default 16)
+//! - `JSH_AGENT_AUTO_APPROVE_READONLY` — auto-run commands accepted by
 //!   `jagent::is_auto_approvable` (fail-closed allowlist; everything else
 //!   still prompts)
 
@@ -33,8 +33,8 @@ const MAX_CONSECUTIVE_PROTOCOL_RETRIES: u32 = 2;
 pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
     let Some(ai_config) = AiConfig::from_env() else {
         eprintln!(
-            "agent: AI is not configured. Set RSH_AI_PROVIDER=anthropic|openai|ollama \
-             (plus the provider API key) or RSH_AI_ENABLED=1; see README."
+            "agent: AI is not configured. Set JSH_AI_PROVIDER=anthropic|openai|ollama \
+             (plus the provider API key) or JSH_AI_ENABLED=1; see README."
         );
         return 1;
     };
@@ -56,7 +56,7 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
         return 1;
     }
 
-    let auto_readonly = env_truthy("RSH_AGENT_AUTO_APPROVE_READONLY");
+    let auto_readonly = env_truthy("JSH_AGENT_AUTO_APPROVE_READONLY");
     let mut protocol_retries = 0_u32;
     // The agent's working directory persists across its own turns (each
     // approved command starts here, and a command's `cd` carries forward)
@@ -177,7 +177,7 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
             }
             AgentState::TurnLimitReached => {
                 eprintln!(
-                    "agent: turn budget of {} reached (RSH_AGENT_MAX_TURNS to raise)",
+                    "agent: turn budget of {} reached (JSH_AGENT_MAX_TURNS to raise)",
                     session.max_turns()
                 );
                 return 1;
@@ -360,7 +360,7 @@ fn chat_config(ai_config: &AiConfig) -> ChatConfig {
         AiProvider::Anthropic => Provider::Anthropic,
         AiProvider::Ollama => Provider::Ollama,
     };
-    // rsh's base_url contract matches the provider defaults (no trailing
+    // jsh's base_url contract matches the provider defaults (no trailing
     // path); jagent's endpoint() appends the per-provider path.
     ChatConfig {
         provider,
@@ -376,7 +376,7 @@ fn chat_config(ai_config: &AiConfig) -> ChatConfig {
 fn environment_meta(share_context: bool, cwd: &Path) -> EnvironmentMeta {
     EnvironmentMeta {
         cwd: cwd.display().to_string(),
-        shell: "rsh".to_string(),
+        shell: "jsh".to_string(),
         os: std::env::consts::OS.to_string(),
         git: if share_context { git_meta(cwd) } else { None },
     }
@@ -409,7 +409,7 @@ fn git_meta(cwd: &Path) -> Option<GitMeta> {
     })
 }
 
-/// Run one approved command through the rsh parser/executor in a forked child,
+/// Run one approved command through the jsh parser/executor in a forked child,
 /// teeing combined stdout+stderr to the terminal while capturing a bounded
 /// copy for the observation. Interactive/TTY-dependent programs will see a
 /// pipe; the agent protocol already biases toward non-interactive commands.
@@ -433,14 +433,14 @@ fn run_captured(command: &str, state: &mut ShellState, agent_cwd: &mut PathBuf) 
     }
     let (r, w) = match pipe() {
         Ok(fds) => (fds.0.into_raw_fd(), fds.1.into_raw_fd()),
-        Err(error) => return (1, format!("[rsh: pipe failed: {error}]")),
+        Err(error) => return (1, format!("[jsh: pipe failed: {error}]")),
     };
     let (status_r, status_w) = match pipe() {
         Ok(fds) => (fds.0.into_raw_fd(), fds.1.into_raw_fd()),
         Err(error) => {
             close(r).ok();
             close(w).ok();
-            return (1, format!("[rsh: pipe failed: {error}]"));
+            return (1, format!("[jsh: pipe failed: {error}]"));
         }
     };
 
@@ -468,7 +468,7 @@ fn run_captured(command: &str, state: &mut ShellState, agent_cwd: &mut PathBuf) 
                     code
                 }
                 Err(error) => {
-                    eprintln!("rsh: parse error: {error}");
+                    eprintln!("jsh: parse error: {error}");
                     2
                 }
             };
@@ -532,7 +532,7 @@ fn run_captured(command: &str, state: &mut ShellState, agent_cwd: &mut PathBuf) 
             }
             let mut output = String::from_utf8_lossy(&captured).to_string();
             if truncated {
-                output.push_str("\n[rsh: further output not captured]");
+                output.push_str("\n[jsh: further output not captured]");
             }
             (exit_code, output)
         }
@@ -541,13 +541,13 @@ fn run_captured(command: &str, state: &mut ShellState, agent_cwd: &mut PathBuf) 
             close(w).ok();
             close(status_r).ok();
             close(status_w).ok();
-            (1, format!("[rsh: fork failed: {error}]"))
+            (1, format!("[jsh: fork failed: {error}]"))
         }
     }
 }
 
 fn max_turns() -> u32 {
-    std::env::var("RSH_AGENT_MAX_TURNS")
+    std::env::var("JSH_AGENT_MAX_TURNS")
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|turns| *turns > 0)

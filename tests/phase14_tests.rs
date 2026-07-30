@@ -2,12 +2,12 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn rsh_bin() -> String {
-    env!("CARGO_BIN_EXE_rsh").to_string()
+fn jsh_bin() -> String {
+    env!("CARGO_BIN_EXE_jsh").to_string()
 }
 
 fn run(script: &str, stdin: &str) -> (String, String, i32) {
-    let mut child = Command::new(rsh_bin())
+    let mut child = Command::new(jsh_bin())
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())
@@ -150,10 +150,10 @@ fn help_for_try_documents_catch() {
 
 #[test]
 fn completer_includes_signed_commands() {
-    let mut state = rsh::environment::ShellState::new(false);
-    rsh::completer::clear_cache();
+    let mut state = jsh::environment::ShellState::new(false);
+    jsh::completer::clear_cache();
     let buf = "wh";
-    let (_, completions) = rsh::completer::complete(buf, buf.len(), &mut state);
+    let (_, completions) = jsh::completer::complete(buf, buf.len(), &mut state);
     // `where` is a signed value-aware builtin; it should be offered as a
     // command completion even though it's not on PATH.
     assert!(
@@ -165,10 +165,10 @@ fn completer_includes_signed_commands() {
 
 #[test]
 fn completer_help_subcommand_lists_signed() {
-    let mut state = rsh::environment::ShellState::new(false);
-    rsh::completer::clear_cache();
+    let mut state = jsh::environment::ShellState::new(false);
+    jsh::completer::clear_cache();
     let buf = "help wh";
-    let (_, completions) = rsh::completer::complete(buf, buf.len(), &mut state);
+    let (_, completions) = jsh::completer::complete(buf, buf.len(), &mut state);
     assert!(
         completions.iter().any(|c| c.text == "where"),
         "expected `where` in `help <TAB>` completions"
@@ -178,8 +178,8 @@ fn completer_help_subcommand_lists_signed() {
 #[test]
 fn highlighter_marks_signed_command_as_valid() {
     use crossterm::style::Color;
-    let mut state = rsh::environment::ShellState::new(false);
-    let spans = rsh::highlighter::highlight("try {|| 1 }", &mut state);
+    let mut state = jsh::environment::ShellState::new(false);
+    let spans = jsh::highlighter::highlight("try {|| 1 }", &mut state);
     // First span is the `try` token; it must be green+bold (valid command),
     // not red (unknown).
     let first = spans.iter().find(|s| s.text == "try").expect("try span");
@@ -190,8 +190,8 @@ fn highlighter_marks_signed_command_as_valid() {
 #[test]
 fn highlighter_marks_unknown_command_as_red() {
     use crossterm::style::Color;
-    let mut state = rsh::environment::ShellState::new(false);
-    let spans = rsh::highlighter::highlight("definitely-not-a-cmd-xyz arg", &mut state);
+    let mut state = jsh::environment::ShellState::new(false);
+    let spans = jsh::highlighter::highlight("definitely-not-a-cmd-xyz arg", &mut state);
     let first = spans
         .iter()
         .find(|s| s.text == "definitely-not-a-cmd-xyz")
@@ -227,7 +227,7 @@ fn arity_signature_covers_new_builtins() {
         "histogram",
     ] {
         assert!(
-            rsh::signature::SIGNATURES.contains_key(*n),
+            jsh::signature::SIGNATURES.contains_key(*n),
             "missing signature: {}",
             n,
         );

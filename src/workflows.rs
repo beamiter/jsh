@@ -34,7 +34,7 @@ impl WorkflowRegistry {
     pub fn new() -> Self {
         let user_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".rsh")
+            .join(".jsh")
             .join("workflows");
 
         let mut registry = WorkflowRegistry {

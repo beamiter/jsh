@@ -38,7 +38,7 @@ fn execute_text(source: &str, state: &mut ShellState) -> i32 {
     match parser::parse(source) {
         Ok(commands) => executor::execute_program(&commands, state),
         Err(e) => {
-            eprintln!("rsh: {}", e);
+            eprintln!("jsh: {}", e);
             state.last_exit_code = 2;
             2
         }
@@ -144,7 +144,7 @@ pub fn run_script(path: &Path, args: &[String]) -> i32 {
             status
         }
         Err(ProgramReadError::Io(e)) => {
-            eprintln!("rsh: {}: {}", path.display(), e);
+            eprintln!("jsh: {}: {}", path.display(), e);
             let code = if e.kind() == std::io::ErrorKind::NotFound {
                 127
             } else {
@@ -167,7 +167,7 @@ pub fn run_stdin(arg0: &str, args: &[String]) -> i32 {
             status
         }
         Err(ProgramReadError::Io(error)) => {
-            eprintln!("rsh: stdin: {}", error);
+            eprintln!("jsh: stdin: {}", error);
             state.last_exit_code = 1;
             1
         }
@@ -323,7 +323,7 @@ impl Shell {
 
     /// Configure interactive startup-file loading.
     ///
-    /// `rcfile` replaces the default `.bashrc`/`.rshrc` choice when present.
+    /// `rcfile` replaces the default `.bashrc`/`.jshrc` choice when present.
     pub fn configure_startup(&mut self, load_config: bool, rcfile: Option<PathBuf>) {
         self.load_startup_config = load_config;
         self.startup_file = rcfile;
@@ -349,7 +349,7 @@ impl Shell {
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound);
                 if !not_found {
-                    eprintln!("rsh: session restore: {error}");
+                    eprintln!("jsh: session restore: {error}");
                 }
             }
         }
@@ -365,7 +365,7 @@ impl Shell {
         if let Some(ref id) = self.session_id {
             let snapshot = session::SessionSnapshot::capture(&self.state, id);
             if let Err(e) = snapshot.save() {
-                eprintln!("rsh: failed to save session: {}", e);
+                eprintln!("jsh: failed to save session: {}", e);
             }
         }
     }
@@ -437,7 +437,7 @@ impl Shell {
             // OSC 2 — set window title to current directory
             {
                 let title = prompt::get_short_cwd(&self.state);
-                osc::set_title(&format!("rsh: {}", title));
+                osc::set_title(&format!("jsh: {}", title));
             }
 
             // Probe Git once per prompt. Both prompt rendering and smart suggestions
@@ -468,7 +468,7 @@ impl Shell {
                             expanded
                         }
                         None => {
-                            eprintln!("rsh: !: event not found");
+                            eprintln!("jsh: !: event not found");
                             continue;
                         }
                     };
@@ -526,7 +526,7 @@ impl Shell {
                             executor::execute_program(&commands, &mut self.state);
                         }
                         Err(e) => {
-                            eprintln!("rsh: {}", e);
+                            eprintln!("jsh: {}", e);
                             self.state.last_exit_code = 2;
                         }
                     }
@@ -591,7 +591,7 @@ impl Shell {
                     // (e.g. EIO once the master is closed). Don't use eprintln! here:
                     // writing to a dead stderr fails and eprintln! would panic, which
                     // would skip the session/history save below. Report best-effort.
-                    let _ = writeln!(io::stderr(), "rsh: editor error: {}", e);
+                    let _ = writeln!(io::stderr(), "jsh: editor error: {}", e);
                     break;
                 }
             }
@@ -626,7 +626,7 @@ impl Shell {
                 return run_exit_trap(&mut self.state);
             }
             Err(ProgramReadError::Io(error)) => {
-                eprintln!("rsh: stdin: {}", error);
+                eprintln!("jsh: stdin: {}", error);
                 self.state.last_exit_code = 1;
                 return run_exit_trap(&mut self.state);
             }
@@ -645,7 +645,7 @@ impl Shell {
                 executor::execute_program(&commands, &mut self.state);
             }
             Err(e) => {
-                eprintln!("rsh: {}", e);
+                eprintln!("jsh: {}", e);
                 self.state.last_exit_code = 2;
             }
         }

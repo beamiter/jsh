@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end benchmark: rsh vs bash/zsh using hyperfine
+# End-to-end benchmark: jsh vs bash/zsh using hyperfine
 #
 # Usage:
 #   ./bench.sh              # build release and run all benchmarks
@@ -7,12 +7,12 @@
 
 set -euo pipefail
 
-RSH="./target/release/rsh"
+JSH="./target/release/jsh"
 SHELLS=()
 
-# --- Build rsh in release mode ---
+# --- Build jsh in release mode ---
 if [[ "${1:-}" != "--skip-build" ]]; then
-    echo "==> Building rsh in release mode..."
+    echo "==> Building jsh in release mode..."
     cargo build --release 2>&1
     echo ""
 fi
@@ -22,8 +22,8 @@ if ! command -v hyperfine &>/dev/null; then
     exit 1
 fi
 
-if [[ ! -x "$RSH" ]]; then
-    echo "ERROR: $RSH not found. Run: cargo build --release"
+if [[ ! -x "$JSH" ]]; then
+    echo "ERROR: $JSH not found. Run: cargo build --release"
     exit 1
 fi
 
@@ -33,7 +33,7 @@ for sh in bash zsh; do
         SHELLS+=("$sh")
     fi
 done
-echo "==> Shells: rsh ${SHELLS[*]}"
+echo "==> Shells: jsh ${SHELLS[*]}"
 echo ""
 
 # Helper for -c flag benchmarks
@@ -41,10 +41,10 @@ run_bench_c() {
     local name="$1"
     local cmd="$2"
     local cmds=()
-    for sh in rsh "${SHELLS[@]}"; do
+    for sh in jsh "${SHELLS[@]}"; do
         local shell_bin
-        if [[ "$sh" == "rsh" ]]; then
-            shell_bin="$RSH"
+        if [[ "$sh" == "jsh" ]]; then
+            shell_bin="$JSH"
         else
             shell_bin="$(command -v "$sh")"
         fi
@@ -60,7 +60,7 @@ run_bench_c() {
 # ==========================================================================
 
 echo "=========================================="
-echo " rsh end-to-end benchmarks (hyperfine)"
+echo " jsh end-to-end benchmarks (hyperfine)"
 echo "=========================================="
 echo ""
 
@@ -92,7 +92,7 @@ run_bench_c "Redirect to /dev/null" "echo hello > /dev/null"
 run_bench_c "Long pipeline" "echo hello | cat | cat | cat | cat | cat | cat | cat"
 
 # 10. Script execution via file
-TMPSCRIPT=$(mktemp /tmp/rsh_bench_XXXXXX.sh)
+TMPSCRIPT=$(mktemp /tmp/jsh_bench_XXXXXX.sh)
 cat > "$TMPSCRIPT" <<'SCRIPT'
 echo start
 FOO=hello
@@ -103,8 +103,8 @@ SCRIPT
 
 echo "--- Script file execution ---"
 cmds=()
-for sh in rsh "${SHELLS[@]}"; do
-    shell_bin=$([[ "$sh" == "rsh" ]] && echo "$RSH" || command -v "$sh")
+for sh in jsh "${SHELLS[@]}"; do
+    shell_bin=$([[ "$sh" == "jsh" ]] && echo "$JSH" || command -v "$sh")
     cmds+=(-n "$sh" "$shell_bin $TMPSCRIPT")
 done
 hyperfine --warmup 3 --min-runs 50 --shell=none "${cmds[@]}" 2>&1

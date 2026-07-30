@@ -1,7 +1,7 @@
 //! Structured command execution journal shared with terminal emulators.
 //!
 //! The journal is deliberately separate from command history. It is an
-//! append-only JSONL event stream so rsh and a terminal can safely contribute
+//! append-only JSONL event stream so jsh and a terminal can safely contribute
 //! metadata without redirecting a child's stdout/stderr away from its PTY.
 
 use nix::fcntl::{Flock, FlockArg};
@@ -54,7 +54,7 @@ pub struct ExecutionRecord {
 enum ExecutionEvent {
     #[serde(rename = "start")]
     Start {
-        rsh_execution_version: u32,
+        jsh_execution_version: u32,
         id: String,
         session_id: Option<String>,
         seq: u64,
@@ -66,7 +66,7 @@ enum ExecutionEvent {
     },
     #[serde(rename = "finish")]
     Finish {
-        rsh_execution_version: u32,
+        jsh_execution_version: u32,
         id: String,
         exit_code: i32,
         duration_ms: u64,
@@ -75,7 +75,7 @@ enum ExecutionEvent {
     },
     #[serde(rename = "output")]
     Output {
-        rsh_execution_version: u32,
+        jsh_execution_version: u32,
         id: String,
         text: String,
         truncated: bool,
@@ -88,17 +88,17 @@ impl ExecutionEvent {
     fn version(&self) -> u32 {
         match self {
             Self::Start {
-                rsh_execution_version,
+                jsh_execution_version,
                 ..
             }
             | Self::Finish {
-                rsh_execution_version,
+                jsh_execution_version,
                 ..
             }
             | Self::Output {
-                rsh_execution_version,
+                jsh_execution_version,
                 ..
-            } => *rsh_execution_version,
+            } => *jsh_execution_version,
         }
     }
 }
@@ -111,18 +111,18 @@ pub struct ExecutionJournal {
 }
 
 impl ExecutionJournal {
-    /// Return the configured journal. `RSH_EXECUTION_JOURNAL` is only an
+    /// Return the configured journal. `JSH_EXECUTION_JOURNAL` is only an
     /// enable/disable switch; a custom location uses
-    /// `RSH_EXECUTION_JOURNAL_PATH`.
+    /// `JSH_EXECUTION_JOURNAL_PATH`.
     pub fn configured() -> Option<Self> {
-        if std::env::var("RSH_EXECUTION_JOURNAL")
+        if std::env::var("JSH_EXECUTION_JOURNAL")
             .ok()
             .as_deref()
             .is_some_and(env_value_is_false)
         {
             return None;
         }
-        let path = select_journal_path(std::env::var_os("RSH_EXECUTION_JOURNAL_PATH"))?;
+        let path = select_journal_path(std::env::var_os("JSH_EXECUTION_JOURNAL_PATH"))?;
         Some(Self::with_path(path))
     }
 
@@ -156,7 +156,7 @@ impl ExecutionJournal {
         let (command, command_truncated) = bounded_text(command, MAX_COMMAND_BYTES);
         let (cwd, _) = bounded_text(cwd, MAX_CWD_BYTES);
         self.append_event(ExecutionEvent::Start {
-            rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
             session_id: match session_id {
                 Some(id) => Some(validate_session_id(id)?.to_string()),
@@ -180,7 +180,7 @@ impl ExecutionJournal {
     ) -> io::Result<()> {
         let (cwd_after, _) = bounded_text(cwd_after, MAX_CWD_BYTES);
         self.append_event(ExecutionEvent::Finish {
-            rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
             exit_code,
             duration_ms,
@@ -190,7 +190,7 @@ impl ExecutionJournal {
     }
 
     /// Append terminal-rendered output. This is used by terminal integrations;
-    /// rsh itself must not pipe child output because doing so breaks TTY
+    /// jsh itself must not pipe child output because doing so breaks TTY
     /// detection, job control, and full-screen applications.
     pub fn record_output(
         &self,
@@ -202,7 +202,7 @@ impl ExecutionJournal {
     ) -> io::Result<()> {
         let (mut text, limited) = bounded_text(text, MAX_OUTPUT_BYTES);
         let mut event = ExecutionEvent::Output {
-            rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
             text: text.clone(),
             truncated: truncated || limited,
@@ -215,7 +215,7 @@ impl ExecutionJournal {
             (text, _) = bounded_text(&text, MAX_OUTPUT_BYTES / 2);
             let retained_bytes = text.len() as u64;
             event = ExecutionEvent::Output {
-                rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                 id: id.to_string(),
                 text,
                 truncated: true,
@@ -310,7 +310,7 @@ impl ExecutionJournal {
 pub fn default_journal_path() -> Option<PathBuf> {
     let state_dir = dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")));
-    state_dir.map(|state_dir| state_dir.join("rsh").join("executions.jsonl"))
+    state_dir.map(|state_dir| state_dir.join("jsh").join("executions.jsonl"))
 }
 
 fn select_journal_path(override_path: Option<std::ffi::OsString>) -> Option<PathBuf> {
@@ -347,7 +347,7 @@ pub fn execution_id(session_id: Option<&str>, seq: u64) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!(
-        "rsh-{hash:016x}-{:x}-{:x}-{seq:x}",
+        "jsh-{hash:016x}-{:x}-{:x}-{seq:x}",
         std::process::id(),
         unix_time_ms()
     )
@@ -572,7 +572,7 @@ fn encode_compacted_record(record: &ExecutionRecord) -> io::Result<Vec<u8>> {
     write_compacted_event(
         &mut encoded,
         &ExecutionEvent::Start {
-            rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: record.id.clone(),
             session_id: record.session_id.clone(),
             seq: record.seq,
@@ -591,7 +591,7 @@ fn encode_compacted_record(record: &ExecutionRecord) -> io::Result<Vec<u8>> {
         write_compacted_event(
             &mut encoded,
             &ExecutionEvent::Finish {
-                rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                 id: record.id.clone(),
                 exit_code,
                 duration_ms,
@@ -604,7 +604,7 @@ fn encode_compacted_record(record: &ExecutionRecord) -> io::Result<Vec<u8>> {
         write_compacted_event(
             &mut encoded,
             &ExecutionEvent::Output {
-                rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                 id: record.id.clone(),
                 text: output.text.clone(),
                 truncated: output.truncated,
@@ -639,11 +639,11 @@ mod tests {
     fn folds_start_finish_and_terminal_output() {
         let (_dir, journal) = journal();
         journal
-            .record_start("rsh-a", Some("tab-1"), 7, "false", "/before", 10)
+            .record_start("jsh-a", Some("tab-1"), 7, "false", "/before", 10)
             .unwrap();
-        journal.record_finish("rsh-a", 1, 25, "/after", 35).unwrap();
+        journal.record_finish("jsh-a", 1, 25, "/after", 35).unwrap();
         journal
-            .record_output("rsh-a", "real terminal error", false, 19, 36)
+            .record_output("jsh-a", "real terminal error", false, 19, 36)
             .unwrap();
 
         let records = journal.records().unwrap();
@@ -654,8 +654,8 @@ mod tests {
             records[0].output.as_ref().unwrap().text,
             "real terminal error"
         );
-        assert_eq!(journal.last_failed().unwrap().unwrap().id, "rsh-a");
-        assert_eq!(journal.show("rsh-a").unwrap().unwrap().seq, 7);
+        assert_eq!(journal.last_failed().unwrap().unwrap().id, "jsh-a");
+        assert_eq!(journal.show("jsh-a").unwrap().unwrap().seq, 7);
         assert_eq!(journal.list(Some("tab-1"), 1).unwrap().len(), 1);
         assert!(journal.list(Some("another-tab"), 10).unwrap().is_empty());
     }
@@ -664,15 +664,15 @@ mod tests {
     fn malformed_unknown_and_orphan_events_are_ignored() {
         let (_dir, journal) = journal();
         journal
-            .record_start("rsh-good", None, 1, "echo ok", "/tmp", 1)
+            .record_start("jsh-good", None, 1, "echo ok", "/tmp", 1)
             .unwrap();
         let mut file = OpenOptions::new()
             .append(true)
             .open(journal.path())
             .unwrap();
         writeln!(file, "not json").unwrap();
-        writeln!(file, "{{\"rsh_execution_version\":99,\"event\":\"start\",\"id\":\"future\",\"session_id\":null,\"seq\":2,\"command\":\"x\",\"cwd\":\"/\",\"started_at_ms\":2}}").unwrap();
-        writeln!(file, "{{\"rsh_execution_version\":1,\"event\":\"finish\",\"id\":\"orphan\",\"exit_code\":1,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}}").unwrap();
+        writeln!(file, "{{\"jsh_execution_version\":99,\"event\":\"start\",\"id\":\"future\",\"session_id\":null,\"seq\":2,\"command\":\"x\",\"cwd\":\"/\",\"started_at_ms\":2}}").unwrap();
+        writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"orphan\",\"exit_code\":1,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}}").unwrap();
         assert_eq!(journal.records().unwrap().len(), 1);
     }
 
@@ -682,12 +682,12 @@ mod tests {
         let command = "x".repeat(MAX_COMMAND_BYTES + 100);
         let output = "e".repeat(MAX_OUTPUT_BYTES + 100);
         journal
-            .record_start("rsh-bounded", None, 1, &command, "/tmp", 1)
+            .record_start("jsh-bounded", None, 1, &command, "/tmp", 1)
             .unwrap();
         journal
-            .record_output("rsh-bounded", &output, false, output.len() as u64, 2)
+            .record_output("jsh-bounded", &output, false, output.len() as u64, 2)
             .unwrap();
-        let record = journal.get("rsh-bounded").unwrap().unwrap();
+        let record = journal.get("jsh-bounded").unwrap().unwrap();
         assert_eq!(record.command.len(), MAX_COMMAND_BYTES);
         assert!(record.command_truncated);
         assert_eq!(record.output.as_ref().unwrap().text.len(), MAX_OUTPUT_BYTES);
@@ -712,7 +712,7 @@ mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let journal = ExecutionJournal::with_path(dir.path().join("custom.jsonl"));
         journal
-            .record_start("rsh-custom", None, 1, "true", "/tmp", 1)
+            .record_start("jsh-custom", None, 1, "true", "/tmp", 1)
             .unwrap();
         assert_eq!(
             fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
@@ -723,10 +723,10 @@ mod tests {
     #[test]
     fn newly_created_custom_parent_is_private() {
         let dir = tempfile::tempdir().unwrap();
-        let parent = dir.path().join("new-rsh-state");
+        let parent = dir.path().join("new-jsh-state");
         let journal = ExecutionJournal::with_path(parent.join("custom.jsonl"));
         journal
-            .record_start("rsh-custom", None, 1, "true", "/tmp", 1)
+            .record_start("jsh-custom", None, 1, "true", "/tmp", 1)
             .unwrap();
         assert_eq!(
             fs::metadata(parent).unwrap().permissions().mode() & 0o777,
@@ -738,10 +738,10 @@ mod tests {
     fn start_rejects_unsafe_or_oversized_session_ids() {
         let (_dir, journal) = journal();
         assert!(journal
-            .record_start("rsh-a", Some("bad;osc"), 1, "true", "/tmp", 1)
+            .record_start("jsh-a", Some("bad;osc"), 1, "true", "/tmp", 1)
             .is_err());
         assert!(journal
-            .record_start("rsh-b", Some(&"x".repeat(129)), 2, "true", "/tmp", 2)
+            .record_start("jsh-b", Some(&"x".repeat(129)), 2, "true", "/tmp", 2)
             .is_err());
         assert!(journal.records().unwrap().is_empty());
     }
@@ -750,8 +750,8 @@ mod tests {
     fn journal_path_override_must_be_absolute() {
         assert!(select_journal_path(Some("relative/file.jsonl".into())).is_none());
         assert_eq!(
-            select_journal_path(Some("/tmp/rsh-test/executions.jsonl".into())),
-            Some(PathBuf::from("/tmp/rsh-test/executions.jsonl"))
+            select_journal_path(Some("/tmp/jsh-test/executions.jsonl".into())),
+            Some(PathBuf::from("/tmp/jsh-test/executions.jsonl"))
         );
     }
 
@@ -771,8 +771,8 @@ mod tests {
         write_compacted_event(
             &mut file,
             &ExecutionEvent::Start {
-                rsh_execution_version: EXECUTION_JOURNAL_VERSION,
-                id: "rsh-after-large-line".into(),
+                jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                id: "jsh-after-large-line".into(),
                 session_id: None,
                 seq: 1,
                 command: "echo recovered".into(),
@@ -786,7 +786,7 @@ mod tests {
 
         let records = journal.records().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].id, "rsh-after-large-line");
+        assert_eq!(records[0].id, "jsh-after-large-line");
     }
 
     #[test]
@@ -802,8 +802,8 @@ mod tests {
             write_compacted_event(
                 &mut file,
                 &ExecutionEvent::Start {
-                    rsh_execution_version: EXECUTION_JOURNAL_VERSION,
-                    id: format!("rsh-{seq}"),
+                    jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                    id: format!("jsh-{seq}"),
                     session_id: Some("tab".into()),
                     seq,
                     command: format!("echo {seq}"),
@@ -837,11 +837,11 @@ mod tests {
             .open(journal.path())
             .unwrap();
         for seq in 0..100_u64 {
-            let id = format!("rsh-large-{seq}");
+            let id = format!("jsh-large-{seq}");
             write_compacted_event(
                 &mut file,
                 &ExecutionEvent::Start {
-                    rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                    jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                     id: id.clone(),
                     session_id: Some("tab".into()),
                     seq,
@@ -855,7 +855,7 @@ mod tests {
             write_compacted_event(
                 &mut file,
                 &ExecutionEvent::Output {
-                    rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                    jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                     id,
                     text: output.clone(),
                     truncated: false,

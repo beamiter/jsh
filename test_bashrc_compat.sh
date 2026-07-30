@@ -34,21 +34,21 @@ echo "Content:"
 cat "$TEST_BASHRC"
 echo ""
 
-# Test with current rsh build
-RSH_BIN="./target/debug/rsh"
+# Test with current jsh build
+JSH_BIN="./target/debug/jsh"
 
-echo "=== Testing rsh with custom .bashrc ==="
-# We need to trick rsh into using our test bashrc
+echo "=== Testing jsh with custom .bashrc ==="
+# We need to trick jsh into using our test bashrc
 # This is done via HOME environment variable
 export HOME="$TEST_DIR"
 
 # Test 1: Check if environment variables are imported
 echo "Test 1: Environment variables"
 echo "Command: echo \$TEST_VAR"
-$RSH_BIN -c 'echo $TEST_VAR' 2>/dev/null || echo "FAIL: Could not run rsh"
+$JSH_BIN -c 'echo $TEST_VAR' 2>/dev/null || echo "FAIL: Could not run jsh"
 
 echo "Command: echo \$MY_PATH"
-$RSH_BIN -c 'echo $MY_PATH' 2>/dev/null || echo "FAIL: Could not run rsh"
+$JSH_BIN -c 'echo $MY_PATH' 2>/dev/null || echo "FAIL: Could not run jsh"
 
 # Test 2: Check if aliases are imported
 echo ""
@@ -59,23 +59,23 @@ mkdir -p "$TEST_DIR/testdir"
 touch "$TEST_DIR/testdir/file1.txt"
 touch "$TEST_DIR/testdir/.hidden"
 cd "$TEST_DIR/testdir"
-$RSH_BIN -c 'll' 2>/dev/null | head -3 || echo "FAIL: Alias not working"
+$JSH_BIN -c 'll' 2>/dev/null | head -3 || echo "FAIL: Alias not working"
 
 echo ""
 echo "Test 3: Alias with arguments"
 echo "Command: mytest"
-$RSH_BIN -c 'mytest' 2>/dev/null || echo "FAIL: Alias expansion failed"
+$JSH_BIN -c 'mytest' 2>/dev/null || echo "FAIL: Alias expansion failed"
 
 echo ""
 echo "Test 4: Alias expansion in pipelines"
 echo "Command: echo hello | grep ."
-$RSH_BIN -c 'echo hello | grep .' 2>/dev/null || echo "FAIL: Alias in pipeline failed"
+$JSH_BIN -c 'echo hello | grep .' 2>/dev/null || echo "FAIL: Alias in pipeline failed"
 
 # Test 5: Built-in commands still work
 echo ""
 echo "Test 5: Built-in commands still work"
 echo "Command: pwd"
-$RSH_BIN -c 'pwd' 2>/dev/null || echo "FAIL: pwd failed"
+$JSH_BIN -c 'pwd' 2>/dev/null || echo "FAIL: pwd failed"
 
 # Cleanup
 rm -rf "$TEST_DIR"

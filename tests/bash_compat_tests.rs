@@ -1,17 +1,17 @@
 /// Bash compatibility regressions found by running real-world setup scripts
-/// (e.g. `source scripts/setup_env.sh`) under rsh:
+/// (e.g. `source scripts/setup_env.sh`) under jsh:
 ///   * `[[ ... || ... ]]` was split into two commands at the `||`
 ///   * `"${arr[@]}"` collapsed into a single space-joined word
 ///   * `arr=("a b" c)` lost element quoting
 ///   * `command -v NAME` treated `-v` as the command to run
 use std::process::{Command, Stdio};
 
-fn rsh_bin() -> String {
-    env!("CARGO_BIN_EXE_rsh").to_string()
+fn jsh_bin() -> String {
+    env!("CARGO_BIN_EXE_jsh").to_string()
 }
 
 fn run(script: &str) -> (String, String, i32) {
-    let out = Command::new(rsh_bin())
+    let out = Command::new(jsh_bin())
         .arg("-c")
         .arg(script)
         .stdin(Stdio::null())

@@ -1,29 +1,29 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
-fn rsh() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rsh"))
+fn jsh() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_jsh"))
 }
 
 fn run(args: &[&str]) -> Output {
-    rsh().args(args).output().expect("run rsh")
+    jsh().args(args).output().expect("run jsh")
 }
 
 fn run_stdin(args: &[&str], input: &str) -> Output {
-    let mut child = rsh()
+    let mut child = jsh()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh");
+        .expect("spawn jsh");
     child
         .stdin
         .as_mut()
         .expect("stdin")
         .write_all(input.as_bytes())
         .expect("write stdin");
-    child.wait_with_output().expect("wait for rsh")
+    child.wait_with_output().expect("wait for jsh")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -39,7 +39,7 @@ fn help_and_version_are_real_cli_actions() {
 
     let version = run(&["--version"]);
     assert!(version.status.success());
-    assert_eq!(text(&version.stdout).trim(), "rsh 0.2.0");
+    assert_eq!(text(&version.stdout).trim(), "jsh 0.2.0");
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn malformed_cli_exits_two_with_a_diagnostic() {
         let output = run(&args);
         assert_eq!(output.status.code(), Some(2), "args: {args:?}");
         assert!(!output.stderr.is_empty(), "args: {args:?}");
-        assert!(text(&output.stderr).contains("rsh:"), "args: {args:?}");
+        assert!(text(&output.stderr).contains("jsh:"), "args: {args:?}");
     }
 }
 
@@ -68,10 +68,10 @@ fn command_mode_assigns_arg0_and_positionals_like_bash() {
 #[test]
 fn script_mode_uses_path_as_arg0() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let script = dir.path().join("args.rsh");
+    let script = dir.path().join("args.jsh");
     std::fs::write(&script, "printf '%s|%s|%s\\n' \"$0\" \"$1\" \"$#\"\n").expect("write script");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rsh"))
+    let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
         .arg(&script)
         .arg("one")
         .output()
@@ -101,10 +101,10 @@ fn syntax_check_does_not_execute() {
 #[test]
 fn stdin_mode_propagates_status_and_skips_interactive_config() {
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(dir.path().join(".bashrc"), "export RSH_RC_WAS_LOADED=yes\n")
+    std::fs::write(dir.path().join(".bashrc"), "export JSH_RC_WAS_LOADED=yes\n")
         .expect("write bashrc");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rsh"))
+    let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
         .env("HOME", dir.path())
         .arg("-s")
         .stdin(Stdio::piped())
@@ -116,7 +116,7 @@ fn stdin_mode_propagates_status_and_skips_interactive_config() {
                 .stdin
                 .as_mut()
                 .expect("stdin")
-                .write_all(b"echo ${RSH_RC_WAS_LOADED:-no}; false\n")?;
+                .write_all(b"echo ${JSH_RC_WAS_LOADED:-no}; false\n")?;
             child.wait_with_output()
         })
         .expect("run stdin mode");

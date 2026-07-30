@@ -1,4 +1,4 @@
-//! Command-line parsing for the `rsh` binary.
+//! Command-line parsing for the `jsh` binary.
 //!
 //! This deliberately stays dependency-free: shell startup is latency-sensitive,
 //! and the supported surface is small enough to keep explicit and testable.
@@ -69,11 +69,11 @@ impl std::fmt::Display for CliError {
 impl std::error::Error for CliError {}
 
 pub const HELP: &str = concat!(
-    "rsh — a modern Bash-inspired shell with structured data pipelines\n\n",
+    "jsh — a modern Bash-inspired shell with structured data pipelines\n\n",
     "Usage:\n",
-    "  rsh [OPTIONS] [SCRIPT [ARG ...]]\n",
-    "  rsh [OPTIONS] -c COMMAND [NAME [ARG ...]]\n",
-    "  rsh context <list|show|last-failed> [OPTIONS]\n\n",
+    "  jsh [OPTIONS] [SCRIPT [ARG ...]]\n",
+    "  jsh [OPTIONS] -c COMMAND [NAME [ARG ...]]\n",
+    "  jsh context <list|show|last-failed> [OPTIONS]\n\n",
     "Input:\n",
     "  -c, --command COMMAND  Execute COMMAND; NAME becomes $0\n",
     "  -s, --stdin            Read commands from standard input\n",
@@ -88,19 +88,19 @@ pub const HELP: &str = concat!(
     "  -h, --help             Print this help\n",
     "  -V, --version          Print version information\n",
     "      --                 Stop parsing options\n\n",
-    "With no SCRIPT, rsh is interactive when stdin is a terminal and otherwise\n",
+    "With no SCRIPT, jsh is interactive when stdin is a terminal and otherwise\n",
     "executes commands read from stdin. Unknown options are errors.\n",
 );
 
 pub fn version() -> String {
-    format!("rsh {}", env!("CARGO_PKG_VERSION"))
+    format!("jsh {}", env!("CARGO_PKG_VERSION"))
 }
 
 pub fn parse_env() -> Result<ParseResult, CliError> {
     let mut parsed = parse_from(std::env::args_os())?;
     if let ParseResult::Run(invocation) = &mut parsed {
         if invocation.session_id.is_none() {
-            invocation.session_id = std::env::var("RSH_SESSION_ID")
+            invocation.session_id = std::env::var("JSH_SESSION_ID")
                 .ok()
                 .filter(|id| valid_session_id(id));
         }
@@ -122,8 +122,8 @@ pub fn entrypoint() -> i32 {
         Ok(ParseResult::Context(args)) => crate::execution_context::run_args(&args),
         Ok(ParseResult::Run(invocation)) => run(invocation),
         Err(error) => {
-            eprintln!("rsh: {error}");
-            eprintln!("Try 'rsh --help' for more information.");
+            eprintln!("jsh: {error}");
+            eprintln!("Try 'jsh --help' for more information.");
             2
         }
     }
@@ -144,7 +144,7 @@ pub fn run(invocation: Invocation) -> i32 {
             args,
         } => crate::shell::run_command(&command, &arg0, &args),
         Input::Script { path, args } => crate::shell::run_script(&path, &args),
-        Input::Stdin { args } => crate::shell::run_stdin("rsh", &args),
+        Input::Stdin { args } => crate::shell::run_stdin("jsh", &args),
         Input::Auto => {
             if std::io::stdin().is_terminal() {
                 let mut shell = crate::shell::Shell::new();
@@ -154,10 +154,10 @@ pub fn run(invocation: Invocation) -> i32 {
                 }
                 shell.run()
             } else if invocation.interactive {
-                eprintln!("rsh: option '-i/--interactive' requires a terminal");
+                eprintln!("jsh: option '-i/--interactive' requires a terminal");
                 2
             } else {
-                crate::shell::run_stdin("rsh", &[])
+                crate::shell::run_stdin("jsh", &[])
             }
         }
     }
@@ -175,7 +175,7 @@ fn check_input(input: &Input) -> i32 {
                 (source, Some(path.display().to_string()))
             }
             Err(error) => {
-                eprintln!("rsh: {}: {error}", path.display());
+                eprintln!("jsh: {}: {error}", path.display());
                 return if error.kind() == std::io::ErrorKind::NotFound {
                     127
                 } else {
@@ -186,7 +186,7 @@ fn check_input(input: &Input) -> i32 {
         Input::Stdin { .. } | Input::Auto => {
             let mut source = String::new();
             if let Err(error) = std::io::stdin().read_to_string(&mut source) {
-                eprintln!("rsh: stdin: {error}");
+                eprintln!("jsh: stdin: {error}");
                 return 1;
             }
             (source, Some("stdin".to_string()))
@@ -202,8 +202,8 @@ fn check_input(input: &Input) -> i32 {
         Ok(_) => 0,
         Err(error) => {
             match label {
-                Some(label) => eprintln!("rsh: {label}: {error}"),
-                None => eprintln!("rsh: {error}"),
+                Some(label) => eprintln!("jsh: {label}: {error}"),
+                None => eprintln!("jsh: {error}"),
             }
             2
         }
@@ -229,7 +229,7 @@ where
         .and_then(|p| PathBuf::from(p).file_name().map(|s| s.to_owned()))
         .and_then(|s| s.into_string().ok())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "rsh".to_string());
+        .unwrap_or_else(|| "jsh".to_string());
 
     // `context` is a process-level query action, not a script path. Keep the
     // recognition deliberately before ordinary option/script parsing so the
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn command_assigns_arg0_and_positionals_like_bash() {
-        let invocation = run(&["rsh", "-c", "echo $0 $1 $#", "worker", "one", "two"]);
+        let invocation = run(&["jsh", "-c", "echo $0 $1 $#", "worker", "one", "two"]);
         assert_eq!(
             invocation.input,
             Input::Command {
@@ -476,12 +476,12 @@ mod tests {
 
     #[test]
     fn command_defaults_arg0_to_program_name() {
-        let invocation = run(&["/usr/bin/rsh", "-c", "true"]);
+        let invocation = run(&["/usr/bin/jsh", "-c", "true"]);
         assert_eq!(
             invocation.input,
             Input::Command {
                 command: "true".into(),
-                arg0: "rsh".into(),
+                arg0: "jsh".into(),
                 args: Vec::new(),
             }
         );
@@ -489,11 +489,11 @@ mod tests {
 
     #[test]
     fn script_stops_option_parsing() {
-        let invocation = run(&["rsh", "script.rsh", "--norc", "x"]);
+        let invocation = run(&["jsh", "script.jsh", "--norc", "x"]);
         assert_eq!(
             invocation.input,
             Input::Script {
-                path: PathBuf::from("script.rsh"),
+                path: PathBuf::from("script.jsh"),
                 args: vec!["--norc".into(), "x".into()],
             }
         );
@@ -502,11 +502,11 @@ mod tests {
 
     #[test]
     fn double_dash_allows_dash_prefixed_script() {
-        let invocation = run(&["rsh", "--", "-script.rsh", "x"]);
+        let invocation = run(&["jsh", "--", "-script.jsh", "x"]);
         assert_eq!(
             invocation.input,
             Input::Script {
-                path: PathBuf::from("-script.rsh"),
+                path: PathBuf::from("-script.jsh"),
                 args: vec!["x".into()],
             }
         );
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn explicit_stdin_has_positionals() {
-        let invocation = run(&["rsh", "-n", "-s", "a", "b"]);
+        let invocation = run(&["jsh", "-n", "-s", "a", "b"]);
         assert!(invocation.noexec);
         assert_eq!(
             invocation.input,
@@ -526,23 +526,23 @@ mod tests {
 
     #[test]
     fn validates_errors_and_conflicts() {
-        assert!(parse_from(["rsh", "--wat"]).is_err());
-        assert!(parse_from(["rsh", "-c"]).is_err());
-        assert!(parse_from(["rsh", "--rcfile"]).is_err());
-        assert!(parse_from(["rsh", "--norc", "--rcfile", "x"]).is_err());
-        assert!(parse_from(["rsh", "--session", "../bad"]).is_err());
-        assert!(parse_from(["rsh", "-i", "-n"]).is_err());
+        assert!(parse_from(["jsh", "--wat"]).is_err());
+        assert!(parse_from(["jsh", "-c"]).is_err());
+        assert!(parse_from(["jsh", "--rcfile"]).is_err());
+        assert!(parse_from(["jsh", "--norc", "--rcfile", "x"]).is_err());
+        assert!(parse_from(["jsh", "--session", "../bad"]).is_err());
+        assert!(parse_from(["jsh", "-i", "-n"]).is_err());
     }
 
     #[test]
     fn recognizes_immediate_actions() {
-        assert_eq!(parse_from(["rsh", "--help"]).unwrap(), ParseResult::Help);
+        assert_eq!(parse_from(["jsh", "--help"]).unwrap(), ParseResult::Help);
         assert_eq!(
-            parse_from(["rsh", "--version"]).unwrap(),
+            parse_from(["jsh", "--version"]).unwrap(),
             ParseResult::Version
         );
         assert_eq!(
-            parse_from(["rsh", "context", "list", "-n", "3", "--json"]).unwrap(),
+            parse_from(["jsh", "context", "list", "-n", "3", "--json"]).unwrap(),
             ParseResult::Context(vec![
                 "list".into(),
                 "-n".into(),
@@ -555,10 +555,10 @@ mod tests {
     #[test]
     fn context_is_an_action_but_double_dash_still_allows_a_script_named_context() {
         assert!(matches!(
-            parse_from(["rsh", "context", "show", "rsh-1"]).unwrap(),
+            parse_from(["jsh", "context", "show", "jsh-1"]).unwrap(),
             ParseResult::Context(_)
         ));
-        let invocation = run(&["rsh", "--", "context", "arg"]);
+        let invocation = run(&["jsh", "--", "context", "arg"]);
         assert_eq!(
             invocation.input,
             Input::Script {

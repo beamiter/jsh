@@ -61,7 +61,7 @@ impl PipelineData {
                     match serde_json::from_str::<serde_json::Value>(line) {
                         Ok(v) => out.push(Value::from_json(v)),
                         Err(_) => {
-                            eprintln!("rsh: cannot parse pipeline input as JSON");
+                            eprintln!("jsh: cannot parse pipeline input as JSON");
                             return Err(1);
                         }
                     }

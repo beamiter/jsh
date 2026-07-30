@@ -489,6 +489,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsh"
+version = "0.2.0"
+dependencies = [
+ "criterion",
+ "crossterm",
+ "dirs",
+ "glob",
+ "indexmap",
+ "jagent",
+ "nix",
+ "once_cell",
+ "quick-xml",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "toml",
+ "unicode-width",
+ "ureq",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -785,29 +808,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rsh"
-version = "0.2.0"
-dependencies = [
- "criterion",
- "crossterm",
- "dirs",
- "glob",
- "indexmap",
- "jagent",
- "nix",
- "once_cell",
- "quick-xml",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "toml",
- "unicode-width",
- "ureq",
 ]
 
 [[package]]

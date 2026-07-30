@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Phase 14c — vs-nushell wallclock benchmark.
 #
-# Runs equivalent structured-data pipelines through rsh and nushell and
+# Runs equivalent structured-data pipelines through jsh and nushell and
 # reports relative wallclock time. Skips nu cases if `nu` isn't installed.
 #
 # Usage:
 #   ./bench_nu.sh              # build release and run all benches
-#   ./bench_nu.sh --skip-build # reuse existing target/release/rsh
+#   ./bench_nu.sh --skip-build # reuse existing target/release/jsh
 
 set -euo pipefail
 
-RSH="./target/release/rsh"
+JSH="./target/release/jsh"
 
 if [[ "${1:-}" != "--skip-build" ]]; then
-    echo "==> Building rsh in release mode..."
+    echo "==> Building jsh in release mode..."
     cargo build --release 2>&1 | tail -5
     echo ""
 fi
@@ -28,9 +28,9 @@ if command -v nu &>/dev/null; then
     HAVE_NU=1
     echo "==> nushell: $(nu --version)"
 else
-    echo "==> nushell: not installed — running rsh-only baseline"
+    echo "==> nushell: not installed — running jsh-only baseline"
 fi
-echo "==> rsh:      $($RSH --version 2>/dev/null || echo 'no --version')"
+echo "==> jsh:      $($JSH --version 2>/dev/null || echo 'no --version')"
 echo ""
 
 # Generate a synthetic JSON list-of-records for the larger cases.
@@ -53,11 +53,11 @@ BIG_JSON="$TMPDIR/big.json"
 
 run_pair() {
     local title="$1"
-    local rsh_script="$2"
+    local jsh_script="$2"
     local nu_script="$3"
 
     echo "--- $title ---"
-    local cmds=(-n rsh "$RSH -c '$rsh_script'")
+    local cmds=(-n jsh "$JSH -c '$jsh_script'")
     if [[ "$HAVE_NU" == "1" ]]; then
         cmds+=(-n nu "nu -c \"$nu_script\"")
     fi
@@ -66,7 +66,7 @@ run_pair() {
 }
 
 echo "============================================"
-echo " rsh vs nushell — structured pipeline bench"
+echo " jsh vs nushell — structured pipeline bench"
 echo " (10k rows, JSON in $BIG_JSON)"
 echo "============================================"
 echo ""

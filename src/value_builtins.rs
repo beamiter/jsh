@@ -413,7 +413,7 @@ fn vb_par_each(
     }
 
     if let Some(msg) = err_slot.lock().unwrap().take() {
-        eprintln!("rsh: {}", msg);
+        eprintln!("jsh: {}", msg);
         state.set_error(msg, 1);
         return Err(1);
     }
@@ -1221,7 +1221,7 @@ fn vb_ps(
 // ---------------------------------------------------------------------------
 
 /// Resolve a closure reference: either the inline-expansion sentinel
-/// `\x01rsh-closure:<idx>\x02` or a let-bound `Value::Closure`.
+/// `\x01jsh-closure:<idx>\x02` or a let-bound `Value::Closure`.
 fn lookup_closure(arg: Option<&String>, state: &ShellState) -> Option<Arc<ClosureData>> {
     let a = arg?;
     if let Some(rest) = a
@@ -1229,7 +1229,7 @@ fn lookup_closure(arg: Option<&String>, state: &ShellState) -> Option<Arc<Closur
         .and_then(|s| s.strip_suffix('\u{02}'))
     {
         if let Some(idx) = rest
-            .strip_prefix("rsh-closure:")
+            .strip_prefix("jsh-closure:")
             .and_then(|s| s.parse::<usize>().ok())
         {
             return state.inline_closures.get(idx).cloned();
@@ -1782,7 +1782,7 @@ fn vb_str(
             "split" => {
                 let sep = rest.first().map(|x| x.as_str()).unwrap_or(" ");
                 return Ok(format!(
-                    "__rsh_split__{}",
+                    "__jsh_split__{}",
                     s.split(sep).collect::<Vec<_>>().join("\x1f")
                 ));
             }
@@ -1822,7 +1822,7 @@ fn vb_str(
     };
     // Apply per-Value. For Bytes, treat as single string.
     let coerce = |r: String| -> Value {
-        if let Some(rest_s) = r.strip_prefix("__rsh_split__") {
+        if let Some(rest_s) = r.strip_prefix("__jsh_split__") {
             Value::List(
                 rest_s
                     .split('\x1f')
@@ -3219,7 +3219,7 @@ fn vb_shuffle(
         .unwrap_or(0) as u64;
     let mut state = seed ^ 0x9E3779B97F4A7C15u64;
     let mut next = || -> u64 {
-        // xorshift64
+        // @@KEEPXOJSHIFT@@64
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -4348,12 +4348,12 @@ fn vb_error(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 16a — module system: `use ./path.rsh [names...]`
+// Phase 16a — module system: `use ./path.jsh [names...]`
 // ---------------------------------------------------------------------------
 
 /// `use PATH [NAME ...]`
 ///
-/// Reads PATH as an rsh source file and executes it in the current shell, so
+/// Reads PATH as a jsh source file and executes it in the current shell, so
 /// any `def`-registered functions land in `state.user_signatures` /
 /// `state.user_typed_fns`. If extra NAMEs are supplied, only those newly
 /// defined functions are kept; the rest are rolled back.
@@ -4883,7 +4883,7 @@ fn vb_http(
     _args: &[String],
     state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let msg = "http: not available — rsh was built without the `ai` feature".to_string();
+    let msg = "http: not available — jsh was built without the `ai` feature".to_string();
     eprintln!("{}", msg);
     state.set_error(msg, 1);
     Err(1)

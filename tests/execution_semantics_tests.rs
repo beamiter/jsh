@@ -2,25 +2,25 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-fn rsh(args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rsh"))
+fn jsh(args: &[&str], stdin: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh");
+        .expect("spawn jsh");
     child
         .stdin
         .as_mut()
         .expect("piped stdin")
         .write_all(stdin.as_bytes())
         .expect("write stdin");
-    child.wait_with_output().expect("wait for rsh")
+    child.wait_with_output().expect("wait for jsh")
 }
 
 fn run_c(command: &str) -> Output {
-    rsh(&["-c", command], "")
+    jsh(&["-c", command], "")
 }
 
 fn stdout(output: &Output) -> String {
@@ -38,13 +38,13 @@ fn wait_promptly(child: &mut Child) -> ExitStatus {
 
     let deadline = Instant::now() + Duration::from_millis(750);
     loop {
-        if let Some(status) = child.try_wait().expect("poll rsh") {
+        if let Some(status) = child.try_wait().expect("poll jsh") {
             return status;
         }
         if Instant::now() >= deadline {
             let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
             let _ = child.wait();
-            panic!("rsh did not stop promptly");
+            panic!("jsh did not stop promptly");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -90,7 +90,7 @@ fn pipefail_uses_the_rightmost_nonzero_status() {
 
 #[test]
 fn command_arg0_and_positional_parameters_are_distinct() {
-    let output = rsh(
+    let output = jsh(
         &[
             "-c",
             "printf '%s|%s|%s' \"$0\" \"$1\" \"$2\"",
@@ -107,10 +107,10 @@ fn command_arg0_and_positional_parameters_are_distinct() {
 #[test]
 fn source_arguments_start_at_one_and_preserve_arg0() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("source_args.rsh");
+    let path = dir.path().join("source_args.jsh");
     std::fs::write(&path, "printf '%s|%s|%s' \"$0\" \"$1\" \"$2\"").expect("write source file");
     let command = format!("source {} a b", path.display());
-    let output = rsh(&["-c", &command, "outer"], "");
+    let output = jsh(&["-c", &command, "outer"], "");
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), "outer|a|b");
 }
@@ -118,9 +118,9 @@ fn source_arguments_start_at_one_and_preserve_arg0() {
 #[test]
 fn script_path_is_arg0_and_script_arguments_start_at_one() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("argv.rsh");
+    let path = dir.path().join("argv.jsh");
     std::fs::write(&path, "printf '%s|%s' \"$0\" \"$1\"").expect("write script");
-    let output = rsh(&[path.to_str().expect("utf8 path"), "value"], "");
+    let output = jsh(&[path.to_str().expect("utf8 path"), "value"], "");
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), format!("{}|value", path.display()));
 }
@@ -146,10 +146,10 @@ fn exit_without_argument_uses_last_status_and_stops_execution() {
 
 #[test]
 fn failglob_reports_an_error_and_returns_nonzero() {
-    let output = run_c("shopt -s failglob; echo /definitely-no-rsh-match-*; echo SHOULD_NOT_RUN");
+    let output = run_c("shopt -s failglob; echo /definitely-no-jsh-match-*; echo SHOULD_NOT_RUN");
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("no match: /definitely-no-rsh-match-*"));
-    assert!(!stdout(&output).contains("definitely-no-rsh-match"));
+    assert!(stderr(&output).contains("no match: /definitely-no-jsh-match-*"));
+    assert!(!stdout(&output).contains("definitely-no-jsh-match"));
     assert!(!stdout(&output).contains("SHOULD_NOT_RUN"));
 }
 
@@ -241,18 +241,18 @@ fn noninteractive_exit_argument_errors_terminate_with_bash_statuses() {
 
 #[test]
 fn interactive_exit_with_too_many_arguments_does_not_request_exit() {
-    let mut state = rsh::environment::ShellState::new(true);
-    rsh::builtins::reset_exit_request();
-    let code = rsh::builtins::run_builtin("exit", &["7".to_string(), "8".to_string()], &mut state);
+    let mut state = jsh::environment::ShellState::new(true);
+    jsh::builtins::reset_exit_request();
+    let code = jsh::builtins::run_builtin("exit", &["7".to_string(), "8".to_string()], &mut state);
     assert_eq!(code, 1);
-    assert!(!rsh::builtins::EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst));
-    rsh::builtins::reset_exit_request();
+    assert!(!jsh::builtins::EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst));
+    jsh::builtins::reset_exit_request();
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn ctrl_c_interrupts_noninteractive_command_under_a_pty() {
-    let command = format!("{} -c 'sleep 1; echo RSH_DONE'", env!("CARGO_BIN_EXE_rsh"));
+    let command = format!("{} -c 'sleep 1; echo JSH_DONE'", env!("CARGO_BIN_EXE_jsh"));
     let mut child = Command::new("script")
         .args(["-qfec", &command, "/dev/null"])
         .stdin(Stdio::piped())
@@ -274,7 +274,7 @@ fn ctrl_c_interrupts_noninteractive_command_under_a_pty() {
         "stderr: {}",
         stderr(&output)
     );
-    assert!(!stdout(&output).contains("RSH_DONE"));
+    assert!(!stdout(&output).contains("JSH_DONE"));
 }
 
 #[cfg(unix)]
@@ -284,22 +284,22 @@ fn direct_hup_and_term_stop_noninteractive_program_and_child() {
     use nix::unistd::Pid;
 
     for (signal, expected) in [(Signal::SIGHUP, 129), (Signal::SIGTERM, 143)] {
-        let child = Command::new(env!("CARGO_BIN_EXE_rsh"))
-            .args(["-c", "sleep 2; echo RSH_DONE"])
+        let child = Command::new(env!("CARGO_BIN_EXE_jsh"))
+            .args(["-c", "sleep 2; echo JSH_DONE"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn rsh");
+            .expect("spawn jsh");
         std::thread::sleep(Duration::from_millis(150));
-        kill(Pid::from_raw(child.id() as i32), signal).expect("signal rsh");
-        let output = child.wait_with_output().expect("wait for signaled rsh");
+        kill(Pid::from_raw(child.id() as i32), signal).expect("signal jsh");
+        let output = child.wait_with_output().expect("wait for signaled jsh");
         assert_eq!(
             output.status.code(),
             Some(expected),
             "signal {signal:?}, stderr: {}",
             stderr(&output)
         );
-        assert!(!stdout(&output).contains("RSH_DONE"));
+        assert!(!stdout(&output).contains("JSH_DONE"));
     }
 }
 
@@ -314,13 +314,13 @@ fn hup_and_term_interrupt_blocked_noninteractive_stdin() {
         (Vec::new(), Signal::SIGTERM, 143),
     ];
     for (args, signal, expected) in cases {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rsh"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn stdin-reading rsh");
+            .expect("spawn stdin-reading jsh");
         let mut input = child.stdin.take().expect("piped stdin");
         input
             .write_all(b"echo SHOULD_NOT_RUN\n")
@@ -328,18 +328,18 @@ fn hup_and_term_interrupt_blocked_noninteractive_stdin() {
 
         std::thread::sleep(Duration::from_millis(100));
         let pid = Pid::from_raw(child.id() as i32);
-        kill(pid, signal).expect("signal blocked rsh");
+        kill(pid, signal).expect("signal blocked jsh");
 
         let deadline = Instant::now() + Duration::from_millis(750);
         let status = loop {
-            if let Some(status) = child.try_wait().expect("poll rsh") {
+            if let Some(status) = child.try_wait().expect("poll jsh") {
                 break status;
             }
             if Instant::now() >= deadline {
                 let _ = kill(pid, Signal::SIGKILL);
                 drop(input);
                 let _ = child.wait();
-                panic!("rsh did not stop promptly for {signal:?}");
+                panic!("jsh did not stop promptly for {signal:?}");
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -375,13 +375,13 @@ fn term_interrupts_blocking_read_builtin() {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rsh"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
         .args(["-c", "read value; echo SHOULD_NOT_RUN"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh read builtin");
+        .expect("spawn jsh read builtin");
     let input = child.stdin.take().expect("piped stdin");
     std::thread::sleep(Duration::from_millis(100));
     kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).expect("signal blocked read");
@@ -407,14 +407,14 @@ fn hup_interrupts_script_blocked_opening_fifo() {
     use nix::unistd::{mkfifo, Pid};
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let fifo = dir.path().join("blocked-script.rsh");
+    let fifo = dir.path().join("blocked-script.jsh");
     mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("create fifo");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rsh"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
         .arg(&fifo)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh fifo script");
+        .expect("spawn jsh fifo script");
     std::thread::sleep(Duration::from_millis(100));
     kill(Pid::from_raw(child.id() as i32), Signal::SIGHUP).expect("signal fifo reader");
     let status = wait_promptly(&mut child);
@@ -427,12 +427,12 @@ fn signal_during_exit_trap_overrides_final_status() {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rsh"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
         .args(["-c", "trap 'sleep 2' EXIT"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh EXIT trap");
+        .expect("spawn jsh EXIT trap");
     std::thread::sleep(Duration::from_millis(200));
     kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).expect("signal EXIT trap");
     let status = wait_promptly(&mut child);
@@ -445,12 +445,12 @@ fn signal_stops_remaining_err_trap_commands() {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rsh"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
         .args(["-c", "trap 'sleep 2; echo SHOULD_NOT_RUN' ERR; false"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh ERR trap");
+        .expect("spawn jsh ERR trap");
     std::thread::sleep(Duration::from_millis(200));
     kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).expect("signal ERR trap");
     let status = wait_promptly(&mut child);
@@ -472,8 +472,8 @@ fn idle_interactive_term_returns_signal_status() {
     use nix::unistd::Pid;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let pid_file = dir.path().join("rsh.pid");
-    let rc_file = dir.path().join("idle.rsh");
+    let pid_file = dir.path().join("jsh.pid");
+    let rc_file = dir.path().join("idle.jsh");
     std::fs::write(
         &rc_file,
         format!("sh -c 'echo $PPID > {}'\n", pid_file.display()),
@@ -481,7 +481,7 @@ fn idle_interactive_term_returns_signal_status() {
     .expect("write rc file");
     let command = format!(
         "{} --rcfile {}",
-        env!("CARGO_BIN_EXE_rsh"),
+        env!("CARGO_BIN_EXE_jsh"),
         rc_file.display()
     );
     let mut script = Command::new("script")
@@ -490,22 +490,22 @@ fn idle_interactive_term_returns_signal_status() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn interactive rsh");
+        .expect("spawn interactive jsh");
     let input = script.stdin.take().expect("script stdin");
     let deadline = Instant::now() + Duration::from_secs(2);
     let shell_pid = loop {
         if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-            break pid.trim().parse::<i32>().expect("numeric rsh pid");
+            break pid.trim().parse::<i32>().expect("numeric jsh pid");
         }
         if Instant::now() >= deadline {
             drop(input);
             let _ = script.kill();
             let _ = script.wait();
-            panic!("interactive rsh did not reach its prompt");
+            panic!("interactive jsh did not reach its prompt");
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    kill(Pid::from_raw(shell_pid), Signal::SIGTERM).expect("signal interactive rsh");
+    kill(Pid::from_raw(shell_pid), Signal::SIGTERM).expect("signal interactive jsh");
     let status = wait_promptly(&mut script);
     drop(input);
     assert_eq!(status.code(), Some(143));

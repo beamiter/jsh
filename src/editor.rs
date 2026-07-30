@@ -2353,8 +2353,8 @@ mod tests {
     #[test]
     fn execution_output_replaces_exit_code_fallback_when_context_is_allowed() {
         let fallback = Some(("cargo test".to_string(), "exit code 101".to_string(), 101));
-        let enriched = last_error_with_execution_output(fallback, Some("rsh-1"), true, |id| {
-            assert_eq!(id, "rsh-1");
+        let enriched = last_error_with_execution_output(fallback, Some("jsh-1"), true, |id| {
+            assert_eq!(id, "jsh-1");
             Some("error[E0425]: missing value\n".to_string())
         });
 
@@ -2373,7 +2373,7 @@ mod tests {
         let fallback = Some(("false".to_string(), "exit code 1".to_string(), 1));
         let mut loaded = false;
         let result =
-            last_error_with_execution_output(fallback.clone(), Some("rsh-1"), false, |_| {
+            last_error_with_execution_output(fallback.clone(), Some("jsh-1"), false, |_| {
                 loaded = true;
                 Some("private terminal output".to_string())
             });
@@ -2387,11 +2387,11 @@ mod tests {
         let fallback = Some(("false".to_string(), "exit code 1".to_string(), 1));
 
         assert_eq!(
-            last_error_with_execution_output(fallback.clone(), Some("rsh-1"), true, |_| None),
+            last_error_with_execution_output(fallback.clone(), Some("jsh-1"), true, |_| None),
             fallback
         );
         assert_eq!(
-            last_error_with_execution_output(fallback.clone(), Some("rsh-1"), true, |_| Some(
+            last_error_with_execution_output(fallback.clone(), Some("jsh-1"), true, |_| Some(
                 String::new()
             ),),
             fallback

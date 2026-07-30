@@ -1,6 +1,6 @@
-use rsh::environment::ShellState;
-use rsh::expand::{expand_word_to_string, expand_words};
-use rsh::parser::parse_word_parts;
+use jsh::environment::ShellState;
+use jsh::expand::{expand_word_to_string, expand_words};
+use jsh::parser::parse_word_parts;
 
 fn make_state() -> ShellState {
     let mut state = ShellState::new(false);

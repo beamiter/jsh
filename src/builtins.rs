@@ -166,7 +166,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
                         state.jobs.continue_fg(id)
                     }
                     None => {
-                        eprintln!("rsh: fg: no current job");
+                        eprintln!("jsh: fg: no current job");
                         1
                     }
                 },
@@ -184,7 +184,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
                         state.jobs.continue_bg(id)
                     }
                     None => {
-                        eprintln!("rsh: bg: no current job");
+                        eprintln!("jsh: bg: no current job");
                         1
                     }
                 },
@@ -235,7 +235,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             if is_builtin(cmd_name) {
                 run_builtin(cmd_name, &args[1..], state)
             } else {
-                eprintln!("rsh: builtin: {}: not a shell builtin", cmd_name);
+                eprintln!("jsh: builtin: {}: not a shell builtin", cmd_name);
                 1
             }
         }
@@ -283,7 +283,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             if let Some(vfn) = crate::value_builtins::VALUE_BUILTINS.get(name) {
                 return run_value_builtin_in_fork(*vfn, args, state);
             }
-            eprintln!("rsh: {}: builtin not yet implemented", name);
+            eprintln!("jsh: {}: builtin not yet implemented", name);
             1
         }
     }
@@ -364,7 +364,7 @@ fn builtin_cd(args: &[String], state: &mut ShellState) -> i32 {
                 d.to_string()
             }
             None => {
-                eprintln!("rsh: cd: OLDPWD not set");
+                eprintln!("jsh: cd: OLDPWD not set");
                 return 1;
             }
         }
@@ -375,7 +375,7 @@ fn builtin_cd(args: &[String], state: &mut ShellState) -> i32 {
                 if idx < state.dir_stack.len() {
                     state.dir_stack[idx].to_string_lossy().to_string()
                 } else {
-                    eprintln!("rsh: cd: invalid stack index: +{}", idx);
+                    eprintln!("jsh: cd: invalid stack index: +{}", idx);
                     return 1;
                 }
             } else {
@@ -385,7 +385,7 @@ fn builtin_cd(args: &[String], state: &mut ShellState) -> i32 {
                         .to_string_lossy()
                         .to_string()
                 } else {
-                    eprintln!("rsh: cd: invalid stack index: -{}", idx);
+                    eprintln!("jsh: cd: invalid stack index: -{}", idx);
                     return 1;
                 }
             }
@@ -423,7 +423,7 @@ fn builtin_cd(args: &[String], state: &mut ShellState) -> i32 {
         }
     }
 
-    eprintln!("rsh: cd: {}: No such file or directory", target);
+    eprintln!("jsh: cd: {}: No such file or directory", target);
     1
 }
 
@@ -478,7 +478,7 @@ fn builtin_exit(args: &[String], state: &ShellState) -> i32 {
         Some(value) => match value.parse::<i32>() {
             Ok(code) => code,
             Err(_) => {
-                eprintln!("rsh: exit: {}: numeric argument required", value);
+                eprintln!("jsh: exit: {}: numeric argument required", value);
                 EXIT_CODE.store(2, Ordering::SeqCst);
                 EXIT_REQUESTED.store(true, Ordering::SeqCst);
                 return 2;
@@ -488,7 +488,7 @@ fn builtin_exit(args: &[String], state: &ShellState) -> i32 {
     };
 
     if args.len() > 1 {
-        eprintln!("rsh: exit: too many arguments");
+        eprintln!("jsh: exit: too many arguments");
         if !state.interactive {
             EXIT_CODE.store(1, Ordering::SeqCst);
             EXIT_REQUESTED.store(true, Ordering::SeqCst);
@@ -506,12 +506,12 @@ fn builtin_return(args: &[String], state: &mut ShellState) -> i32 {
         Some(value) => match value.parse::<i32>() {
             Ok(code) => code,
             Err(_) => {
-                eprintln!("rsh: return: {}: numeric argument required", value);
+                eprintln!("jsh: return: {}: numeric argument required", value);
                 if state.return_depth > 0 {
                     state.return_requested = true;
                     state.return_value = 2;
                 } else {
-                    eprintln!("rsh: return: can only return from a function or sourced script");
+                    eprintln!("jsh: return: can only return from a function or sourced script");
                 }
                 return 2;
             }
@@ -520,7 +520,7 @@ fn builtin_return(args: &[String], state: &mut ShellState) -> i32 {
     };
 
     if args.len() > 1 {
-        eprintln!("rsh: return: too many arguments");
+        eprintln!("jsh: return: too many arguments");
         if state.return_depth > 0 {
             state.return_requested = true;
             state.return_value = 1;
@@ -529,7 +529,7 @@ fn builtin_return(args: &[String], state: &mut ShellState) -> i32 {
     }
 
     if state.return_depth == 0 {
-        eprintln!("rsh: return: can only return from a function or sourced script");
+        eprintln!("jsh: return: can only return from a function or sourced script");
         return 2;
     }
 
@@ -540,7 +540,7 @@ fn builtin_return(args: &[String], state: &mut ShellState) -> i32 {
 
 fn builtin_loop_control(name: &str, _args: &[String], state: &mut ShellState) -> i32 {
     if state.loop_depth == 0 {
-        eprintln!("rsh: {}: only meaningful in a loop", name);
+        eprintln!("jsh: {}: only meaningful in a loop", name);
         return 1;
     }
 
@@ -692,7 +692,7 @@ fn builtin_pwd() -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("rsh: pwd: {}", e);
+            eprintln!("jsh: pwd: {}", e);
             1
         }
     }
@@ -715,7 +715,7 @@ fn builtin_alias(args: &[String], state: &mut ShellState) -> i32 {
             match state.aliases.get(arg) {
                 Some(v) => println!("alias {}='{}'", arg, v),
                 None => {
-                    eprintln!("rsh: alias: {}: not found", arg);
+                    eprintln!("jsh: alias: {}: not found", arg);
                     return 1;
                 }
             }
@@ -747,7 +747,7 @@ fn builtin_type(args: &[String], state: &mut ShellState) -> i32 {
         } else if let Some(path) = find_in_path(arg) {
             println!("{} is {}", arg, path);
         } else {
-            eprintln!("rsh: type: {}: not found", arg);
+            eprintln!("jsh: type: {}: not found", arg);
             ret = 1;
         }
     }
@@ -840,7 +840,7 @@ fn command_describe(names: &[String], verbose: bool, state: &ShellState) -> i32 
             Some((terse, described)) => println!("{}", if verbose { described } else { terse }),
             None => {
                 if verbose {
-                    eprintln!("rsh: command: {}: not found", name);
+                    eprintln!("jsh: command: {}: not found", name);
                 }
                 ret = 1;
             }
@@ -849,8 +849,8 @@ fn command_describe(names: &[String], verbose: bool, state: &ShellState) -> i32 
     ret
 }
 
-/// Use bash to source a script file when rsh's parser can't handle it,
-/// then reload environment variables and simple functions back into rsh.
+/// Use bash to source a script file when jsh's parser can't handle it,
+/// then reload environment variables and simple functions back into jsh.
 fn source_via_bash(path: &str, source_args: &[String], state: &mut ShellState) -> i32 {
     // Create a bash script that sources the file and outputs environment variables
     let bash_script = r#"
@@ -873,7 +873,7 @@ declare -F | awk '{print $3}'
     command
         .arg("-c")
         .arg(bash_script)
-        .arg("rsh-source")
+        .arg("jsh-source")
         .arg(path)
         .args(source_args);
     match command.output() {
@@ -883,7 +883,7 @@ declare -F | awk '{print $3}'
 
             // If bash had errors, print them but continue
             if !stderr.is_empty() && !stderr.contains("warning") {
-                eprintln!("rsh: bash source warnings: {}", stderr.trim());
+                eprintln!("jsh: bash source warnings: {}", stderr.trim());
             }
 
             // Parse exported variables from bash output
@@ -914,7 +914,7 @@ declare -F | awk '{print $3}'
             }
         }
         Err(e) => {
-            eprintln!("rsh: source: failed to execute bash fallback: {}", e);
+            eprintln!("jsh: source: failed to execute bash fallback: {}", e);
             1
         }
     }
@@ -922,7 +922,7 @@ declare -F | awk '{print $3}'
 
 fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
     if args.is_empty() {
-        eprintln!("rsh: source: filename argument required");
+        eprintln!("jsh: source: filename argument required");
         return 1;
     }
 
@@ -942,12 +942,12 @@ fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
             // 2. Try $PATH
             found
         } else {
-            eprintln!("rsh: source: {}: No such file or directory", filename);
+            eprintln!("jsh: source: {}: No such file or directory", filename);
             return 1;
         }
     } else {
         // Absolute or relative path doesn't exist
-        eprintln!("rsh: source: {}: No such file or directory", filename);
+        eprintln!("jsh: source: {}: No such file or directory", filename);
         return 1;
     };
 
@@ -986,14 +986,14 @@ fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
                     last
                 }
                 Err(e) => {
-                    eprintln!("rsh: source: {}: parse error: {}", resolved_path, e);
+                    eprintln!("jsh: source: {}: parse error: {}", resolved_path, e);
                     // Try bash as fallback only for complex scripts
                     source_via_bash(&resolved_path, &source_params, state)
                 }
             }
         }
         Err(e) => {
-            eprintln!("rsh: source: {}: {}", resolved_path, e);
+            eprintln!("jsh: source: {}: {}", resolved_path, e);
             1
         }
     };
@@ -1033,7 +1033,7 @@ fn builtin_eval(args: &[String], state: &mut ShellState) -> i32 {
             last
         }
         Err(e) => {
-            eprintln!("rsh: eval: parse error: {}", e);
+            eprintln!("jsh: eval: parse error: {}", e);
             2
         }
     }
@@ -1772,7 +1772,7 @@ fn builtin_set(args: &[String], state: &mut ShellState) -> i32 {
                         "vi" => state.editing_mode = crate::environment::EditingMode::Vi,
                         "emacs" => state.editing_mode = crate::environment::EditingMode::Emacs,
                         _ => {
-                            eprintln!("rsh: set: unknown option: {}", args[i]);
+                            eprintln!("jsh: set: unknown option: {}", args[i]);
                             return 1;
                         }
                     }
@@ -1789,7 +1789,7 @@ fn builtin_set(args: &[String], state: &mut ShellState) -> i32 {
                         "vi" => state.editing_mode = crate::environment::EditingMode::Emacs,
                         "emacs" => state.editing_mode = crate::environment::EditingMode::Vi,
                         _ => {
-                            eprintln!("rsh: set: unknown option: {}", args[i]);
+                            eprintln!("jsh: set: unknown option: {}", args[i]);
                             return 1;
                         }
                     }
@@ -1907,21 +1907,21 @@ fn builtin_printf(args: &[String]) -> i32 {
 
 fn builtin_shift(args: &[String], state: &mut ShellState) -> i32 {
     if args.len() > 1 {
-        eprintln!("rsh: shift: too many arguments");
+        eprintln!("jsh: shift: too many arguments");
         return 1;
     }
     let count = match args.first() {
         Some(value) => match value.parse::<usize>() {
             Ok(count) => count,
             Err(_) => {
-                eprintln!("rsh: shift: {}: numeric argument required", value);
+                eprintln!("jsh: shift: {}: numeric argument required", value);
                 return 1;
             }
         },
         None => 1,
     };
     if count > state.positional_params.len() {
-        eprintln!("rsh: shift: shift count out of range");
+        eprintln!("jsh: shift: shift count out of range");
         return 1;
     }
     state.positional_params.drain(..count);
@@ -1979,7 +1979,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
         let fd: i32 = match fd_clean.parse() {
             Ok(n) => n,
             Err(_) => {
-                eprintln!("rsh: exec: invalid file descriptor: {}", fd_str);
+                eprintln!("jsh: exec: invalid file descriptor: {}", fd_str);
                 return 1;
             }
         };
@@ -1992,7 +1992,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                     Ok(file) => {
                         let src_fd = file.into_raw_fd();
                         if let Err(_) = dup2_raw(src_fd, fd) {
-                            eprintln!("rsh: exec: dup2 failed");
+                            eprintln!("jsh: exec: dup2 failed");
                             return 1;
                         }
                         if src_fd != fd {
@@ -2000,7 +2000,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                         }
                     }
                     Err(_) => {
-                        eprintln!("rsh: exec: cannot open {} for reading", target);
+                        eprintln!("jsh: exec: cannot open {} for reading", target);
                         return 1;
                     }
                 }
@@ -2011,7 +2011,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                     Ok(file) => {
                         let src_fd = file.into_raw_fd();
                         if let Err(_) = dup2_raw(src_fd, fd) {
-                            eprintln!("rsh: exec: dup2 failed");
+                            eprintln!("jsh: exec: dup2 failed");
                             return 1;
                         }
                         if src_fd != fd {
@@ -2019,7 +2019,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                         }
                     }
                     Err(_) => {
-                        eprintln!("rsh: exec: cannot open {} for writing", target);
+                        eprintln!("jsh: exec: cannot open {} for writing", target);
                         return 1;
                     }
                 }
@@ -2030,7 +2030,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                     Ok(file) => {
                         let src_fd = file.into_raw_fd();
                         if let Err(_) = dup2_raw(src_fd, fd) {
-                            eprintln!("rsh: exec: dup2 failed");
+                            eprintln!("jsh: exec: dup2 failed");
                             return 1;
                         }
                         if src_fd != fd {
@@ -2038,7 +2038,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                         }
                     }
                     Err(_) => {
-                        eprintln!("rsh: exec: cannot open {} for appending", target);
+                        eprintln!("jsh: exec: cannot open {} for appending", target);
                         return 1;
                     }
                 }
@@ -2052,12 +2052,12 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                     match target.parse::<i32>() {
                         Ok(target_fd) => {
                             if let Err(_) = dup2_raw(target_fd, fd) {
-                                eprintln!("rsh: exec: dup2 failed");
+                                eprintln!("jsh: exec: dup2 failed");
                                 return 1;
                             }
                         }
                         Err(_) => {
-                            eprintln!("rsh: exec: invalid target FD: {}", target);
+                            eprintln!("jsh: exec: invalid target FD: {}", target);
                             return 1;
                         }
                     }
@@ -2090,13 +2090,13 @@ fn builtin_pushd(args: &[String], state: &mut ShellState) -> i32 {
     let target = if remaining_args.is_empty() {
         // pushd with no args swaps top two directories
         if state.dir_stack.is_empty() {
-            eprintln!("rsh: pushd: no other directory");
+            eprintln!("jsh: pushd: no other directory");
             return 1;
         }
         match state.dir_stack.pop() {
             Some(d) => d.to_string_lossy().to_string(),
             None => {
-                eprintln!("rsh: pushd: no other directory");
+                eprintln!("jsh: pushd: no other directory");
                 return 1;
             }
         }
@@ -2107,7 +2107,7 @@ fn builtin_pushd(args: &[String], state: &mut ShellState) -> i32 {
                 if idx < state.dir_stack.len() {
                     state.dir_stack[idx].to_string_lossy().to_string()
                 } else {
-                    eprintln!("rsh: pushd: invalid stack index: +{}", idx);
+                    eprintln!("jsh: pushd: invalid stack index: +{}", idx);
                     return 1;
                 }
             } else {
@@ -2116,7 +2116,7 @@ fn builtin_pushd(args: &[String], state: &mut ShellState) -> i32 {
                         .to_string_lossy()
                         .to_string()
                 } else {
-                    eprintln!("rsh: pushd: invalid stack index: -{}", idx);
+                    eprintln!("jsh: pushd: invalid stack index: -{}", idx);
                     return 1;
                 }
             }
@@ -2146,7 +2146,7 @@ fn builtin_pushd(args: &[String], state: &mut ShellState) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("rsh: pushd: {}: {}", target, e);
+            eprintln!("jsh: pushd: {}: {}", target, e);
             1
         }
     }
@@ -2154,7 +2154,7 @@ fn builtin_pushd(args: &[String], state: &mut ShellState) -> i32 {
 
 fn builtin_popd(state: &mut ShellState) -> i32 {
     if state.dir_stack.is_empty() {
-        eprintln!("rsh: popd: directory stack empty");
+        eprintln!("jsh: popd: directory stack empty");
         return 1;
     }
 
@@ -2170,13 +2170,13 @@ fn builtin_popd(state: &mut ShellState) -> i32 {
                     0
                 }
                 Err(e) => {
-                    eprintln!("rsh: popd: {}", e);
+                    eprintln!("jsh: popd: {}", e);
                     1
                 }
             }
         }
         None => {
-            eprintln!("rsh: popd: directory stack empty");
+            eprintln!("jsh: popd: directory stack empty");
             1
         }
     }
@@ -2230,7 +2230,7 @@ fn builtin_trap(args: &[String], state: &mut ShellState) -> i32 {
                 valid_signals.iter().any(|&s| s == sig_lower) || sig_lower.parse::<i32>().is_ok();
 
             if !is_valid {
-                eprintln!("rsh: trap: {} is not a valid signal name", sig);
+                eprintln!("jsh: trap: {} is not a valid signal name", sig);
                 return 1;
             }
 
@@ -2711,13 +2711,13 @@ fn builtin_z(args: &[String], state: &mut ShellState) -> i32 {
                     0
                 }
                 Err(e) => {
-                    eprintln!("rsh: z: {}: {}", target, e);
+                    eprintln!("jsh: z: {}: {}", target, e);
                     1
                 }
             }
         }
         None => {
-            eprintln!("rsh: z: no match for: {}", args.join(" "));
+            eprintln!("jsh: z: no match for: {}", args.join(" "));
             1
         }
     }
@@ -2749,7 +2749,7 @@ fn builtin_hook(args: &[String], state: &mut ShellState) -> i32 {
         "preexec" => &mut state.hooks.preexec,
         "chpwd" => &mut state.hooks.chpwd,
         _ => {
-            eprintln!("rsh: hook: unknown hook type: {}", hook_type);
+            eprintln!("jsh: hook: unknown hook type: {}", hook_type);
             return 1;
         }
     };
@@ -2764,7 +2764,7 @@ fn builtin_hook(args: &[String], state: &mut ShellState) -> i32 {
             hook_list.retain(|h| h != func);
         }
         _ => {
-            eprintln!("rsh: hook: unknown action: {} (use add or remove)", action);
+            eprintln!("jsh: hook: unknown action: {} (use add or remove)", action);
             return 1;
         }
     }
@@ -2857,7 +2857,7 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
     }
 
     if command_name.is_empty() {
-        eprintln!("rsh: complete: no command specified");
+        eprintln!("jsh: complete: no command specified");
         return 1;
     }
 
@@ -3061,7 +3061,7 @@ fn builtin_disown(args: &[String], state: &mut ShellState) -> i32 {
             let id = job.id;
             state.jobs.jobs.retain(|j| j.id != id);
         } else {
-            eprintln!("rsh: disown: no current job");
+            eprintln!("jsh: disown: no current job");
             return 1;
         }
         return 0;
@@ -3074,7 +3074,7 @@ fn builtin_disown(args: &[String], state: &mut ShellState) -> i32 {
             0
         }
         None => {
-            eprintln!("rsh: disown: {}: no such job", args[0]);
+            eprintln!("jsh: disown: {}: no such job", args[0]);
             1
         }
     }
@@ -3103,7 +3103,7 @@ fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
             match id.and_then(|id| state.jobs.get_by_id(id)) {
                 Some(job) => job.pid.as_raw(),
                 None => {
-                    eprintln!("rsh: wait: {}: no such job", arg);
+                    eprintln!("jsh: wait: {}: no such job", arg);
                     last_status = 127;
                     continue;
                 }
@@ -3112,7 +3112,7 @@ fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
             match arg.parse::<i32>() {
                 Ok(p) => p,
                 Err(_) => {
-                    eprintln!("rsh: wait: {}: not a pid or valid job spec", arg);
+                    eprintln!("jsh: wait: {}: not a pid or valid job spec", arg);
                     last_status = 127;
                     continue;
                 }
@@ -3200,7 +3200,7 @@ fn builtin_shopt(args: &[String], state: &mut ShellState) -> i32 {
                     "checkwinsize" => state.shell_opts.checkwinsize = true,
                     "inherit_errexit" => state.shell_opts.inherit_errexit = true,
                     _ => {
-                        eprintln!("rsh: shopt: {}: invalid option name", opt);
+                        eprintln!("jsh: shopt: {}: invalid option name", opt);
                         exit_code = 1;
                     }
                 }
@@ -3220,7 +3220,7 @@ fn builtin_shopt(args: &[String], state: &mut ShellState) -> i32 {
                     "checkwinsize" => state.shell_opts.checkwinsize = false,
                     "inherit_errexit" => state.shell_opts.inherit_errexit = false,
                     _ => {
-                        eprintln!("rsh: shopt: {}: invalid option name", opt);
+                        eprintln!("jsh: shopt: {}: invalid option name", opt);
                         exit_code = 1;
                     }
                 }
@@ -3246,7 +3246,7 @@ fn builtin_shopt(args: &[String], state: &mut ShellState) -> i32 {
                     Some(true) => println!("{}\ton", opt),
                     Some(false) => println!("{}\toff", opt),
                     None => {
-                        eprintln!("rsh: shopt: {}: invalid option name", opt);
+                        eprintln!("jsh: shopt: {}: invalid option name", opt);
                         exit_code = 1;
                     }
                 }
@@ -3393,7 +3393,7 @@ fn builtin_bookmark(args: &[String], state: &mut ShellState) -> i32 {
                 Some(path) => {
                     let old_dir = std::env::current_dir().ok();
                     if let Err(e) = std::env::set_current_dir(&path) {
-                        eprintln!("rsh: bookmark go: {}: {}", path, e);
+                        eprintln!("jsh: bookmark go: {}: {}", path, e);
                         return 1;
                     }
                     if let Ok(new_dir) = std::env::current_dir() {
@@ -3402,7 +3402,7 @@ fn builtin_bookmark(args: &[String], state: &mut ShellState) -> i32 {
                     0
                 }
                 None => {
-                    eprintln!("rsh: bookmark '{}' not found", name);
+                    eprintln!("jsh: bookmark '{}' not found", name);
                     1
                 }
             }
@@ -3428,7 +3428,7 @@ fn builtin_bookmark(args: &[String], state: &mut ShellState) -> i32 {
                     println!("Removed bookmark '{}'", name);
                     0
                 } else {
-                    eprintln!("rsh: bookmark '{}' not found", name);
+                    eprintln!("jsh: bookmark '{}' not found", name);
                     1
                 }
             } else {
@@ -3655,7 +3655,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
 fn builtin_help(args: &[String], state: &ShellState) -> i32 {
     // Phase 14b: prefer signature-driven help when available.
     if args.is_empty() {
-        println!("rsh — a Bash-inspired shell with structured data pipelines\n");
+        println!("jsh — a Bash-inspired shell with structured data pipelines\n");
         println!("Core builtins:");
         for (name, desc) in HELP_ENTRIES {
             println!("  {:12} {}", name, desc.split(" — ").nth(1).unwrap_or(desc));
@@ -3737,6 +3737,6 @@ fn builtin_help(args: &[String], state: &ShellState) -> i32 {
             return 0;
         }
     }
-    eprintln!("rsh: help: no help for '{}'", cmd);
+    eprintln!("jsh: help: no help for '{}'", cmd);
     1
 }

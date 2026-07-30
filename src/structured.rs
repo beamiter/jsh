@@ -5,7 +5,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 /// Read JSON from stdin (array or newline-delimited objects).
 pub fn read_json_stdin() -> Vec<Value> {
     if io::stdin().is_terminal() {
-        eprintln!("rsh: this command requires piped JSON input");
+        eprintln!("jsh: this command requires piped JSON input");
         return Vec::new();
     }
     let stdin = io::stdin();

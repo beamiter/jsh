@@ -12,7 +12,7 @@ impl BookmarkDB {
     pub fn load_default() -> Self {
         let path = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".rsh_bookmarks");
+            .join(".jsh_bookmarks");
         let mut db = BookmarkDB {
             bookmarks: HashMap::new(),
             file_path: path,

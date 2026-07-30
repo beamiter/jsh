@@ -413,7 +413,7 @@ fn expand_part(part: &WordPart, state: &mut ShellState) -> String {
                 captured: state.let_vars.clone(),
             });
             state.inline_closures.push(data);
-            format!("\x01rsh-closure:{}\x02", state.inline_closures.len() - 1)
+            format!("\x01jsh-closure:{}\x02", state.inline_closures.len() - 1)
         }
     }
 }

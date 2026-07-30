@@ -5,19 +5,19 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn rsh_bin() -> String {
-    env!("CARGO_BIN_EXE_rsh").to_string()
+fn jsh_bin() -> String {
+    env!("CARGO_BIN_EXE_jsh").to_string()
 }
 
 fn run(script: &str, stdin: &str) -> (String, String, i32) {
-    let mut child = Command::new(rsh_bin())
+    let mut child = Command::new(jsh_bin())
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh");
+        .expect("spawn jsh");
     if !stdin.is_empty() {
         child
             .stdin
@@ -81,10 +81,10 @@ fn let_negative_index() {
 #[test]
 fn let_does_not_swallow_bash_arithmetic_let() {
     // `let x=1+2` (no spaces around =) must keep bash arithmetic semantics.
-    // Either rsh's bash-let runs and sets x to "3", or it errors — we just
+    // Either jsh's bash-let runs and sets x to "3", or it errors — we just
     // need to verify our typed-let intercept did NOT trigger.
     let (_, _, code) = run(r#"let x=1+2; echo $x"#, "");
-    // bash-let is not implemented as a builtin in rsh; the important thing is
+    // bash-let is not implemented as a builtin in jsh; the important thing is
     // that we don't crash and don't bind `x` to the typed-let value "1+2".
     // Just assert exit status is sane.
     assert!(code == 0 || code == 127, "unexpected exit {}", code);

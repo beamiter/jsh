@@ -1,5 +1,5 @@
 /// Stream processing and utility commands
-/// Adds functional programming style commands to rsh
+/// Adds functional programming style commands to jsh
 /// sum - Add up all numbers in arguments
 use std::io::IsTerminal;
 
@@ -89,7 +89,7 @@ pub fn builtin_lines(_args: &[String]) -> i32 {
 
 /// stats - Show cache and performance statistics
 pub fn builtin_stats(_args: &[String]) -> i32 {
-    println!("=== rsh Performance Stats ===");
+    println!("=== jsh Performance Stats ===");
 
     // Parser cache stats
     if let Some(stats) = crate::parser::cache_stats() {

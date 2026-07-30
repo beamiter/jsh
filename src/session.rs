@@ -1,7 +1,7 @@
 /// Session persistence: save/restore shell state across terminal restarts.
 ///
-/// When jterm4 spawns rsh with `--session <id>`, rsh restores state from
-/// `~/.rsh/sessions/<id>.json`. On exit, rsh saves a snapshot back.
+/// When jterm4 spawns jsh with `--session <id>`, jsh restores state from
+/// `~/.jsh/sessions/<id>.json`. On exit, jsh saves a snapshot back.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -45,7 +45,7 @@ const SKIP_ENV_VARS: &[&str] = &[
     "XDG_SESSION_ID",
     "XDG_RUNTIME_DIR",
     // Internal
-    "RSH_SESSION_ID",
+    "JSH_SESSION_ID",
     "TERM_SESSION_ID",
 ];
 
@@ -148,7 +148,7 @@ pub struct SessionSnapshot {
 fn sessions_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".rsh")
+        .join(".jsh")
         .join("sessions")
 }
 
@@ -247,7 +247,7 @@ impl SessionSnapshot {
     pub fn apply(self, state: &mut ShellState) {
         // Restore CWD
         if let Err(e) = std::env::set_current_dir(&self.cwd) {
-            eprintln!("rsh: session restore: failed to cd to {}: {}", self.cwd, e);
+            eprintln!("jsh: session restore: failed to cd to {}: {}", self.cwd, e);
         }
 
         // Merge env vars: snapshot values override, but keep process-inherited vars for SKIP list
@@ -408,8 +408,8 @@ pub fn detect_environment() -> EnvironmentContext {
         }
     }
 
-    // Nix shell — check env var first (rsh is the nix shell itself),
-    // then check for flake.nix (rsh is the parent, nix develop ran as child)
+    // Nix shell — check env var first (jsh is the nix shell itself),
+    // then check for flake.nix (jsh is the parent, nix develop ran as child)
     let in_nix = std::env::var("IN_NIX_SHELL").is_ok() || std::env::var("NIX_BUILD_TOP").is_ok();
     let flake_dir = find_flake_dir();
     if in_nix || flake_dir.is_some() {
@@ -465,7 +465,7 @@ pub fn reactivate_environment(ctx: &EnvironmentContext, state: &mut ShellState) 
                 }
             } else {
                 eprintln!(
-                    "rsh: session restore: venv {} no longer exists",
+                    "jsh: session restore: venv {} no longer exists",
                     virtual_env
                 );
             }
@@ -475,7 +475,7 @@ pub fn reactivate_environment(ctx: &EnvironmentContext, state: &mut ShellState) 
             // restore — let the user re-enter `nix develop` explicitly.
         }
         EnvironmentContext::Docker { .. } | EnvironmentContext::Ssh { .. } => {
-            // Docker/SSH context is informational at the rsh level.
+            // Docker/SSH context is informational at the jsh level.
             // Re-establishing the connection is jterm4's responsibility.
         }
         EnvironmentContext::Plain => {}

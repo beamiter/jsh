@@ -37,9 +37,9 @@ fn should_use_color(is_terminal: bool, no_color_is_set: bool) -> bool {
 
 fn format_shell_error(msg: &str, color: bool) -> String {
     if color {
-        format!("\x1b[1;31mrsh:\x1b[0m {}", msg)
+        format!("\x1b[1;31mjsh:\x1b[0m {}", msg)
     } else {
-        format!("rsh: {}", msg)
+        format!("jsh: {}", msg)
     }
 }
 
@@ -286,7 +286,7 @@ fn execute_pipeline_in_context(
 
 fn report_expansion_error(state: &mut ShellState) -> Option<i32> {
     state.take_expansion_error().map(|message| {
-        eprintln!("rsh: {}", message);
+        eprintln!("jsh: {}", message);
         state.set_error(message, 1);
         state.last_exit_code = 1;
         state.abort_current_program = true;
@@ -331,7 +331,7 @@ fn execute_complete_command_outcome(
                 };
             }
             Err(e) => {
-                eprintln!("rsh: fork failed: {}", e);
+                eprintln!("jsh: fork failed: {}", e);
                 state.last_exit_code = 1;
                 return CommandOutcome {
                     status: 1,
@@ -458,13 +458,13 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
         let f = match crate::value_builtins::VALUE_BUILTINS.get(name.as_str()) {
             Some(f) => *f,
             None => {
-                eprintln!("rsh: {}: not value-aware (shouldn't happen)", name);
+                eprintln!("jsh: {}: not value-aware (shouldn't happen)", name);
                 return 1;
             }
         };
         if let Some(sig) = crate::signature::SIGNATURES.get(name.as_str()) {
             if let Err(msg) = sig.validate_args(args) {
-                eprintln!("rsh: {}", msg);
+                eprintln!("jsh: {}", msg);
                 state.set_error(msg, 2);
                 return 2;
             }
@@ -476,7 +476,7 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
         // Last command should print to stdout
         if i == cmds.len() - 1 {
             if let Err(e) = data.write_to_stdout() {
-                eprintln!("rsh: {}", e);
+                eprintln!("jsh: {}", e);
                 return 1;
             }
             data = PipelineData::Empty;
@@ -531,7 +531,7 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
             match pipe() {
                 Ok((r, w)) => (Some(r.into_raw_fd()), Some(w.into_raw_fd())),
                 Err(e) => {
-                    eprintln!("rsh: pipe failed: {}", e);
+                    eprintln!("jsh: pipe failed: {}", e);
                     if let Some(fd) = prev_read_fd {
                         close(fd).ok();
                     }
@@ -588,7 +588,7 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
             }
             Err(e) => {
                 signal::set_foreground_pgid(None);
-                eprintln!("rsh: fork failed: {}", e);
+                eprintln!("jsh: fork failed: {}", e);
                 return 1;
             }
         }
@@ -889,7 +889,7 @@ pub fn apply_closure(
                     if let Some(sig) = crate::signature::SIGNATURES.get(name.as_str()) {
                         if let Err(msg) = sig.validate_args(extra_args) {
                             state.set_error(msg.clone(), 2);
-                            eprintln!("rsh: {}", msg);
+                            eprintln!("jsh: {}", msg);
                             return Err(2);
                         }
                     }
@@ -1050,7 +1050,7 @@ fn execute_simple_with_mode(
         let sig = state.user_signatures.get(cmd_name).cloned();
         if let Some(s) = &sig {
             if let Err(msg) = s.validate_args(args) {
-                eprintln!("rsh: {}", msg);
+                eprintln!("jsh: {}", msg);
                 state.set_error(msg, 2);
                 return 2;
             }
@@ -1071,7 +1071,7 @@ fn execute_simple_with_mode(
                 if let Some(p) = s.params.get(i) {
                     if !p.rest {
                         if let Err(msg) = crate::signature::check_value_type(&v, p.kind, &p.name) {
-                            eprintln!("rsh: {}: {}", cmd_name, msg);
+                            eprintln!("jsh: {}: {}", cmd_name, msg);
                             state.set_error(msg, 2);
                             return 2;
                         }
@@ -1087,7 +1087,7 @@ fn execute_simple_with_mode(
                     other => crate::pipeline_data::PipelineData::Values(vec![other]),
                 };
                 if let Err(e) = pd.write_to_stdout() {
-                    eprintln!("rsh: {}", e);
+                    eprintln!("jsh: {}", e);
                     return 1;
                 }
                 return 0;
@@ -1632,14 +1632,14 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                 let (read_from_parent, write_to_child) = match pipe() {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("rsh: pipe failed: {}", e);
+                        eprintln!("jsh: pipe failed: {}", e);
                         return 1;
                     }
                 };
                 let (read_from_child, write_to_parent) = match pipe() {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("rsh: pipe failed: {}", e);
+                        eprintln!("jsh: pipe failed: {}", e);
                         return 1;
                     }
                 };
@@ -1691,7 +1691,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                         0
                     }
                     Err(_) => {
-                        eprintln!("rsh: coproc: fork failed");
+                        eprintln!("jsh: coproc: fork failed");
                         1
                     }
                 }
@@ -1753,7 +1753,7 @@ fn heredoc_fd(data: &str) -> Option<RawFd> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    dir.push(format!("rsh-heredoc-{}-{}", pid, nanos));
+    dir.push(format!("jsh-heredoc-{}-{}", pid, nanos));
 
     let mut file = OpenOptions::new()
         .read(true)
@@ -1956,7 +1956,7 @@ mod output_tests {
         let error = format_shell_error("ech: command not found", false);
         let hint = format_command_hint("echo", false);
 
-        assert_eq!(error, "rsh: ech: command not found");
+        assert_eq!(error, "jsh: ech: command not found");
         assert_eq!(hint, "       did you mean 'echo'?");
         assert!(!error.contains('\x1b'));
         assert!(!hint.contains('\x1b'));

@@ -1,3 +1,3 @@
 fn main() {
-    std::process::exit(rsh::cli::entrypoint());
+    std::process::exit(jsh::cli::entrypoint());
 }

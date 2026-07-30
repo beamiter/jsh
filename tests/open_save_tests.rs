@@ -2,12 +2,12 @@ use std::io::Write;
 /// Phase 6a — `open` and `save` (file I/O bridges to converters).
 use std::process::{Command, Stdio};
 
-fn rsh_bin() -> String {
-    env!("CARGO_BIN_EXE_rsh").to_string()
+fn jsh_bin() -> String {
+    env!("CARGO_BIN_EXE_jsh").to_string()
 }
 
 fn run_in(dir: &std::path::Path, script: &str) -> (String, String, i32) {
-    let child = Command::new(rsh_bin())
+    let child = Command::new(jsh_bin())
         .current_dir(dir)
         .arg("-c")
         .arg(script)
@@ -25,7 +25,7 @@ fn run_in(dir: &std::path::Path, script: &str) -> (String, String, i32) {
 }
 
 fn run_with_stdin(dir: &std::path::Path, script: &str, stdin: &str) -> (String, String, i32) {
-    let mut child = Command::new(rsh_bin())
+    let mut child = Command::new(jsh_bin())
         .current_dir(dir)
         .arg("-c")
         .arg(script)

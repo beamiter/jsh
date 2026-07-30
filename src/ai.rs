@@ -27,10 +27,10 @@ impl AiConfig {
     }
 
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Option<Self> {
-        let provider_name = get("RSH_AI_PROVIDER").unwrap_or_default();
+        let provider_name = get("JSH_AI_PROVIDER").unwrap_or_default();
         let provider_name = provider_name.trim();
         let explicitly_enabled = !provider_name.is_empty()
-            || get("RSH_AI_ENABLED")
+            || get("JSH_AI_ENABLED")
                 .as_deref()
                 .is_some_and(env_value_is_truthy);
         if !explicitly_enabled {
@@ -38,7 +38,7 @@ impl AiConfig {
         }
 
         let provider = if provider_name.is_empty() {
-            // Provider auto-detection is only reached after RSH_AI_ENABLED opted in.
+            // Provider auto-detection is only reached after JSH_AI_ENABLED opted in.
             if get("OPENAI_API_KEY").as_deref().is_some_and(nonempty) {
                 AiProvider::OpenAI
             } else if get("ANTHROPIC_API_KEY").as_deref().is_some_and(nonempty) {
@@ -57,12 +57,12 @@ impl AiConfig {
 
         let (api_key, default_model, default_url) = match &provider {
             AiProvider::OpenAI => (
-                get("OPENAI_API_KEY").or_else(|| get("RSH_AI_API_KEY")),
+                get("OPENAI_API_KEY").or_else(|| get("JSH_AI_API_KEY")),
                 "gpt-4o-mini".to_string(),
                 "https://api.openai.com/v1".to_string(),
             ),
             AiProvider::Anthropic => (
-                get("ANTHROPIC_API_KEY").or_else(|| get("RSH_AI_API_KEY")),
+                get("ANTHROPIC_API_KEY").or_else(|| get("JSH_AI_API_KEY")),
                 "claude-sonnet-4-20250514".to_string(),
                 "https://api.anthropic.com".to_string(),
             ),
@@ -73,13 +73,13 @@ impl AiConfig {
             ),
         };
 
-        let model = get("RSH_AI_MODEL")
+        let model = get("JSH_AI_MODEL")
             .filter(|value| nonempty(value))
             .unwrap_or(default_model);
-        let base_url = get("RSH_AI_BASE_URL")
+        let base_url = get("JSH_AI_BASE_URL")
             .filter(|value| nonempty(value))
             .unwrap_or(default_url);
-        let share_context = get("RSH_AI_SHARE_CONTEXT")
+        let share_context = get("JSH_AI_SHARE_CONTEXT")
             .as_deref()
             .is_some_and(env_value_is_truthy);
 
@@ -93,7 +93,7 @@ impl AiConfig {
     }
 
     /// Local inference stays local. Cloud inference only gets optional shell
-    /// context after the user explicitly opts in with RSH_AI_SHARE_CONTEXT.
+    /// context after the user explicitly opts in with JSH_AI_SHARE_CONTEXT.
     pub fn allows_extended_context(&self) -> bool {
         self.provider == AiProvider::Ollama || self.share_context
     }
@@ -387,34 +387,34 @@ mod tests {
     #[test]
     fn api_keys_do_not_enable_ai_implicitly() {
         assert!(config(&[("OPENAI_API_KEY", "secret")]).is_none());
-        assert!(config(&[("RSH_AI_ENABLED", "false"), ("OPENAI_API_KEY", "secret")]).is_none());
+        assert!(config(&[("JSH_AI_ENABLED", "false"), ("OPENAI_API_KEY", "secret")]).is_none());
     }
 
     #[test]
     fn provider_or_truthy_enabled_flag_explicitly_enables_ai() {
-        let explicit = config(&[("RSH_AI_PROVIDER", "ollama")]).unwrap();
+        let explicit = config(&[("JSH_AI_PROVIDER", "ollama")]).unwrap();
         assert_eq!(explicit.provider, AiProvider::Ollama);
 
-        let detected = config(&[("RSH_AI_ENABLED", "YeS"), ("OPENAI_API_KEY", "secret")]).unwrap();
+        let detected = config(&[("JSH_AI_ENABLED", "YeS"), ("OPENAI_API_KEY", "secret")]).unwrap();
         assert_eq!(detected.provider, AiProvider::OpenAI);
 
-        let local_default = config(&[("RSH_AI_ENABLED", "1")]).unwrap();
+        let local_default = config(&[("JSH_AI_ENABLED", "1")]).unwrap();
         assert_eq!(local_default.provider, AiProvider::Ollama);
     }
 
     #[test]
     fn cloud_extended_context_requires_separate_opt_in() {
-        let private = config(&[("RSH_AI_PROVIDER", "openai")]).unwrap();
+        let private = config(&[("JSH_AI_PROVIDER", "openai")]).unwrap();
         assert!(!private.allows_extended_context());
 
         let shared = config(&[
-            ("RSH_AI_PROVIDER", "anthropic"),
-            ("RSH_AI_SHARE_CONTEXT", "on"),
+            ("JSH_AI_PROVIDER", "anthropic"),
+            ("JSH_AI_SHARE_CONTEXT", "on"),
         ])
         .unwrap();
         assert!(shared.allows_extended_context());
 
-        let local = config(&[("RSH_AI_PROVIDER", "ollama")]).unwrap();
+        let local = config(&[("JSH_AI_PROVIDER", "ollama")]).unwrap();
         assert!(local.allows_extended_context());
     }
 }

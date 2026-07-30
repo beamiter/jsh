@@ -17,7 +17,7 @@ pub enum EditingMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConfigSource {
     Bashrc, // 使用 .bashrc，直接用 bash 执行
-    Rshrc,  // 使用 .rshrc，用 rsh 解析器执行
+    Jshrc,  // 使用 .jshrc，用 jsh 解析器执行
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub struct ShellOpts {
     pub cdspell: bool,               // shopt cdspell: correct cd spelling errors
     pub checkwinsize: bool,          // shopt checkwinsize: update LINES/COLUMNS
     pub inherit_errexit: bool,       // shopt inherit_errexit: subshells inherit errexit
-    pub config_source: ConfigSource, // which config file to use: .bashrc or .rshrc
+    pub config_source: ConfigSource, // which config file to use: .bashrc or .jshrc
 }
 
 impl Default for ShellOpts {
@@ -229,7 +229,7 @@ impl ShellState {
             .unwrap_or_else(|_| String::from("localhost"));
 
         let path_hash = Self::hash_path(env_vars.get("PATH").map(|s| s.as_str()).unwrap_or(""));
-        let arg0 = env::args().next().unwrap_or_else(|| "rsh".to_string());
+        let arg0 = env::args().next().unwrap_or_else(|| "jsh".to_string());
 
         ShellState {
             env_vars,
@@ -329,7 +329,7 @@ impl ShellState {
     /// The `$-` string: one letter per currently enabled option, in the order
     /// bash prints them. Scripts test it to detect `set -e`/`set -x` before
     /// toggling an option and restoring it (nvm.sh does this on every call),
-    /// so the letters rsh does not model simply never appear.
+    /// so the letters jsh does not model simply never appear.
     pub fn option_flags(&self) -> String {
         let mut flags = String::new();
         if self.shell_opts.errexit {

@@ -32,12 +32,12 @@
 - Publish prebuilt Linux binaries (glibc and static musl, x86_64 and aarch64)
   from tagged releases, together with checksums and a `manifest.json` served at
   a stable "latest" URL.
-- Added `scripts/install-rsh.sh`, the one-command install and update path. It
-  verifies checksums, checks that the new binary identifies itself as rsh,
+- Added `scripts/install-jsh.sh`, the one-command install and update path. It
+  verifies checksums, checks that the new binary identifies itself as jsh,
   swaps it in atomically, keeps the previous binary for rollback, and reports
-  when `PATH` resolves `rsh` to the BSD remote shell instead. `--check --json`
+  when `PATH` resolves `jsh` to an unrelated binary instead. `--check --json`
   reports installed and latest versions for tooling, backed by a shared cache
-  at `~/.cache/rsh/update-check.json`.
+  at `~/.cache/jsh/update-check.json`.
 
 ## 0.2.0
 

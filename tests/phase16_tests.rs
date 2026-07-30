@@ -2,12 +2,12 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn rsh_bin() -> String {
-    env!("CARGO_BIN_EXE_rsh").to_string()
+fn jsh_bin() -> String {
+    env!("CARGO_BIN_EXE_jsh").to_string()
 }
 
 fn run(script: &str, stdin: &str) -> (String, String, i32) {
-    let mut child = Command::new(rsh_bin())
+    let mut child = Command::new(jsh_bin())
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())
@@ -43,7 +43,7 @@ fn write_temp(name: &str, content: &str) -> String {
 #[test]
 fn use_imports_def_functions_from_file() {
     let p = write_temp(
-        "rsh_phase16_basic.rsh",
+        "jsh_phase16_basic.jsh",
         "def add a:int b:int {|a,b| $a + $b}\ndef mul a:int b:int {|a,b| $a * $b}\n",
     );
     let (out, _, code) = run(&format!("use {}; add 3 4", p), "");
@@ -58,7 +58,7 @@ fn use_imports_def_functions_from_file() {
 #[test]
 fn use_selective_keeps_only_named() {
     let p = write_temp(
-        "rsh_phase16_select.rsh",
+        "jsh_phase16_select.jsh",
         "def add a:int b:int {|a,b| $a + $b}\ndef mul a:int b:int {|a,b| $a * $b}\n",
     );
     let (_, err, code) = run(&format!("use {} add; mul 1 2", p), "");
@@ -72,7 +72,7 @@ fn use_selective_keeps_only_named() {
 
 #[test]
 fn use_missing_file_errors_cleanly() {
-    let (_, err, code) = run("use /tmp/does_not_exist_rsh_phase16.rsh", "");
+    let (_, err, code) = run("use /tmp/does_not_exist_jsh_phase16.jsh", "");
     assert_ne!(code, 0);
     assert!(err.contains("use:"), "stderr was: {}", err);
 }

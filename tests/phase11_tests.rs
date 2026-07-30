@@ -2,12 +2,12 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn rsh_bin() -> String {
-    env!("CARGO_BIN_EXE_rsh").to_string()
+fn jsh_bin() -> String {
+    env!("CARGO_BIN_EXE_jsh").to_string()
 }
 
 fn run(script: &str, stdin: &str) -> (String, String, i32) {
-    let mut child = Command::new(rsh_bin())
+    let mut child = Command::new(jsh_bin())
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

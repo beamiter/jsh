@@ -1,8 +1,8 @@
-// Integration tests for RSH shell functionality
+// Integration tests for JSH shell functionality
 // Tests verify that features parse and execute correctly
 
-use rsh::parser::ast::{Command, WordPart};
-use rsh::parser::parse;
+use jsh::parser::ast::{Command, WordPart};
+use jsh::parser::parse;
 
 #[test]
 fn test_simple_arithmetic() {

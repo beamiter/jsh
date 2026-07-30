@@ -1,25 +1,25 @@
 /// Phase 5a — typed-value pipeline tests.
 ///
 /// These exercise the in-process value-aware pipeline path: from-json, where,
-/// select, sort-by, to-json, to-table, count, math. Tests run an `rsh -c ...`
+/// select, sort-by, to-json, to-table, count, math. Tests run an `jsh -c ...`
 /// subprocess, capture stdout, and assert against expected JSON / table.
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn rsh_bin() -> String {
+fn jsh_bin() -> String {
     // CARGO_BIN_EXE_<name> is populated by Cargo for integration tests.
-    env!("CARGO_BIN_EXE_rsh").to_string()
+    env!("CARGO_BIN_EXE_jsh").to_string()
 }
 
 fn run(script: &str, stdin: &str) -> (String, String, i32) {
-    let mut child = Command::new(rsh_bin())
+    let mut child = Command::new(jsh_bin())
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn rsh");
+        .expect("spawn jsh");
     if !stdin.is_empty() {
         child
             .stdin

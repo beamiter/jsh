@@ -105,13 +105,13 @@ jobs:
       - name: Smoke-test the binary
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/rsh"
+          bin="target/${{ matrix.target }}/release/jsh"
           banner="$("${bin}" --version)"
           printf '%s\n' "${banner}"
-          # The installer and every jterm identify rsh by this exact banner
-          # shape, because /usr/bin/rsh is the BSD remote shell on Debian.
+          # The installer and every jterm identify jsh by this exact banner
+          # shape, never by the binary's name alone.
           case "${banner}" in
-            "rsh ${{ needs.verify.outputs.version }}"*) ;;
+            "jsh ${{ needs.verify.outputs.version }}"*) ;;
             *)
               echo "::error::unexpected --version banner: ${banner}"
               exit 1
@@ -124,12 +124,12 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          name="rsh-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          name="jsh-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
           staging="dist/${name}"
           mkdir -p "${staging}"
-          cp "target/${{ matrix.target }}/release/rsh" "${staging}/rsh"
+          cp "target/${{ matrix.target }}/release/jsh" "${staging}/jsh"
           cp README.md CHANGELOG.md "${staging}/"
-          chmod 0755 "${staging}/rsh"
+          chmod 0755 "${staging}/jsh"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           rm -rf "${staging}"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
@@ -184,8 +184,8 @@ jobs:
           # The installer and the jterm update check read it from there, so no
           # API token and no rate limit are involved.
           : > artifacts.jsonl
-          for archive in rsh-"${VERSION}"-*.tar.gz; do
-            target="${archive#rsh-${VERSION}-}"
+          for archive in jsh-"${VERSION}"-*.tar.gz; do
+            target="${archive#jsh-${VERSION}-}"
             target="${target%.tar.gz}"
             jq -n \
               --arg target "${target}" \
@@ -199,14 +199,14 @@ jobs:
             --arg version "${VERSION}" \
             --arg tag "${TAG}" \
             --arg repo "${REPO}" \
-            '{schema: 1, name: "rsh", version: $version, tag: $tag,
+            '{schema: 1, name: "jsh", version: $version, tag: $tag,
               repository: $repo, artifacts: .}' \
             artifacts.jsonl > manifest.json
           rm artifacts.jsonl
           cat manifest.json
 
       - name: Stage the installer
-        run: cp scripts/install-rsh.sh dist/install-rsh.sh
+        run: cp scripts/install-jsh.sh dist/install-jsh.sh
 
       - name: Extract release notes
         id: notes
@@ -236,9 +236,9 @@ jobs:
           else
             if [ -n "${NOTES_FILE}" ]; then
               gh release create "${TAG}" dist/* \
-                --title "rsh ${TAG}" --notes-file "${NOTES_FILE}" --verify-tag
+                --title "jsh ${TAG}" --notes-file "${NOTES_FILE}" --verify-tag
             else
               gh release create "${TAG}" dist/* \
-                --title "rsh ${TAG}" --generate-notes --verify-tag
+                --title "jsh ${TAG}" --generate-notes --verify-tag
             fi
           fi

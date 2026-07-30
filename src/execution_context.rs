@@ -1,6 +1,6 @@
 //! Query and render the structured execution journal.
 //!
-//! Both `rsh context ...` and the interactive `context` builtin use this
+//! Both `jsh context ...` and the interactive `context` builtin use this
 //! module, so parsing, status codes, filtering, and JSON schemas stay aligned.
 
 use crate::execution::{ExecutionJournal, ExecutionRecord};
@@ -104,7 +104,7 @@ impl ContextError {
         Self {
             kind: ContextErrorKind::Disabled,
             message: if execution_journal_explicitly_disabled() {
-                "execution journal is disabled by RSH_EXECUTION_JOURNAL".to_string()
+                "execution journal is disabled by JSH_EXECUTION_JOURNAL".to_string()
             } else {
                 "execution journal is unavailable because no state directory is configured"
                     .to_string()
@@ -577,12 +577,12 @@ fn render_error(error: &ContextError, json: bool) -> String {
         output.push('\n');
         output
     } else {
-        format!("rsh: context: {}\n", error.message)
+        format!("jsh: context: {}\n", error.message)
     }
 }
 
 fn execution_journal_explicitly_disabled() -> bool {
-    std::env::var("RSH_EXECUTION_JOURNAL")
+    std::env::var("JSH_EXECUTION_JOURNAL")
         .ok()
         .is_some_and(|value| {
             matches!(
@@ -662,7 +662,7 @@ mod tests {
 
     fn record(exit_code: Option<i32>, output: Option<&str>) -> ExecutionRecord {
         ExecutionRecord {
-            id: "rsh-test-1".to_string(),
+            id: "jsh-test-1".to_string(),
             session_id: Some("tab-1".to_string()),
             seq: 7,
             command: "printf 'secret output'\nnext".to_string(),
@@ -701,9 +701,9 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&strings(&["show", "--json", "rsh-test.1"])).unwrap(),
+            parse_args(&strings(&["show", "--json", "jsh-test.1"])).unwrap(),
             ContextRequest::Show {
-                id: "rsh-test.1".to_string(),
+                id: "jsh-test.1".to_string(),
                 json: true,
             }
         );
@@ -762,7 +762,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(output.contains("ID: rsh-test-1"));
+        assert!(output.contains("ID: jsh-test-1"));
         assert!(output.contains("Exit: 9"));
         assert!(output.contains("printf 'secret output'"));
         assert!(output.contains("compiler failed\n"));
