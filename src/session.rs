@@ -31,6 +31,13 @@ const SKIP_ENV_VARS: &[&str] = &[
     "LINES",
     "TERM",
     "COLORTERM",
+    // Same criterion as TERM/COLORTERM, and the omission mattered: restoring a
+    // session captured under one terminal into another left the first
+    // terminal's identity in the live shell, so anything branching on
+    // TERM_PROGRAM saw the wrong emulator.
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "VTE_VERSION",
     "WINDOWID",
     "DISPLAY",
     "WAYLAND_DISPLAY",
@@ -527,6 +534,25 @@ fn cleanup_stale_sessions_in(dir: &Path, max_age: std::time::Duration) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A snapshot is portable between terminals, so every variable naming the
+    /// terminal that captured it has to be left behind on restore.
+    #[test]
+    fn test_terminal_identity_is_not_persisted() {
+        for name in [
+            "TERM",
+            "COLORTERM",
+            "TERM_PROGRAM",
+            "TERM_PROGRAM_VERSION",
+            "VTE_VERSION",
+        ] {
+            assert!(
+                !should_persist_env(name),
+                "{name} would survive a restore into a different terminal"
+            );
+        }
+        assert!(should_persist_env("EDITOR"));
+    }
 
     #[test]
     fn test_session_snapshot_roundtrip() {
