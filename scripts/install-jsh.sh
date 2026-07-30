@@ -217,6 +217,41 @@ jsh_version_of() {
     return 0
 }
 
+# One dotted field of a version, as a number. A missing or non-numeric field
+# reads as 0, so a version this script cannot parse sorts as older rather than
+# tricking the caller into installing it.
+version_field() {
+    field="$(printf '%s' "$1" | cut -d. -f"$2")"
+    field="${field%%[!0-9]*}"
+    [ -n "${field}" ] || field=0
+    printf '%s' "${field}"
+}
+
+# Is $1 a strictly newer release than $2? Compares MAJOR.MINOR.PATCH
+# numerically, because comparing the strings only tells you they differ:
+# "0.10.0" is not newer than "0.9.0" as text, and a published release that is
+# *older* than the installed one (a yanked tag, or a build from source that ran
+# ahead of the last tag) would otherwise be offered as an update.
+#
+# A pre-release suffix is dropped rather than ordered, so 0.3.0-rc1 and 0.3.0
+# compare equal and neither is offered over the other. Ordering them properly
+# needs the full semver rule, and offering nothing is the safe answer.
+version_gt() {
+    left="${1#v}"
+    right="${2#v}"
+    left="${left%%-*}"
+    right="${right%%-*}"
+    i=1
+    while [ "${i}" -le 3 ]; do
+        l="$(version_field "${left}" "${i}")"
+        r="$(version_field "${right}" "${i}")"
+        [ "${l}" -gt "${r}" ] && return 0
+        [ "${l}" -lt "${r}" ] && return 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # Absolute path of the jsh that PATH resolves to, whatever it turns out to be.
 path_jsh() {
     resolved="$(command -v jsh 2>/dev/null)" || return 0
@@ -356,7 +391,7 @@ emit_check_json() {
         "$([ -n "${installed_version}" ] && printf '"%s"' "$(json_str "${dest}")" || printf 'null')" \
         "$([ -n "$1" ] && printf '"%s"' "$(json_str "$1")" || printf 'null')" \
         "$([ -n "${target}" ] && printf '"%s"' "$(json_str "${target}")" || printf 'null')" \
-        "$([ -n "$1" ] && [ "$1" != "${installed_version}" ] && printf 'true' || printf 'false')" \
+        "$([ -n "$1" ] && version_gt "$1" "${installed_version}" && printf 'true' || printf 'false')" \
         "$([ -n "${shadowed_by}" ] && printf '"%s"' "$(json_str "${shadowed_by}")" || printf 'null')" \
         "$([ -n "$2" ] && printf '"%s"' "$(json_str "$2")" || printf 'null')"
 }
@@ -410,6 +445,19 @@ fi
 if [ -n "${installed_version}" ] && [ "${installed_version}" = "${version}" ] && [ "${force}" -eq 0 ]; then
     say "jsh ${installed_version} is already installed at ${dest}"
     say "use --force to reinstall"
+    exit 0
+fi
+
+# Refuse to walk backwards by accident. Reached when the newest published
+# release is older than what is installed — a yanked tag, or a build from
+# source that ran ahead of the last tag. An explicit --version or --force is
+# still honoured, because asking for an older build by name is a real thing to
+# want; what must not happen is a bare `install-jsh.sh` quietly replacing a
+# working shell with an older one.
+if [ -n "${installed_version}" ] && [ -z "${want_version}" ] && [ "${force}" -eq 0 ] \
+    && version_gt "${installed_version}" "${version}"; then
+    say "jsh ${installed_version} at ${dest} is newer than the published ${version}"
+    say "nothing to do; use --version ${version} to install that build anyway"
     exit 0
 fi
 

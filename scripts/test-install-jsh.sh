@@ -133,7 +133,36 @@ assert "update message" matches "${out}" 'updated jsh 0\.3\.0 -> 0\.3\.1'
 assert "new version is live" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
 assert "previous binary kept for rollback" [ -f "${FAKE_HOME}/.local/state/jsh/rollback/jsh-0.3.0" ]
 
+echo "== update_available means newer, not merely different =="
+# The published release is now OLDER than what is installed: a yanked tag, or a
+# source build that ran ahead of the last tag. Comparing the two strings only
+# says they differ, which offered the user a downgrade labelled "update".
+make_release 0.2.9
+out="$(run --check --json --max-age 0 2> /dev/null)"
+indent "${out}"
+assert "older published release is not an update" matches "${out}" '"update_available":false'
+assert "still reports what is published" matches "${out}" '"latest":"0\.2\.9"'
+out="$(run 2>&1)"
+indent "${out}"
+assert "a bare run refuses to walk backwards" matches "${out}" 'is newer than the published 0\.2\.9'
+assert "installed binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+# Asking for the older build by name is still honoured: that is a real request,
+# unlike a bare run silently replacing a working shell.
+out="$(run --version 0.2.9 2>&1)"
+assert "--version still installs the older build" version_is "${BIN}/jsh" "jsh 0.2.9 (fake)"
+out="$(run --version 0.3.1 2>&1)"
+assert "and back" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+# Numeric ordering, not lexicographic: as text "0.10.0" sorts below "0.3.1".
+make_release 0.10.0
+out="$(run --check --json --max-age 0 2> /dev/null)"
+assert "0.10.0 is newer than 0.3.1" matches "${out}" '"update_available":true'
+make_release 0.3.1
+out="$(run --check --json --max-age 0 2> /dev/null)"
+assert "the same version is not an update" matches "${out}" '"update_available":false'
+
 echo "== shared update-check cache =="
+make_release 0.3.1
+out="$(run --check --json --max-age 0 2> /dev/null)" # refresh the cache after the probes above
 assert "cache written" [ -f "${FAKE_HOME}/.cache/jsh/update-check.json" ]
 mv "${REL}/latest/download/manifest.json" "${REL}/manifest.hidden"
 out="$(run --check --json --max-age 3600 2> /dev/null)"
