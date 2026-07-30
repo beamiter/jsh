@@ -1744,19 +1744,37 @@ fn is_char_device(path: &str) -> bool {
     }
 }
 
+/// Permission probe shared by `test`/`[` and `[[ ]]`, so the two can never
+/// disagree again (`[[ -x /etc/passwd ]]` used to be a plain existence check).
+///
+/// `-r`/`-w`/`-x` must answer for the EFFECTIVE user, like bash's `sh_eaccess`:
+/// plain `access(2)` asks about the REAL uid, which is the wrong answer in a
+/// setuid or `su`-style context. `faccessat(AT_EACCESS)` is the portable
+/// spelling of `eaccess`, which nix only exposes on Linux/FreeBSD.
+///
+/// Root is the case worth naming: the kernel grants root R_OK/W_OK on every
+/// file and X_OK whenever *any* execute bit is set, so `[[ -w /etc/passwd ]]`
+/// is legitimately true for root and false for everyone else. Differential
+/// tests against bash therefore have to run as the same user.
+fn access_ok(path: &str, mode: nix::unistd::AccessFlags) -> bool {
+    use nix::fcntl::AtFlags;
+    use std::os::fd::BorrowedFd;
+    // SAFETY: AT_FDCWD is a valid special descriptor for the *at syscalls and is
+    // only borrowed for the duration of the call.
+    let cwd = unsafe { BorrowedFd::borrow_raw(nix::libc::AT_FDCWD) };
+    nix::unistd::faccessat(cwd, std::path::Path::new(path), mode, AtFlags::AT_EACCESS).is_ok()
+}
+
 fn is_readable(path: &str) -> bool {
-    use nix::unistd;
-    unistd::access(std::path::Path::new(path), unistd::AccessFlags::R_OK).is_ok()
+    access_ok(path, nix::unistd::AccessFlags::R_OK)
 }
 
 fn is_writable(path: &str) -> bool {
-    use nix::unistd;
-    unistd::access(std::path::Path::new(path), unistd::AccessFlags::W_OK).is_ok()
+    access_ok(path, nix::unistd::AccessFlags::W_OK)
 }
 
 fn is_executable(path: &str) -> bool {
-    use nix::unistd;
-    unistd::access(std::path::Path::new(path), unistd::AccessFlags::X_OK).is_ok()
+    access_ok(path, nix::unistd::AccessFlags::X_OK)
 }
 
 fn cmp_int(a: &str, b: &str, f: fn(i64, i64) -> bool) -> i32 {
@@ -1769,6 +1787,117 @@ fn cmp_int(a: &str, b: &str, f: fn(i64, i64) -> bool) -> i32 {
             }
         }
         _ => 2,
+    }
+}
+
+/// Every `set -o` name bash knows, in the order bash lists them, paired with
+/// its short flag letter. jsh enforces a subset (errexit, nounset, xtrace,
+/// noglob, pipefail, globstar, vi/emacs); the rest are remembered in
+/// `shell_opts.tracked_opts` so they are neither silently mistaken for
+/// positional parameters nor lost across `eval "$(set +o)"`.
+///
+/// Remembered-but-not-enforced today: allexport, braceexpand, errtrace,
+/// functrace, hashall, histexpand, history, ignoreeof, interactive-comments,
+/// keyword, monitor, noclobber, noexec, nolog, notify, onecmd, physical, posix,
+/// privileged, verbose. Rejecting them instead would be worse: bash accepts
+/// them, so `set -a` in a real script must not become a hard error.
+const SET_OPTIONS: &[(&str, Option<char>)] = &[
+    ("allexport", Some('a')),
+    ("braceexpand", Some('B')),
+    ("emacs", None),
+    ("errexit", Some('e')),
+    ("errtrace", Some('E')),
+    ("functrace", Some('T')),
+    ("globstar", None), // jsh extension: bash exposes globstar via shopt only
+    ("hashall", Some('h')),
+    ("histexpand", Some('H')),
+    ("history", None),
+    ("ignoreeof", None),
+    ("interactive-comments", None),
+    ("keyword", Some('k')),
+    ("monitor", Some('m')),
+    ("noclobber", Some('C')),
+    ("noexec", Some('n')),
+    ("noglob", Some('f')),
+    ("nolog", None),
+    ("notify", Some('b')),
+    ("nounset", Some('u')),
+    ("onecmd", Some('t')),
+    ("physical", Some('P')),
+    ("pipefail", None),
+    ("posix", None),
+    ("privileged", Some('p')),
+    ("verbose", Some('v')),
+    ("vi", None),
+    ("xtrace", Some('x')),
+];
+
+const SET_USAGE: &str = "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [arg ...]";
+
+fn set_option_name_for_flag(c: char) -> Option<&'static str> {
+    SET_OPTIONS
+        .iter()
+        .find(|(_, flag)| *flag == Some(c))
+        .map(|(name, _)| *name)
+}
+
+fn set_option_is_known(name: &str) -> bool {
+    SET_OPTIONS.iter().any(|(n, _)| *n == name)
+}
+
+/// Apply one `set -o NAME` / `set +o NAME`.
+fn apply_shell_option(state: &mut ShellState, name: &str, enable: bool) {
+    match name {
+        "errexit" => state.shell_opts.errexit = enable,
+        "nounset" => state.shell_opts.nounset = enable,
+        "xtrace" => state.shell_opts.xtrace = enable,
+        "noclobber" => state.shell_opts.noclobber = enable,
+        "pipefail" => state.shell_opts.pipefail = enable,
+        "noglob" => state.shell_opts.noglob = enable,
+        "globstar" => state.shell_opts.globstar = enable,
+        "vi" => {
+            state.editing_mode = if enable {
+                crate::environment::EditingMode::Vi
+            } else {
+                crate::environment::EditingMode::Emacs
+            }
+        }
+        "emacs" => {
+            state.editing_mode = if enable {
+                crate::environment::EditingMode::Emacs
+            } else {
+                crate::environment::EditingMode::Vi
+            }
+        }
+        other => {
+            state
+                .shell_opts
+                .tracked_opts
+                .insert(other.to_string(), enable);
+        }
+    }
+}
+
+fn shell_option_enabled(state: &ShellState, name: &str) -> bool {
+    match name {
+        "errexit" => state.shell_opts.errexit,
+        "nounset" => state.shell_opts.nounset,
+        "xtrace" => state.shell_opts.xtrace,
+        "noclobber" => state.shell_opts.noclobber,
+        "pipefail" => state.shell_opts.pipefail,
+        "noglob" => state.shell_opts.noglob,
+        "globstar" => state.shell_opts.globstar,
+        "vi" => state.editing_mode == crate::environment::EditingMode::Vi,
+        "emacs" => state.editing_mode == crate::environment::EditingMode::Emacs,
+        other => match state.shell_opts.tracked_opts.get(other) {
+            Some(&enabled) => enabled,
+            // Defaults for the options jsh only remembers, as bash reports them.
+            None => match other {
+                "braceexpand" | "hashall" | "interactive-comments" => true,
+                "history" | "monitor" => state.interactive,
+                _ => false,
+            },
+        },
     }
 }
 
@@ -2385,9 +2514,16 @@ fn eval_cond_primary(args: &[&str], pos: &mut usize, state: &mut ShellState) -> 
                     .map(|m| if m.len() > 0 { 0 } else { 1 })
                     .unwrap_or(1)
             }
+            // Permission bits, not mere existence: `[[ -x /etc/passwd ]]` was
+            // true here while `test -x /etc/passwd` was correctly false.
             "-r" | "-w" | "-x" => {
                 *pos += 2;
-                if Path::new(operand).exists() {
+                let ok = match op {
+                    "-r" => is_readable(operand),
+                    "-w" => is_writable(operand),
+                    _ => is_executable(operand),
+                };
+                if ok {
                     0
                 } else {
                     1
@@ -2422,7 +2558,45 @@ fn is_cond_binary_op(op: &str) -> bool {
     matches!(
         op,
         "==" | "=" | "!=" | "<" | ">" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "=~"
-    )
+    ) || op == crate::parser::parse::REGEX_LITERAL_OP
+}
+
+/// `[[ left =~ right ]]`. `literal` is set when the operand was quoted, which
+/// bash matches as a plain string instead of a regex.
+///
+/// BASH_REMATCH is populated with the whole match followed by the capture
+/// groups; `=~` is close to useless without it.
+fn eval_regex_match(left: &str, right: &str, literal: bool, state: &mut ShellState) -> i32 {
+    let pattern = if literal {
+        regex::escape(right)
+    } else {
+        right.to_string()
+    };
+    match regex::Regex::new(&pattern) {
+        Ok(re) => {
+            if let Some(captures) = re.captures(left) {
+                let mut rematch = Vec::new();
+                for i in 0..captures.len() {
+                    rematch.push(
+                        captures
+                            .get(i)
+                            .map(|m| m.as_str().to_string())
+                            .unwrap_or_default(),
+                    );
+                }
+                state.set_array("BASH_REMATCH", rematch);
+                0
+            } else {
+                state.set_array("BASH_REMATCH", Vec::new());
+                1
+            }
+        }
+        Err(e) => {
+            // Loud, like bash: a bad regex is a usage error, not "no match".
+            eprintln!("jsh: [[: {}: invalid regex: {}", right, e);
+            2
+        }
+    }
 }
 
 fn eval_cond_binary(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i32 {
@@ -2484,30 +2658,9 @@ fn eval_cond_binary(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i
         "-le" => cmp_int(left, right, |a, b| a <= b),
         "-gt" => cmp_int(left, right, |a, b| a > b),
         "-ge" => cmp_int(left, right, |a, b| a >= b),
-        "=~" => {
-            // Real regex matching with BASH_REMATCH
-            match regex::Regex::new(right) {
-                Ok(re) => {
-                    if let Some(captures) = re.captures(left) {
-                        // Store BASH_REMATCH array
-                        let mut rematch = Vec::new();
-                        for i in 0..captures.len() {
-                            rematch.push(
-                                captures
-                                    .get(i)
-                                    .map(|m| m.as_str().to_string())
-                                    .unwrap_or_default(),
-                            );
-                        }
-                        state.arrays.insert("BASH_REMATCH".to_string(), rematch);
-                        0
-                    } else {
-                        state.arrays.insert("BASH_REMATCH".to_string(), Vec::new());
-                        1
-                    }
-                }
-                Err(_) => 2,
-            }
+        "=~" => eval_regex_match(left, right, false, state),
+        op if op == crate::parser::parse::REGEX_LITERAL_OP => {
+            eval_regex_match(left, right, true, state)
         }
         _ => 1,
     }

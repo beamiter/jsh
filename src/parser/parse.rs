@@ -25,6 +25,117 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+/// Operator word the `[[ ]]` evaluator sees in place of `=~` when the right
+/// operand was quoted, which bash matches literally instead of as a regex. The
+/// trailing control character cannot occur in a word a user typed.
+pub const REGEX_LITERAL_OP: &str = "=~\u{1}";
+
+/// True when the whole operand is a single quoted string (`"a|b"`, `'a|b'`,
+/// `"$re"`). Bash then matches it literally rather than as a regex.
+fn is_fully_quoted(raw: &str) -> bool {
+    let mut chars = raw.chars();
+    let quote = match chars.next() {
+        Some(q @ ('\'' | '"')) => q,
+        _ => return false,
+    };
+    let mut consumed = quote.len_utf8();
+    let mut escaped = false;
+    for c in chars {
+        consumed += c.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == '"' && c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == quote {
+            return consumed == raw.len();
+        }
+    }
+    false
+}
+
+fn copy_balanced(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String, close: char) {
+    let open = if close == ')' { '(' } else { '{' };
+    let mut depth = 0usize;
+    for c in chars.by_ref() {
+        out.push(c);
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return;
+            }
+        }
+    }
+}
+
+/// Protect the regex metacharacters that word expansion would otherwise claim.
+///
+/// The `=~` operand still goes through expansion (bash expands `$re` there), but
+/// it must not go through pathname or brace expansion: `[0-9]` would glob
+/// against the cwd, `a{1,2}` would split into two words, and `\.` would lose its
+/// backslash. Quoted stretches and `$(...)`/`${...}`/backticks are copied
+/// verbatim, so they keep their own rules.
+fn protect_regex_operand(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                out.push(c);
+                for c2 in chars.by_ref() {
+                    out.push(c2);
+                    if c2 == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                out.push(c);
+                while let Some(c2) = chars.next() {
+                    out.push(c2);
+                    if c2 == '\\' {
+                        if let Some(c3) = chars.next() {
+                            out.push(c3);
+                        }
+                        continue;
+                    }
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '`' => {
+                out.push(c);
+                for c2 in chars.by_ref() {
+                    out.push(c2);
+                    if c2 == '`' {
+                        break;
+                    }
+                }
+            }
+            '$' => {
+                out.push(c);
+                match chars.peek() {
+                    Some(&'(') => copy_balanced(&mut chars, &mut out, ')'),
+                    Some(&'{') => copy_balanced(&mut chars, &mut out, '}'),
+                    _ => {}
+                }
+            }
+            '\\' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '<' | '>' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Split a C-style for header into its `init ; condition ; update` sections on
 /// top-level semicolons (those not nested inside parentheses).
 fn split_for_header(s: &str) -> Vec<String> {
@@ -473,6 +584,14 @@ impl<'a> Parser<'a> {
                     if w == "]]" {
                         return Ok(());
                     }
+                    // The right operand of `=~` is a regex, not an expression:
+                    // it has to survive as ONE word. `(a|z)bc` reaches us as
+                    // LParen/Word/Pipe/Word/RParen/Word, and pushing those
+                    // separately handed `Regex::new("(")` a broken pattern (and
+                    // `|` fell out of the conditional entirely).
+                    if w == "=~" {
+                        self.parse_regex_operand(words)?;
+                    }
                     continue;
                 }
                 Token::And => "&&",
@@ -494,6 +613,47 @@ impl<'a> Parser<'a> {
             words.push(vec![WordPart::Literal(op.to_string())]);
             self.advance();
         }
+    }
+
+    /// Take the right operand of `[[ ... =~ ... ]]` as a single word, straight
+    /// from the source text: the lexer's token boundaries are meaningless inside
+    /// a regex, so adjacent tokens (no whitespace between their spans) are one
+    /// operand.
+    fn parse_regex_operand(&mut self, words: &mut Vec<Word>) -> Result<(), ParseError> {
+        match &self.current.token {
+            Token::Eof => return Err(ParseError::Incomplete),
+            // `[[ x =~ ]]` is malformed; let the normal path report it.
+            Token::Newline => return Ok(()),
+            Token::Word(w) if w == "]]" => return Ok(()),
+            _ => {}
+        }
+        let start = self.current.span.0;
+        let mut end = self.current.span.1;
+        self.advance();
+        loop {
+            match &self.current.token {
+                Token::Eof | Token::Newline => break,
+                // A gap between spans is whitespace: the operand ended.
+                _ if self.current.span.0 != end => break,
+                _ => {
+                    end = self.current.span.1;
+                    self.advance();
+                }
+            }
+        }
+        let raw = &self.input[start..end];
+        if is_fully_quoted(raw) {
+            // Bash matches a quoted operand literally. The evaluator only ever
+            // sees expanded strings, so the intent has to ride along with the
+            // operator; the marker is a control character no real word contains.
+            if let Some(last) = words.last_mut() {
+                *last = vec![WordPart::Literal(REGEX_LITERAL_OP.to_string())];
+            }
+            words.push(parse_word_parts(raw));
+        } else {
+            words.push(parse_word_parts(&protect_regex_operand(raw)));
+        }
+        Ok(())
     }
 
     fn parse_compound_command(&mut self) -> Result<Command, ParseError> {
