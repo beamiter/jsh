@@ -997,6 +997,21 @@ fn execute_simple_with_mode(
 
     // Check for function
     if let Some(func_body) = state.functions.get(cmd_name).cloned() {
+        // A function call carries its redirections and its assignment prefix
+        // exactly like a builtin does: `f 2>/dev/null` must silence everything
+        // the body writes, and `V=x f` must expose V for the call only.
+        let saved_fds = setup_redirects(&cmd.redirects, state);
+        let saved_vars: Vec<(String, Option<String>)> = cmd
+            .assignments
+            .iter()
+            .map(|a| {
+                let old = state.get_var(&a.name).map(|s| s.to_string());
+                let val = expand_word_to_string(&a.value, state);
+                state.set_var(&a.name, &val);
+                (a.name.clone(), old)
+            })
+            .collect();
+
         state.push_local_scope();
         state.push_positional_params(args.to_vec());
         let caller_loop_depth = std::mem::replace(&mut state.loop_depth, 0);
@@ -1006,6 +1021,14 @@ fn execute_simple_with_mode(
         state.loop_depth = caller_loop_depth;
         state.pop_positional_params();
         state.pop_local_scope();
+
+        for (name, old) in saved_vars {
+            match old {
+                Some(v) => state.set_var(&name, &v),
+                None => state.unset_var(&name),
+            }
+        }
+        restore_fds(saved_fds);
 
         // Handle return statement in function
         let return_code = if state.return_requested {
@@ -1167,6 +1190,56 @@ fn execute_simple_with_mode(
                     shell_command_hint(&suggestion);
                 }
             }
+            exit_code
+        }
+        Err(e) => {
+            shell_error(&format!("fork failed: {}", e));
+            1
+        }
+    }
+}
+
+/// Run an external program from an already-expanded argv, bypassing functions
+/// and aliases. Redirections and assignments belong to the caller's frame and
+/// are expected to be in place before this is called.
+///
+/// The `command` builtin needs this: re-joining argv with spaces and re-parsing
+/// the result destroyed every argument that contained whitespace, quotes or a
+/// newline (`command sed -e "$multiline_script"` lost its script entirely).
+pub fn spawn_external(argv: &[String], state: &mut ShellState) -> i32 {
+    let Some(cmd_name) = argv.first() else {
+        return 0;
+    };
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
+            signal::reset_child_signals();
+            let pid = nix::unistd::getpid();
+            setpgid(pid, pid).ok();
+
+            let c_cmd = CString::new(cmd_name.as_str()).unwrap_or_default();
+            let c_args: Vec<CString> = argv
+                .iter()
+                .map(|s| CString::new(s.as_str()).unwrap_or_default())
+                .collect();
+
+            let _ = execvp(&c_cmd, &c_args);
+            let (msg, code) = exec_error_info(cmd_name);
+            shell_error(&format!("{}: {}", cmd_name, msg));
+            child_exit(code);
+        }
+        Ok(ForkResult::Parent { child }) => {
+            setpgid(child, child).ok();
+            signal::set_foreground_pgid(Some(child.as_raw()));
+            let exit_code = if state.interactive {
+                wait_for_fg(child, state)
+            } else {
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => code,
+                    Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                    _ => 1,
+                }
+            };
+            signal::set_foreground_pgid(None);
             exit_code
         }
         Err(e) => {

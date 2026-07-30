@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `source ~/.nvm/nvm.sh` no longer recurses until the stack overflows, and
+  `nvm` runs. Three fixes: `$-` now reports the enabled options instead of
+  expanding to the literal text `$-` (nvm's "is errexit set?" guard was always
+  true, so every call re-invoked itself); redirections and the assignment
+  prefix on a shell-function call are now applied to the function body, so
+  `f 2>/dev/null` silences it and `V=x f` scopes V to the call; and
+  `command NAME ...` execs the already-expanded argv instead of re-joining it
+  with spaces and re-parsing, which used to shred any argument containing
+  whitespace or newlines.
+
 - `${...}` now picks its operator from the character right after the parameter
   name instead of searching the whole body for each operator in turn. A `-`,
   `=` or `+` inside a pattern used to hijack the expansion, so `${v##*a-b*}`

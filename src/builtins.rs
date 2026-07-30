@@ -221,17 +221,10 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             if is_builtin(cmd_name) {
                 run_builtin(cmd_name, &args[1..], state)
             } else {
-                let cmd = args.join(" ");
-                match parser::parse(&cmd) {
-                    Ok(cmds) => {
-                        let mut last = 0;
-                        for c in &cmds {
-                            last = crate::executor::execute_complete_command(c, state);
-                        }
-                        last
-                    }
-                    Err(_) => 1,
-                }
+                // Hand the already-expanded argv straight to exec. Re-joining
+                // and re-parsing it would destroy any argument holding
+                // whitespace, quotes or newlines.
+                crate::executor::spawn_external(args, state)
             }
         }
         "builtin" => {

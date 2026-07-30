@@ -506,6 +506,7 @@ fn parameter_value(name: &str, state: &ShellState) -> Option<String> {
         "#" => Some(state.positional_params.len().to_string()),
         "@" | "*" => Some(state.positional_params.join(" ")),
         "0" => Some(state.arg0.clone()),
+        "-" => Some(state.option_flags()),
         _ if name.len() <= 3 && name.chars().all(|c| c.is_ascii_digit()) => {
             let idx: usize = name.parse().unwrap_or(0);
             if idx > 0 && idx <= state.positional_params.len() {
@@ -526,6 +527,7 @@ fn expand_variable(name: &str, state: &mut ShellState) -> String {
         "#" => state.positional_params.len().to_string(),
         "@" | "*" => state.positional_params.join(" "),
         "0" => state.arg0.clone(),
+        "-" => state.option_flags(),
         _ if name.len() <= 3 && name.chars().all(|c| c.is_ascii_digit()) => {
             let idx: usize = name.parse().unwrap_or(0);
             if idx > 0 && idx <= state.positional_params.len() {

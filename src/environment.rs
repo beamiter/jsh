@@ -326,6 +326,30 @@ impl ShellState {
         hasher.finish()
     }
 
+    /// The `$-` string: one letter per currently enabled option, in the order
+    /// bash prints them. Scripts test it to detect `set -e`/`set -x` before
+    /// toggling an option and restoring it (nvm.sh does this on every call),
+    /// so the letters rsh does not model simply never appear.
+    pub fn option_flags(&self) -> String {
+        let mut flags = String::new();
+        if self.shell_opts.errexit {
+            flags.push('e');
+        }
+        if self.shell_opts.noglob {
+            flags.push('f');
+        }
+        // Command hashing and brace expansion are always on, as in bash.
+        flags.push('h');
+        if self.interactive {
+            flags.push('i');
+        }
+        flags.push('B');
+        if self.shell_opts.xtrace {
+            flags.push('x');
+        }
+        flags
+    }
+
     pub fn get_var(&self, name: &str) -> Option<&str> {
         match name {
             "?" => return None, // handled by expand

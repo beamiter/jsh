@@ -399,3 +399,64 @@ fn anchored_replacements_are_unaffected() {
     let (out, _, _) = run(r#"s=Hello-World; echo "[${s/#Hello/Bye}][${s/%World/Earth}]""#);
     assert_eq!(out, "[Bye-World][Hello-Earth]\n");
 }
+
+// ---------------------------------------------------------------------------
+// Regressions from `source ~/.nvm/nvm.sh`, which recursed until the stack
+// blew: `$-` expanded to the literal text `$-`, so nvm's "is errexit set?"
+// guard was always true and the function re-invoked itself forever.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dollar_dash_reports_the_enabled_options() {
+    let (out, _, _) = run(r#"echo "[$-]"; set -e; echo "[$-]"; set +e; set -x; echo "[$-]""#);
+    assert_eq!(out, "[hB]\n[ehB]\n[hBx]\n");
+}
+
+#[test]
+fn dollar_dash_drives_the_nvm_option_guard() {
+    // `[ "${-#*e}" != "$-" ]` is true only while errexit is on.
+    let probe = r#"if [ "${-#*e}" != "$-" ]; then echo on; else echo off; fi"#;
+    let (out, _, _) = run(&format!("{}; set -e; {}", probe, probe));
+    assert_eq!(out, "off\non\n");
+}
+
+#[test]
+fn redirections_on_a_function_call_apply_to_its_body() {
+    let (out, err, _) = run(r#"f() { echo out; echo err >&2; }; f 2>/dev/null; f >/dev/null"#);
+    assert_eq!(out, "out\n");
+    assert_eq!(err, "err\n");
+}
+
+#[test]
+fn function_stderr_redirection_holds_inside_command_substitution() {
+    // nvm reads `X="$(some_fn 2>/dev/null)"` and breaks out of a loop when X is
+    // empty; the leaked diagnostic kept the loop running forever.
+    let (out, err, _) =
+        run(r#"f() { echo boom >&2; return 2; }; x="$(f 2>/dev/null)"; echo "[$x]""#);
+    assert_eq!(out, "[]\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+}
+
+#[test]
+fn assignment_prefix_on_a_function_call_is_temporary() {
+    let (out, _, _) = run(r#"f() { echo "in=$V"; }; V=outer; V=inner f; echo "after=$V""#);
+    assert_eq!(out, "in=inner\nafter=outer\n");
+}
+
+#[test]
+fn command_preserves_arguments_containing_whitespace() {
+    // `command X ...` used to re-join argv with spaces and re-parse it, which
+    // split any argument holding a space or a newline into separate words.
+    let (out, err, _) = run("command printf '<%s>\\n' 'a b' 'c\nd'");
+    assert_eq!(out, "<a b>\n<c\nd>\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+}
+
+#[test]
+fn command_passes_a_multiline_script_argument_through() {
+    // The shape nvm uses: a sed program written across several lines.
+    let script = "printf 'a\\n' | command sed -e \"\n    s#a#A#;\n  \"";
+    let (out, err, _) = run(script);
+    assert_eq!(out, "A\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+}

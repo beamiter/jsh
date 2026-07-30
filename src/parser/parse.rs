@@ -1912,10 +1912,11 @@ pub fn parse_word_parts(raw: &str) -> Word {
                             || c2 == '!'
                             || c2 == '#'
                             || c2 == '@'
+                            || c2 == '-'
                             || c2 == '*' =>
                     {
                         let mut var = String::new();
-                        if "?$!#@*".contains(c2) {
+                        if "?$!#@*-".contains(c2) {
                             var.push(c2);
                             chars.next();
                         } else {
@@ -2156,10 +2157,11 @@ fn parse_word_parts_inner(input: &str) -> Vec<WordPart> {
                         || c2 == '!'
                         || c2 == '#'
                         || c2 == '@'
+                        || c2 == '-'
                         || c2 == '*' =>
                 {
                     let mut var = String::new();
-                    if "?$!#@*".contains(c2) {
+                    if "?$!#@*-".contains(c2) {
                         var.push(c2);
                         chars.next();
                     } else {
