@@ -36,6 +36,12 @@ pub struct JobTable {
     next_id: usize,
 }
 
+impl Default for JobTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JobTable {
     pub fn new() -> Self {
         JobTable {
@@ -189,30 +195,61 @@ impl JobTable {
 }
 
 fn send_notification(command: &str, exit_code: i32, elapsed: Duration) {
+    let (summary, body) = notification_text(command, exit_code, elapsed);
+    dispatch_notification(
+        &summary,
+        &body,
+        crate::osc::notify_osc777,
+        |summary, body| {
+            std::process::Command::new("notify-send")
+                .args([summary, body])
+                .spawn()
+                .ok();
+        },
+    );
+}
+
+fn notification_text(command: &str, exit_code: i32, elapsed: Duration) -> (String, String) {
     let dur = format_job_duration(elapsed);
-    let (summary, body) = if exit_code == 0 {
-        (
-            "Command completed".to_string(),
-            format!("{} ({})", command, dur),
-        )
+    let summary = if exit_code == 0 {
+        "Command completed".to_string()
     } else {
-        (
-            format!("Command failed (exit {})", exit_code),
-            format!("{} ({})", command, dur),
-        )
+        format!("Command failed (exit {})", exit_code)
     };
+    (summary, format!("{} ({})", command, dur))
+}
 
-    // OSC 777 terminal notification (iTerm2, Kitty, etc.)
-    crate::osc::notify_osc777(&summary, &body);
-
-    // OSC 9 desktop notification (Windows Terminal, ConEmu)
-    crate::osc::notify_osc9(&format!("{}: {}", summary, body));
-
-    // Also try notify-send (Linux desktop)
-    std::process::Command::new("notify-send")
-        .args([&summary, &body])
-        .spawn()
-        .ok();
+/// Route one finished job to exactly ONE notification channel.
+///
+/// This used to fire three: OSC 777, then OSC 9, then a spawned notify-send.
+/// The comments justified the two OSC forms by assuming they reach disjoint
+/// terminals, which is false here — jterm_core's shared parser turns both into
+/// the same `ParserEvent::Notification`, so jterm1/jterm4 raised two popups, and
+/// notify-send made a third on any desktop where the terminal had already
+/// notified.
+///
+/// Policy: prefer the in-band OSC channel whenever the mark sink is a terminal.
+/// The terminal knows whether its window is focused and can suppress, route or
+/// coalesce the popup, and the notification survives ssh with no D-Bus in
+/// between. `notify-send` is the fallback for exactly one case: there is no
+/// terminal listening (stderr redirected, jsh in a pipeline), so nobody else
+/// will tell the user. OSC 777 is the primary in-band form because it carries
+/// summary and body as separate fields; OSC 9 is deliberately not emitted (see
+/// `osc::notify_osc9`).
+///
+/// The sinks are parameters so tests can count deliveries per channel.
+fn dispatch_notification<InBand, Desktop>(
+    summary: &str,
+    body: &str,
+    emit_in_band: InBand,
+    notify_desktop: Desktop,
+) where
+    InBand: FnOnce(&str, &str) -> bool,
+    Desktop: FnOnce(&str, &str),
+{
+    if !emit_in_band(summary, body) {
+        notify_desktop(summary, body);
+    }
 }
 
 fn format_job_duration(d: Duration) -> String {
@@ -223,5 +260,87 @@ fn format_job_duration(d: Duration) -> String {
         format!("{}m{:.0}s", secs / 60, secs % 60)
     } else {
         format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Records what each channel was told, so "one event, one notification" is
+    /// an assertion rather than a hope.
+    #[derive(Default)]
+    struct Deliveries {
+        in_band: RefCell<Vec<(String, String)>>,
+        desktop: RefCell<Vec<(String, String)>>,
+    }
+
+    fn deliver(summary: &str, body: &str, terminal_listening: bool) -> Deliveries {
+        let log = Deliveries::default();
+        dispatch_notification(
+            summary,
+            body,
+            |summary, body| {
+                log.in_band
+                    .borrow_mut()
+                    .push((summary.to_string(), body.to_string()));
+                terminal_listening
+            },
+            |summary, body| {
+                log.desktop
+                    .borrow_mut()
+                    .push((summary.to_string(), body.to_string()));
+            },
+        );
+        log
+    }
+
+    #[test]
+    fn a_finished_job_notifies_once_in_band_when_a_terminal_is_listening() {
+        // Regression: this fired OSC 777 + OSC 9 + notify-send, and jterm_core
+        // parses both OSC forms, so one job produced three notifications.
+        let log = deliver("Command completed", "sleep 30 (30.0s)", true);
+
+        assert_eq!(
+            log.in_band.borrow().as_slice(),
+            [(
+                "Command completed".to_string(),
+                "sleep 30 (30.0s)".to_string()
+            )]
+        );
+        assert!(log.desktop.borrow().is_empty(), "notify-send would be #2");
+    }
+
+    #[test]
+    fn notify_send_is_the_fallback_only_when_no_terminal_took_it() {
+        let log = deliver("Command completed", "sleep 30 (30.0s)", false);
+
+        assert_eq!(log.in_band.borrow().len(), 1);
+        assert_eq!(
+            log.desktop.borrow().as_slice(),
+            [(
+                "Command completed".to_string(),
+                "sleep 30 (30.0s)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn notification_text_reports_command_duration_and_failure() {
+        assert_eq!(
+            notification_text("cargo build", 0, Duration::from_secs(90)),
+            (
+                "Command completed".to_string(),
+                "cargo build (1m30s)".to_string()
+            )
+        );
+        assert_eq!(
+            notification_text("cargo build", 101, Duration::from_millis(1500)),
+            (
+                "Command failed (exit 101)".to_string(),
+                "cargo build (1.5s)".to_string()
+            )
+        );
     }
 }
