@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `source /opt/ros/humble/setup.bash` (and ament setup scripts generally) now
+  works. Four Bash gaps were in the way: double quotes did not nest inside a
+  backtick substitution, so `"`dirname "$f"`"` cut the command short;
+  `${BASH_SOURCE[0]}` was unset, so a sourced script could not find its own
+  directory; `:` was not a builtin; and `IFS` started unset, so the common
+  `old=$IFS; ...; IFS=$old` idiom emptied it and killed word splitting for the
+  rest of the session.
 - Publish prebuilt Linux binaries (glibc and static musl, x86_64 and aarch64)
   from tagged releases, together with checksums and a `manifest.json` served at
   a stable "latest" URL.

@@ -32,6 +32,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     ".",
     "eval",
     "read",
+    ":",
     "true",
     "false",
     "test",
@@ -131,6 +132,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "source" | "." => builtin_source(args, state),
         "eval" => builtin_eval(args, state),
         "read" => builtin_read(args, state),
+        ":" => 0,
         "true" => 0,
         "false" => 1,
         "test" | "[" => builtin_test(args),
@@ -968,6 +970,14 @@ fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
         state.positional_params = source_params.clone();
     }
 
+    // Bash exposes the file being sourced as `${BASH_SOURCE[0]}`, with outer
+    // frames following it. Setup scripts use it to locate their own directory,
+    // so push a frame for the duration of the source.
+    let old_bash_source = state.arrays.get("BASH_SOURCE").cloned();
+    let mut frames = old_bash_source.clone().unwrap_or_default();
+    frames.insert(0, resolved_path.clone());
+    state.set_array("BASH_SOURCE", frames);
+
     state.return_depth += 1;
     let result = match std::fs::read_to_string(&resolved_path) {
         Ok(content) => {
@@ -998,6 +1008,12 @@ fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
 
     // Restore state
     state.positional_params = old_params;
+    match old_bash_source {
+        Some(frames) => state.set_array("BASH_SOURCE", frames),
+        None => {
+            state.arrays.remove("BASH_SOURCE");
+        }
+    }
 
     result
 }

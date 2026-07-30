@@ -1440,6 +1440,28 @@ fn try_parse_closure(raw: &str) -> Option<WordPart> {
     Some(WordPart::Closure { params, body_src })
 }
 
+/// Consume a backtick command substitution body, stopping at the first
+/// unescaped backtick (which is consumed). Backslash escapes are preserved
+/// verbatim for the later word-part stage. Inside backticks nothing else
+/// nests, so a `"` here must not be read as opening a quote in the enclosing
+/// scan — that is exactly what `"`dirname "$f"`"` relies on.
+fn read_backtick_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut body = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => break,
+            '\\' => {
+                body.push('\\');
+                if let Some(next) = chars.next() {
+                    body.push(next);
+                }
+            }
+            _ => body.push(c),
+        }
+    }
+    body
+}
+
 fn read_command_sub(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
     let mut cmd = String::new();
     let mut depth = 1;
@@ -1479,6 +1501,11 @@ fn read_command_sub(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Str
                     if next == '"' {
                         break;
                     }
+                    if next == '`' {
+                        cmd.push_str(&read_backtick_body(chars));
+                        cmd.push('`');
+                        continue;
+                    }
                     if next == '$' && chars.peek() == Some(&'(') {
                         cmd.push(chars.next().unwrap());
                         let nested = read_command_sub(chars);
@@ -1486,6 +1513,11 @@ fn read_command_sub(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Str
                         cmd.push(')');
                     }
                 }
+            }
+            '`' => {
+                cmd.push(c);
+                cmd.push_str(&read_backtick_body(chars));
+                cmd.push('`');
             }
             '$' if chars.peek() == Some(&'(') => {
                 cmd.push('$');
@@ -1599,6 +1631,11 @@ fn read_double_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> S
                 let nested = read_parameter_expansion(chars);
                 inner.push_str(&nested);
                 inner.push('}');
+            }
+            '`' => {
+                inner.push('`');
+                inner.push_str(&read_backtick_body(chars));
+                inner.push('`');
             }
             _ => inner.push(c),
         }

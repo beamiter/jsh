@@ -210,3 +210,112 @@ fn command_without_options_still_runs_the_command() {
     assert_eq!(code, 0);
     assert_eq!(out, "ran\n");
 }
+
+// ---------------------------------------------------------------------------
+// Regressions from `source /opt/ros/humble/setup.bash` (ament setup scripts):
+//   AMENT_CURRENT_PREFIX=$(builtin cd "`dirname "${BASH_SOURCE[0]}"`" && pwd)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_quotes_nest_inside_a_backtick_substitution() {
+    // The inner `"` must not close the outer quote: the whole backtick body is
+    // one command, so `dirname` gets its argument.
+    let (out, err, _) = run(r#"f=/a/b/c.txt; echo "`dirname "$f"`""#);
+    assert_eq!(out, "/a/b\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+}
+
+#[test]
+fn backticks_with_nested_quotes_survive_inside_command_substitution() {
+    let (out, err, _) =
+        run(r#"f=/etc/hostname; d=$(builtin cd "`dirname "$f"`" && pwd); echo "$d""#);
+    assert_eq!(out, "/etc\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+}
+
+#[test]
+fn backtick_body_may_contain_a_closing_paren_inside_command_substitution() {
+    let (out, err, _) = run(r#"echo "$(echo "`echo "a)b"`")""#);
+    assert_eq!(out, "a)b\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+}
+
+#[test]
+fn bash_source_names_the_file_being_sourced() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("setup.bash");
+    std::fs::write(&script, "echo \"${BASH_SOURCE[0]}\"\n").unwrap();
+    let (out, err, code) = run(&format!("source {}", script.display()));
+    assert_eq!(code, 0);
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+    assert_eq!(out, format!("{}\n", script.display()));
+}
+
+#[test]
+fn bash_source_is_restored_after_the_sourced_file_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = dir.path().join("outer.bash");
+    let inner = dir.path().join("inner.bash");
+    std::fs::write(&inner, "echo \"inner=${BASH_SOURCE[0]}\"\n").unwrap();
+    std::fs::write(
+        &outer,
+        format!(
+            "source {}\necho \"outer=${{BASH_SOURCE[0]}}\"\n",
+            inner.display()
+        ),
+    )
+    .unwrap();
+    let (out, _, _) = run(&format!("source {}", outer.display()));
+    assert_eq!(
+        out,
+        format!("inner={}\nouter={}\n", inner.display(), outer.display())
+    );
+}
+
+#[test]
+fn setup_script_locates_its_own_directory() {
+    // The exact idiom every ament prefix-level setup.bash opens with.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("setup.bash");
+    std::fs::write(
+        &script,
+        "PREFIX=$(builtin cd \"`dirname \"${BASH_SOURCE[0]}\"`\" && pwd)\necho \"$PREFIX\"\n",
+    )
+    .unwrap();
+    let (out, err, code) = run(&format!("source {}", script.display()));
+    assert_eq!(code, 0);
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+    assert_eq!(
+        out.trim_end(),
+        dir.path().canonicalize().unwrap().display().to_string()
+    );
+}
+
+#[test]
+fn colon_is_a_successful_no_op_builtin() {
+    let (out, err, code) = run(": ignored args; echo $?");
+    assert_eq!(code, 0);
+    assert_eq!(out, "0\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+}
+
+#[test]
+fn colon_expands_its_arguments_for_default_assignment() {
+    // `: ${VAR:=default}` is how setup.sh seeds AMENT_CURRENT_PREFIX.
+    let (out, _, _) = run(r#": ${V:=fallback}; echo "$V""#);
+    assert_eq!(out, "fallback\n");
+}
+
+#[test]
+fn ifs_starts_at_the_bash_default() {
+    let (out, _, _) = run(r#"x="a b c"; set -- $x; echo $#"#);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn saving_and_restoring_ifs_keeps_word_splitting_alive() {
+    // Setup scripts stash IFS, switch to ":" to walk a path list, then restore.
+    // With IFS unset at startup the restore emptied it and killed splitting.
+    let (out, _, _) = run(r#"old=$IFS; IFS=":"; IFS=$old; x="a b c"; set -- $x; echo $#"#);
+    assert_eq!(out, "3\n");
+}

@@ -211,6 +211,11 @@ impl ShellState {
         for (k, v) in env::vars() {
             env_vars.insert(k, v);
         }
+        // Bash always starts with IFS at its default. Scripts routinely save and
+        // restore it (`old=$IFS; ...; IFS=$old`), so leaving it unset would let
+        // that idiom clobber IFS to the empty string and kill word splitting for
+        // the rest of the session.
+        env_vars.insert("IFS".to_string(), " \t\n".to_string());
         let mut aliases = HashMap::new();
         if interactive {
             aliases.insert("ls".to_string(), "ls --color=auto".to_string());
