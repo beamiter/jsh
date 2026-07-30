@@ -13,12 +13,12 @@
 //!   `jagent::is_auto_approvable` (fail-closed allowlist; everything else
 //!   still prompts)
 
-use crate::ai::{AiConfig, AiProvider};
+use crate::ai::{build_redacted_chat_request, AiConfig};
 use crate::environment::ShellState;
-use jagent::provider::{build_chat_request, parse_chat_response, ChatConfig, Message};
+use jagent::provider::{parse_chat_response_full, ChatConfig, Message};
 use jagent::{
-    AgentSession, AgentState, ApprovedCommand, EnvironmentMeta, GitMeta, ModelOutcome, Provider,
-    Role, SessionError,
+    AgentSession, AgentState, ApprovedCommand, EnvironmentMeta, GitMeta, ModelOutcome, Role,
+    SessionError,
 };
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -307,14 +307,13 @@ fn request_model(
     agent_cwd: &Path,
 ) -> Result<String, String> {
     let environment = environment_meta(share_context, agent_cwd);
-    // Transcript observations replay real terminal output; scrub
-    // high-confidence secret shapes before anything leaves the machine.
-    let user_text = jagent::redact_secrets(&jagent::agent_user_prompt(
-        &session.build_user_prompt(),
-        &environment,
-        None,
-    ));
-    let request = build_chat_request(
+    // Transcript observations replay real terminal output, which is where API
+    // keys and connection strings show up. The scrubbing no longer happens
+    // here: `crate::ai::build_redacted_chat_request` is the single outbound
+    // funnel and redacts the system text and every turn on the way, so this
+    // call site cannot forget it (and neither can the next one).
+    let user_text = jagent::agent_user_prompt(&session.build_user_prompt(), &environment, None);
+    let request = build_redacted_chat_request(
         chat,
         Some(&jagent::build_agent_system_prompt()),
         &[Message {
@@ -351,26 +350,22 @@ fn request_model(
     }
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("invalid response JSON: {error}"))?;
-    parse_chat_response(chat.provider, &json).map_err(|error| error.to_string())
+    let parsed =
+        parse_chat_response_full(chat.provider, &json).map_err(|error| error.to_string())?;
+    if parsed.reached_token_limit {
+        // `parse_chat_response` would append a human-readable advisory note
+        // here, which the strict JSON protocol parser would then reject with a
+        // confusing "invalid JSON". Report the real cause instead.
+        return Err(format!(
+            "model stopped at the {AGENT_MAX_TOKENS}-token output limit; its reply is truncated"
+        ));
+    }
+    Ok(parsed.text)
 }
 
 fn chat_config(ai_config: &AiConfig) -> ChatConfig {
-    let provider = match ai_config.provider {
-        AiProvider::OpenAI => Provider::OpenAiCompatible,
-        AiProvider::Anthropic => Provider::Anthropic,
-        AiProvider::Ollama => Provider::Ollama,
-    };
-    // jsh's base_url contract matches the provider defaults (no trailing
-    // path); jagent's endpoint() appends the per-provider path.
-    ChatConfig {
-        provider,
-        api_key: ai_config.api_key.clone(),
-        model: ai_config.model.clone(),
-        base_url: ai_config.base_url.clone(),
-        max_tokens: AGENT_MAX_TOKENS,
-        // Strict JSON protocol compliance beats creativity here.
-        temperature: Some(0.0),
-    }
+    // Strict JSON protocol compliance beats creativity here.
+    ai_config.chat_config(AGENT_MAX_TOKENS, Some(0.0))
 }
 
 fn environment_meta(share_context: bool, cwd: &Path) -> EnvironmentMeta {
