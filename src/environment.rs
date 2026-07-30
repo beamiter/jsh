@@ -73,7 +73,41 @@ impl Default for ShellOpts {
             checkwinsize: false,
             inherit_errexit: false,
             config_source: ConfigSource::Bashrc,
+            tracked_opts: HashMap::new(),
         }
+    }
+}
+
+/// True if `name` is a shell identifier (`[A-Za-z_][A-Za-z0-9_]*`) — the only
+/// spelling bash's `export`, `unset` and `declare` accept as a variable name.
+pub fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// True if `name` may be handed to the C environment.
+///
+/// `std::env::set_var` / `remove_var` PANIC — killing the whole shell with exit
+/// 101 — on an empty name, a name containing `=`, or an interior NUL. A typo
+/// such as `export =` must not be able to do that, so every call goes through
+/// the two helpers below.
+fn env_name_ok(name: &str) -> bool {
+    !name.is_empty() && !name.contains('=') && !name.contains('\0')
+}
+
+fn set_env_checked(name: &str, value: &str) {
+    if env_name_ok(name) && !value.contains('\0') {
+        env::set_var(name, value);
+    }
+}
+
+fn remove_env_checked(name: &str) {
+    if env_name_ok(name) {
+        env::remove_var(name);
     }
 }
 

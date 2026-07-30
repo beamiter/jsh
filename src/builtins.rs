@@ -563,7 +563,13 @@ fn builtin_export(args: &[String], state: &mut ShellState) -> i32 {
     }
 
     if args.first().map(|s| s.as_str()) == Some("-n") {
+        let mut status = 0;
         for arg in &args[1..] {
+            if !crate::environment::is_valid_identifier(arg) {
+                eprintln!("jsh: export: `{}': not a valid identifier", arg);
+                status = 1;
+                continue;
+            }
             if let Some(val) = state.env_vars.remove(arg) {
                 env::remove_var(arg);
                 // If in function scope, set to local_vars; otherwise just unset
@@ -572,29 +578,54 @@ fn builtin_export(args: &[String], state: &mut ShellState) -> i32 {
                 }
             }
         }
-        return 0;
+        return status;
     }
 
+    let mut status = 0;
     for arg in args {
-        if let Some(eq_pos) = arg.find('=') {
-            let name = &arg[..eq_pos];
-            let value = &arg[eq_pos + 1..];
-            state.export_var(name, value);
-        } else {
-            // Get value from any scope
-            if let Some(val) = state.get_var(arg).map(|s| s.to_string()) {
-                state.export_var(arg, &val);
-            } else if !state.env_vars.contains_key(arg) {
-                state.export_var(arg, "");
+        // Validate before touching the environment: `export =` used to reach
+        // std::env::set_var with an empty name, which panics and takes the whole
+        // shell down with exit 101.
+        let (name, value) = match arg.find('=') {
+            Some(eq_pos) => (&arg[..eq_pos], Some(&arg[eq_pos + 1..])),
+            None => (arg.as_str(), None),
+        };
+        if !crate::environment::is_valid_identifier(name) {
+            eprintln!("jsh: export: `{}': not a valid identifier", arg);
+            status = 1;
+            continue;
+        }
+        match value {
+            Some(value) => state.export_var(name, value),
+            None => {
+                // Get value from any scope
+                if let Some(val) = state.get_var(name).map(|s| s.to_string()) {
+                    state.export_var(name, &val);
+                } else if !state.env_vars.contains_key(name) {
+                    state.export_var(name, "");
+                }
             }
         }
     }
-    0
+    status
 }
 
 fn builtin_unset(args: &[String], state: &mut ShellState) -> i32 {
+    // Bash only complains about an invalid name when the kind was pinned with
+    // `-v`/`-f`; a bare `unset ""` or `unset a=b` is a silent no-op returning 0.
+    // Either way the name must never reach std::env::remove_var, which panics
+    // on an empty name and killed the shell with exit 101.
+    let explicit_kind = args.iter().any(|a| a == "-v" || a == "-f");
+    let mut status = 0;
     for name in args {
         if name == "-v" || name == "-f" {
+            continue;
+        }
+        if !crate::environment::is_valid_identifier(name) && !name.contains('[') {
+            if explicit_kind {
+                eprintln!("jsh: unset: `{}': not a valid identifier", name);
+                status = 1;
+            }
             continue;
         }
         // Support unset arr[idx]
@@ -616,7 +647,7 @@ fn builtin_unset(args: &[String], state: &mut ShellState) -> i32 {
         }
         state.unset_var(name);
     }
-    0
+    status
 }
 
 fn builtin_echo(args: &[String]) -> i32 {
