@@ -15,7 +15,7 @@ pub fn expand_word(word: &Word, state: &mut ShellState) -> Vec<String> {
         if fields.len() == 1 && fields[0].is_empty() && array_refs_all_empty(word, state) {
             return Vec::new();
         }
-        return fields;
+        return glob_fields(fields, state);
     }
 
     // Check for "$@"/$@/$* which expand to multiple fields (positional params).
@@ -25,25 +25,34 @@ pub fn expand_word(word: &Word, state: &mut ShellState) -> Vec<String> {
         if fields.len() == 1 && fields[0].is_empty() && state.positional_params.is_empty() {
             return Vec::new();
         }
-        return fields;
+        return glob_fields(fields, state);
     }
 
-    // Check for brace expansion/range that produces multiple words
+    // Check for brace expansion/range that produces multiple words.
+    //
+    // Brace expansion runs before pathname expansion, and each alternative keeps
+    // the quoting it was written with: `{*,zz}` globs while `{'*',zz}` does not.
+    // Splicing an alternative's *parts* back into the word preserves that;
+    // substituting its expanded text would flatten `'*'` and `*` to the same
+    // thing. Ranges are generated text, so they become plain literals.
     for (i, part) in word.iter().enumerate() {
-        let items = match part {
-            WordPart::BraceExpansion(items) => Some(expand_brace_items(items, state)),
-            WordPart::BraceRange { start, end, step } => {
-                Some(expand_brace_range(start, end, step.as_deref()))
-            }
+        let alternatives: Option<Vec<Word>> = match part {
+            WordPart::BraceExpansion(items) => Some(items.clone()),
+            WordPart::BraceRange { start, end, step } => Some(
+                expand_brace_range(start, end, step.as_deref())
+                    .into_iter()
+                    .map(|item| vec![WordPart::Literal(item)])
+                    .collect(),
+            ),
             _ => None,
         };
-        if let Some(items) = items {
+        if let Some(alternatives) = alternatives {
             let mut results = Vec::new();
-            for item in &items {
+            for alternative in &alternatives {
                 let mut new_word: Word = Vec::new();
                 for (j, p) in word.iter().enumerate() {
                     if j == i {
-                        new_word.push(WordPart::Literal(item.clone()));
+                        new_word.extend(alternative.iter().cloned());
                     } else {
                         new_word.push(p.clone());
                     }
@@ -54,16 +63,16 @@ pub fn expand_word(word: &Word, state: &mut ShellState) -> Vec<String> {
         }
     }
 
-    // Expand parts while tracking which bytes came from unquoted expansions
-    // (variables, command substitution, arithmetic). Only those bytes are
-    // candidates for IFS word splitting.
+    // Expand parts while tracking, per byte, which bytes came from unquoted
+    // expansions (candidates for IFS word splitting) and which may act as glob
+    // metacharacters (candidates for pathname expansion).
     let (expanded, mask, has_unsplittable) = expand_word_masked(word, state);
 
     let mut fields = ifs_split(&expanded, &mask, state);
     if fields.is_empty() {
         if has_unsplittable {
             // e.g. `echo ""` or `echo "$empty"` → one empty field.
-            fields.push(String::new());
+            fields.push(Field::new());
         } else {
             // e.g. `echo $empty` → no fields at all.
             return Vec::new();
@@ -71,19 +80,61 @@ pub fn expand_word(word: &Word, state: &mut ShellState) -> Vec<String> {
     }
 
     // Globbing applies per resulting field, after word splitting.
-    let mut out = Vec::new();
-    for field in fields {
-        out.extend(glob_field(&field, state));
+    glob_fields(fields, state)
+}
+
+/// One field of an expanded word, carrying per-byte glob eligibility alongside
+/// its text.
+///
+/// Quoting **cannot** be recovered from expanded text: the parser has already
+/// consumed the quote characters, so any `'` or `"` still present arrived as
+/// *data*. Re-deriving it by scanning (which this module used to do) was wrong
+/// in both directions — `echo '*'` globbed, and a filename containing an
+/// apostrophe silently disabled globbing for its whole field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Field {
+    text: String,
+    /// `globbable[i]` is true when byte `i` of `text` may act as a glob
+    /// metacharacter. Always the same length as `text`.
+    globbable: Vec<bool>,
+}
+
+impl Field {
+    fn new() -> Self {
+        Self::default()
     }
-    out
+
+    /// Append `text`, marking every one of its bytes with the same eligibility.
+    fn push_str(&mut self, text: &str, globbable: bool) {
+        self.text.push_str(text);
+        self.globbable.resize(self.text.len(), globbable);
+    }
+
+    /// Append one character, marking each of its UTF-8 bytes.
+    fn push_char(&mut self, c: char, globbable: bool) {
+        self.text.push(c);
+        self.globbable.resize(self.text.len(), globbable);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// A field whose bytes are all glob-eligible — used where the caller already
+    /// knows the text came from an unquoted expansion.
+    fn unquoted(text: &str) -> Self {
+        let mut field = Self::new();
+        field.push_str(text, true);
+        field
+    }
 }
 
 /// Expand each part of a word, recording per-byte whether it originated from an
 /// unquoted expansion (splittable) plus whether any unsplittable part was seen
 /// (so an empty result can be distinguished: `echo ""` keeps one empty field,
 /// `echo $empty` keeps none).
-fn expand_word_masked(word: &Word, state: &mut ShellState) -> (String, Vec<bool>, bool) {
-    let mut s = String::new();
+fn expand_word_masked(word: &Word, state: &mut ShellState) -> (Field, Vec<bool>, bool) {
+    let mut field = Field::new();
     let mut mask: Vec<bool> = Vec::new();
     let mut has_unsplittable = false;
     for part in word {
@@ -98,9 +149,31 @@ fn expand_word_masked(word: &Word, state: &mut ShellState) -> (String, Vec<bool>
         for _ in 0..text.len() {
             mask.push(splittable);
         }
-        s.push_str(&text);
+        field.push_str(&text, part_is_globbable(part, false));
     }
-    (s, mask, has_unsplittable)
+    (field, mask, has_unsplittable)
+}
+
+/// May the bytes this part expands to act as glob metacharacters?
+///
+/// Only two sources qualify, matching POSIX: metacharacters the *parser* saw
+/// unquoted (`WordPart::Glob`, which is the only place unquoted `*?[` land), and
+/// the results of unquoted expansions (`x='*'; echo $x` does glob). Everything
+/// else is protected — quoted text, backslash escapes (which the parser folds
+/// into `Literal`), tilde expansion, and process substitution paths. `quoted`
+/// is set when the part sits inside double quotes, which protects it outright.
+fn part_is_globbable(part: &WordPart, quoted: bool) -> bool {
+    if quoted {
+        return false;
+    }
+    matches!(
+        part,
+        WordPart::Glob(_)
+            | WordPart::Variable(_)
+            | WordPart::VariablePath { .. }
+            | WordPart::CommandSub(_)
+            | WordPart::Arithmetic(_)
+    )
 }
 
 /// Split a string into fields at splittable IFS characters. `mask[byte]` is true
@@ -108,7 +181,8 @@ fn expand_word_masked(word: &Word, state: &mut ShellState) -> (String, Vec<bool>
 /// leading/trailing IFS whitespace is trimmed, runs of IFS whitespace delimit a
 /// single field boundary, and each IFS non-whitespace character (with any
 /// adjacent IFS whitespace) is one delimiter that can produce empty fields.
-fn ifs_split(s: &str, mask: &[bool], state: &ShellState) -> Vec<String> {
+fn ifs_split(input: &Field, mask: &[bool], state: &ShellState) -> Vec<Field> {
+    let s = input.text.as_str();
     if s.is_empty() {
         return Vec::new();
     }
@@ -118,7 +192,7 @@ fn ifs_split(s: &str, mask: &[bool], state: &ShellState) -> Vec<String> {
         .unwrap_or_else(|| " \t\n".to_string());
     if ifs.is_empty() {
         // IFS empty → no word splitting at all.
-        return vec![s.to_string()];
+        return vec![input.clone()];
     }
     let is_ws = |c: char| (c == ' ' || c == '\t' || c == '\n') && ifs.contains(c);
     let is_ifs = |c: char| ifs.contains(c);
@@ -130,8 +204,8 @@ fn ifs_split(s: &str, mask: &[bool], state: &ShellState) -> Vec<String> {
         mask.get(bp).copied().unwrap_or(false) && is_ifs(chars[i].1)
     };
 
-    let mut fields: Vec<String> = Vec::new();
-    let mut field = String::new();
+    let mut fields: Vec<Field> = Vec::new();
+    let mut field = Field::new();
     let mut field_pending = false;
     let mut i = 0;
 
@@ -174,7 +248,9 @@ fn ifs_split(s: &str, mask: &[bool], state: &ShellState) -> Vec<String> {
                 }
             }
         } else {
-            field.push(chars[i].1);
+            let (byte_pos, c) = chars[i];
+            let globbable = input.globbable.get(byte_pos).copied().unwrap_or(false);
+            field.push_char(c, globbable);
             field_pending = true;
             i += 1;
         }
@@ -186,20 +262,50 @@ fn ifs_split(s: &str, mask: &[bool], state: &ShellState) -> Vec<String> {
     fields
 }
 
-/// IFS-split a string that came entirely from an unquoted expansion.
-fn ifs_split_unquoted(s: &str, state: &ShellState) -> Vec<String> {
+/// IFS-split a string that came entirely from an unquoted expansion. Such bytes
+/// are glob-eligible: `arr=('*'); echo ${arr[@]}` globs, exactly as bash does.
+fn ifs_split_unquoted(s: &str, state: &ShellState) -> Vec<Field> {
     let mask = vec![true; s.len()];
-    ifs_split(s, &mask, state)
+    ifs_split(&Field::unquoted(s), &mask, state)
+}
+
+/// Apply glob expansion to every field of a split word, in order.
+fn glob_fields(fields: Vec<Field>, state: &mut ShellState) -> Vec<String> {
+    let mut out = Vec::new();
+    for field in fields {
+        out.extend(glob_field(&field, state));
+    }
+    out
+}
+
+/// Turn a field into a glob pattern, neutralising every metacharacter that
+/// quoting protected so the matcher sees it as literal text.
+///
+/// Escaping is delegated to the `glob` crate so it always agrees with the
+/// matcher that consumes the result (it wraps a metacharacter in a one-element
+/// character class: `*` → `[*]`).
+fn glob_pattern_for(field: &Field) -> String {
+    let mut pattern = String::with_capacity(field.text.len());
+    for (byte_pos, c) in field.text.char_indices() {
+        if field.globbable.get(byte_pos).copied().unwrap_or(false) {
+            pattern.push(c);
+        } else {
+            pattern.push_str(&glob::Pattern::escape(&c.to_string()));
+        }
+    }
+    pattern
 }
 
 /// Apply glob/extglob expansion to a single already-split field.
-fn glob_field(expanded: &str, state: &mut ShellState) -> Vec<String> {
+fn glob_field(field: &Field, state: &mut ShellState) -> Vec<String> {
+    let expanded = field.text.as_str();
     let has_extglob = state.shell_opts.extglob && crate::glob_match::contains_extglob(expanded);
 
     if has_extglob {
         expand_with_extglob(expanded, state)
-    } else if contains_glob(expanded) && !state.shell_opts.noglob {
-        match glob::glob(expanded) {
+    } else if field_contains_glob(field) && !state.shell_opts.noglob {
+        let pattern = glob_pattern_for(field);
+        match glob::glob(&pattern) {
             Ok(paths) => {
                 let mut results: Vec<String> = paths
                     .filter_map(|p| p.ok())
@@ -403,22 +509,26 @@ fn ifs_first(state: &ShellState) -> String {
 
 /// Expand a list of parts into separate fields, honoring $@/$* splitting rules.
 /// `quoted` indicates the parts are inside double quotes (affects $* joining).
-fn expand_parts_to_fields(parts: &[WordPart], state: &mut ShellState, quoted: bool) -> Vec<String> {
-    let mut fields: Vec<String> = vec![String::new()];
+///
+/// `quoted` also decides glob eligibility for the values this produces:
+/// positional parameters and array elements are patterns only while unquoted, so
+/// `set -- '*'; echo $@` globs while `echo "$@"` does not.
+fn expand_parts_to_fields(parts: &[WordPart], state: &mut ShellState, quoted: bool) -> Vec<Field> {
+    let mut fields: Vec<Field> = vec![Field::new()];
     for part in parts {
         match part {
             WordPart::Variable(name) if name == "@" => {
                 let params = state.positional_params.clone();
-                append_fields(&mut fields, params);
+                append_fields(&mut fields, as_fields(params, !quoted));
             }
             WordPart::Variable(name) if name == "*" => {
                 if quoted {
                     let sep = ifs_first(state);
                     let joined = state.positional_params.join(&sep);
-                    fields.last_mut().unwrap().push_str(&joined);
+                    fields.last_mut().unwrap().push_str(&joined, false);
                 } else {
                     let params = state.positional_params.clone();
-                    append_fields(&mut fields, params);
+                    append_fields(&mut fields, as_fields(params, !quoted));
                 }
             }
             WordPart::Variable(name) if array_at_star_ref(name, state).is_some() => {
@@ -427,9 +537,9 @@ fn expand_parts_to_fields(parts: &[WordPart], state: &mut ShellState, quoted: bo
                 if quoted {
                     if subscript == "*" {
                         let sep = ifs_first(state);
-                        fields.last_mut().unwrap().push_str(&vals.join(&sep));
+                        fields.last_mut().unwrap().push_str(&vals.join(&sep), false);
                     } else {
-                        append_fields(&mut fields, vals);
+                        append_fields(&mut fields, as_fields(vals, false));
                     }
                 } else {
                     // Unquoted, each element is still subject to IFS splitting.
@@ -446,19 +556,34 @@ fn expand_parts_to_fields(parts: &[WordPart], state: &mut ShellState, quoted: bo
             }
             other => {
                 let s = expand_part(other, state);
-                fields.last_mut().unwrap().push_str(&s);
+                let globbable = part_is_globbable(other, quoted);
+                fields.last_mut().unwrap().push_str(&s, globbable);
             }
         }
     }
     fields
 }
 
+/// Wrap already-expanded strings as fields with uniform glob eligibility.
+fn as_fields(values: Vec<String>, globbable: bool) -> Vec<Field> {
+    values
+        .into_iter()
+        .map(|value| {
+            let mut field = Field::new();
+            field.push_str(&value, globbable);
+            field
+        })
+        .collect()
+}
+
 /// Merge additional fields: the first attaches to the current trailing field,
 /// the rest become new fields. Empty input leaves `fields` untouched.
-fn append_fields(fields: &mut Vec<String>, more: Vec<String>) {
+fn append_fields(fields: &mut Vec<Field>, more: Vec<Field>) {
     let mut iter = more.into_iter();
     if let Some(first) = iter.next() {
-        fields.last_mut().unwrap().push_str(&first);
+        let last = fields.last_mut().unwrap();
+        last.text.push_str(&first.text);
+        last.globbable.extend_from_slice(&first.globbable);
         for f in iter {
             fields.push(f);
         }
@@ -2074,24 +2199,17 @@ fn get_var_value(name: &str, state: &ShellState) -> i64 {
         .unwrap_or(0)
 }
 
-fn contains_glob(s: &str) -> bool {
-    let mut escaped = false;
-    let mut in_single = false;
-    let mut in_double = false;
-    for c in s.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '*' | '?' | '[' if !in_single && !in_double => return true,
-            _ => {}
-        }
-    }
-    false
+/// Does this field contain a glob metacharacter that quoting left eligible?
+///
+/// This replaced a predicate that re-scanned the *expanded* text for `'`, `"`
+/// and `\` to guess which metacharacters had been quoted. That guess is not
+/// recoverable — the parser consumed the real quotes long before — so it was
+/// wrong in both directions: `echo '*'` globbed, while a filename holding an
+/// apostrophe (`$x*` where `x="it's"`) stopped globbing altogether.
+fn field_contains_glob(field: &Field) -> bool {
+    field.text.char_indices().any(|(byte_pos, c)| {
+        matches!(c, '*' | '?' | '[') && field.globbable.get(byte_pos).copied().unwrap_or(false)
+    })
 }
 
 /// Check if a glob pattern explicitly includes a dot (meaning it will match hidden files).
