@@ -242,13 +242,109 @@ fn glob_field(expanded: &str, state: &mut ShellState) -> Vec<String> {
     }
 }
 
-/// Split `arr[@]` / `arr[*]` into (array name, subscript) when the name refers
-/// to an existing array.
-fn array_at_star_ref<'a>(name: &'a str, state: &ShellState) -> Option<(&'a str, &'a str)> {
+/// Split a `name[subscript]` body into its two halves, or `None` when the body
+/// is not a closed subscript reference at all.
+///
+/// Never slice a `${...}` body by hand: `${a[}` arrives here as the name `a[`,
+/// where the old `&name[bracket + 1..name.len() - 1]` is the reversed byte
+/// range `2..1` and panics — a typo at the prompt killed the whole shell.
+fn split_subscript(name: &str) -> Option<(&str, &str)> {
     let bracket = name.find('[')?;
-    let var_name = &name[..bracket];
-    let subscript = &name[bracket + 1..name.len().saturating_sub(1)];
-    if (subscript == "@" || subscript == "*") && state.is_array(var_name) {
+    let close = name.len().checked_sub(1)?;
+    if close <= bracket || name.as_bytes()[close] != b']' {
+        return None;
+    }
+    Some((&name[..bracket], &name[bracket + 1..close]))
+}
+
+/// Is `s` a plain parameter name (`[A-Za-z_][A-Za-z0-9_]*`)? Used to keep the
+/// subscript handling from claiming bodies like `v#[a-z]`, where the `[` opens a
+/// glob bracket expression inside a pattern operator instead of a subscript.
+fn is_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b'_') | Some(b'A'..=b'Z') | Some(b'a'..=b'z') => {}
+        _ => return false,
+    }
+    bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
+}
+
+/// Does bash reject this `${...}` body outright as a bad substitution? An array
+/// subscript that is never closed (`${a[}`, `${a[0}`) or is empty (`${a[]}`) is
+/// a fatal error with status 1, not a silently empty expansion — and the
+/// unclosed forms are exactly the ones that used to panic the process.
+fn subscript_is_malformed(body: &str) -> bool {
+    let b = body.as_bytes();
+    // `#` (length) and `!` (indirection/keys) are prefixes, not part of the
+    // name; the subscript behind them is validated the same way.
+    let mut i = match b.first() {
+        Some(b'#') | Some(b'!') => 1,
+        _ => 0,
+    };
+    // Only a plain name can carry a subscript. Anything else — `$1`, `$@`, or a
+    // pattern operator such as `${v#[a-z]}` — is none of this check's business.
+    if !matches!(b.get(i), Some(b'_') | Some(b'A'..=b'Z') | Some(b'a'..=b'z')) {
+        return false;
+    }
+    while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+        i += 1;
+    }
+    if b.get(i) != Some(&b'[') {
+        return false;
+    }
+    let subscript_start = i + 1;
+    let mut depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    // `${a[]}`: the brackets close, but with nothing between.
+                    return i == subscript_start;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true // ran off the end of the body with the `[` still open
+}
+
+/// The values `var_name` contributes through an `[@]`/`[*]` subscript. Bash
+/// treats a plain scalar as a one-element array, so `${x[0]}`, `${x[@]}` and
+/// `${#x[@]}` all answer for `x=abc`; jsh used to expand them to nothing.
+fn element_values(var_name: &str, state: &ShellState) -> Vec<String> {
+    if state.is_array(var_name) {
+        state.array_values(var_name)
+    } else {
+        match state.get_var(var_name) {
+            Some(v) => vec![v.to_string()],
+            None => Vec::new(),
+        }
+    }
+}
+
+/// One element of `var_name[subscript]`, treating a scalar as a one-element
+/// array so that `${x[0]}` on `x=abc` yields `abc` the way bash does.
+fn subscript_element(var_name: &str, subscript: &str, state: &ShellState) -> Option<String> {
+    if state.is_array(var_name) {
+        return state.get_array_element(var_name, subscript);
+    }
+    let value = state.get_var(var_name)?;
+    match subscript.trim().parse::<usize>() {
+        Ok(0) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// Split `arr[@]` / `arr[*]` into (name, subscript) when the name has elements
+/// to expand: a declared array, or a scalar standing in for a one-element one.
+fn array_at_star_ref<'a>(name: &'a str, state: &ShellState) -> Option<(&'a str, &'a str)> {
+    let (var_name, subscript) = split_subscript(name)?;
+    if (subscript == "@" || subscript == "*")
+        && (state.is_array(var_name) || state.get_var(var_name).is_some())
+    {
         Some((var_name, subscript))
     } else {
         None
@@ -273,7 +369,7 @@ fn array_refs_all_empty(word: &Word, state: &ShellState) -> bool {
     fn walk(part: &WordPart, state: &ShellState) -> bool {
         match part {
             WordPart::Variable(name) => match array_at_star_ref(name, state) {
-                Some((var_name, _)) => state.array_values(var_name).is_empty(),
+                Some((var_name, _)) => element_values(var_name, state).is_empty(),
                 None => true,
             },
             WordPart::DoubleQuoted(parts) => parts.iter().all(|p| walk(p, state)),
@@ -327,7 +423,7 @@ fn expand_parts_to_fields(parts: &[WordPart], state: &mut ShellState, quoted: bo
             }
             WordPart::Variable(name) if array_at_star_ref(name, state).is_some() => {
                 let (var_name, subscript) = array_at_star_ref(name, state).unwrap();
-                let vals = state.array_values(var_name);
+                let vals = element_values(var_name, state);
                 if quoted {
                     if subscript == "*" {
                         let sep = ifs_first(state);
@@ -520,6 +616,13 @@ fn parameter_value(name: &str, state: &ShellState) -> Option<String> {
 }
 
 fn expand_variable(name: &str, state: &mut ShellState) -> String {
+    // `${}` and a malformed array subscript are hard errors in bash ("bad
+    // substitution", status 1), not silently empty expansions. Rejecting them
+    // here also means nothing downstream ever slices a body like `a[`.
+    if name.is_empty() || subscript_is_malformed(name) {
+        state.expansion_error = Some(format!("${{{}}}: bad substitution", name));
+        return String::new();
+    }
     match name {
         "?" => state.last_exit_code.to_string(),
         "$" => std::process::id().to_string(),
@@ -541,13 +644,19 @@ fn expand_variable(name: &str, state: &mut ShellState) -> String {
 }
 
 fn expand_parameter(name: &str, state: &mut ShellState) -> String {
-    // ${#arr[@]} or ${#arr[*]} → array length
+    // ${#arr[@]} / ${#arr[*]} → element count; ${#arr[i]} → length of one
+    // element. Bash answers for undeclared names too (0 elements) and counts a
+    // plain scalar as one element, so neither form requires a declared array.
     if let Some(inner) = name.strip_prefix('#') {
-        if let Some(bracket) = inner.find('[') {
-            let var_name = &inner[..bracket];
-            let subscript = &inner[bracket + 1..inner.len().saturating_sub(1)];
-            if (subscript == "@" || subscript == "*") && state.is_array(var_name) {
-                return state.array_length(var_name).to_string();
+        if let Some((var_name, subscript)) = split_subscript(inner) {
+            if is_name(var_name) {
+                if subscript == "@" || subscript == "*" {
+                    return element_values(var_name, state).len().to_string();
+                }
+                return subscript_element(var_name, subscript, state)
+                    .unwrap_or_default()
+                    .len()
+                    .to_string();
             }
         }
     }
@@ -599,11 +708,17 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
 
     // ${!arr[@]} → array keys
     if let Some(inner) = name.strip_prefix('!') {
-        if let Some(bracket) = inner.find('[') {
-            let var_name = &inner[..bracket];
-            let subscript = &inner[bracket + 1..inner.len().saturating_sub(1)];
-            if (subscript == "@" || subscript == "*") && state.is_array(var_name) {
-                return state.array_keys(var_name).join(" ");
+        if let Some((var_name, subscript)) = split_subscript(inner) {
+            if (subscript == "@" || subscript == "*") && is_name(var_name) {
+                if state.is_array(var_name) {
+                    return state.array_keys(var_name).join(" ");
+                }
+                // A scalar stands in for a one-element array, so its only key
+                // is 0; an unset name has no keys at all.
+                return match state.get_var(var_name) {
+                    Some(_) => "0".to_string(),
+                    None => String::new(),
+                };
             }
         }
     }
@@ -644,6 +759,10 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
                 if state.is_array(var_name) {
                     return state.array_values(var_name).join(" ");
                 }
+                // A scalar stands in for a one-element array.
+                if let Some(v) = state.get_var(var_name) {
+                    return v.to_string();
+                }
             }
 
             // ${arr[idx]} - single element access
@@ -651,6 +770,13 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
                 return state
                     .get_array_element(var_name, subscript_part)
                     .unwrap_or_default();
+            }
+            // `x=abc` behaves like `x=(abc)`: `${x[0]}` is the value and every
+            // other index is unset. Real scripts index scalars defensively
+            // (`${BASH_SOURCE[0]}`, `${PIPESTATUS[0]}`), so answering nothing
+            // here silently hands them the wrong value.
+            if after_bracket.is_empty() && is_name(var_name) && state.get_var(var_name).is_some() {
+                return subscript_element(var_name, subscript_part, state).unwrap_or_default();
             }
         }
     }
@@ -1043,8 +1169,10 @@ fn expand_brace_items(items: &[Vec<WordPart>], state: &mut ShellState) -> Vec<St
 fn expand_brace_range(start: &str, end: &str, step: Option<&str>) -> Vec<String> {
     // Try integer range
     if let (Ok(s), Ok(e)) = (start.parse::<i64>(), end.parse::<i64>()) {
+        // `saturating_abs`: `{1..9..-9223372036854775808}` would panic on a
+        // plain `abs()`, and a brace range must never be able to kill the shell.
         let step_abs = step
-            .and_then(|s| s.parse::<i64>().ok().map(|v| v.abs()))
+            .and_then(|s| s.parse::<i64>().ok().map(|v| v.saturating_abs()))
             .unwrap_or(1);
         if step_abs == 0 {
             return vec![];
@@ -1058,23 +1186,25 @@ fn expand_brace_range(start: &str, end: &str, step: Option<&str>) -> Vec<String>
 
         let mut results = Vec::new();
         let mut i = s;
-        if step_val > 0 {
-            while i <= e {
-                if needs_pad {
-                    results.push(format!("{:0>width$}", i, width = pad_width));
-                } else {
-                    results.push(i.to_string());
+        loop {
+            if step_val > 0 {
+                if i > e {
+                    break;
                 }
-                i += step_val;
+            } else if i < e {
+                break;
             }
-        } else {
-            while i >= e {
-                if needs_pad {
-                    results.push(format!("{:0>width$}", i, width = pad_width));
-                } else {
-                    results.push(i.to_string());
-                }
-                i += step_val;
+            if needs_pad {
+                results.push(format!("{:0>width$}", i, width = pad_width));
+            } else {
+                results.push(i.to_string());
+            }
+            // `{9223372036854775806..9223372036854775807}` walked off the end of
+            // i64 and panicked with "attempt to add with overflow"; the last
+            // element is simply the last one there is.
+            match i.checked_add(step_val) {
+                Some(next) => i = next,
+                None => break,
             }
         }
         return results;
@@ -1084,8 +1214,10 @@ fn expand_brace_range(start: &str, end: &str, step: Option<&str>) -> Vec<String>
     if start.len() == 1 && end.len() == 1 {
         let s = start.chars().next().unwrap();
         let e = end.chars().next().unwrap();
+        // `saturating_abs`/`checked_add`: `{a..z..-2147483648}` panicked on
+        // `abs()` and a huge positive step panicked on the `i += step_val` below.
         let step_abs = step
-            .and_then(|s| s.parse::<i32>().ok().map(|v| v.abs()))
+            .and_then(|s| s.parse::<i32>().ok().map(|v| v.saturating_abs()))
             .unwrap_or(1);
         if step_abs == 0 {
             return vec![];
@@ -1095,19 +1227,20 @@ fn expand_brace_range(start: &str, end: &str, step: Option<&str>) -> Vec<String>
         let mut results = Vec::new();
         let mut i = s as i32;
         let end_i = e as i32;
-        if step_val > 0 {
-            while i <= end_i {
-                if let Some(c) = char::from_u32(i as u32) {
-                    results.push(c.to_string());
+        loop {
+            if step_val > 0 {
+                if i > end_i {
+                    break;
                 }
-                i += step_val;
+            } else if i < end_i {
+                break;
             }
-        } else {
-            while i >= end_i {
-                if let Some(c) = char::from_u32(i as u32) {
-                    results.push(c.to_string());
-                }
-                i += step_val;
+            if let Some(c) = char::from_u32(i as u32) {
+                results.push(c.to_string());
+            }
+            match i.checked_add(step_val) {
+                Some(next) => i = next,
+                None => break,
             }
         }
         return results;
@@ -2104,4 +2237,117 @@ pub fn expand_words(words: &[Word], state: &mut ShellState) -> Vec<String> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `${a[}` reaches `split_subscript` as the name `a[`, where the old
+    /// hand-rolled `&name[bracket + 1..len - 1]` is the reversed range 2..1 and
+    /// panics — a typo used to kill the whole shell process.
+    #[test]
+    fn split_subscript_rejects_unclosed_and_reversed_ranges() {
+        assert_eq!(split_subscript("a[0]"), Some(("a", "0")));
+        assert_eq!(split_subscript("a[@]"), Some(("a", "@")));
+        assert_eq!(split_subscript("a[]"), Some(("a", "")));
+        assert_eq!(split_subscript("a[${b[0]}]"), Some(("a", "${b[0]}")));
+        // None of these may panic, and none of them is a subscript reference.
+        assert_eq!(split_subscript("a["), None);
+        assert_eq!(split_subscript("a[}"), None);
+        assert_eq!(split_subscript("a[0}"), None);
+        assert_eq!(split_subscript("["), None);
+        assert_eq!(split_subscript("[]"), Some(("", "")));
+        assert_eq!(split_subscript(""), None);
+        assert_eq!(split_subscript("plain"), None);
+    }
+
+    #[test]
+    fn malformed_subscripts_are_bad_substitutions() {
+        for body in ["a[", "a[}", "a[0", "a[]", "#a[", "!a[", "arr[0"] {
+            assert!(subscript_is_malformed(body), "should be rejected: {body}");
+        }
+        // Well-formed bodies, and bodies where `[` opens a glob bracket
+        // expression inside a pattern operator rather than a subscript.
+        for body in [
+            "a",
+            "a[0]",
+            "a[@]",
+            "a[*]",
+            "#a[@]",
+            "!a[@]",
+            "v#[a-z]",
+            "v%[0-9]",
+            "v/[abc]/x",
+            "#",
+            "!",
+            "?",
+            "@",
+            "*",
+            "1",
+            "a[@]:1:2",
+            "a[i+1]",
+        ] {
+            assert!(!subscript_is_malformed(body), "should be accepted: {body}");
+        }
+    }
+
+    #[test]
+    fn is_name_matches_plain_parameter_names() {
+        assert!(is_name("a"));
+        assert!(is_name("_x9"));
+        assert!(!is_name(""));
+        assert!(!is_name("9a"));
+        assert!(!is_name("v#"));
+        assert!(!is_name("a-b"));
+    }
+
+    /// `{9223372036854775806..9223372036854775807}` used to abort the shell with
+    /// "attempt to add with overflow", and an `i64::MIN`/`i32::MIN` step used to
+    /// abort it inside `abs()`.
+    #[test]
+    fn brace_ranges_saturate_instead_of_overflowing() {
+        assert_eq!(
+            expand_brace_range("9223372036854775806", "9223372036854775807", None),
+            vec!["9223372036854775806", "9223372036854775807"]
+        );
+        assert_eq!(
+            expand_brace_range("-9223372036854775807", "-9223372036854775808", None),
+            vec!["-9223372036854775807", "-9223372036854775808"]
+        );
+        assert_eq!(
+            expand_brace_range("1", "3", Some("9223372036854775807")),
+            vec!["1"]
+        );
+        assert_eq!(
+            expand_brace_range("1", "9", Some("-9223372036854775808")),
+            vec!["1"]
+        );
+        assert_eq!(expand_brace_range("a", "z", Some("-2147483648")), vec!["a"]);
+        // The ordinary cases still behave.
+        assert_eq!(
+            expand_brace_range("1", "5", None),
+            vec!["1", "2", "3", "4", "5"]
+        );
+        assert_eq!(
+            expand_brace_range("5", "1", None),
+            vec!["5", "4", "3", "2", "1"]
+        );
+        assert_eq!(
+            expand_brace_range("1", "10", Some("3")),
+            vec!["1", "4", "7", "10"]
+        );
+        assert_eq!(
+            expand_brace_range("a", "e", None),
+            vec!["a", "b", "c", "d", "e"]
+        );
+        assert_eq!(
+            expand_brace_range("e", "a", None),
+            vec!["e", "d", "c", "b", "a"]
+        );
+        assert_eq!(
+            expand_brace_range("1", "5", Some("0")),
+            Vec::<String>::new()
+        );
+    }
 }

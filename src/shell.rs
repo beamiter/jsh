@@ -127,11 +127,47 @@ pub fn run_command(command: &str, arg0: &str, args: &[String]) -> i32 {
     finish_noninteractive(state, status)
 }
 
+/// Resolve the script named on the command line the way bash does: a bare name
+/// (no slash) that is not a file in the cwd is looked up in `$PATH`. Bash only
+/// needs the file to be readable there, not executable. Anything else — a
+/// relative or absolute path — is opened exactly as given, and a name that
+/// cannot be found anywhere is returned unchanged so the caller's diagnostic
+/// still quotes what the user typed.
+fn resolve_script_path(path: &Path) -> PathBuf {
+    resolve_script_in(path, std::env::var("PATH").ok().as_deref())
+}
+
+/// `resolve_script_path` with the search path passed in, so tests do not have to
+/// mutate the process environment.
+fn resolve_script_in(path: &Path, search_path: Option<&str>) -> PathBuf {
+    if path.to_string_lossy().contains('/') || path.is_file() {
+        return path.to_path_buf();
+    }
+    for dir in search_path.unwrap_or("").split(':') {
+        let dir = if dir.is_empty() { "." } else { dir };
+        let candidate = Path::new(dir).join(path);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Execute a script file without loading startup files, history, or sessions.
 pub fn run_script(path: &Path, args: &[String]) -> i32 {
     let arg0 = path.to_string_lossy().into_owned();
+    let script_path = resolve_script_path(path);
     let mut state = noninteractive_state(&arg0, args);
-    let status = match read_script_interruptibly(path) {
+    // Bash exposes the running script as `${BASH_SOURCE[0]}` whether it was
+    // sourced or executed; jsh only set it while sourcing. With it unset,
+    // `SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"` — the idiom
+    // nearly every setup script opens with — saw `dirname ""`, resolved to the
+    // *caller's* cwd, and silently read files from the wrong directory.
+    state.set_array(
+        "BASH_SOURCE",
+        vec![script_path.to_string_lossy().into_owned()],
+    );
+    let status = match read_script_interruptibly(&script_path) {
         Ok(content) => {
             let source = match content.strip_prefix("#!") {
                 Some(rest) => rest.split_once('\n').map_or("", |(_, body)| body),
@@ -664,4 +700,41 @@ fn init_interactive_job_control() {
 
     let shell_pgid = getpgrp();
     tcsetpgrp(std::io::stdin(), shell_pgid).ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bash searches `$PATH` for a bare script name and reports the file it
+    /// actually opened as `${BASH_SOURCE[0]}`; a name with a slash, or one that
+    /// exists in the cwd, is never searched for.
+    #[test]
+    fn script_path_is_searched_in_path_only_for_a_bare_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).expect("mkdir bin");
+        std::fs::write(bin.join("onpath.sh"), "true\n").expect("write script");
+
+        let search = bin.to_str().unwrap();
+        assert_eq!(
+            resolve_script_in(Path::new("onpath.sh"), Some(search)),
+            bin.join("onpath.sh")
+        );
+        // A slash means "use this path", even when the basename is on PATH.
+        assert_eq!(
+            resolve_script_in(Path::new("./onpath.sh"), Some(search)),
+            PathBuf::from("./onpath.sh")
+        );
+        // A name found nowhere is returned unchanged so the diagnostic can still
+        // quote what the user typed.
+        assert_eq!(
+            resolve_script_in(Path::new("missing.sh"), Some(search)),
+            PathBuf::from("missing.sh")
+        );
+        assert_eq!(
+            resolve_script_in(Path::new("onpath.sh"), None),
+            PathBuf::from("onpath.sh")
+        );
+    }
 }
