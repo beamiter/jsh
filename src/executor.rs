@@ -284,6 +284,108 @@ fn execute_pipeline_in_context(
     }
 }
 
+/// `set -u`: report an unset parameter and abort, as bash does.
+///
+/// Bash treats this as a fatal expansion error: the message goes to stderr, the
+/// status is 1 and a non-interactive shell stops right there. `abort_current_program`
+/// is the same lever failglob already pulls, so nested lists unwind too.
+fn report_nounset(state: &mut ShellState, param: &str) -> i32 {
+    let message = format!("{}: unbound variable", param);
+    eprintln!("jsh: {}", message);
+    state.set_error(message, 1);
+    state.last_exit_code = 1;
+    if !state.interactive {
+        state.abort_current_program = true;
+    }
+    1
+}
+
+/// The first parameter reference in `words` that `set -u` should reject, spelled
+/// the way bash spells it in the message (`x` for a variable, `$1` for a
+/// positional parameter).
+///
+/// Only the forms where bash is unambiguous are checked: a bare `$name`,
+/// `${name}` or `$N`. `${x:-default}`, `${x+set}`, `${#x}`, `$@`/`$*` and `$?`
+/// never trip it — the first two because bash exempts them, the rest because
+/// the exhaustive check belongs where the parameter is actually expanded.
+fn nounset_violation(words: &[Word], state: &ShellState) -> Option<String> {
+    fn scan(parts: &[WordPart], state: &ShellState) -> Option<String> {
+        for part in parts {
+            let found = match part {
+                WordPart::Variable(name) => unset_parameter(name, state),
+                WordPart::DoubleQuoted(inner) => scan(inner, state),
+                WordPart::BraceExpansion(alts) => alts.iter().find_map(|a| scan(a, state)),
+                // Command substitutions, arithmetic and process substitutions
+                // run their own expansion (in a child, for the first two), so
+                // they check themselves.
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+    words.iter().find_map(|w| scan(w, state))
+}
+
+fn unset_parameter(name: &str, state: &ShellState) -> Option<String> {
+    let first = name.chars().next()?;
+    if first.is_ascii_digit() {
+        // `$0` is always set; `$12` is unset when there are fewer than 12 args.
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let idx: usize = name.parse().unwrap_or(0);
+        if idx > 0 && idx > state.positional_params.len() {
+            return Some(format!("${}", name));
+        }
+        return None;
+    }
+    // Anything that is not a plain identifier is either a special parameter
+    // (`@`, `*`, `?`, `-`, `#`) or carries an operator (`x:-y`, `#x`, `!x`).
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    if state.get_var(name).is_some()
+        || state.is_array(name)
+        || state.let_vars.contains_key(name)
+        || state.arrays.contains_key(name)
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// `$PS4` (default `+ `), the xtrace prefix.
+fn xtrace_prefix(state: &ShellState) -> String {
+    state
+        .get_var("PS4")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "+ ".to_string())
+}
+
+/// Quote a traced word the way bash's xtrace does, so a word with spaces or
+/// shell metacharacters reads back as one word.
+fn xtrace_quote(word: &str) -> String {
+    let needs_quotes = word.is_empty()
+        || word
+            .chars()
+            .any(|c| c.is_whitespace() || "\"'$&|;<>()*?[]{}~#!^`\\".contains(c) || c.is_control());
+    if needs_quotes {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    } else {
+        word.to_string()
+    }
+}
+
+fn xtrace_line(state: &ShellState, words: &[String]) {
+    let line: Vec<String> = words.iter().map(|w| xtrace_quote(w)).collect();
+    eprintln!("{}{}", xtrace_prefix(state), line.join(" "));
+}
+
 fn report_expansion_error(state: &mut ShellState) -> Option<i32> {
     state.take_expansion_error().map(|message| {
         eprintln!("jsh: {}", message);
@@ -663,7 +765,11 @@ fn execute_command_in_pipeline_child(cmd: &Command, state: &mut ShellState) -> i
     }
 }
 
-fn execute_assignment(assign: &Assignment, state: &mut ShellState) {
+/// Perform one assignment and return how xtrace should render it. The rendering
+/// is built from the value that was actually assigned, because expanding the
+/// word a second time just to trace it would run its command substitutions
+/// twice.
+fn execute_assignment(assign: &Assignment, state: &mut ShellState) -> String {
     if let Some(ref array_words) = assign.array_value {
         // Array assignment: arr=(a b c). Each element is a normal word, so an
         // unquoted expansion inside one can split into several elements and
@@ -672,29 +778,42 @@ fn execute_assignment(assign: &Assignment, state: &mut ShellState) {
         for w in array_words {
             values.extend(expand_word(w, state));
         }
+        let trace = format!(
+            "{}=({})",
+            assign.name,
+            values
+                .iter()
+                .map(|v| xtrace_quote(v))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         if assign.append {
             let arr = state.arrays.entry(assign.name.clone()).or_default();
             arr.extend(values);
         } else {
             state.arrays.insert(assign.name.clone(), values);
         }
+        trace
     } else if let Some(ref index) = assign.index {
         // Indexed assignment: arr[idx]=value
         let value = expand_word_to_string(&assign.value, state);
         state.set_array_element(&assign.name, index, &value);
+        format!("{}[{}]={}", assign.name, index, xtrace_quote(&value))
     } else if assign.append {
         // String append: var+=value
         let value = expand_word_to_string(&assign.value, state);
         if state.is_array(&assign.name) {
             let arr = state.arrays.entry(assign.name.clone()).or_default();
-            arr.push(value);
+            arr.push(value.clone());
         } else {
             let old = state.get_var(&assign.name).unwrap_or("").to_string();
             state.set_var(&assign.name, &format!("{}{}", old, value));
         }
+        format!("{}+={}", assign.name, xtrace_quote(&value))
     } else {
         let value = expand_word_to_string(&assign.value, state);
         state.set_var(&assign.name, &value);
+        format!("{}={}", assign.name, xtrace_quote(&value))
     }
 }
 
@@ -925,26 +1044,228 @@ fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState) -> i32 {
     execute_simple_with_mode(cmd, state, true)
 }
 
+thread_local! {
+    /// Alias names currently being expanded. Bash stops re-expanding a word that
+    /// is already in the chain, which is what keeps `alias ls='ls -la'` (and the
+    /// mutual `alias a=b; alias b=a`) from looping forever.
+    static ALIAS_CHAIN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct AliasGuard;
+
+impl AliasGuard {
+    fn enter(name: &str) -> Option<AliasGuard> {
+        ALIAS_CHAIN.with(|chain| {
+            let mut chain = chain.borrow_mut();
+            if chain.iter().any(|n| n == name) {
+                return None;
+            }
+            chain.push(name.to_string());
+            Some(AliasGuard)
+        })
+    }
+}
+
+impl Drop for AliasGuard {
+    fn drop(&mut self) {
+        ALIAS_CHAIN.with(|chain| {
+            chain.borrow_mut().pop();
+        });
+    }
+}
+
+/// The alias name a command word could stand for.
+///
+/// Only a bare, unquoted literal can name an alias: bash substitutes aliases
+/// textually before any expansion, so `$cmd` or `"ls"` never triggers one.
+fn alias_head(cmd: &SimpleCommand) -> Option<&str> {
+    match cmd.words.first()?.as_slice() {
+        [WordPart::Literal(s)] => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+fn parse_cached(source: &str) -> Option<Vec<CompleteCommand>> {
+    if let Some(cached) = crate::parser::cache::cache_get(source) {
+        return Some(cached);
+    }
+    let parsed = crate::parser::parse(source).ok()?;
+    crate::parser::cache::cache_insert(source.to_string(), parsed.clone());
+    Some(parsed)
+}
+
+/// The first / last `Simple` command of a parsed alias body, which is where the
+/// caller's assignment prefix and trailing arguments belong (`alias ll='ls|less'`
+/// plus `ll /tmp` is `ls | less /tmp` in bash).
+fn simple_at<'a>(program: &'a mut [CompleteCommand], last: bool) -> Option<&'a mut SimpleCommand> {
+    let cmd = if last {
+        program.last_mut()?
+    } else {
+        program.first_mut()?
+    };
+    let pipeline = if last {
+        match cmd.list.rest.last_mut() {
+            Some((_, p)) => p,
+            None => &mut cmd.list.first,
+        }
+    } else {
+        &mut cmd.list.first
+    };
+    let command = if last {
+        pipeline.commands.last_mut()?
+    } else {
+        pipeline.commands.first_mut()?
+    };
+    match command {
+        Command::Simple(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Alias-expand the word at `idx` in place.
+///
+/// Bash re-checks the next word for an alias when the alias body ends in a
+/// space, which is what makes `alias sudo='sudo '` expand the command after it.
+fn expand_trailing_alias(words: &mut Vec<Word>, mut idx: usize, state: &ShellState) {
+    let mut steps = 0;
+    while idx < words.len() && steps < 16 {
+        steps += 1;
+        let name = match words[idx].as_slice() {
+            [WordPart::Literal(s)] => s.clone(),
+            _ => return,
+        };
+        let body = match state.aliases.get(&name) {
+            Some(b) => b.clone(),
+            None => return,
+        };
+        let _guard = match AliasGuard::enter(&name) {
+            Some(g) => g,
+            None => return,
+        };
+        // Only a plain word list can be spliced in mid-command; a body with a
+        // pipeline or a redirection is not a valid argument position.
+        let mut program = match parse_cached(&body) {
+            Some(p) => p,
+            None => return,
+        };
+        if program.len() != 1 {
+            return;
+        }
+        let replacement = match simple_at(&mut program, false) {
+            Some(s)
+                if s.redirects.is_empty() && s.assignments.is_empty() && !s.words.is_empty() =>
+            {
+                s.words.clone()
+            }
+            _ => return,
+        };
+        let len = replacement.len();
+        words.splice(idx..idx + 1, replacement);
+        if !body.ends_with(' ') && !body.ends_with('\t') {
+            return;
+        }
+        // This body also ends in a space, so the word after the substitution is
+        // itself a candidate.
+        idx += len;
+    }
+}
+
+/// Substitute an alias for the command word and run the result.
+///
+/// The alias body is TEXTUAL: it is parsed, and the caller's remaining words are
+/// carried over as already-parsed words. Re-joining the expanded argv into a
+/// string and re-parsing it (what jsh used to do) ran a second expansion pass,
+/// so `e '$(echo INJECTED)'` executed the substitution that single quotes were
+/// supposed to protect, and the early return skipped redirection setup entirely.
+fn try_alias(cmd: &SimpleCommand, state: &mut ShellState) -> Option<i32> {
+    let name = alias_head(cmd)?.to_string();
+    let body = state.aliases.get(&name)?.clone();
+    let guard = AliasGuard::enter(&name)?;
+    let mut program = parse_cached(&body)?;
+    if program.is_empty() {
+        return None;
+    }
+
+    // The caller's trailing arguments join the last command of the body; its
+    // redirections come after the body's own, so `alias e='echo >a'; e >b`
+    // writes to b, exactly as the textual `echo >a >b` would.
+    let mut rest: Vec<Word> = cmd.words[1..].to_vec();
+    if !rest.is_empty() && (body.ends_with(' ') || body.ends_with('\t')) {
+        expand_trailing_alias(&mut rest, 0, state);
+    }
+    match simple_at(&mut program, true) {
+        Some(tail) => {
+            tail.words.extend(rest);
+            tail.redirects.extend(cmd.redirects.iter().cloned());
+        }
+        None if rest.is_empty() && cmd.redirects.is_empty() => {}
+        // A compound body (`alias x='if ...; fi'`) has nowhere to put the
+        // caller's extras; bash would produce a syntax error, so decline the
+        // alias rather than silently dropping them.
+        None => return None,
+    }
+    if let Some(head) = simple_at(&mut program, false) {
+        for (i, assign) in cmd.assignments.iter().enumerate() {
+            head.assignments.insert(i, assign.clone());
+        }
+    }
+
+    let mut last = 0;
+    for c in &program {
+        last = execute_complete_command(c, state);
+        if control_flow_requested(state) {
+            break;
+        }
+    }
+    drop(guard);
+    Some(last)
+}
+
 fn execute_simple_with_mode(
     cmd: &SimpleCommand,
     state: &mut ShellState,
     fork_external: bool,
 ) -> i32 {
-    if state.shell_opts.xtrace && !cmd.words.is_empty() {
-        let trace: Vec<String> = cmd
-            .words
+    // Aliases are substituted for the command word before anything is expanded,
+    // like bash does at parse time.
+    if let Some(code) = try_alias(cmd, state) {
+        return code;
+    }
+
+    // `set -u` has to look at the words BEFORE expansion: expansion turns an
+    // unset parameter into the empty string and the distinction is gone.
+    if state.shell_opts.nounset {
+        let assignment_values: Vec<Word> = cmd
+            .assignments
             .iter()
-            .map(|w| expand_word_to_string(w, state))
+            .map(|a| a.value.clone())
+            .chain(
+                cmd.assignments
+                    .iter()
+                    .filter_map(|a| a.array_value.clone())
+                    .flatten(),
+            )
             .collect();
-        eprintln!("+ {}", trace.join(" "));
+        if let Some(param) = nounset_violation(&cmd.words, state)
+            .or_else(|| nounset_violation(&assignment_values, state))
+        {
+            return report_nounset(state, &param);
+        }
     }
 
     // Handle assignments only (no command)
     if cmd.words.is_empty() {
+        // Bash gives an assignment-only command the status of the last command
+        // substitution it ran: `out=$(false); echo $?` prints 1.
+        state.last_command_sub_status = None;
+        let mut traced = Vec::new();
         for assign in &cmd.assignments {
-            execute_assignment(assign, state);
+            traced.push(execute_assignment(assign, state));
         }
-        return 0;
+        if state.shell_opts.xtrace {
+            eprintln!("{}{}", xtrace_prefix(state), traced.join(" "));
+        }
+        return state.last_command_sub_status.take().unwrap_or(0);
     }
 
     // Phase 5b: nushell-style `let NAME = EXPR`.
@@ -967,32 +1288,8 @@ fn execute_simple_with_mode(
     let cmd_name = &expanded[0];
     let args = &expanded[1..];
 
-    // Check for alias expansion
-    if let Some(alias_val) = state.aliases.get(cmd_name).cloned() {
-        let full_cmd = if args.is_empty() {
-            alias_val
-        } else {
-            format!("{} {}", alias_val, args.join(" "))
-        };
-        let parse_result = if let Some(cached) = crate::parser::cache::cache_get(&full_cmd) {
-            Some(cached)
-        } else if let Ok(parsed) = crate::parser::parse(&full_cmd) {
-            crate::parser::cache::cache_insert(full_cmd.clone(), parsed.clone());
-            Some(parsed)
-        } else {
-            None
-        };
-        if let Some(cmds) = parse_result {
-            let removed_alias = state.aliases.remove(cmd_name);
-            let mut last = 0;
-            for c in &cmds {
-                last = execute_complete_command(c, state);
-            }
-            if let Some(alias) = removed_alias {
-                state.aliases.insert(cmd_name.clone(), alias);
-            }
-            return last;
-        }
+    if state.shell_opts.xtrace {
+        xtrace_line(state, &expanded);
     }
 
     // Check for function

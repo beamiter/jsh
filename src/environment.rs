@@ -36,29 +36,41 @@ impl Default for PromptStyle {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellOpts {
-    pub errexit: bool,               // set -e
-    pub xtrace: bool,                // set -x
-    pub pipefail: bool,              // set -o pipefail
-    pub globstar: bool,              // set -o globstar
-    pub dotglob: bool,               // shopt dotglob: match hidden files
-    pub nullglob: bool,              // shopt nullglob: empty string for no matches
-    pub failglob: bool,              // shopt failglob: error on no matches
-    pub extglob: bool,               // shopt extglob: extended glob patterns
-    pub nocaseglob: bool,            // shopt nocaseglob: case-insensitive matching
-    pub noglob: bool,                // shopt noglob: disable pathname expansion
-    pub lastpipe: bool,              // shopt lastpipe: last pipe component in current shell
-    pub autocd: bool,                // shopt autocd: cd to bare directory names
-    pub cdspell: bool,               // shopt cdspell: correct cd spelling errors
-    pub checkwinsize: bool,          // shopt checkwinsize: update LINES/COLUMNS
-    pub inherit_errexit: bool,       // shopt inherit_errexit: subshells inherit errexit
+    pub errexit: bool, // set -e
+    #[serde(default)]
+    pub nounset: bool, // set -u
+    pub xtrace: bool,  // set -x
+    #[serde(default)]
+    pub noclobber: bool, // set -C
+    pub pipefail: bool, // set -o pipefail
+    pub globstar: bool, // set -o globstar
+    pub dotglob: bool, // shopt dotglob: match hidden files
+    pub nullglob: bool, // shopt nullglob: empty string for no matches
+    pub failglob: bool, // shopt failglob: error on no matches
+    pub extglob: bool, // shopt extglob: extended glob patterns
+    pub nocaseglob: bool, // shopt nocaseglob: case-insensitive matching
+    pub noglob: bool,  // shopt noglob: disable pathname expansion
+    pub lastpipe: bool, // shopt lastpipe: last pipe component in current shell
+    pub autocd: bool,  // shopt autocd: cd to bare directory names
+    pub cdspell: bool, // shopt cdspell: correct cd spelling errors
+    pub checkwinsize: bool, // shopt checkwinsize: update LINES/COLUMNS
+    pub inherit_errexit: bool, // shopt inherit_errexit: subshells inherit errexit
     pub config_source: ConfigSource, // which config file to use: .bashrc or .jshrc
+    /// On/off state of the `set -o` names bash accepts but jsh does not model
+    /// (`allexport`, `monitor`, `posix`, ...). They are remembered rather than
+    /// dropped so the `eval "$(set +o)"` save/restore idiom round-trips, and so
+    /// `set -o NAME` for a real bash option is never mistaken for an operand.
+    #[serde(default)]
+    pub tracked_opts: HashMap<String, bool>,
 }
 
 impl Default for ShellOpts {
     fn default() -> Self {
         ShellOpts {
             errexit: false,
+            nounset: false,
             xtrace: false,
+            noclobber: false,
             pipefail: false,
             globstar: true,
             dotglob: false,
@@ -233,6 +245,15 @@ pub struct ShellState {
     /// Phase 15c: typed user functions — name → closure body. The closure
     /// captures let_vars at def time, like inline `{||...}` closures.
     pub user_typed_fns: HashMap<String, std::sync::Arc<crate::value::ClosureData>>,
+    /// Exit status of the most recently completed command substitution, or
+    /// `None` when none has run since the last command. Bash gives a command
+    /// made up of nothing but assignments the status of the last command
+    /// substitution in it (`out=$(false)` leaves `$?` at 1), which is the only
+    /// way that status is observable.
+    ///
+    /// Set by `expand::expand_command_sub` when it reaps the child; consumed by
+    /// `executor::execute_simple`.
+    pub last_command_sub_status: Option<i32>,
     /// Command text a builtin (the agent's insert-only review path) asks the
     /// editor to prefill into the next prompt. Review-only: taking this never
     /// executes anything.
@@ -321,6 +342,7 @@ impl ShellState {
             last_error: None,
             user_signatures: HashMap::new(),
             user_typed_fns: HashMap::new(),
+            last_command_sub_status: None,
             pending_editor_insert: None,
         }
     }
@@ -377,7 +399,13 @@ impl ShellState {
         if self.interactive {
             flags.push('i');
         }
+        if self.shell_opts.nounset {
+            flags.push('u');
+        }
         flags.push('B');
+        if self.shell_opts.noclobber {
+            flags.push('C');
+        }
         if self.shell_opts.xtrace {
             flags.push('x');
         }
@@ -430,7 +458,7 @@ impl ShellState {
     pub fn set_var(&mut self, name: &str, value: &str) {
         if self.env_vars.contains_key(name) {
             self.env_vars.insert(name.to_string(), value.to_string());
-            env::set_var(name, value);
+            set_env_checked(name, value);
             if name == "PATH" {
                 self.invalidate_path_cache();
             }
@@ -440,7 +468,7 @@ impl ShellState {
         } else {
             // At global scope: set in env_vars
             self.env_vars.insert(name.to_string(), value.to_string());
-            env::set_var(name, value);
+            set_env_checked(name, value);
             if name == "PATH" {
                 self.invalidate_path_cache();
             }
@@ -449,7 +477,7 @@ impl ShellState {
 
     pub fn export_var(&mut self, name: &str, value: &str) {
         self.env_vars.insert(name.to_string(), value.to_string());
-        env::set_var(name, value);
+        set_env_checked(name, value);
         // Remove from all local scopes
         for scope in &mut self.local_vars_stack {
             scope.remove(name);
@@ -467,7 +495,7 @@ impl ShellState {
         }
         self.arrays.remove(name);
         self.assoc_arrays.remove(name);
-        env::remove_var(name);
+        remove_env_checked(name);
         if name == "PATH" {
             self.invalidate_path_cache();
         }

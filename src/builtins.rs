@@ -1914,57 +1914,116 @@ fn builtin_set(args: &[String], state: &mut ShellState) -> i32 {
         }
         return 0;
     }
+
+    // Bash parses the whole option list before it changes anything: `set -e -q`
+    // reports the bad option and leaves errexit OFF. Collect the requested
+    // changes first, then apply them, so a typo cannot half-apply.
+    let mut pending: Vec<(&'static str, bool)> = Vec::new();
+    let mut list_long = false; // `set -o` with no name
+    let mut list_short = false; // `set +o` with no name
+    let mut operand_start: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "-e" => state.shell_opts.errexit = true,
-            "+e" => state.shell_opts.errexit = false,
-            "-x" => state.shell_opts.xtrace = true,
-            "+x" => state.shell_opts.xtrace = false,
-            "-o" => {
-                i += 1;
-                if i < args.len() {
-                    match args[i].as_str() {
-                        "errexit" => state.shell_opts.errexit = true,
-                        "xtrace" => state.shell_opts.xtrace = true,
-                        "pipefail" => state.shell_opts.pipefail = true,
-                        "globstar" => state.shell_opts.globstar = true,
-                        "vi" => state.editing_mode = crate::environment::EditingMode::Vi,
-                        "emacs" => state.editing_mode = crate::environment::EditingMode::Emacs,
-                        _ => {
-                            eprintln!("jsh: set: unknown option: {}", args[i]);
-                            return 1;
-                        }
+        let arg = args[i].as_str();
+        // `--` ends option parsing; the rest become the positional parameters
+        // even when there is nothing left (`set --` clears them).
+        if arg == "--" {
+            operand_start = Some(i + 1);
+            break;
+        }
+        // A lone `-` also ends option parsing and, as a bash special case,
+        // turns xtrace and verbose off. A lone `+` just ends option parsing.
+        if arg == "-" || arg == "+" {
+            if arg == "-" {
+                pending.push(("xtrace", false));
+                pending.push(("verbose", false));
+            }
+            operand_start = Some(i + 1);
+            break;
+        }
+        let mut chars = arg.chars();
+        let sign = chars.next().unwrap_or(' ');
+        if sign != '-' && sign != '+' {
+            // First operand: everything from here on is a positional parameter.
+            operand_start = Some(i);
+            break;
+        }
+        let enable = sign == '-';
+        // Short options cluster: `-euo` is `-e -u -o`.
+        for c in chars {
+            if c == 'o' {
+                // `-o` takes the next word as the option name, but only when
+                // that word is not itself an option; `set -o` alone lists.
+                let next_is_name = args
+                    .get(i + 1)
+                    .map(|n| !n.starts_with('-') && !n.starts_with('+'))
+                    .unwrap_or(false);
+                if next_is_name {
+                    i += 1;
+                    let name = args[i].as_str();
+                    if !set_option_is_known(name) {
+                        eprintln!("jsh: set: {}: invalid option name", name);
+                        return 2;
                     }
+                    let canonical = SET_OPTIONS
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(n, _)| *n)
+                        .unwrap();
+                    pending.push((canonical, enable));
+                } else if enable {
+                    list_long = true;
+                } else {
+                    list_short = true;
                 }
+                continue;
             }
-            "+o" => {
-                i += 1;
-                if i < args.len() {
-                    match args[i].as_str() {
-                        "errexit" => state.shell_opts.errexit = false,
-                        "xtrace" => state.shell_opts.xtrace = false,
-                        "pipefail" => state.shell_opts.pipefail = false,
-                        "globstar" => state.shell_opts.globstar = false,
-                        "vi" => state.editing_mode = crate::environment::EditingMode::Emacs,
-                        "emacs" => state.editing_mode = crate::environment::EditingMode::Vi,
-                        _ => {
-                            eprintln!("jsh: set: unknown option: {}", args[i]);
-                            return 1;
-                        }
-                    }
+            match set_option_name_for_flag(c) {
+                Some(name) => pending.push((name, enable)),
+                None => {
+                    // Loud failure, like bash. Never reinterpret an unknown
+                    // flag as a positional parameter: that turned every
+                    // `set -euo pipefail` into a silent no-op.
+                    eprintln!("jsh: set: -{}: invalid option", c);
+                    eprintln!("{}", SET_USAGE);
+                    return 2;
                 }
-            }
-            "--" => {
-                state.positional_params = args[i + 1..].to_vec();
-                return 0;
-            }
-            _ => {
-                state.positional_params = args[i..].to_vec();
-                return 0;
             }
         }
         i += 1;
+    }
+
+    for (name, enable) in pending {
+        apply_shell_option(state, name, enable);
+    }
+    if list_long {
+        for (name, _) in SET_OPTIONS {
+            println!(
+                "{:<15}\t{}",
+                name,
+                if shell_option_enabled(state, name) {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+        }
+    }
+    if list_short {
+        for (name, _) in SET_OPTIONS {
+            println!(
+                "set {}o {}",
+                if shell_option_enabled(state, name) {
+                    "-"
+                } else {
+                    "+"
+                },
+                name
+            );
+        }
+    }
+    if let Some(start) = operand_start {
+        state.positional_params = args[start..].to_vec();
     }
     0
 }
