@@ -54,6 +54,7 @@ pub struct ExecutionRecord {
 enum ExecutionEvent {
     #[serde(rename = "start")]
     Start {
+        #[serde(alias = "rsh_execution_version")]
         jsh_execution_version: u32,
         id: String,
         session_id: Option<String>,
@@ -66,6 +67,7 @@ enum ExecutionEvent {
     },
     #[serde(rename = "finish")]
     Finish {
+        #[serde(alias = "rsh_execution_version")]
         jsh_execution_version: u32,
         id: String,
         exit_code: i32,
@@ -75,6 +77,7 @@ enum ExecutionEvent {
     },
     #[serde(rename = "output")]
     Output {
+        #[serde(alias = "rsh_execution_version")]
         jsh_execution_version: u32,
         id: String,
         text: String,
@@ -115,6 +118,11 @@ impl ExecutionJournal {
     /// enable/disable switch; a custom location uses
     /// `JSH_EXECUTION_JOURNAL_PATH`.
     pub fn configured() -> Option<Self> {
+        // The journal moved from ~/.local/state/rsh to ~/.local/state/jsh with
+        // the 0.2.0 rename, so `exec last-failed` and the terminal integrations
+        // would otherwise start from an empty stream.
+        crate::config::migrate_legacy_rsh_data();
+
         if std::env::var("JSH_EXECUTION_JOURNAL")
             .ok()
             .as_deref()
@@ -633,6 +641,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = ExecutionJournal::with_path(dir.path().join("executions.jsonl"));
         (dir, journal)
+    }
+
+    /// A journal written before the 0.2.0 rename tags every event with
+    /// `rsh_execution_version`. Without the serde alias those events fail to
+    /// deserialize and a migrated journal reads as empty, so `context
+    /// last-failed` loses everything recorded under the old name.
+    #[test]
+    fn pre_rename_journal_events_are_still_readable() {
+        let (_dir, journal) = journal();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal.path())
+            .unwrap();
+        writeln!(file, "{{\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"rsh-a\",\"session_id\":\"tab-1\",\"seq\":3,\"command\":\"make\",\"cwd\":\"/p\",\"started_at_ms\":10}}").unwrap();
+        writeln!(file, "{{\"rsh_execution_version\":1,\"event\":\"finish\",\"id\":\"rsh-a\",\"exit_code\":2,\"duration_ms\":5,\"cwd_after\":\"/p\",\"ended_at_ms\":15}}").unwrap();
+        writeln!(file, "{{\"rsh_execution_version\":1,\"event\":\"output\",\"id\":\"rsh-a\",\"text\":\"boom\",\"truncated\":false,\"total_bytes\":4,\"captured_at_ms\":16}}").unwrap();
+        drop(file);
+
+        let records = journal.records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "rsh-a");
+        assert_eq!(records[0].seq, 3);
+        assert_eq!(records[0].command, "make");
+        assert_eq!(records[0].exit_code, Some(2));
+        assert_eq!(records[0].output.as_ref().unwrap().text, "boom");
+        assert_eq!(journal.last_failed().unwrap().unwrap().id, "rsh-a");
     }
 
     #[test]

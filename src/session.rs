@@ -145,7 +145,11 @@ pub struct SessionSnapshot {
 }
 
 /// Directory where session snapshot files are stored.
+///
+/// Every default-location save/load/list funnels through here, which makes it
+/// the one place that has to copy pre-rename ~/.rsh/sessions snapshots across.
 fn sessions_dir() -> PathBuf {
+    crate::config::migrate_legacy_rsh_data();
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".jsh")
@@ -679,6 +683,34 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["private-session.json"]);
+    }
+
+    /// Saved sessions moved from ~/.rsh/sessions to ~/.jsh/sessions with the
+    /// 0.2.0 rename. A snapshot copied across must still load — including its
+    /// 0600/0700 privacy requirements, which `load_from_dir` enforces.
+    #[test]
+    fn a_migrated_snapshot_loads_from_the_new_sessions_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let legacy_dir = home.join(".rsh").join("sessions");
+        ensure_private_directory(&legacy_dir).expect("legacy sessions dir");
+
+        let mut snapshot_state = ShellState::new(false);
+        snapshot_state.aliases.insert("ll".into(), "ls -la".into());
+        let snapshot = SessionSnapshot::capture(&snapshot_state, "tab1");
+        let json = serde_json::to_vec(&snapshot).expect("serialize");
+        fs::write(legacy_dir.join("tab1.json"), &json).expect("legacy snapshot");
+
+        let report = crate::config::migrate_legacy_rsh_data_in(&home, &state);
+        assert!(report.warnings.is_empty(), "{report:?}");
+
+        let new_dir = home.join(".jsh").join("sessions");
+        let loaded = SessionSnapshot::load_from_dir("tab1", &new_dir).expect("load migrated");
+        assert_eq!(loaded.session_id, "tab1");
+        assert_eq!(loaded.aliases.get("ll"), Some(&"ls -la".to_string()));
+        // The rsh copy stays where it was.
+        assert!(legacy_dir.join("tab1.json").is_file());
     }
 
     #[test]

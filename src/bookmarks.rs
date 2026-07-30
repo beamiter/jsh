@@ -10,6 +10,10 @@ pub struct BookmarkDB {
 
 impl BookmarkDB {
     pub fn load_default() -> Self {
+        // Bookmarks moved with the 0.2.0 rename; copy ~/.rsh_bookmarks across
+        // before the first read so `bookmark ls` is not silently empty.
+        crate::config::migrate_legacy_rsh_data();
+
         let path = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".jsh_bookmarks");

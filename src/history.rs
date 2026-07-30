@@ -4,14 +4,16 @@ use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HISTORY_RECORD_VERSION: u32 = 1;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// One hint per process, however many `History` instances get built.
+static LEGACY_HISTORY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct HistoryEntry {
@@ -25,6 +27,12 @@ pub struct HistoryEntry {
 /// happen to contain JSON.
 #[derive(Deserialize, Serialize)]
 struct HistoryRecord {
+    /// The field was named `rsh_history_version` before the 0.2.0 rename. The
+    /// alias is what makes a pre-rename history file readable at all: without
+    /// it the record fails to deserialize, falls through to the legacy
+    /// tab-separated branch, and each JSON line is stored as if the whole line
+    /// were the command the user typed.
+    #[serde(alias = "rsh_history_version")]
     jsh_history_version: u32,
     command: String,
     timestamp: u64,
@@ -51,11 +59,17 @@ pub struct History {
 
 impl History {
     pub fn new(max_size: usize) -> Self {
-        let file_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".jsh_history");
+        // The pre-rename ~/.rsh_history has to be in place before the first
+        // read, or an interactive shell starts with an empty history panel and
+        // the user assumes the data is gone.
+        crate::config::migrate_legacy_rsh_data();
 
-        Self::new_with_path(max_size, file_path)
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let file_path = home.join(".jsh_history");
+
+        let history = Self::new_with_path(max_size, file_path);
+        history.warn_about_unimported_legacy_history(&home);
+        history
     }
 
     /// Load decoded entries from the default history file. This is the
@@ -64,6 +78,48 @@ impl History {
     /// JSONL or legacy on-disk formats.
     pub fn load_default_entries(max_size: usize) -> Vec<HistoryEntry> {
         Self::new(max_size).entries
+    }
+
+    /// Tell the user, once, when a pre-rename history file was left behind.
+    ///
+    /// The automatic migration only ever copies into a path that does not
+    /// exist yet, because it must never clobber newer data. That leaves one
+    /// case uncovered: a user who already started the renamed binary has a
+    /// small fresh ~/.jsh_history, so their full ~/.rsh_history will never be
+    /// read by anything. Detecting that is read-only — importing stays the
+    /// user's decision, since merging two histories is not something to do
+    /// behind their back.
+    fn warn_about_unimported_legacy_history(&self, home: &Path) {
+        if LEGACY_HISTORY_HINT_SHOWN.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // A hint is for a human at a terminal. Scripts compare stderr.
+        if !io::stderr().is_terminal() {
+            return;
+        }
+        let legacy_path = crate::config::legacy_history_path(home);
+        let Ok(legacy_entries) = read_entries(&legacy_path) else {
+            return;
+        };
+        // The newest legacy record is the one that survives history trimming,
+        // so its presence is a reliable "already imported" marker.
+        let Some(newest) = legacy_entries.iter().max_by_key(|entry| entry.timestamp) else {
+            return;
+        };
+        if self.entries.contains(newest) {
+            return;
+        }
+        eprintln!(
+            "jsh: {} holds {} command(s) from before the rsh->jsh rename, and {} already existed, so they were not imported automatically.",
+            legacy_path.display(),
+            legacy_entries.len(),
+            self.file_path.display()
+        );
+        eprintln!(
+            "jsh: import them with: cat {} >> {}",
+            legacy_path.display(),
+            self.file_path.display()
+        );
     }
 
     fn new_with_path(max_size: usize, file_path: PathBuf) -> Self {
@@ -561,6 +617,106 @@ mod tests {
         assert_eq!(history.entries[1].timestamp, 10);
         assert_eq!(history.entries[1].cwd.as_deref(), Some("/old"));
         assert_eq!(history.entries[2], json_entry);
+    }
+
+    /// A pre-rename history file uses `rsh_history_version`. Without the serde
+    /// alias the record fails to deserialize, the loader falls through to the
+    /// legacy tab-separated branch, and every entry becomes a "command" whose
+    /// text is the raw JSON line — with timestamp 0 and no cwd. That is what a
+    /// hand-renamed ~/.rsh_history did before this fix.
+    #[test]
+    fn pre_rename_history_records_keep_command_timestamp_and_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"rsh_history_version":1,"command":"echo one","timestamp":10,"cwd":"/p"}"#,
+                "\n",
+                r#"{"rsh_history_version":1,"command":"if true\nthen echo hi\nfi","timestamp":11,"cwd":"/q"}"#,
+                "\n",
+            ),
+        )
+        .expect("pre-rename fixture");
+
+        let history = load_test_history(&path, 10);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history.entries[0],
+            HistoryEntry {
+                command: "echo one".into(),
+                timestamp: 10,
+                cwd: Some("/p".into()),
+            }
+        );
+        assert_eq!(
+            history.entries[1],
+            HistoryEntry {
+                command: "if true\nthen echo hi\nfi".into(),
+                timestamp: 11,
+                cwd: Some("/q".into()),
+            }
+        );
+    }
+
+    /// The realistic post-import state: pre-rename records concatenated onto a
+    /// file that already holds new-format ones, plus a corrupt line. Nothing
+    /// may be dropped and saving must not lose either side.
+    #[test]
+    fn mixed_pre_and_post_rename_records_survive_a_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"jsh_history_version":1,"command":"ls","timestamp":30,"cwd":"/new"}"#,
+                "\n",
+                "{not json at all\n",
+                r#"{"rsh_history_version":1,"command":"echo old","timestamp":10,"cwd":"/old"}"#,
+                "\n",
+            ),
+        )
+        .expect("mixed fixture");
+
+        let history = load_test_history(&path, 10);
+        history.save();
+
+        let restored = load_test_history(&path, 10);
+        let commands = restored.entries();
+        assert!(commands.contains(&"ls"), "{commands:?}");
+        assert!(commands.contains(&"echo old"), "{commands:?}");
+        // The unparsable line is preserved verbatim rather than discarded.
+        assert!(commands.contains(&"{not json at all"), "{commands:?}");
+        let cwds: Vec<Option<&str>> = restored
+            .entries
+            .iter()
+            .map(|entry| entry.cwd.as_deref())
+            .collect();
+        assert!(cwds.contains(&Some("/old")), "{cwds:?}");
+    }
+
+    /// A corrupt pre-rename file must not take the shell down, and must not
+    /// affect the current history file.
+    #[test]
+    fn a_corrupt_pre_rename_file_does_not_disturb_the_current_history() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&home).expect("home");
+        fs::write(home.join(".rsh_history"), b"\x00\x01 garbage \xff\n").expect("corrupt fixture");
+        fs::write(
+            home.join(".jsh_history"),
+            r#"{"jsh_history_version":1,"command":"keep","timestamp":5,"cwd":null}"#.to_owned()
+                + "\n",
+        )
+        .expect("current history");
+
+        let report = crate::config::migrate_legacy_rsh_data_in(&home, &state);
+        assert!(report.migrated.is_empty(), "{report:?}");
+
+        let history = load_test_history(&home.join(".jsh_history"), 10);
+        assert_eq!(history.entries(), vec!["keep"]);
     }
 
     #[test]
