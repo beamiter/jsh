@@ -319,3 +319,83 @@ fn saving_and_restoring_ifs_keeps_word_splitting_alive() {
     let (out, _, _) = run(r#"old=$IFS; IFS=":"; IFS=$old; x="a b c"; set -- $x; echo $#"#);
     assert_eq!(out, "3\n");
 }
+
+// ---------------------------------------------------------------------------
+// ${...} operator dispatch. Every operator used to be searched for
+// independently across the whole body, so punctuation inside a pattern
+// hijacked the expansion: `${v##*a-b*}` was read as `${v##*a}` defaulting to
+// `b*`. /etc/profile.d/xdg_dirs_desktop_session.sh trips over exactly this.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strip_pattern_may_contain_a_dash() {
+    let (out, _, _) = run(r#"v=x-y-z; echo "[${v##*-}][${v#*-}][${v%%-*}][${v%-*}]""#);
+    assert_eq!(out, "[z][y-z][x][x-y]\n");
+}
+
+#[test]
+fn strip_pattern_may_contain_equals_and_plus() {
+    let (out, _, _) = run(r#"d=a=b=c; p=x+y; echo "[${d#*=}][${d%%=*}][${p#*+}][${p%%+*}]""#);
+    assert_eq!(out, "[b=c][a][y][x]\n");
+}
+
+#[test]
+fn desktop_session_guard_from_etc_profile_d() {
+    // `-n "${V##*$D/xdg-$S*}"` must be false when the entry is already present,
+    // otherwise the directory gets prepended to XDG_CONFIG_DIRS a second time.
+    let script = r#"
+        V=/etc/xdg/xdg-ubuntu:/etc/xdg/xdg-jwm-xcb:/etc/xdg
+        D=/etc/xdg
+        S=jwm-xcb
+        if [ -n "${V##*$D/xdg-$S*}" ]; then echo prepend; else echo keep; fi
+    "#;
+    let (out, _, _) = run(script);
+    assert_eq!(out, "keep\n");
+}
+
+#[test]
+fn colon_default_operators_still_win_over_a_bare_dash() {
+    let (out, _, _) = run(r#"unset u; e=; echo "[${u:-a-b}][${e:-c-d}][${e-x}][${u-y-z}]""#);
+    assert_eq!(out, "[a-b][c-d][][y-z]\n");
+}
+
+#[test]
+fn substring_offset_and_length_still_work() {
+    let (out, _, _) = run(r#"s=Hello-World; echo "[${s:2}][${s:2:3}][${s: -5}][${s:0:5}]""#);
+    assert_eq!(out, "[llo-World][llo][World][Hello]\n");
+}
+
+#[test]
+fn question_mark_operator_reports_and_aborts() {
+    let (out, err, code) = run(r#"echo before; echo "${u:?is required}"; echo after"#);
+    assert_eq!(out, "before\n");
+    assert!(err.contains("u: is required"), "got stderr {:?}", err);
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn case_conversion_operators() {
+    let (out, _, _) = run(r#"s=hello-World; echo "[${s^^}][${s,,}][${s^}][${s,}]""#);
+    assert_eq!(
+        out,
+        "[HELLO-WORLD][hello-world][Hello-World][hello-World]\n"
+    );
+}
+
+#[test]
+fn replacement_pattern_and_text_are_expanded() {
+    let (out, _, _) = run(r#"s=x-y-z; sep=-; rep=+; echo "[${s//$sep/$rep}][${s//${sep}/.}]""#);
+    assert_eq!(out, "[x+y+z][x.y.z]\n");
+}
+
+#[test]
+fn replacement_pattern_may_be_an_escaped_slash() {
+    let (out, _, _) = run(r#"p=/a/b/c; echo "[${p//\//_}][${p/\//_}][${p//\/}]""#);
+    assert_eq!(out, "[_a_b_c][_a/b/c][abc]\n");
+}
+
+#[test]
+fn anchored_replacements_are_unaffected() {
+    let (out, _, _) = run(r#"s=Hello-World; echo "[${s/#Hello/Bye}][${s/%World/Earth}]""#);
+    assert_eq!(out, "[Bye-World][Hello-Earth]\n");
+}

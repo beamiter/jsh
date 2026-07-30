@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `${...}` now picks its operator from the character right after the parameter
+  name instead of searching the whole body for each operator in turn. A `-`,
+  `=` or `+` inside a pattern used to hijack the expansion, so `${v##*a-b*}`
+  was read as `${v##*a}` defaulting to `b*` — which made
+  `/etc/profile.d/xdg_dirs_desktop_session.sh` prepend a directory to
+  `XDG_CONFIG_DIRS` that was already there. Added `${var:?message}`,
+  `${var?message}` and the `^ ^^ , ,,` case-conversion operators, taught
+  `${var/pat/rep}` to expand variables in both halves and to accept an escaped
+  `\/`, and extended `${var:offset:length}` to negative lengths.
+
 - `source /opt/ros/humble/setup.bash` (and ament setup scripts generally) now
   works. Four Bash gaps were in the way: double quotes did not nest inside a
   backtick substitution, so `"`dirname "$f"`"` cut the command short;

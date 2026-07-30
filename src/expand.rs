@@ -653,111 +653,107 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
         }
     }
 
-    // ${var:-default}
-    if let Some(pos) = name.find(":-") {
-        let var = &name[..pos];
-        let default = expand_param_operand(&name[pos + 2..], state);
-        return match parameter_value(var, state) {
-            Some(v) if !v.is_empty() => v,
-            _ => default,
-        };
-    }
-    // ${var:=default} (assign default)
-    if let Some(pos) = name.find(":=") {
-        let var = &name[..pos];
-        let default = expand_param_operand(&name[pos + 2..], state);
-        return match parameter_value(var, state) {
-            Some(v) if !v.is_empty() => v,
-            _ => {
-                let val = default;
-                state.set_var(var, &val);
-                val
-            }
-        };
-    }
-    // ${var:+alternate}
-    if let Some(pos) = name.find(":+") {
-        let var = &name[..pos];
-        let alt = expand_param_operand(&name[pos + 2..], state);
-        return match parameter_value(var, state) {
-            Some(v) if !v.is_empty() => alt,
-            _ => String::new(),
-        };
-    }
-    // ${var-default}
-    if let Some(pos) = name.find('-') {
-        let var = &name[..pos];
-        let default = expand_param_operand(&name[pos + 1..], state);
-        return parameter_value(var, state).unwrap_or(default);
-    }
-    // ${var=default}
-    if let Some(pos) = name.find('=') {
-        let var = &name[..pos];
-        let default = expand_param_operand(&name[pos + 1..], state);
-        return match parameter_value(var, state) {
-            Some(v) => v,
-            None => {
-                let val = default;
-                state.set_var(var, &val);
-                val
-            }
-        };
-    }
-    // ${var+alternate}
-    if let Some(pos) = name.find('+') {
-        let var = &name[..pos];
-        let alt = expand_param_operand(&name[pos + 1..], state);
-        return if parameter_value(var, state).is_some() {
-            alt
-        } else {
-            String::new()
-        };
-    }
-    // ${var:offset:length} and ${var:offset}
-    if let Some(pos) = name.find(':') {
-        let var = &name[..pos];
-        let rest = &name[pos + 1..];
-        // Check it's numeric (substring operation)
-        if rest.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
-            let val = state.get_var(var).unwrap_or("");
-            if let Some(colon2) = rest.find(':') {
-                let offset: i64 = rest[..colon2].parse().unwrap_or(0);
-                let length: usize = rest[colon2 + 1..].parse().unwrap_or(val.len());
-                let start = if offset < 0 {
-                    (val.len() as i64 + offset).max(0) as usize
-                } else {
-                    offset as usize
-                };
-                let end = (start + length).min(val.len());
-                return val.get(start..end).unwrap_or("").to_string();
-            } else {
-                let offset: i64 = rest.parse().unwrap_or(0);
-                let start = if offset < 0 {
-                    (val.len() as i64 + offset).max(0) as usize
-                } else {
-                    offset as usize
-                };
-                return val.get(start..).unwrap_or("").to_string();
-            }
-        }
-    }
-    // ${#var} (string length) — must be checked before ${var#pattern}
+    // ${#var} (string length) — the leading `#` is a prefix, not an operator,
+    // so this is settled before the operator dispatch below.
     if let Some(var) = name.strip_prefix('#') {
         if !var.is_empty() && !var.contains('#') && !var.contains('[') {
             let val = state.get_var(var).unwrap_or("");
             return val.len().to_string();
         }
     }
-    // Pattern operators: #/## (prefix strip), %/%% (suffix strip), / (replace).
-    // Dispatch on the FIRST of #, %, / after the variable name so that a # or %
-    // appearing inside a /replacement (e.g. ${v/#a/X}, ${v/%c/Y}) is not
-    // mistaken for a strip operator. Array subscripts in [...] are skipped.
-    if let Some(op) = find_pattern_op(name) {
+
+    // Everything after the parameter name is one operator plus its word. Bash
+    // decides which operator from the character at exactly that boundary, so
+    // find the boundary once and dispatch on it. Searching the whole body for
+    // each operator in turn let punctuation inside a pattern hijack the
+    // expansion: `${v##*a-b*}` was read as `${v##*a}` defaulting to `b*`.
+    if let Some(op) = param_op_start(name) {
         let var = &name[..op];
-        let val = parameter_value(var, state).unwrap_or_default();
         let spec = &name[op..];
+
+        // ${var:-default} / ${var:=default} / ${var:?message} / ${var:+alt}
+        // treat an empty value like an unset one; the colon-less forms below
+        // only react to a genuinely unset parameter.
+        if let Some(rest) = spec.strip_prefix(":-") {
+            let default = expand_param_operand(rest, state);
+            return match parameter_value(var, state) {
+                Some(v) if !v.is_empty() => v,
+                _ => default,
+            };
+        }
+        if let Some(rest) = spec.strip_prefix(":=") {
+            let default = expand_param_operand(rest, state);
+            return match parameter_value(var, state) {
+                Some(v) if !v.is_empty() => v,
+                _ => {
+                    state.set_var(var, &default);
+                    default
+                }
+            };
+        }
+        if let Some(rest) = spec.strip_prefix(":+") {
+            let alt = expand_param_operand(rest, state);
+            return match parameter_value(var, state) {
+                Some(v) if !v.is_empty() => alt,
+                _ => String::new(),
+            };
+        }
+        if let Some(rest) = spec.strip_prefix(":?") {
+            return match parameter_value(var, state) {
+                Some(v) if !v.is_empty() => v,
+                _ => {
+                    let msg = expand_param_operand(rest, state);
+                    state.expansion_error = Some(if msg.is_empty() {
+                        format!("{}: parameter null or not set", var)
+                    } else {
+                        format!("{}: {}", var, msg)
+                    });
+                    String::new()
+                }
+            };
+        }
+        if let Some(rest) = spec.strip_prefix('?') {
+            return match parameter_value(var, state) {
+                Some(v) => v,
+                None => {
+                    let msg = expand_param_operand(rest, state);
+                    state.expansion_error = Some(if msg.is_empty() {
+                        format!("{}: parameter not set", var)
+                    } else {
+                        format!("{}: {}", var, msg)
+                    });
+                    String::new()
+                }
+            };
+        }
+        if let Some(rest) = spec.strip_prefix('-') {
+            let default = expand_param_operand(rest, state);
+            return parameter_value(var, state).unwrap_or(default);
+        }
+        if let Some(rest) = spec.strip_prefix('=') {
+            return match parameter_value(var, state) {
+                Some(v) => v,
+                None => {
+                    let default = expand_param_operand(rest, state);
+                    state.set_var(var, &default);
+                    default
+                }
+            };
+        }
+        if let Some(rest) = spec.strip_prefix('+') {
+            let alt = expand_param_operand(rest, state);
+            return if parameter_value(var, state).is_some() {
+                alt
+            } else {
+                String::new()
+            };
+        }
+
+        // Pattern operators: #/## (prefix strip), %/%% (suffix strip),
+        // / (replace), ^/^^ and ,/,, (case conversion).
         match spec.as_bytes()[0] {
             b'#' => {
+                let val = parameter_value(var, state).unwrap_or_default();
                 if let Some(pat) = spec.strip_prefix("##") {
                     let pat = expand_param_operand(pat, state);
                     // greedy (longest) prefix strip
@@ -777,6 +773,7 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
                 return val;
             }
             b'%' => {
+                let val = parameter_value(var, state).unwrap_or_default();
                 if let Some(pat) = spec.strip_prefix("%%") {
                     let pat = expand_param_operand(pat, state);
                     // greedy (longest) suffix strip
@@ -795,7 +792,43 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
                 }
                 return val;
             }
-            b'/' => return pattern_replace(&val, spec),
+            b'/' => {
+                let val = parameter_value(var, state).unwrap_or_default();
+                return pattern_replace(&val, spec, state);
+            }
+            b'^' | b',' => {
+                let val = parameter_value(var, state).unwrap_or_default();
+                return convert_case(&val, spec);
+            }
+            b':' => {
+                // ${var:offset} and ${var:offset:length}. The four colon
+                // operators above have already been ruled out.
+                let val = parameter_value(var, state).unwrap_or_default();
+                let rest = &spec[1..];
+                let (offset_text, length_text) = match rest.split_once(':') {
+                    Some((o, l)) => (o, Some(l)),
+                    None => (rest, None),
+                };
+                let offset: i64 = offset_text.trim().parse().unwrap_or(0);
+                let start = if offset < 0 {
+                    (val.len() as i64 + offset).max(0) as usize
+                } else {
+                    (offset as usize).min(val.len())
+                };
+                let end = match length_text {
+                    Some(l) => {
+                        let len: i64 = l.trim().parse().unwrap_or(val.len() as i64);
+                        if len < 0 {
+                            // A negative length is an offset from the end.
+                            ((val.len() as i64 + len).max(start as i64) as usize).min(val.len())
+                        } else {
+                            (start + len as usize).min(val.len())
+                        }
+                    }
+                    None => val.len(),
+                };
+                return val.get(start..end).unwrap_or("").to_string();
+            }
             _ => {}
         }
     }
@@ -809,24 +842,107 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
     String::new()
 }
 
-/// Index of the first #, %, or / that acts as a parameter-expansion operator
-/// (after a non-empty variable name, ignoring chars inside [...] subscripts).
-fn find_pattern_op(name: &str) -> Option<usize> {
-    let bytes = name.as_bytes();
-    let mut depth = 0i32;
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'[' => depth += 1,
-            b']' => {
-                if depth > 0 {
-                    depth -= 1;
+/// Byte offset where a `${...}` body stops being the parameter name and starts
+/// being an operator, or `None` when the body is nothing but a name (or a form
+/// the callers above already handled, such as a leading `#` or `!`).
+///
+/// A name is `[A-Za-z_][A-Za-z0-9_]*` with an optional `[subscript]`, a run of
+/// digits for positional parameters, or a single special character. Everything
+/// from there on belongs to the operator, punctuation included — which is what
+/// keeps `${v##*a-b*}` from being read as `${v-...}`.
+fn param_op_start(name: &str) -> Option<usize> {
+    let b = name.as_bytes();
+    let first = *b.first()?;
+    let mut i = 1;
+    match first {
+        // `#` and `!` lead the length and indirection forms, not a name.
+        b'#' | b'!' => return None,
+        b'@' | b'*' | b'?' | b'$' | b'-' | b'0' => {}
+        b'1'..=b'9' => {
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        b'_' | b'A'..=b'Z' | b'a'..=b'z' => {
+            while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            if b.get(i) == Some(&b'[') {
+                let mut depth = 0usize;
+                while i < b.len() {
+                    match b[i] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
                 }
             }
-            b'#' | b'%' | b'/' if depth == 0 && i > 0 => return Some(i),
-            _ => {}
+        }
+        _ => return None,
+    }
+    if i < b.len() {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+/// `${var^}`, `${var^^}`, `${var,}` and `${var,,}`. `spec` starts with the
+/// operator character; an optional glob after it limits which characters are
+/// converted (bash defaults that pattern to `?`, i.e. every character).
+fn convert_case(val: &str, spec: &str) -> String {
+    let op = spec.as_bytes()[0];
+    let all = spec.len() >= 2 && spec.as_bytes()[1] == op;
+    let pat = &spec[if all { 2 } else { 1 }..];
+    let matches = |c: char| pat.is_empty() || match_glob(pat, &c.to_string());
+    let convert = |c: char| -> String {
+        if op == b'^' {
+            c.to_uppercase().collect()
+        } else {
+            c.to_lowercase().collect()
+        }
+    };
+    let mut out = String::with_capacity(val.len());
+    for (idx, c) in val.chars().enumerate() {
+        // The single-character form only touches the first character.
+        if (all || idx == 0) && matches(c) {
+            out.push_str(&convert(c));
+        } else {
+            out.push(c);
         }
     }
-    None
+    out
+}
+
+/// Split a `${var/pat/rep}` body at its first unescaped `/`, returning the raw
+/// pattern and replacement with `\/` reduced to a literal slash. A slash that
+/// only appears after expanding a variable is data, not the separator, so the
+/// split happens before expansion.
+fn split_replace_spec(body: &str) -> (String, String) {
+    let mut pat = String::new();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('/') => pat.push('/'),
+                Some(other) => {
+                    pat.push('\\');
+                    pat.push(other);
+                }
+                None => pat.push('\\'),
+            },
+            '/' => return (pat, chars.as_str().replace("\\/", "/")),
+            _ => pat.push(c),
+        }
+    }
+    (pat, String::new())
 }
 
 enum ReplaceAnchor {
@@ -837,7 +953,7 @@ enum ReplaceAnchor {
 
 /// Handle ${var/pat/rep}, ${var//pat/rep}, ${var/#pat/rep}, ${var/%pat/rep}.
 /// `spec` begins with '/'. The pattern is a shell glob.
-fn pattern_replace(val: &str, spec: &str) -> String {
+fn pattern_replace(val: &str, spec: &str, state: &mut ShellState) -> String {
     let global = spec.starts_with("//");
     let body = if global { &spec[2..] } else { &spec[1..] };
     let (anchor, body) = if let Some(rest) = body.strip_prefix('#') {
@@ -847,7 +963,10 @@ fn pattern_replace(val: &str, spec: &str) -> String {
     } else {
         (ReplaceAnchor::None, body)
     };
-    let (pat, rep) = body.split_once('/').unwrap_or((body, ""));
+    let (pat, rep) = split_replace_spec(body);
+    let pat = expand_param_operand(&pat, state);
+    let rep = expand_param_operand(&rep, state);
+    let (pat, rep) = (pat.as_str(), rep.as_str());
     if pat.is_empty() {
         return val.to_string();
     }
