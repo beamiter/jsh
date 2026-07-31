@@ -460,3 +460,133 @@ fn command_passes_a_multiline_script_argument_through() {
     assert_eq!(out, "A\n");
     assert!(err.is_empty(), "unexpected stderr: {}", err);
 }
+
+// ---------------------------------------------------------------------------
+// Sourcing a stock ~/.bashrc: shopt names, `[[ ]]` operands, extended globs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn shopt_accepts_bash_option_names_it_does_not_model() {
+    // The first line of the stock Debian .bashrc that jsh reached.
+    let (out, err, code) = run("shopt -s histappend; shopt histappend");
+    assert_eq!(out, format!("{:<15}\ton\n", "histappend"));
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn shopt_remembers_unmodelled_options_across_set_and_unset() {
+    let (out, _, _) = run("shopt -s cmdhist progcomp; shopt -u progcomp; \
+         shopt -q cmdhist; echo cmdhist=$?; shopt -q progcomp; echo progcomp=$?");
+    assert_eq!(out, "cmdhist=0\nprogcomp=1\n");
+}
+
+#[test]
+fn shopt_rejects_names_bash_does_not_have() {
+    let (_, err, code) = run("shopt -s not_an_option");
+    assert!(
+        err.contains("not_an_option: invalid shell option name"),
+        "unexpected stderr: {}",
+        err
+    );
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn shopt_clustered_o_and_q_query_a_set_option() {
+    // `if ! shopt -oq posix` guards the completion block of every stock
+    // .bashrc. Reading `-oq` as two option names made it print two errors.
+    let (out, err, _) = run("if ! shopt -oq posix; then echo enabled; fi");
+    assert_eq!(out, "enabled\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+
+    let (out, _, code) = run("set -o posix; shopt -oq posix; echo status=$?");
+    assert_eq!(out, "status=0\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn shopt_prints_a_reusable_form_with_dash_p() {
+    let (out, _, _) = run("shopt -s dotglob; shopt -p dotglob; shopt -po errexit");
+    assert_eq!(out, "shopt -s dotglob\nset +o errexit\n");
+}
+
+#[test]
+fn conditional_keeps_an_empty_expansion_as_an_operand() {
+    // `[[ -n ${ZSH_VERSION-} ]]` decides whether nvm's completion script takes
+    // its zsh branch. Dropping the empty word left the one-operand test
+    // `[[ -n ]]`, which is true, so the zsh branch ran and called `autoload`.
+    let (out, err, _) = run(
+        "if [[ -n ${ZSH_VERSION-} ]]; then echo zsh; else echo bash; fi; \
+         if [[ -z ${ZSH_VERSION-} ]]; then echo empty; fi",
+    );
+    assert_eq!(out, "bash\nempty\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+}
+
+#[test]
+fn conditional_operands_are_not_word_split() {
+    let (out, _, _) = run(r#"v="a b"; [[ $v == "x" ]] && echo yes || echo no"#);
+    assert_eq!(out, "no\n");
+}
+
+#[test]
+fn conditional_patterns_are_not_pathname_expanded() {
+    let (out, _, _) = run("cd \"$(mktemp -d)\" && touch one.rs two.rs && \
+         f=zzz.rs && [[ $f == *.rs ]] && echo match || echo no-match");
+    assert_eq!(out, "match\n");
+}
+
+#[test]
+fn extended_globs_parse_wherever_a_word_may_appear() {
+    // Every one of these was a parse error, which is what stopped
+    // `source /usr/share/bash-completion/bash_completion` dead.
+    let script = r#"
+shopt -s extglob
+u=Linux
+[[ $u == @(Linux|GNU/*) ]] && echo cond
+case --nodir in --!(no-*)dir*) echo case;; *) echo other;; esac
+case -abc in -?(\[)+([a-zA-Z0-9?])) echo short;; *) echo long;; esac
+f() { [[ $1 == *@(solaris|aix)* ]] && echo osfunc; }
+f solaris2.11
+"#;
+    let (out, err, code) = run(script);
+    assert_eq!(out, "cond\ncase\nshort\nosfunc\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn extended_globs_expand_pathnames_and_leave_negation_alone() {
+    let (out, _, _) = run(
+        "cd \"$(mktemp -d)\" && touch keep.rs drop.txt && shopt -s extglob && \
+         echo !(*.txt)",
+    );
+    assert_eq!(out, "keep.rs\n");
+
+    // `!(...)` at the head of a command is still bash's pipeline negation.
+    let (out, _, _) = run("!(true); echo status=$?");
+    assert_eq!(out, "status=1\n");
+}
+
+#[test]
+fn parameter_expansion_ends_at_its_own_brace() {
+    // `${option2%%[<{().[]*}` — bash-completion's __parse_options — used to
+    // swallow the closing brace because the `{` inside the bracket expression
+    // was counted as a nested expansion.
+    let (out, _, _) = run("x='abc<def'; echo \"${x%%[<{().[]*}\"; y=Q; echo ${z:-${y}}");
+    assert_eq!(out, "abc\nQ\n");
+}
+
+#[test]
+fn complete_registers_every_command_it_names() {
+    // bash-completion registers `_longopt` for two dozen commands at a time,
+    // and `complete -F _minimal ''` names the empty command word.
+    let (out, err, code) = run(
+        "_f() { :; }; complete -F _f awk bison cat; complete -F _f ''; \
+         complete -D -F _f; complete | wc -l",
+    );
+    assert_eq!(out, "4\n");
+    assert!(err.is_empty(), "unexpected stderr: {}", err);
+    assert_eq!(code, 0);
+}

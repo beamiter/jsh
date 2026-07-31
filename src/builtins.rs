@@ -2668,33 +2668,17 @@ fn eval_cond_binary(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i
     *pos += 3;
     match op {
         "==" | "=" => {
-            if right.contains('*') || right.contains('?') {
-                if glob_match(right, left) {
-                    0
-                } else {
-                    1
-                }
+            if cond_pattern_match(right, left, state) {
+                0
             } else {
-                if left == right {
-                    0
-                } else {
-                    1
-                }
+                1
             }
         }
         "!=" => {
-            if right.contains('*') || right.contains('?') {
-                if glob_match(right, left) {
-                    1
-                } else {
-                    0
-                }
+            if cond_pattern_match(right, left, state) {
+                1
             } else {
-                if left != right {
-                    0
-                } else {
-                    1
-                }
+                0
             }
         }
         "<" => {
@@ -2725,8 +2709,19 @@ fn eval_cond_binary(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i
     }
 }
 
-fn glob_match(pattern: &str, text: &str) -> bool {
-    crate::glob_match::glob_match(pattern, text)
+/// The right operand of `[[ x == pat ]]`. Bash always treats it as a pattern;
+/// matching literally when it holds no metacharacter is just the cheap path to
+/// the same answer. `[` counts as one — `[[ a == [ab] ]]` is true — and so do
+/// the extended-glob openers once `shopt -s extglob` is on.
+fn cond_pattern_match(pattern: &str, text: &str, state: &ShellState) -> bool {
+    let extglob = state.shell_opts.extglob;
+    let is_pattern = pattern.contains(['*', '?', '['])
+        || (extglob && crate::glob_match::contains_extglob(pattern));
+    if is_pattern {
+        crate::glob_match::pattern_match(pattern, text, extglob)
+    } else {
+        pattern == text
+    }
 }
 
 // ============================================================
@@ -3050,11 +3045,28 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
     let mut prefix: Option<String> = None;
     let mut suffix: Option<String> = None;
     let mut remove = false;
-    let mut command_name = String::new();
+    let mut fallback_spec = false;
+    let mut command_names: Vec<String> = Vec::new();
     let mut i = 0;
 
     while i < args.len() {
         match args[i].as_str() {
+            // Flags jsh does not act on yet. They still have to be recognised:
+            // `complete -o default -F __nvm nvm` registered a spec for the word
+            // `default`, and `complete -A stopped -P '"%' -S '"' bg` one for
+            // `stopped`. Both shapes are all over bash-completion.
+            "-o" | "-A" | "-C" => i += 1,
+            // `-D`, `-E` and `-I` name no command: they install the fallback
+            // completion, the empty-line completion and the first-word one.
+            // jsh has nowhere to put them yet, but they are valid calls and
+            // must not be reported as a missing command name.
+            "-D" | "-E" | "-I" => fallback_spec = true,
+            "-p" | "-a" | "-b" | "-c" | "-e" | "-g" | "-j" | "-k" | "-s" | "-u" | "-v" => {}
+            // Everything after `--` is a command name, empty string included.
+            "--" => {
+                command_names.extend(args[i + 1..].iter().cloned());
+                i = args.len();
+            }
             "-W" => {
                 i += 1;
                 if i < args.len() {
@@ -3094,35 +3106,46 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
                 }
             }
             "-r" => remove = true,
-            _ => command_name = args[i].clone(),
+            name => command_names.push(name.to_string()),
         }
         i += 1;
     }
 
-    if command_name.is_empty() {
+    // One `complete` call names any number of commands — bash-completion
+    // registers `_longopt` for two dozen at a time — and `''` is one of them,
+    // the spec bash uses when the command word is empty.
+    if command_names.is_empty() {
+        if remove {
+            state.completion_specs.clear();
+            return 0;
+        }
+        if fallback_spec {
+            return 0;
+        }
         eprintln!("jsh: complete: no command specified");
         return 1;
     }
 
-    if remove {
-        state.completion_specs.remove(&command_name);
-        return 0;
+    for command_name in command_names {
+        if remove {
+            state.completion_specs.remove(&command_name);
+            continue;
+        }
+        state.completion_specs.insert(
+            command_name.clone(),
+            crate::environment::CompletionSpec {
+                command: command_name,
+                word_list: word_list.clone(),
+                function: function.clone(),
+                directory,
+                file,
+                glob_pattern: glob_pattern.clone(),
+                filter_pattern: filter_pattern.clone(),
+                prefix: prefix.clone(),
+                suffix: suffix.clone(),
+            },
+        );
     }
-
-    state.completion_specs.insert(
-        command_name.clone(),
-        crate::environment::CompletionSpec {
-            command: command_name,
-            word_list,
-            function,
-            directory,
-            file,
-            glob_pattern,
-            filter_pattern,
-            prefix,
-            suffix,
-        },
-    );
     0
 }
 
@@ -3383,144 +3406,246 @@ fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
 // shopt (shell options)
 // ============================================================
 
-fn builtin_shopt(args: &[String], state: &mut ShellState) -> i32 {
-    // shopt [-psuE] [optname ...]
-    // -p: print all options (default when no args)
-    // -s: set option
-    // -u: unset option
+/// Every `shopt` name bash knows, in the order bash lists them, paired with the
+/// value a fresh bash reports for it.
+///
+/// jsh enforces the globbing and navigation options; the rest are remembered in
+/// `shell_opts.shopt_opts` so a `.bashrc` that opens with `shopt -s histappend`
+/// starts a shell instead of an error, and `shopt histappend` still answers
+/// with what was set. Rejecting them would be worse than remembering them: the
+/// stock Debian `.bashrc` alone sets two, and bash-completion sets two more.
+const SHOPT_OPTIONS: &[(&str, bool)] = &[
+    ("autocd", false),
+    ("assoc_expand_once", false),
+    ("cdable_vars", false),
+    ("cdspell", false),
+    ("checkhash", false),
+    ("checkjobs", false),
+    ("checkwinsize", true),
+    ("cmdhist", true),
+    ("compat31", false),
+    ("compat32", false),
+    ("compat40", false),
+    ("compat41", false),
+    ("compat42", false),
+    ("compat43", false),
+    ("compat44", false),
+    ("complete_fullquote", true),
+    ("direxpand", false),
+    ("dirspell", false),
+    ("dotglob", false),
+    ("execfail", false),
+    ("expand_aliases", true),
+    ("extdebug", false),
+    ("extglob", false),
+    ("extquote", true),
+    ("failglob", false),
+    ("force_fignore", true),
+    ("globasciiranges", true),
+    ("globskipdots", true),
+    ("globstar", false),
+    ("gnu_errfmt", false),
+    ("histappend", false),
+    ("histreedit", false),
+    ("histverify", false),
+    ("hostcomplete", true),
+    ("huponexit", false),
+    ("inherit_errexit", false),
+    ("interactive_comments", true),
+    ("lastpipe", false),
+    ("lithist", false),
+    ("localvar_inherit", false),
+    ("localvar_unset", false),
+    ("login_shell", false),
+    ("mailwarn", false),
+    ("no_empty_cmd_completion", false),
+    ("nocaseglob", false),
+    ("nocasematch", false),
+    ("noexpand_translation", false),
+    ("noglob", false), // jsh extension: bash spells this `set -f`
+    ("nullglob", false),
+    ("patsub_replacement", true),
+    ("progcomp", true),
+    ("progcomp_alias", false),
+    ("promptvars", true),
+    ("restricted_shell", false),
+    ("shift_verbose", false),
+    ("sourcepath", true),
+    ("varredir_close", false),
+    ("xpg_echo", false),
+];
 
-    if args.is_empty() {
-        // Print all options
-        print_shopt_options(&state.shell_opts);
-        return 0;
+const SHOPT_USAGE: &str = "shopt: usage: shopt [-pqsu] [-o] [optname ...]";
+
+pub fn shopt_option_is_known(name: &str) -> bool {
+    SHOPT_OPTIONS.iter().any(|(n, _)| *n == name)
+}
+
+/// The live value of one `shopt` name: the field jsh keeps for it, else what
+/// was last remembered, else bash's default.
+fn shopt_enabled(state: &ShellState, name: &str) -> bool {
+    match name {
+        "dotglob" => state.shell_opts.dotglob,
+        "nullglob" => state.shell_opts.nullglob,
+        "failglob" => state.shell_opts.failglob,
+        "extglob" => state.shell_opts.extglob,
+        "nocaseglob" => state.shell_opts.nocaseglob,
+        "noglob" => state.shell_opts.noglob,
+        "globstar" => state.shell_opts.globstar,
+        "lastpipe" => state.shell_opts.lastpipe,
+        "autocd" => state.shell_opts.autocd,
+        "cdspell" => state.shell_opts.cdspell,
+        "checkwinsize" => state.shell_opts.checkwinsize,
+        "inherit_errexit" => state.shell_opts.inherit_errexit,
+        other => match state.shell_opts.shopt_opts.get(other) {
+            Some(&enabled) => enabled,
+            None => SHOPT_OPTIONS
+                .iter()
+                .find(|(n, _)| *n == other)
+                .map(|(_, default)| *default)
+                .unwrap_or(false),
+        },
     }
+}
 
-    let mut setting = None;
-    let mut print_all = false;
-    let mut opts = Vec::new();
-    let mut i = 0;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "-s" => setting = Some(true),
-            "-u" => setting = Some(false),
-            "-p" => print_all = true,
-            s if s.starts_with('-') => {
-                // Unknown option, treat as option name (for compat)
-                opts.push(s[1..].to_string());
-            }
-            _ => opts.push(args[i].clone()),
+/// Apply one `shopt -s NAME` / `shopt -u NAME`.
+pub fn set_shopt_option(state: &mut ShellState, name: &str, enable: bool) {
+    match name {
+        "dotglob" => state.shell_opts.dotglob = enable,
+        "nullglob" => state.shell_opts.nullglob = enable,
+        "failglob" => state.shell_opts.failglob = enable,
+        "extglob" => state.shell_opts.extglob = enable,
+        "nocaseglob" => state.shell_opts.nocaseglob = enable,
+        "noglob" => state.shell_opts.noglob = enable,
+        "globstar" => state.shell_opts.globstar = enable,
+        "lastpipe" => state.shell_opts.lastpipe = enable,
+        "autocd" => state.shell_opts.autocd = enable,
+        "cdspell" => state.shell_opts.cdspell = enable,
+        "checkwinsize" => state.shell_opts.checkwinsize = enable,
+        "inherit_errexit" => state.shell_opts.inherit_errexit = enable,
+        other => {
+            state
+                .shell_opts
+                .shopt_opts
+                .insert(other.to_string(), enable);
         }
-        i += 1;
     }
+}
 
-    if print_all {
-        print_shopt_options(&state.shell_opts);
-        return 0;
+fn builtin_shopt(args: &[String], state: &mut ShellState) -> i32 {
+    // shopt [-pqsu] [-o] [optname ...]
+    // -s/-u set or unset, -p prints a line that can be read back, -q prints
+    // nothing and answers through the exit status, -o works on `set -o` names.
+    let mut setting: Option<bool> = None;
+    let mut reusable = false;
+    let mut quiet = false;
+    let mut set_o = false;
+
+    let mut first_name = args.len();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            first_name = i + 1;
+            break;
+        }
+        // Only a `-` cluster is an option; the first bare word starts the names.
+        if !(arg.len() > 1 && arg.starts_with('-')) {
+            first_name = i;
+            break;
+        }
+        for c in arg.chars().skip(1) {
+            match c {
+                's' => setting = Some(true),
+                'u' => setting = Some(false),
+                'p' => reusable = true,
+                'q' => quiet = true,
+                'o' => set_o = true,
+                _ => {
+                    eprintln!("jsh: shopt: -{}: invalid option", c);
+                    eprintln!("jsh: {}", SHOPT_USAGE);
+                    return 2;
+                }
+            }
+        }
+        first_name = i + 1;
     }
+    let names = &args[first_name..];
 
-    if opts.is_empty() {
-        // No options specified, print all
-        print_shopt_options(&state.shell_opts);
+    if names.is_empty() {
+        if !quiet {
+            print_shopt_options(state, setting, reusable, set_o);
+        }
         return 0;
     }
 
     let mut exit_code = 0;
-    for opt in opts {
+    // Query mode reports failure unless *every* name is on, so it has to look at
+    // all of them; `-s`/`-u` still apply the names that are valid.
+    let mut all_enabled = true;
+    for name in names {
+        let known = if set_o {
+            set_option_is_known(name)
+        } else {
+            shopt_option_is_known(name)
+        };
+        if !known {
+            eprintln!("jsh: shopt: {}: invalid shell option name", name);
+            exit_code = 1;
+            all_enabled = false;
+            continue;
+        }
         match setting {
-            Some(true) => {
-                // Set option
-                match opt.as_str() {
-                    "dotglob" => state.shell_opts.dotglob = true,
-                    "nullglob" => state.shell_opts.nullglob = true,
-                    "failglob" => state.shell_opts.failglob = true,
-                    "extglob" => state.shell_opts.extglob = true,
-                    "nocaseglob" => state.shell_opts.nocaseglob = true,
-                    "noglob" => state.shell_opts.noglob = true,
-                    "lastpipe" => state.shell_opts.lastpipe = true,
-                    "autocd" => state.shell_opts.autocd = true,
-                    "cdspell" => state.shell_opts.cdspell = true,
-                    "checkwinsize" => state.shell_opts.checkwinsize = true,
-                    "inherit_errexit" => state.shell_opts.inherit_errexit = true,
-                    _ => {
-                        eprintln!("jsh: shopt: {}: invalid option name", opt);
-                        exit_code = 1;
-                    }
-                }
-            }
-            Some(false) => {
-                // Unset option
-                match opt.as_str() {
-                    "dotglob" => state.shell_opts.dotglob = false,
-                    "nullglob" => state.shell_opts.nullglob = false,
-                    "failglob" => state.shell_opts.failglob = false,
-                    "extglob" => state.shell_opts.extglob = false,
-                    "nocaseglob" => state.shell_opts.nocaseglob = false,
-                    "noglob" => state.shell_opts.noglob = false,
-                    "lastpipe" => state.shell_opts.lastpipe = false,
-                    "autocd" => state.shell_opts.autocd = false,
-                    "cdspell" => state.shell_opts.cdspell = false,
-                    "checkwinsize" => state.shell_opts.checkwinsize = false,
-                    "inherit_errexit" => state.shell_opts.inherit_errexit = false,
-                    _ => {
-                        eprintln!("jsh: shopt: {}: invalid option name", opt);
-                        exit_code = 1;
-                    }
+            Some(enable) => {
+                if set_o {
+                    apply_shell_option(state, name, enable);
+                } else {
+                    set_shopt_option(state, name, enable);
                 }
             }
             None => {
-                // No -s or -u specified, just report status
-                let value = match opt.as_str() {
-                    "dotglob" => Some(state.shell_opts.dotglob),
-                    "nullglob" => Some(state.shell_opts.nullglob),
-                    "failglob" => Some(state.shell_opts.failglob),
-                    "extglob" => Some(state.shell_opts.extglob),
-                    "nocaseglob" => Some(state.shell_opts.nocaseglob),
-                    "noglob" => Some(state.shell_opts.noglob),
-                    "lastpipe" => Some(state.shell_opts.lastpipe),
-                    "autocd" => Some(state.shell_opts.autocd),
-                    "cdspell" => Some(state.shell_opts.cdspell),
-                    "checkwinsize" => Some(state.shell_opts.checkwinsize),
-                    "inherit_errexit" => Some(state.shell_opts.inherit_errexit),
-                    _ => None,
+                let enabled = if set_o {
+                    shell_option_enabled(state, name)
+                } else {
+                    shopt_enabled(state, name)
                 };
-
-                match value {
-                    Some(true) => println!("{}\ton", opt),
-                    Some(false) => println!("{}\toff", opt),
-                    None => {
-                        eprintln!("jsh: shopt: {}: invalid option name", opt);
-                        exit_code = 1;
-                    }
+                all_enabled &= enabled;
+                if !quiet {
+                    print_shopt_line(name, enabled, reusable, set_o);
                 }
             }
         }
     }
 
+    if setting.is_none() && !all_enabled && exit_code == 0 {
+        exit_code = 1;
+    }
     exit_code
 }
 
-fn print_shopt_options(opts: &crate::environment::ShellOpts) {
-    // Print all options and their status (like bash)
-    let options = vec![
-        ("autocd", opts.autocd),
-        ("cdspell", opts.cdspell),
-        ("checkwinsize", opts.checkwinsize),
-        ("dotglob", opts.dotglob),
-        ("extglob", opts.extglob),
-        ("failglob", opts.failglob),
-        ("inherit_errexit", opts.inherit_errexit),
-        ("lastpipe", opts.lastpipe),
-        ("nocaseglob", opts.nocaseglob),
-        ("noglob", opts.noglob),
-        ("nullglob", opts.nullglob),
-    ];
+fn print_shopt_line(name: &str, enabled: bool, reusable: bool, set_o: bool) {
+    match (reusable, set_o) {
+        (true, true) => println!("set {}o {}", if enabled { '-' } else { '+' }, name),
+        (true, false) => println!("shopt -{} {}", if enabled { 's' } else { 'u' }, name),
+        // Bash pads the name to 15 columns, then a tab.
+        (false, _) => println!("{:<15}\t{}", name, if enabled { "on" } else { "off" }),
+    }
+}
 
-    for (name, value) in options {
-        if value {
-            println!("{}\ton", name);
-        } else {
-            println!("{}\toff", name);
+/// `shopt` with no names lists options: all of them, or — after `-s` / `-u` —
+/// only those currently on or off.
+fn print_shopt_options(state: &ShellState, setting: Option<bool>, reusable: bool, set_o: bool) {
+    if set_o {
+        for (name, _) in SET_OPTIONS {
+            let enabled = shell_option_enabled(state, name);
+            if setting.is_none_or(|want| want == enabled) {
+                print_shopt_line(name, enabled, reusable, true);
+            }
+        }
+        return;
+    }
+    for (name, _) in SHOPT_OPTIONS {
+        let enabled = shopt_enabled(state, name);
+        if setting.is_none_or(|want| want == enabled) {
+            print_shopt_line(name, enabled, reusable, false);
         }
     }
 }

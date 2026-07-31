@@ -62,6 +62,13 @@ pub struct ShellOpts {
     /// `set -o NAME` for a real bash option is never mistaken for an operand.
     #[serde(default)]
     pub tracked_opts: HashMap<String, bool>,
+    /// On/off state of the `shopt` names bash accepts but jsh does not model
+    /// (`histappend`, `progcomp`, `expand_aliases`, ...). Remembered for the
+    /// same reason as `tracked_opts`: a `.bashrc` full of `shopt -s` lines must
+    /// not spray "invalid option name" errors, and a later `shopt NAME` has to
+    /// answer with what was set.
+    #[serde(default)]
+    pub shopt_opts: HashMap<String, bool>,
 }
 
 impl Default for ShellOpts {
@@ -86,6 +93,7 @@ impl Default for ShellOpts {
             inherit_errexit: false,
             config_source: ConfigSource::Bashrc,
             tracked_opts: HashMap::new(),
+            shopt_opts: HashMap::new(),
         }
     }
 }

@@ -1748,9 +1748,20 @@ fn read_parameter_expansion(chars: &mut std::iter::Peekable<std::str::Chars<'_>>
                 in_double = true;
                 inner.push(c);
             }
-            '{' => {
-                depth += 1;
+            // Only `${` opens a nested expansion. A bare `{` is an ordinary
+            // pattern character, and counting it as an opener stole the closing
+            // brace of expansions such as `${opt%%[<{().[]*}`, leaving the
+            // pattern with a trailing `}` that matched nothing.
+            '$' if chars.peek() == Some(&'{') => {
                 inner.push(c);
+                inner.push(chars.next().unwrap());
+                depth += 1;
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                inner.push(c);
+                inner.push(chars.next().unwrap());
+                inner.push_str(&read_command_sub(chars));
+                inner.push(')');
             }
             '}' => {
                 depth -= 1;
@@ -2048,16 +2059,9 @@ pub fn parse_word_parts(raw: &str) -> Word {
                     }
                     Some(&'{') => {
                         chars.next();
-                        let mut var = String::new();
-                        while let Some(&c2) = chars.peek() {
-                            if c2 == '}' {
-                                chars.next();
-                                break;
-                            }
-                            var.push(c2);
-                            chars.next();
-                        }
-                        parts.push(WordPart::Variable(var));
+                        // Stopping at the first `}` cut `${x:-${y}}` short and
+                        // left the extra brace in the word.
+                        parts.push(WordPart::Variable(read_parameter_expansion(&mut chars)));
                     }
                     Some(&'"') => {
                         chars.next();
@@ -2343,23 +2347,7 @@ fn parse_word_parts_inner(input: &str) -> Vec<WordPart> {
                 }
                 Some(&'{') => {
                     chars.next();
-                    let mut var = String::new();
-                    let mut depth = 1;
-                    while let Some(&c2) = chars.peek() {
-                        if c2 == '{' {
-                            depth += 1;
-                        }
-                        if c2 == '}' {
-                            depth -= 1;
-                            if depth == 0 {
-                                chars.next();
-                                break;
-                            }
-                        }
-                        var.push(c2);
-                        chars.next();
-                    }
-                    parts.push(WordPart::Variable(var));
+                    parts.push(WordPart::Variable(read_parameter_expansion(&mut chars)));
                 }
                 Some(&'(') => {
                     chars.next();

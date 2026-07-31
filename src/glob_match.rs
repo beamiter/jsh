@@ -178,481 +178,187 @@ pub fn contains_extglob(pattern: &str) -> bool {
     false
 }
 
-/// Match a value against an extended glob pattern
-/// Supports !(pat), ?(pat), *(pat), +(pat), @(pat)
+/// Match `value` against a shell pattern the way `case`, `[[ == ]]` and
+/// `${var#pat}` do: `@(a|b)` and friends are patterns only while
+/// `shopt -s extglob` is on, and plain glob syntax otherwise.
+pub fn pattern_match(pattern: &str, value: &str, extglob: bool) -> bool {
+    if extglob && contains_extglob(pattern) {
+        extglob_match(pattern, value)
+    } else {
+        glob_match(pattern, value)
+    }
+}
+
+/// Match `value` against an extended-glob `pattern`, anchored at both ends.
+///
+/// The extended forms are `?(a|b)` (zero or one), `*(a|b)` (zero or more),
+/// `+(a|b)` (one or more), `@(a|b)` (exactly one) and `!(a|b)` (anything that
+/// is not one of them). Every one of them can be followed by more pattern, so
+/// matching has to backtrack over how much of the value the group consumed:
+/// `!(no-*)dir*` matches `nodir` only if `!(no-*)` settles on `no` and leaves
+/// `dir` for the rest of the pattern.
 pub fn extglob_match(pattern: &str, value: &str) -> bool {
-    // If pattern contains no extglob syntax, fall back to regular glob
+    // A pattern with no group is a plain glob; the iterative matcher answers it
+    // without the recursion this one needs.
     if !contains_extglob(pattern) {
         return glob_match(pattern, value);
     }
-
-    match_extglob_recursive(pattern, value, 0, 0)
-}
-
-/// Helper: Check if value from start position matches any of the patterns exactly
-fn matches_any_pattern(patterns: &[String], value: &[char], start: usize) -> Option<usize> {
-    for subpat in patterns {
-        if let Some(len) = try_match_subpattern(subpat, value, start) {
-            return Some(len);
-        }
-    }
-    None
-}
-
-/// Helper: Try to match a subpattern starting at a position, return matched length if successful
-fn try_match_subpattern(pattern: &str, value: &[char], start: usize) -> Option<usize> {
-    let pat_chars: Vec<char> = pattern.chars().collect();
-    let mut pi = 0;
-    let mut vi = start;
-
-    while pi < pat_chars.len() && vi < value.len() {
-        match pat_chars[pi] {
-            '*' => {
-                if pi + 1 >= pat_chars.len() {
-                    return Some(value.len() - start);
-                }
-                // Star: try to match rest
-                loop {
-                    if try_match_subpattern_from(&pat_chars, pi + 1, value, vi).is_some() {
-                        return Some(vi - start);
-                    }
-                    if vi >= value.len() {
-                        break;
-                    }
-                    vi += 1;
-                }
-                return None;
-            }
-            '?' => {
-                pi += 1;
-                vi += 1;
-            }
-            c => {
-                if c == value[vi] {
-                    pi += 1;
-                    vi += 1;
-                } else {
-                    return None;
-                }
-            }
-        }
-    }
-
-    if pi == pat_chars.len() {
-        Some(vi - start)
-    } else {
-        None
-    }
-}
-
-/// Helper: Try to match pattern from pi position
-fn try_match_subpattern_from(
-    pattern: &[char],
-    pi: usize,
-    value: &[char],
-    vi: usize,
-) -> Option<usize> {
-    let mut pi = pi;
-    let mut vi = vi;
-
-    while pi < pattern.len() && vi < value.len() {
-        match pattern[pi] {
-            '*' => {
-                if pi + 1 >= pattern.len() {
-                    return Some(value.len() - vi);
-                }
-                loop {
-                    if try_match_subpattern_from(pattern, pi + 1, value, vi).is_some() {
-                        return Some(0);
-                    }
-                    if vi >= value.len() {
-                        break;
-                    }
-                    vi += 1;
-                }
-                return None;
-            }
-            '?' => {
-                pi += 1;
-                vi += 1;
-            }
-            c => {
-                if c == value[vi] {
-                    pi += 1;
-                    vi += 1;
-                } else {
-                    return None;
-                }
-            }
-        }
-    }
-
-    if pi == pattern.len() {
-        Some(0)
-    } else {
-        None
-    }
-}
-
-/// Recursive helper for extglob matching
-fn match_extglob_recursive(pattern: &str, value: &str, pi: usize, vi: usize) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let v: Vec<char> = value.chars().collect();
-
-    let mut pi = pi;
-    let mut vi = vi;
-
-    while pi < p.len() {
-        // Check for extglob pattern at current position
-        if pi + 1 < p.len() && p[pi + 1] == '(' {
-            match p[pi] {
-                '!' => {
-                    // !(pat): match anything NOT matching pat
-                    if let Some((patterns, end)) = parse_extglob_group(&p, pi) {
-                        // Check if remaining value matches any of the patterns
-                        let mut matched_any = false;
-                        for subpat in &patterns {
-                            if match_extglob_pattern(subpat, &v, vi) {
-                                matched_any = true;
-                                break;
-                            }
-                        }
-
-                        if matched_any {
-                            // One of the patterns matched, so !(pat) fails
-                            return false;
-                        }
-
-                        // None of the patterns matched - this is what !(pat) wants
-                        if end >= p.len() {
-                            // This is the end of the pattern, so we matched!
-                            // Return true since the remaining value successfully didn't match pat
-                            return true;
-                        }
-
-                        // There's more pattern after !(pat) - continue parsing
-                        pi = end;
-                        // !(pat) doesn't consume characters by itself
-                    } else {
-                        // Invalid extglob, treat as literal
-                        if vi < v.len() && v[vi] == p[pi] {
-                            pi += 1;
-                            vi += 1;
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-                '?' => {
-                    // ?(pat): match 0 or 1 occurrence of pat
-                    if let Some((patterns, end)) = parse_extglob_group(&p, pi) {
-                        // Try matching exactly one occurrence
-                        if let Some(matched_len) = matches_any_pattern(&patterns, &v, vi) {
-                            let new_vi = vi + matched_len;
-                            if match_extglob_recursive(pattern, value, end, new_vi) {
-                                return true;
-                            }
-                        }
-                        // Try matching zero occurrences (just skip to end)
-                        return match_extglob_recursive(pattern, value, end, vi);
-                    } else {
-                        // Invalid extglob, treat as literal
-                        if vi < v.len() && v[vi] == p[pi] {
-                            pi += 1;
-                            vi += 1;
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-                '*' => {
-                    // *(pat): match 0 or more occurrences of pat
-                    if let Some((patterns, end)) = parse_extglob_group(&p, pi) {
-                        // Greedy: match as many as possible, then backtrack if needed
-                        let mut current_vi = vi;
-                        loop {
-                            // Try to match one more occurrence
-                            if let Some(matched_len) =
-                                matches_any_pattern(&patterns, &v, current_vi)
-                            {
-                                current_vi += matched_len;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Now try from longest to shortest match
-                        loop {
-                            if match_extglob_recursive(pattern, value, end, current_vi) {
-                                return true;
-                            }
-                            if current_vi == vi {
-                                break;
-                            }
-                            // Backtrack: try with one fewer match
-                            // Find the last successful match position
-                            let mut prev_vi = vi;
-                            let mut test_vi = vi;
-                            while test_vi < current_vi {
-                                if let Some(matched_len) =
-                                    matches_any_pattern(&patterns, &v, test_vi)
-                                {
-                                    prev_vi = test_vi + matched_len;
-                                    test_vi = prev_vi;
-                                } else {
-                                    break;
-                                }
-                            }
-                            current_vi = prev_vi;
-                        }
-                        return false;
-                    } else {
-                        // Invalid extglob, treat as literal
-                        if vi < v.len() && v[vi] == p[pi] {
-                            pi += 1;
-                            vi += 1;
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-                '+' => {
-                    // +(pat): match 1 or more occurrences of pat
-                    if let Some((patterns, end)) = parse_extglob_group(&p, pi) {
-                        // Must match at least once
-                        let mut current_vi = vi;
-
-                        // Match the first occurrence
-                        if matches_any_pattern(&patterns, &v, current_vi).is_none() {
-                            return false;
-                        }
-
-                        // Keep matching greedily
-                        loop {
-                            if let Some(matched_len) =
-                                matches_any_pattern(&patterns, &v, current_vi)
-                            {
-                                current_vi += matched_len;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Now try from longest to shortest match
-                        loop {
-                            if match_extglob_recursive(pattern, value, end, current_vi) {
-                                return true;
-                            }
-                            // Backtrack
-                            let mut prev_vi = vi;
-                            let mut test_vi = vi;
-                            while test_vi < current_vi {
-                                if let Some(matched_len) =
-                                    matches_any_pattern(&patterns, &v, test_vi)
-                                {
-                                    prev_vi = test_vi + matched_len;
-                                    test_vi = prev_vi;
-                                } else {
-                                    break;
-                                }
-                            }
-                            if prev_vi == current_vi {
-                                break;
-                            }
-                            current_vi = prev_vi;
-                        }
-                        return false;
-                    } else {
-                        // Invalid extglob, treat as literal
-                        if vi < v.len() && v[vi] == p[pi] {
-                            pi += 1;
-                            vi += 1;
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-                '@' => {
-                    // @(pat): match exactly one of the patterns
-                    if let Some((patterns, end)) = parse_extglob_group(&p, pi) {
-                        if let Some(matched_len) = matches_any_pattern(&patterns, &v, vi) {
-                            return match_extglob_recursive(pattern, value, end, vi + matched_len);
-                        }
-                        return false;
-                    } else {
-                        // Invalid extglob, treat as literal
-                        if vi < v.len() && v[vi] == p[pi] {
-                            pi += 1;
-                            vi += 1;
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-                _ => {
-                    if vi < v.len() && v[vi] == p[pi] {
-                        pi += 1;
-                        vi += 1;
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        } else if p[pi] == '*' && pi + 1 >= p.len() {
-            // Trailing star matches everything
-            return true;
-        } else if p[pi] == '*' {
-            // Regular star: match any sequence
-            if vi >= v.len() {
-                return match_extglob_recursive(pattern, value, pi + 1, vi);
-            }
-            // Try matching zero characters
-            if match_extglob_recursive(pattern, value, pi + 1, vi) {
-                return true;
-            }
-            // Try matching one or more characters
-            return match_extglob_recursive(pattern, value, pi, vi + 1);
-        } else if p[pi] == '?' || p[pi] == v.get(vi).copied().unwrap_or('\0') {
-            // Single char match
-            if vi >= v.len() {
-                return false;
-            }
-            pi += 1;
-            vi += 1;
-        } else {
-            // Mismatch
-            return false;
-        }
-    }
-
-    vi == v.len()
+    match_from(&p, 0, &v, 0)
 }
 
-/// Parse an extglob group like !(a|b|c)
-/// Returns the list of patterns and the position after the closing paren
-fn parse_extglob_group(pattern: &[char], start: usize) -> Option<(Vec<String>, usize)> {
-    if start + 1 >= pattern.len() || pattern[start + 1] != '(' {
+/// True when `p[pi..]` matches all of `v[vi..]`.
+fn match_from(p: &[char], pi: usize, v: &[char], vi: usize) -> bool {
+    if pi >= p.len() {
+        return vi >= v.len();
+    }
+
+    if let Some((kind, alts, end)) = parse_extglob_group(p, pi) {
+        return match_group(kind, &alts, p, end, v, vi);
+    }
+
+    match p[pi] {
+        '\\' if pi + 1 < p.len() => {
+            if vi < v.len() && v[vi] == p[pi + 1] {
+                match_from(p, pi + 2, v, vi + 1)
+            } else {
+                false
+            }
+        }
+        '*' => {
+            // Every split point, shortest first.
+            (vi..=v.len()).any(|k| match_from(p, pi + 1, v, k))
+        }
+        '?' => vi < v.len() && match_from(p, pi + 1, v, vi + 1),
+        '[' => {
+            let mut after = pi;
+            match match_char_class(p, &mut after) {
+                Some((negated, ranges)) => {
+                    vi < v.len()
+                        && char_in_class(v[vi], negated, &ranges)
+                        && match_from(p, after, v, vi + 1)
+                }
+                // An unclosed `[` is a literal, as in a plain glob.
+                None => vi < v.len() && v[vi] == '[' && match_from(p, pi + 1, v, vi + 1),
+            }
+        }
+        c => vi < v.len() && v[vi] == c && match_from(p, pi + 1, v, vi + 1),
+    }
+}
+
+/// The five group operators, by their leading character.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupKind {
+    ZeroOrOne,  // ?(...)
+    ZeroOrMore, // *(...)
+    OneOrMore,  // +(...)
+    ExactlyOne, // @(...)
+    Not,        // !(...)
+}
+
+/// Match one group at `v[vi..]`, then `p[end..]` against what is left.
+fn match_group(
+    kind: GroupKind,
+    alts: &[Vec<char>],
+    p: &[char],
+    end: usize,
+    v: &[char],
+    vi: usize,
+) -> bool {
+    match kind {
+        GroupKind::Not => {
+            // Anything the alternatives do NOT match, of any length.
+            (vi..=v.len()).any(|k| !alts_match(alts, &v[vi..k]) && match_from(p, end, v, k))
+        }
+        GroupKind::ExactlyOne => {
+            (vi..=v.len()).any(|k| alts_match(alts, &v[vi..k]) && match_from(p, end, v, k))
+        }
+        GroupKind::ZeroOrOne => {
+            match_from(p, end, v, vi)
+                || (vi..=v.len()).any(|k| alts_match(alts, &v[vi..k]) && match_from(p, end, v, k))
+        }
+        GroupKind::ZeroOrMore => match_repeat(alts, p, end, v, vi, true),
+        GroupKind::OneOrMore => match_repeat(alts, p, end, v, vi, false),
+    }
+}
+
+/// Match zero (or one, when `allow_empty` is false) or more repetitions of
+/// `alts`, then the rest of the pattern. Each repetition must consume at least
+/// one character, which is what keeps `*(a|)` from looping forever.
+fn match_repeat(
+    alts: &[Vec<char>],
+    p: &[char],
+    end: usize,
+    v: &[char],
+    vi: usize,
+    allow_empty: bool,
+) -> bool {
+    if allow_empty && match_from(p, end, v, vi) {
+        return true;
+    }
+    (vi + 1..=v.len())
+        .any(|k| alts_match(alts, &v[vi..k]) && match_repeat(alts, p, end, v, k, true))
+}
+
+/// True when one alternative matches the whole of `value`.
+fn alts_match(alts: &[Vec<char>], value: &[char]) -> bool {
+    alts.iter().any(|alt| match_from(alt, 0, value, 0))
+}
+
+/// Parse the extended-glob group starting at `pattern[start]`, if there is one.
+/// Returns its kind, its `|`-separated alternatives and the index just past the
+/// closing paren. Alternatives keep their own metacharacters — including nested
+/// groups — because they are matched by the same function that parsed them.
+fn parse_extglob_group(
+    pattern: &[char],
+    start: usize,
+) -> Option<(GroupKind, Vec<Vec<char>>, usize)> {
+    let kind = match pattern.get(start)? {
+        '?' => GroupKind::ZeroOrOne,
+        '*' => GroupKind::ZeroOrMore,
+        '+' => GroupKind::OneOrMore,
+        '@' => GroupKind::ExactlyOne,
+        '!' => GroupKind::Not,
+        _ => return None,
+    };
+    if pattern.get(start + 1) != Some(&'(') {
         return None;
     }
 
+    let mut alts = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 1usize;
     let mut i = start + 2;
-    let mut depth = 1;
-    let mut current = String::new();
-    let mut patterns = Vec::new();
-
-    while i < pattern.len() && depth > 0 {
-        match pattern[i] {
+    while i < pattern.len() {
+        let c = pattern[i];
+        match c {
+            '\\' if i + 1 < pattern.len() => {
+                current.push(c);
+                current.push(pattern[i + 1]);
+                i += 1;
+            }
             '(' => {
                 depth += 1;
-                current.push('(');
+                current.push(c);
             }
             ')' => {
                 depth -= 1;
                 if depth == 0 {
-                    if !current.is_empty() {
-                        patterns.push(current.trim().to_string());
-                    }
-                    return Some((patterns, i + 1));
-                } else {
-                    current.push(')');
+                    alts.push(current);
+                    return Some((kind, alts, i + 1));
                 }
+                current.push(c);
             }
             '|' if depth == 1 => {
-                if !current.is_empty() {
-                    patterns.push(current.trim().to_string());
-                    current = String::new();
-                }
+                alts.push(std::mem::take(&mut current));
             }
-            c => current.push(c),
+            _ => current.push(c),
         }
         i += 1;
     }
 
-    None // Unclosed paren
-}
-
-/// Check if a simple pattern matches at a position in the value
-fn match_extglob_pattern(pattern: &str, value: &[char], start: usize) -> bool {
-    let pat_chars: Vec<char> = pattern.chars().collect();
-    let mut pi = 0;
-    let mut vi = start;
-
-    while pi < pat_chars.len() && vi < value.len() {
-        match pat_chars[pi] {
-            '*' => {
-                // Star in subpattern
-                if pi + 1 >= pat_chars.len() {
-                    return true; // Star at end matches rest
-                }
-                // Try matching rest
-                loop {
-                    if match_extglob_pattern_iter(&pat_chars, pi + 1, value, vi) {
-                        return true;
-                    }
-                    if vi >= value.len() {
-                        break;
-                    }
-                    vi += 1;
-                }
-                return false;
-            }
-            '?' => {
-                // Question mark matches any single char
-                pi += 1;
-                vi += 1;
-            }
-            c => {
-                if c == value[vi] {
-                    pi += 1;
-                    vi += 1;
-                } else {
-                    return false;
-                }
-            }
-        }
-    }
-
-    pi == pat_chars.len() && vi == value.len()
-}
-
-/// Helper for matching pattern from pi with value from vi
-fn match_extglob_pattern_iter(pattern: &[char], pi: usize, value: &[char], vi: usize) -> bool {
-    let mut pi = pi;
-    let mut vi = vi;
-
-    while pi < pattern.len() && vi < value.len() {
-        match pattern[pi] {
-            '*' => {
-                if pi + 1 >= pattern.len() {
-                    return true;
-                }
-                loop {
-                    if match_extglob_pattern_iter(pattern, pi + 1, value, vi) {
-                        return true;
-                    }
-                    if vi >= value.len() {
-                        break;
-                    }
-                    vi += 1;
-                }
-                return false;
-            }
-            '?' => {
-                pi += 1;
-                vi += 1;
-            }
-            c => {
-                if c == value[vi] {
-                    pi += 1;
-                    vi += 1;
-                } else {
-                    return false;
-                }
-            }
-        }
-    }
-
-    pi == pattern.len() && vi == value.len()
+    None // Unclosed group: not an extended glob after all.
 }
 
 #[cfg(test)]
@@ -828,5 +534,48 @@ mod tests {
         assert!(extglob_match("@(foo|bar)", "foo"));
         assert!(extglob_match("@(foo|bar)", "bar"));
         assert!(!extglob_match("@(foo|bar)", "baz"));
+    }
+
+    /// A group is rarely the whole pattern. Matching it used to consume nothing
+    /// (`!(...)`) or the first alternative that fit (`@(...)`), so anything
+    /// after the group could not match — the shape bash-completion is built on.
+    #[test]
+    fn test_extglob_group_followed_by_more_pattern() {
+        assert!(extglob_match("!(x)bc", "abc"));
+        assert!(extglob_match("!(no-*)dir*", "nodir"));
+        assert!(extglob_match("--!(no-*)dir*", "--nodir"));
+        assert!(!extglob_match("--!(no-*)dir*", "--no-fdir"));
+        assert!(extglob_match("@(a|ab)c", "abc"));
+        assert!(extglob_match("+(a|b)c", "aabc"));
+        assert!(extglob_match("?(a)bc", "bc"));
+        assert!(extglob_match("*(ab)c", "ababc"));
+        assert!(!extglob_match("*(ab)c", "abax"));
+        // Groups nest, and the value after them still has to line up.
+        assert!(extglob_match("@(a|!(b))z", "cz"));
+        assert!(extglob_match("-?(\\[)+([a-zA-Z0-9?])", "-abc"));
+        assert!(extglob_match("-?(\\[)+([a-zA-Z0-9?])", "-[a"));
+    }
+
+    #[test]
+    fn test_extglob_alternatives_carry_glob_syntax() {
+        assert!(extglob_match("@(Linux|GNU/*)", "Linux"));
+        assert!(extglob_match("@(Linux|GNU/*)", "GNU/kFreeBSD"));
+        assert!(!extglob_match("@(Linux|GNU/*)", "Darwin"));
+        assert!(extglob_match("*@(solaris|aix)*", "solaris2.11"));
+        assert!(!extglob_match("*@(solaris|aix)*", "linux-gnu"));
+        assert!(extglob_match("!(*.txt)", "file.rs"));
+        assert!(!extglob_match("!(*.txt)", "file.txt"));
+    }
+
+    /// `pattern_match` is the gate `shopt -s extglob` controls: with the option
+    /// off, `@(a|b)` is not a group at all.
+    #[test]
+    fn test_pattern_match_honours_extglob_option() {
+        assert!(pattern_match("@(foo|bar)", "foo", true));
+        assert!(!pattern_match("@(foo|bar)", "foo", false));
+        assert!(pattern_match("@(foo|bar)", "@(foo|bar)", false));
+        // Plain globs behave the same either way.
+        assert!(pattern_match("*.txt", "a.txt", true));
+        assert!(pattern_match("*.txt", "a.txt", false));
     }
 }

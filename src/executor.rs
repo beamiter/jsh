@@ -1276,8 +1276,13 @@ fn execute_simple_with_mode(
         return execute_typed_let(&cmd.words, state);
     }
 
-    // Expand words
-    let expanded = expand_words(&cmd.words, state);
+    // Expand words. A `[[ ]]` conditional keeps one operand per word: the
+    // parser only ever produces a bare `[[` head word for that construct.
+    let expanded = if is_conditional_command(&cmd.words) {
+        crate::expand::expand_conditional_words(&cmd.words, state)
+    } else {
+        expand_words(&cmd.words, state)
+    };
     if let Some(code) = report_expansion_error(state) {
         return code;
     }
@@ -1791,7 +1796,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                     let hit = fall
                         || arm.patterns.iter().any(|p| {
                             let pat = expand_word_to_string(p, state);
-                            match_pattern(&value, &pat)
+                            match_pattern(&value, &pat, state.shell_opts.extglob)
                         });
                     if hit {
                         last = execute_command_list(&arm.body, state);
@@ -2019,8 +2024,19 @@ fn execute_condition(cmds: &[CompleteCommand], state: &mut ShellState) -> i32 {
     with_errexit_suppressed(state, |state| execute_command_list(cmds, state))
 }
 
-fn match_pattern(value: &str, pattern: &str) -> bool {
-    crate::glob_match::glob_match(pattern, value)
+fn match_pattern(value: &str, pattern: &str, extglob: bool) -> bool {
+    crate::glob_match::pattern_match(pattern, value, extglob)
+}
+
+/// True for a `[[ ... ]]` conditional, whose operands expand by different rules
+/// than a normal command's arguments.
+fn is_conditional_command(words: &[Word]) -> bool {
+    // `[[` reaches the word parser as one part, but as a Glob rather than a
+    // Literal: it opens with a bracket.
+    matches!(
+        words.first().map(|w| w.as_slice()),
+        Some([WordPart::Literal(head)] | [WordPart::Glob(head)]) if head == "[["
+    )
 }
 
 // --- Redirect handling ---

@@ -216,21 +216,12 @@ fn parse_bash_output(output: &str, state: &mut ShellState) {
                     let opt_value = parts[parts.len() - 1];
                     let enabled = opt_value == "on";
 
-                    // Map bash shopt names to jsh ShellOpts
-                    match opt_name {
-                        "globstar" => state.shell_opts.globstar = enabled,
-                        "dotglob" => state.shell_opts.dotglob = enabled,
-                        "nullglob" => state.shell_opts.nullglob = enabled,
-                        "failglob" => state.shell_opts.failglob = enabled,
-                        "extglob" => state.shell_opts.extglob = enabled,
-                        "nocaseglob" => state.shell_opts.nocaseglob = enabled,
-                        "noglob" => state.shell_opts.noglob = enabled,
-                        "lastpipe" => state.shell_opts.lastpipe = enabled,
-                        "autocd" => state.shell_opts.autocd = enabled,
-                        "cdspell" => state.shell_opts.cdspell = enabled,
-                        "checkwinsize" => state.shell_opts.checkwinsize = enabled,
-                        "inherit_errexit" => state.shell_opts.inherit_errexit = enabled,
-                        _ => {} // Unknown shopt, ignore
+                    // Map bash shopt names to jsh ShellOpts. Names jsh does not
+                    // model are remembered rather than dropped, so `shopt
+                    // histappend` answers the same in jsh as in the bash the
+                    // settings came from.
+                    if crate::builtins::shopt_option_is_known(opt_name) {
+                        crate::builtins::set_shopt_option(state, opt_name, enabled);
                     }
                 }
             }

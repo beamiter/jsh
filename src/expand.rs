@@ -2260,31 +2260,39 @@ fn expand_with_extglob(pattern: &str, state: &mut ShellState) -> Vec<String> {
     // Get the directory to search
     let search_dir = if dir_path.is_empty() || dir_path == "." {
         std::env::current_dir().unwrap_or_default()
+    } else if dir_path.starts_with('~') {
+        dirs::home_dir().unwrap_or_default().join(&dir_path[1..])
     } else {
-        let expanded_dir = if dir_path.starts_with('~') {
-            dirs::home_dir().unwrap_or_default().join(&dir_path[1..])
-        } else {
-            std::path::PathBuf::from(dir_path)
-        };
-        expanded_dir
+        std::path::PathBuf::from(&dir_path)
+    };
+
+    // A match keeps the directory part the pattern was written with, `./`
+    // included. Reporting the canonical path instead turned `echo !(*.txt)`
+    // into a list of absolute paths — and resolved symlinks on the way.
+    let literal_prefix = &pattern[..pattern.len() - file_pattern.len()];
+    let prefix = if literal_prefix.starts_with('~') {
+        format!("{}/", search_dir.to_string_lossy())
+    } else {
+        literal_prefix.to_string()
     };
 
     let mut results = Vec::new();
 
     if let Ok(entries) = fs::read_dir(&search_dir) {
         for entry in entries.flatten() {
-            if let Ok(path) = entry.path().canonicalize() {
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    // Apply dotglob filtering
-                    if !state.shell_opts.dotglob && filename.starts_with('.') {
-                        continue;
-                    }
+            let name = entry.file_name();
+            let filename = match name.to_str() {
+                Some(f) => f,
+                None => continue,
+            };
+            // Apply dotglob filtering
+            if !state.shell_opts.dotglob && filename.starts_with('.') {
+                continue;
+            }
 
-                    // Apply extglob matching
-                    if crate::glob_match::extglob_match(&file_pattern, filename) {
-                        results.push(path.to_string_lossy().to_string());
-                    }
-                }
+            // Apply extglob matching
+            if crate::glob_match::extglob_match(&file_pattern, filename) {
+                results.push(format!("{}{}", prefix, filename));
             }
         }
     }
@@ -2350,6 +2358,27 @@ pub fn expand_words(words: &[Word], state: &mut ShellState) -> Vec<String> {
     let mut result = Vec::new();
     for word in words {
         result.extend(expand_word(word, state));
+        if state.expansion_error.is_some() {
+            break;
+        }
+    }
+    result
+}
+
+/// Expand the words of a `[[ ]]` conditional: one operand per word, always.
+///
+/// Bash performs neither word splitting nor pathname expansion inside `[[ ]]`,
+/// and that is not a nicety. Splitting made `[[ $v == x ]]` read `$v`'s second
+/// field as the operator; globbing replaced the pattern in `[[ $f == *.rs ]]`
+/// with whatever the directory happened to hold; and dropping the empty field
+/// of an unset parameter turned `[[ -n ${ZSH_VERSION-} ]]` into the one-operand
+/// test `[[ -n ]]`, which is true — so every bash script that branches on
+/// "am I zsh?" took the zsh branch.
+pub fn expand_conditional_words(words: &[Word], state: &mut ShellState) -> Vec<String> {
+    state.expansion_error = None;
+    let mut result = Vec::new();
+    for word in words {
+        result.push(expand_word_to_string(word, state));
         if state.expansion_error.is_some() {
             break;
         }

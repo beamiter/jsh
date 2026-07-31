@@ -55,6 +55,7 @@ enum LexicalIssue {
     UnclosedCommandSubstitution,
     UnclosedParameterExpansion,
     UnclosedProcessSubstitution,
+    UnclosedExtendedGlob,
     TrailingEscape,
 }
 
@@ -63,6 +64,9 @@ pub struct Lexer<'a> {
     pos: usize,
     lenient: bool,
     issue: Option<LexicalIssue>,
+    /// The token emitted before the one being read. Only `!(` needs it: at the
+    /// start of a command `!` negates, anywhere else it opens an extended glob.
+    prev_token: Option<Token>,
 }
 
 impl<'a> Lexer<'a> {
@@ -72,6 +76,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             lenient: false,
             issue: None,
+            prev_token: None,
         }
     }
 
@@ -81,6 +86,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             lenient: true,
             issue: None,
+            prev_token: None,
         }
     }
 
@@ -326,6 +332,143 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Read the body of an extended glob group — the `(...)` of `@(a|b)` — with
+    /// the opening paren already consumed. Unlike a command substitution the
+    /// body is a *pattern*: `#` is an ordinary character and `|` separates
+    /// alternatives, so only nesting, quoting and expansions may hide a `)`.
+    fn read_extglob_body(&mut self, word: &mut String) -> bool {
+        let mut depth = 1usize;
+        loop {
+            let c = match self.next_char() {
+                Some(c) => c,
+                None => {
+                    self.record_issue(LexicalIssue::UnclosedExtendedGlob);
+                    return false;
+                }
+            };
+            match c {
+                '\\' => {
+                    word.push(c);
+                    match self.next_char() {
+                        Some(next) => word.push(next),
+                        None => {
+                            self.record_issue(LexicalIssue::UnclosedExtendedGlob);
+                            return false;
+                        }
+                    }
+                }
+                '\'' => {
+                    word.push(c);
+                    let (body, closed) = self.read_single_quoted();
+                    word.push_str(&body);
+                    if !closed {
+                        self.record_issue(LexicalIssue::UnterminatedSingleQuote);
+                        return false;
+                    }
+                    word.push('\'');
+                }
+                '"' => {
+                    word.push(c);
+                    let (body, closed) = self.read_double_quoted();
+                    word.push_str(&body);
+                    if !closed {
+                        self.record_issue(LexicalIssue::UnterminatedDoubleQuote);
+                        return false;
+                    }
+                    word.push('"');
+                }
+                '`' => {
+                    word.push(c);
+                    let (body, closed) = self.read_backtick_substitution();
+                    word.push_str(&body);
+                    if !closed {
+                        self.record_issue(LexicalIssue::UnclosedCommandSubstitution);
+                        return false;
+                    }
+                    word.push('`');
+                }
+                '$' if self.peek_char() == Some('(') => {
+                    self.next_char();
+                    word.push('$');
+                    word.push('(');
+                    if !self.read_paren_body(word, LexicalIssue::UnclosedCommandSubstitution) {
+                        return false;
+                    }
+                }
+                '$' if self.peek_char() == Some('{') => {
+                    self.next_char();
+                    word.push('$');
+                    word.push('{');
+                    if !self.read_brace_body(word) {
+                        return false;
+                    }
+                }
+                '(' => {
+                    depth += 1;
+                    word.push(c);
+                }
+                ')' => {
+                    word.push(c);
+                    depth -= 1;
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+                _ => word.push(c),
+            }
+        }
+    }
+
+    /// True when the `(` about to be read opens an extended glob group, i.e.
+    /// `word` ends in an unquoted, unescaped `?`, `*`, `+`, `@` or `!`.
+    ///
+    /// A leading `!` is the exception: `!(cmd)` at the start of a command is
+    /// bash's pipeline negation, and only `shopt -s extglob` — which the lexer
+    /// cannot see — makes bash read it as a pattern instead. Keeping negation
+    /// wherever a command may start is the reading that cannot break a working
+    /// script, since every other position rejects `!` as a word anyway.
+    fn opens_extglob(&self, word: &str) -> bool {
+        let prefix = match word.chars().last() {
+            Some(c @ ('?' | '*' | '+' | '@' | '!')) => c,
+            _ => return false,
+        };
+        // `\@(` and `'@'(` are literal: an escaped prefix is preceded by an odd
+        // number of backslashes, and a quoted one ends the word with a quote.
+        let before = &word[..word.len() - prefix.len_utf8()];
+        if before.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1 {
+            return false;
+        }
+        prefix != '!' || !before.is_empty() || !self.at_command_start()
+    }
+
+    /// True when the next word would start a command, the one place `!` is a
+    /// reserved word rather than the head of a pattern.
+    fn at_command_start(&self) -> bool {
+        match &self.prev_token {
+            None => true,
+            Some(Token::Word(w)) => matches!(
+                w.as_str(),
+                "!" | "if" | "then" | "elif" | "else" | "while" | "until" | "do"
+            ),
+            Some(token) => matches!(
+                token,
+                Token::Newline
+                    | Token::Semi
+                    | Token::Amp
+                    | Token::AmpBang
+                    | Token::And
+                    | Token::Or
+                    | Token::Pipe
+                    | Token::PipeAnd
+                    | Token::LParen
+                    | Token::LBrace
+                    | Token::DoubleSemi
+                    | Token::SemiAmp
+                    | Token::DoubleSemiAmp
+            ),
+        }
+    }
+
     fn read_dollar_paren(&mut self, word: &mut String) {
         self.next_char(); // $
         self.next_char(); // (
@@ -421,12 +564,10 @@ impl<'a> Lexer<'a> {
                     }
                     word.push('`');
                 }
-                '{' => {
-                    word.push(c);
-                    if !self.read_brace_body(word) {
-                        return false;
-                    }
-                }
+                // A bare `{` does not nest: only `${` opens a new expansion.
+                // Treating it as an opener swallowed the closing brace of
+                // patterns that merely contain one, as in
+                // `${opt%%[<{().[]*}`, and the rest of the script with it.
                 _ => word.push(c),
             }
         }
@@ -544,9 +685,18 @@ impl<'a> Lexer<'a> {
                 Some(c) => match c {
                     ' ' | '\t' | '\n' | '|' | '&' | ';' => break,
                     '(' | ')' => {
+                        // Extended glob: `@(a|b)`, `?(x)`, `*(x)`, `+(x)`, `!(x)`.
+                        // The group belongs to the word, so a pattern keeps its
+                        // shape whether it lands in `[[ ]]`, a `case` label or a
+                        // plain argument.
+                        if c == '(' && self.opens_extglob(&word) {
+                            self.next_char();
+                            word.push('(');
+                            self.read_extglob_body(&mut word);
+                        }
                         // Check for array assignment: name=(...)
                         // If word contains '=' and we see '(', continue reading the array
-                        if c == '(' && word.contains('=') {
+                        else if c == '(' && word.contains('=') {
                             // This is array assignment, read until matching )
                             self.next_char();
                             word.push('(');
@@ -850,6 +1000,7 @@ impl<'a> Lexer<'a> {
             }
         };
 
+        self.prev_token = Some(token.clone());
         SpannedToken {
             token,
             span: (start, self.pos),
