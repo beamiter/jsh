@@ -26,6 +26,13 @@ CACHE_FILE="${CACHE_HOME}/jsh/update-check.json"
 ROLLBACK_DIR="${STATE_HOME}/jsh/rollback"
 # glibc floor of the prebuilt gnu artifacts (built on Ubuntu 22.04).
 GNU_GLIBC_MIN="2.35"
+# Ceilings for anything downloaded. A release archive is a few tens of MiB; a
+# manifest or checksum is a few hundred bytes. Without a ceiling a hostile or
+# broken mirror can fill the user's disk while the script waits patiently.
+MAX_ARCHIVE_BYTES=104857600
+MAX_METADATA_BYTES=65536
+# Seconds allowed for one `--version` probe of an untrusted binary.
+PROBE_TIMEOUT=5
 
 channel="release"
 bin_dir=""
@@ -141,6 +148,65 @@ case "${max_age}" in
 esac
 [ -n "${HOME:-}" ] || die "HOME is not set"
 
+# --- untrusted input grammar -------------------------------------------------
+#
+# A version, a target triple, and a base URL each arrive from a command line, an
+# environment variable, or a downloaded manifest, and each is then interpolated
+# into both a URL and a filesystem path. Validate the grammar once, up front,
+# instead of hoping that `../`, a newline, or a shell metacharacter does
+# something harmless further down.
+
+valid_version() {
+    case "$1" in
+        '' | *[!0-9A-Za-z.-]* | *..* | .* | -*) return 1 ;;
+        [0-9]*) ;;
+        *) return 1 ;;
+    esac
+    [ "${#1}" -le 64 ]
+}
+
+valid_target() {
+    case "$1" in
+        '' | *[!0-9A-Za-z._-]* | *..* | .* | -*) return 1 ;;
+    esac
+    [ "${#1}" -le 64 ]
+}
+
+# HTTPS is the only remote scheme. `file://` and loopback HTTP stay available
+# because the acceptance tests and local mirrors need them, and neither can be
+# reached by an attacker who does not already control the environment.
+valid_base_url() {
+    case "$1" in
+        *[!!-~]* | *..* | *\\* | *\?* | *\#* | *@*) return 1 ;;
+    esac
+    case "$1" in
+        https://?*) ;;
+        file:///*) ;;
+        http://localhost | http://localhost[:/]*) ;;
+        http://127.0.0.1 | http://127.0.0.1[:/]*) ;;
+        *) return 1 ;;
+    esac
+    [ "${#1}" -le 512 ]
+}
+
+valid_sha256() {
+    [ "${#1}" -eq 64 ] || return 1
+    case "$1" in
+        *[!0-9a-fA-F]*) return 1 ;;
+    esac
+    return 0
+}
+
+valid_base_url "${BASE_URL}" \
+    || die "JSH_INSTALL_BASE_URL must be a plain HTTPS (or file/loopback) URL: ${BASE_URL}"
+if [ -n "${want_version}" ]; then
+    valid_version "${want_version}" || die "not a valid version: ${want_version}"
+fi
+if [ -n "${JSH_INSTALL_TARGET:-}" ]; then
+    valid_target "${JSH_INSTALL_TARGET}" \
+        || die "not a valid target triple: ${JSH_INSTALL_TARGET}"
+fi
+
 # --- platform detection ------------------------------------------------------
 
 version_ge() {
@@ -202,9 +268,22 @@ detect_target() {
 
 # Prints the version of a jsh binary, or nothing when the file is not jsh.
 # This is the same identity check jterm3 performs before adopting a shell.
+#
+# The probe writes to a file rather than a pipe, and runs under a deadline: a
+# binary we have not identified yet may fork a descendant that inherits the
+# probe's stdout, and a command substitution reading a pipe waits for *every*
+# holder to close it, not just the child we started.
 jsh_version_of() {
-    [ -n "$1" ] && [ -x "$1" ] || return 0
-    banner="$("$1" --version 2>/dev/null | head -1)" || return 0
+    [ -n "$1" ] && [ -f "$1" ] && [ -x "$1" ] || return 0
+    make_tmp
+    probe="${tmp_dir}/probe.banner"
+    : > "${probe}" 2> /dev/null || return 0
+    if have timeout; then
+        timeout "${PROBE_TIMEOUT}" "$1" --version > "${probe}" 2> /dev/null < /dev/null || :
+    else
+        "$1" --version > "${probe}" 2> /dev/null < /dev/null || :
+    fi
+    banner="$(head -1 "${probe}" 2> /dev/null | cut -c1-256)"
     case "${banner}" in
         # Only the first field is the version, so a banner that grows a build
         # suffix later still parses.
@@ -265,18 +344,42 @@ path_jsh() {
 # --- download helpers --------------------------------------------------------
 
 fetch() {
-    # fetch URL DEST
+    # fetch URL DEST MAX_BYTES
     #
     # Bounded on purpose: a terminal runs `--check` on a background thread, and
-    # an unreachable host must fail rather than hang there forever.
+    # an unreachable host must fail rather than hang there forever. The byte
+    # ceiling and the HTTPS-only redirect policy bound what a mirror can do
+    # with a connection we opened: a release download follows a redirect to a
+    # CDN, so redirects cannot simply be disabled, but they must not be allowed
+    # to leave HTTPS.
     if have curl; then
-        curl -fsSL --retry 3 --retry-delay 1 \
-            --connect-timeout 10 --max-time 300 -o "$2" "$1"
+        case "$1" in
+            https://*)
+                curl -fsSL --proto '=https' --proto-redir '=https' \
+                    --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 \
+                    --max-filesize "$3" -o "$2" "$1"
+                ;;
+            *)
+                curl -fsSL --retry 3 --retry-delay 1 \
+                    --connect-timeout 10 --max-time 300 --max-filesize "$3" -o "$2" "$1"
+                ;;
+        esac
     elif have wget; then
-        wget -q --tries=3 --timeout=30 -O "$2" "$1"
+        wget -q --tries=3 --timeout=30 -O "$2" "$1" || return 1
+        # wget has no size ceiling of its own, so enforce it after the fact
+        # rather than leaving this path unbounded.
+        if [ "$(file_size "$2")" -gt "$3" ]; then
+            rm -f "$2"
+            warn "$1 exceeds its ${3}-byte limit"
+            return 1
+        fi
     else
         die "need curl or wget to download ${1}"
     fi
+}
+
+file_size() {
+    wc -c < "$1" 2> /dev/null | tr -d ' ' || printf '0'
 }
 
 sha256_of() {
@@ -307,7 +410,10 @@ json_str() {
 cache_get() {
     # cache_get FIELD -> value from the shared update-check cache, if fresh.
     [ "${max_age}" -gt 0 ] || return 1
-    [ -f "${CACHE_FILE}" ] || return 1
+    # A symlink at the cache name would make this read (and the write below)
+    # act on a file the user never agreed to share with the installer.
+    [ -f "${CACHE_FILE}" ] && [ ! -L "${CACHE_FILE}" ] || return 1
+    [ "$(file_size "${CACHE_FILE}")" -le "${MAX_METADATA_BYTES}" ] || return 1
     checked="$(sed -n 's/.*"checked_at"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "${CACHE_FILE}" | head -1)"
     [ -n "${checked}" ] || return 1
     age=$(( $(now_epoch) - checked ))
@@ -319,23 +425,39 @@ cache_get() {
 
 cache_put() {
     # cache_put LATEST TARGET
+    #
+    # Best effort: an unwritable cache never fails an install. The temporary
+    # name is unpredictable and private, and it is replaced by rename(2), so a
+    # concurrent reader sees either the old file or the new one and never a
+    # half-written one — and no other user can pre-create the name we write to.
     dir="$(dirname "${CACHE_FILE}")"
     mkdir -p "${dir}" 2> /dev/null || return 0
-    tmp="${CACHE_FILE}.$$"
-    printf '{"schema":1,"checked_at":%s,"latest":"%s","target":"%s"}\n' \
-        "$(now_epoch)" "$(json_str "$1")" "$(json_str "$2")" > "${tmp}" 2> /dev/null || return 0
-    mv -f "${tmp}" "${CACHE_FILE}" 2> /dev/null || rm -f "${tmp}"
+    chmod 0700 "${dir}" 2> /dev/null || :
+    if [ -L "${CACHE_FILE}" ]; then
+        rm -f "${CACHE_FILE}" 2> /dev/null || return 0
+    fi
+    tmp="$(mktemp "${dir}/update-check.XXXXXX" 2> /dev/null)" || return 0
+    chmod 0600 "${tmp}" 2> /dev/null || :
+    if printf '{"schema":1,"checked_at":%s,"latest":"%s","target":"%s"}\n' \
+        "$(now_epoch)" "$(json_str "$1")" "$(json_str "$2")" > "${tmp}" 2> /dev/null; then
+        mv -f "${tmp}" "${CACHE_FILE}" 2> /dev/null || rm -f "${tmp}"
+    else
+        rm -f "${tmp}"
+    fi
     return 0
 }
 
 latest_version() {
     # Reads the manifest published at a stable "latest" URL, so no API token
-    # and no rate limit are involved.
+    # and no rate limit are involved. The version it names is untrusted input:
+    # it becomes part of a URL and a path, so it must satisfy the same grammar
+    # as a version typed on the command line.
     make_tmp
     manifest="${tmp_dir}/manifest.json"
-    fetch "${BASE_URL}/latest/download/manifest.json" "${manifest}" 2> /dev/null || return 1
+    fetch "${BASE_URL}/latest/download/manifest.json" "${manifest}" "${MAX_METADATA_BYTES}" \
+        2> /dev/null || return 1
     version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${manifest}" | head -1)"
-    [ -n "${version}" ] || return 1
+    valid_version "${version}" || return 1
     printf '%s\n' "${version}"
 }
 
@@ -472,23 +594,67 @@ make_tmp
 staged="${tmp_dir}/jsh"
 
 if [ "${channel}" = "release" ]; then
+    # Both halves of every name below already satisfy the version/target
+    # grammar, so the archive name and URL cannot contain a path segment,
+    # traversal, or shell metacharacter.
+    valid_version "${version}" || die "not a valid version: ${version}"
+    valid_target "${target}" || die "not a valid target triple: ${target}"
     archive="jsh-${version}-${target}.tar.gz"
     url="${BASE_URL}/download/v${version}/${archive}"
     say "downloading ${archive}"
-    fetch "${url}" "${tmp_dir}/${archive}" || die "download failed: ${url}"
-    # The checksum sits next to the archive, so it guards against a truncated
-    # or corrupted transfer; HTTPS is what makes the source trustworthy.
-    if fetch "${url}.sha256" "${tmp_dir}/${archive}.sha256" 2> /dev/null; then
-        expected="$(cut -d' ' -f1 < "${tmp_dir}/${archive}.sha256")"
-        actual="$(sha256_of "${tmp_dir}/${archive}")"
-        [ "${expected}" = "${actual}" ] \
-            || die "checksum mismatch for ${archive} (expected ${expected}, got ${actual})"
-    else
-        warn "no published checksum for ${archive}; skipping verification"
-    fi
-    tar -C "${tmp_dir}" -xzf "${tmp_dir}/${archive}" || die "cannot unpack ${archive}"
-    unpacked="${tmp_dir}/jsh-${version}-${target}/jsh"
-    [ -f "${unpacked}" ] || die "${archive} does not contain jsh-${version}-${target}/jsh"
+    fetch "${url}" "${tmp_dir}/${archive}" "${MAX_ARCHIVE_BYTES}" || die "download failed: ${url}"
+
+    # The published checksum is mandatory. It is same-origin, so it proves only
+    # that the bytes are the ones the release published — but without it a
+    # mirror can serve anything at all, and "continue without verification" is
+    # exactly the path an attacker would arrange to take.
+    fetch "${url}.sha256" "${tmp_dir}/${archive}.sha256" "${MAX_METADATA_BYTES}" 2> /dev/null \
+        || die "no published checksum at ${url}.sha256; refusing to install unverified bytes"
+    expected="$(cut -d' ' -f1 < "${tmp_dir}/${archive}.sha256" | head -1 | tr -d '\r')"
+    valid_sha256 "${expected}" || die "published checksum for ${archive} is not a SHA-256 digest"
+    actual="$(sha256_of "${tmp_dir}/${archive}")"
+    expected="$(printf '%s' "${expected}" | tr 'A-F' 'a-f')"
+    actual="$(printf '%s' "${actual}" | tr 'A-F' 'a-f')"
+    [ "${expected}" = "${actual}" ] \
+        || die "checksum mismatch for ${archive} (expected ${expected}, got ${actual})"
+
+    # Extract exactly one known member, and only after proving the archive
+    # contains nothing else. `tar -x` on an unexamined archive will happily
+    # follow an absolute path, a `..` traversal, or a symlink member out of the
+    # temporary directory.
+    member="jsh-${version}-${target}/jsh"
+    names="${tmp_dir}/archive.names"
+    types="${tmp_dir}/archive.types"
+    tar -tzf "${tmp_dir}/${archive}" > "${names}" 2> /dev/null \
+        || die "cannot read the contents of ${archive}"
+    tar -tzvf "${tmp_dir}/${archive}" > "${types}" 2> /dev/null \
+        || die "cannot read the contents of ${archive}"
+    # Names: only the expected directory and the expected binary. This rejects
+    # an absolute path, a `..` traversal, and any extra payload by construction.
+    while IFS= read -r name; do
+        [ -n "${name}" ] || continue
+        case "${name}" in
+            "${member}" | "jsh-${version}-${target}" | "jsh-${version}-${target}/") ;;
+            *) die "${archive} contains an unexpected member: ${name}" ;;
+        esac
+    done < "${names}"
+    # Types: the leading character of a verbose listing is the entry type, so a
+    # symlink (l), hard link (h), device, or FIFO is refused before extraction.
+    while IFS= read -r entry; do
+        [ -n "${entry}" ] || continue
+        case "${entry}" in
+            -* | d*) ;;
+            *) die "${archive} contains a link or special file: ${entry}" ;;
+        esac
+    done < "${types}"
+    grep -qx "${member}" "${names}" || die "${archive} does not contain ${member}"
+    tar -C "${tmp_dir}" -xzf "${tmp_dir}/${archive}" "${member}" \
+        || die "cannot unpack ${member} from ${archive}"
+    unpacked="${tmp_dir}/${member}"
+    [ -f "${unpacked}" ] && [ ! -L "${unpacked}" ] \
+        || die "${archive} does not contain a regular ${member}"
+    [ "$(file_size "${unpacked}")" -le "${MAX_ARCHIVE_BYTES}" ] \
+        || die "${member} exceeds its ${MAX_ARCHIVE_BYTES}-byte limit"
     mv "${unpacked}" "${staged}"
 else
     have cargo || die "channel 'source' needs cargo (https://rustup.rs)"
@@ -515,8 +681,9 @@ version="${staged_version}"
 
 # Keep the outgoing binary so a bad release can be undone without a network.
 backup=""
-if [ -n "${installed_version}" ]; then
+if [ -n "${installed_version}" ] && valid_version "${installed_version}"; then
     if mkdir -p "${ROLLBACK_DIR}" 2> /dev/null; then
+        chmod 0700 "${ROLLBACK_DIR}" 2> /dev/null || :
         backup="${ROLLBACK_DIR}/jsh-${installed_version}"
         rm -f "${ROLLBACK_DIR}"/jsh-* 2> /dev/null || :
         cp "${dest}" "${backup}" 2> /dev/null || backup=""
@@ -524,9 +691,14 @@ if [ -n "${installed_version}" ]; then
 fi
 
 # Land the new binary with rename(2) inside the destination directory: the swap
-# is atomic and running shells keep the inode they were started from.
-incoming="${dest_dir}/.jsh.incoming.$$"
-cp "${staged}" "${incoming}" || die "cannot write to ${dest_dir}"
+# is atomic and running shells keep the inode they were started from. The
+# staging name is unpredictable, so nothing can pre-create it and have the
+# install write through a symlink or an existing file it does not own.
+incoming="$(mktemp "${dest_dir}/.jsh.incoming.XXXXXX")" || die "cannot write to ${dest_dir}"
+cat < "${staged}" > "${incoming}" || {
+    rm -f "${incoming}"
+    die "cannot write to ${dest_dir}"
+}
 chmod 0755 "${incoming}"
 mv -f "${incoming}" "${dest}" || {
     rm -f "${incoming}"
@@ -535,7 +707,12 @@ mv -f "${incoming}" "${dest}" || {
 
 if [ "$(jsh_version_of "${dest}")" != "${version}" ]; then
     if [ -n "${backup}" ] && [ -f "${backup}" ]; then
-        cp "${backup}" "${incoming}" && mv -f "${incoming}" "${dest}"
+        if restoring="$(mktemp "${dest_dir}/.jsh.rollback.XXXXXX" 2> /dev/null)"; then
+            cat < "${backup}" > "${restoring}" \
+                && chmod 0755 "${restoring}" \
+                && mv -f "${restoring}" "${dest}" \
+                || rm -f "${restoring}"
+        fi
         die "the installed binary failed its self-check; restored ${installed_version}"
     fi
     die "the installed binary failed its self-check at ${dest}"

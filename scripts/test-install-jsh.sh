@@ -183,6 +183,102 @@ assert "nonzero exit" [ ${rc} -ne 0 ]
 assert "checksum message" matches "${out}" 'checksum mismatch'
 assert "old binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
 
+echo "== an absent or malformed checksum aborts =="
+make_release 0.3.21
+rm -f "${REL}/download/v0.3.21/jsh-0.3.21-${TARGET}.tar.gz.sha256"
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "nonzero exit" [ ${rc} -ne 0 ]
+assert "refuses to install unverified bytes" matches "${out}" 'refusing to install unverified bytes'
+assert "old binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+
+make_release 0.3.22
+printf 'not-a-digest  jsh-0.3.22-%s.tar.gz\n' "${TARGET}" \
+    > "${REL}/download/v0.3.22/jsh-0.3.22-${TARGET}.tar.gz.sha256"
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "nonzero exit" [ ${rc} -ne 0 ]
+assert "malformed digest rejected" matches "${out}" 'is not a SHA-256 digest'
+
+echo "== hostile archive members are rejected before extraction =="
+make_release 0.3.23
+rm -rf "${ROOT}/hostile"
+mkdir -p "${ROOT}/hostile/jsh-0.3.23-${TARGET}"
+ln -s /etc/passwd "${ROOT}/hostile/jsh-0.3.23-${TARGET}/jsh"
+(cd "${ROOT}/hostile" && tar -czf "${REL}/download/v0.3.23/jsh-0.3.23-${TARGET}.tar.gz" "jsh-0.3.23-${TARGET}")
+(cd "${REL}/download/v0.3.23" && sha256sum "jsh-0.3.23-${TARGET}.tar.gz" > "jsh-0.3.23-${TARGET}.tar.gz.sha256")
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "nonzero exit" [ ${rc} -ne 0 ]
+assert "symlink member rejected" matches "${out}" 'contains a link or special file'
+
+make_release 0.3.24
+rm -rf "${ROOT}/hostile"
+mkdir -p "${ROOT}/hostile/jsh-0.3.24-${TARGET}"
+printf '#!/bin/sh\necho "jsh 0.3.24 (fake)"\n' > "${ROOT}/hostile/jsh-0.3.24-${TARGET}/jsh"
+chmod +x "${ROOT}/hostile/jsh-0.3.24-${TARGET}/jsh"
+printf 'payload\n' > "${ROOT}/hostile/jsh-0.3.24-${TARGET}/extra"
+(cd "${ROOT}/hostile" && tar -czf "${REL}/download/v0.3.24/jsh-0.3.24-${TARGET}.tar.gz" "jsh-0.3.24-${TARGET}")
+(cd "${REL}/download/v0.3.24" && sha256sum "jsh-0.3.24-${TARGET}.tar.gz" > "jsh-0.3.24-${TARGET}.tar.gz.sha256")
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "nonzero exit" [ ${rc} -ne 0 ]
+assert "extra member rejected" matches "${out}" 'unexpected member'
+
+make_release 0.3.25
+rm -rf "${ROOT}/hostile"
+mkdir -p "${ROOT}/hostile/jsh-0.3.25-${TARGET}"
+printf '#!/bin/sh\necho "jsh 0.3.25 (fake)"\n' > "${ROOT}/hostile/jsh-0.3.25-${TARGET}/jsh"
+chmod +x "${ROOT}/hostile/jsh-0.3.25-${TARGET}/jsh"
+printf 'owned\n' > "${ROOT}/hostile/escape"
+(cd "${ROOT}/hostile/jsh-0.3.25-${TARGET}" \
+    && tar -cPzf "${REL}/download/v0.3.25/jsh-0.3.25-${TARGET}.tar.gz" \
+        -C "${ROOT}/hostile" "jsh-0.3.25-${TARGET}" "../hostile/escape" 2> /dev/null)
+(cd "${REL}/download/v0.3.25" && sha256sum "jsh-0.3.25-${TARGET}.tar.gz" > "jsh-0.3.25-${TARGET}.tar.gz.sha256")
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "nonzero exit" [ ${rc} -ne 0 ]
+assert "traversal member rejected" matches "${out}" 'unexpected member'
+assert "nothing escaped the temporary directory" [ ! -f "${ROOT}/hostile/escape.installed" ]
+assert "old binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+
+echo "== untrusted version, target, and base URL grammars are rejected =="
+out="$(run --version '../../etc' 2>&1)"
+rc=$?
+assert "traversal version rejected" [ ${rc} -ne 0 ]
+assert "traversal version message" matches "${out}" 'not a valid version'
+out="$(env -i HOME="${FAKE_HOME}" PATH="${PATH_FOR_RUN}" \
+    JSH_INSTALL_BASE_URL="http://example.invalid/releases" \
+    JSH_INSTALL_TARGET="${TARGET}" sh "${INSTALLER}" --check 2>&1)"
+rc=$?
+assert "plain-HTTP base URL rejected" [ ${rc} -ne 0 ]
+assert "plain-HTTP message" matches "${out}" 'JSH_INSTALL_BASE_URL'
+out="$(env -i HOME="${FAKE_HOME}" PATH="${PATH_FOR_RUN}" \
+    JSH_INSTALL_BASE_URL="file://${REL}" \
+    JSH_INSTALL_TARGET="../../etc" sh "${INSTALLER}" --check 2>&1)"
+rc=$?
+assert "traversal target rejected" [ ${rc} -ne 0 ]
+assert "traversal target message" matches "${out}" 'not a valid target triple'
+
+echo "== the update-check cache is private and symlink-safe =="
+make_release 0.3.26
+rm -f "${FAKE_HOME}/.cache/jsh/update-check.json"
+run --check --json --max-age 0 > /dev/null 2>&1
+assert "cache is 0600" [ "$(stat -c '%a' "${FAKE_HOME}/.cache/jsh/update-check.json")" = "600" ]
+assert "cache directory is 0700" [ "$(stat -c '%a' "${FAKE_HOME}/.cache/jsh")" = "700" ]
+victim="${ROOT}/cache-victim"
+printf 'untouched\n' > "${victim}"
+rm -f "${FAKE_HOME}/.cache/jsh/update-check.json"
+ln -s "${victim}" "${FAKE_HOME}/.cache/jsh/update-check.json"
+run --check --json --max-age 0 > /dev/null 2>&1
+assert "symlinked cache is replaced, not followed" [ "$(cat "${victim}")" = "untouched" ]
+assert "cache is a regular file again" [ ! -L "${FAKE_HOME}/.cache/jsh/update-check.json" ]
+
 echo "== a binary that reports the wrong version is rejected =="
 make_release 0.3.3
 stage="${ROOT}/stage2/jsh-0.3.3-${TARGET}"
