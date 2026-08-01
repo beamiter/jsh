@@ -196,6 +196,11 @@ const MAX_AI_HEADERS: usize = 16;
 const MAX_AI_HEADER_BYTES: usize = 32 * 1024;
 #[cfg(feature = "ai")]
 const MAX_AI_RESPONSE_BODY_BYTES: u64 = 1024 * 1024;
+/// Response *headers* are read into memory before any body limit applies, so
+/// they need bounds of their own. A provider answers with a couple of dozen
+/// short headers; a hostile or broken endpoint can answer with thousands.
+const MAX_AI_RESPONSE_HEADERS: usize = 64;
+const MAX_AI_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 
 pub struct AiWorker {
     tx: mpsc::SyncSender<AiRequest>,
@@ -879,6 +884,7 @@ fn post_json(request: &HttpRequest) -> Result<serde_json::Value, String> {
         .send(request.body.as_str())
         .map_err(|error| format!("Request failed: {error}"))?;
     let status = response.status();
+    response_headers_within_limits(response.headers())?;
     let text = response
         .body_mut()
         .with_config()
@@ -898,6 +904,32 @@ fn post_json(request: &HttpRequest) -> Result<serde_json::Value, String> {
         return Err(format!("HTTP {}", status.as_u16()));
     }
     Ok(json)
+}
+
+/// Refuse a response whose headers alone are unreasonable.
+///
+/// The body is already bounded, but headers are parsed and retained before the
+/// body limit is reached. Both a count and a cumulative byte budget are needed:
+/// many tiny headers and a few enormous ones are the same problem.
+#[cfg(feature = "ai")]
+fn response_headers_within_limits(headers: &ureq::http::HeaderMap) -> Result<(), String> {
+    if headers.len() > MAX_AI_RESPONSE_HEADERS {
+        return Err(format!(
+            "Response carries more than {MAX_AI_RESPONSE_HEADERS} headers"
+        ));
+    }
+    let mut total = 0usize;
+    for (name, value) in headers {
+        total = total
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len());
+        if total > MAX_AI_RESPONSE_HEADER_BYTES {
+            return Err(format!(
+                "Response headers exceed the {MAX_AI_RESPONSE_HEADER_BYTES}-byte limit"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// All three providers report failures in the body; OpenAI/Anthropic nest a
@@ -1170,6 +1202,35 @@ mod ai_tests {
                 limit: MAX_MODEL_TEXT_BYTES
             })
         ));
+    }
+
+    #[test]
+    fn response_headers_are_bounded_by_count_and_cumulative_bytes() {
+        use ureq::http::header::{HeaderMap, HeaderName, HeaderValue};
+
+        let mut ordinary = HeaderMap::new();
+        ordinary.insert("content-type", HeaderValue::from_static("application/json"));
+        assert!(response_headers_within_limits(&ordinary).is_ok());
+
+        let mut too_many = HeaderMap::new();
+        for index in 0..=MAX_AI_RESPONSE_HEADERS {
+            let name = HeaderName::try_from(format!("x-pad-{index}")).unwrap();
+            too_many.insert(name, HeaderValue::from_static("v"));
+        }
+        assert!(response_headers_within_limits(&too_many)
+            .unwrap_err()
+            .contains("more than"));
+
+        // Few headers, but enormous ones: the same problem, a different shape.
+        let mut too_large = HeaderMap::new();
+        let value = "v".repeat(MAX_AI_RESPONSE_HEADER_BYTES / 4 + 1);
+        for index in 0..4 {
+            let name = HeaderName::try_from(format!("x-big-{index}")).unwrap();
+            too_large.insert(name, HeaderValue::try_from(value.clone()).unwrap());
+        }
+        assert!(response_headers_within_limits(&too_large)
+            .unwrap_err()
+            .contains("exceed the"));
     }
 
     #[test]
