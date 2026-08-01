@@ -2,18 +2,34 @@
 /// Supports timestamped entries for rich Ctrl+R panel display.
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, IsTerminal, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+type ScoredHistoryMatch = (String, Vec<usize>, i32, u64, Option<String>);
 
 const HISTORY_RECORD_VERSION: u32 = 1;
+/// A command is useful only while it remains reviewable and cheaply
+/// serializable. This includes the JSONL newline so readers and writers agree
+/// exactly at the boundary.
+const MAX_HISTORY_RECORD_BYTES: usize = 1024 * 1024;
+/// Bound startup and merge memory even if a local file is malformed or was
+/// produced by an older, unbounded build.
+const MAX_HISTORY_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HISTORY_ENTRIES: usize = 100_000;
+const MAX_HISTORY_CWD_BYTES: usize = 64 * 1024;
+const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const HISTORY_LOCK_RETRY: Duration = Duration::from_millis(10);
+const SAFE_FILE_OPEN_FLAGS: i32 =
+    nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// One hint per process, however many `History` instances get built.
 static LEGACY_HISTORY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+static HISTORY_IO_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct HistoryEntry {
@@ -64,7 +80,13 @@ impl History {
         // the user assumes the data is gone.
         crate::config::migrate_legacy_rsh_data();
 
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let home = dirs::home_dir().unwrap_or_else(|| {
+            // A shared /tmp parent is intentionally rejected by the directory
+            // ownership check. Use a per-user fallback namespace instead.
+            // SAFETY: geteuid has no preconditions and only reads process state.
+            let uid = unsafe { nix::libc::geteuid() };
+            std::env::temp_dir().join(format!("jsh-{uid}"))
+        });
         let file_path = home.join(".jsh_history");
 
         let history = Self::new_with_path(max_size, file_path);
@@ -98,7 +120,7 @@ impl History {
             return;
         }
         let legacy_path = crate::config::legacy_history_path(home);
-        let Ok(legacy_entries) = read_entries(&legacy_path) else {
+        let Ok(legacy_entries) = read_entries(&legacy_path, MAX_HISTORY_ENTRIES) else {
             return;
         };
         // The newest legacy record is the one that survives history trimming,
@@ -109,23 +131,24 @@ impl History {
         if self.entries.contains(newest) {
             return;
         }
+        // `Path`'s Debug representation quotes and escapes arbitrary bytes.
+        // Do not print a copy/paste shell command here: even correct-looking
+        // paths may contain whitespace, control bytes, or shell metacharacters.
         eprintln!(
-            "jsh: {} holds {} command(s) from before the rsh->jsh rename, and {} already existed, so they were not imported automatically.",
-            legacy_path.display(),
+            "jsh: {legacy_path:?} holds {} command(s) from before the rsh->jsh rename, and {:?} already existed, so they were not imported automatically.",
             legacy_entries.len(),
-            self.file_path.display()
+            self.file_path
         );
         eprintln!(
-            "jsh: import them with: cat {} >> {}",
-            legacy_path.display(),
-            self.file_path.display()
+            "jsh: review {legacy_path:?} and append it to {:?} manually if desired.",
+            self.file_path
         );
     }
 
     fn new_with_path(max_size: usize, file_path: PathBuf) -> Self {
         let mut h = History {
             entries: Vec::new(),
-            max_size,
+            max_size: max_size.min(MAX_HISTORY_ENTRIES),
             file_path,
             position: 0,
         };
@@ -137,16 +160,27 @@ impl History {
         // Updated jsh processes coordinate through a stable sidecar lock.
         // Atomic rewrites already protect readers from torn files; the lock
         // additionally keeps us from racing an append at startup.
-        let _lock = self
-            .file_path
-            .exists()
-            .then(|| lock_history_file(&self.file_path).ok())
-            .flatten();
-        self.entries = read_entries_or_empty(&self.file_path).unwrap_or_default();
-        trim_to_limit(&mut self.entries, self.max_size);
-        if self.file_path.exists() {
-            let _ = set_private_file_permissions(&self.file_path);
+        if matches!(
+            fs::symlink_metadata(&self.file_path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ) {
+            self.entries.clear();
+            self.position = 0;
+            return;
         }
+        self.entries = match lock_history_file(&self.file_path) {
+            Ok(_lock) => match read_entries_or_empty(&self.file_path, self.max_size) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    warn_history_io("load", &self.file_path, &error);
+                    Vec::new()
+                }
+            },
+            Err(error) => {
+                warn_history_io("lock", &self.file_path, &error);
+                Vec::new()
+            }
+        };
         self.position = self.entries.len();
     }
 
@@ -156,13 +190,13 @@ impl History {
         }
 
         if let Ok(record) = serde_json::from_str::<HistoryRecord>(line) {
-            return (record.jsh_history_version == HISTORY_RECORD_VERSION).then_some(
-                HistoryEntry {
+            return (record.jsh_history_version == HISTORY_RECORD_VERSION)
+                .then_some(HistoryEntry {
                     command: record.command,
                     timestamp: record.timestamp,
                     cwd: record.cwd,
-                },
-            );
+                })
+                .and_then(normalize_history_entry);
         }
 
         // Legacy format: "timestamp\tcwd\tcommand" or a plain command.
@@ -174,14 +208,14 @@ impl History {
                 } else {
                     Some(parts[1].to_string())
                 };
-                return Some(HistoryEntry {
+                return normalize_history_entry(HistoryEntry {
                     command: parts[2].to_string(),
                     timestamp: ts,
                     cwd,
                 });
             }
         }
-        Some(HistoryEntry {
+        normalize_history_entry(HistoryEntry {
             command: line.to_string(),
             timestamp: 0,
             cwd: None,
@@ -193,7 +227,9 @@ impl History {
     }
 
     pub fn save(&self) {
-        let _ = self.save_inner();
+        if let Err(error) = self.save_inner() {
+            warn_history_io("save", &self.file_path, &error);
+        }
     }
 
     fn save_inner(&self) -> io::Result<()> {
@@ -201,7 +237,7 @@ impl History {
 
         // Merge with what is currently on disk while holding the lock. This
         // preserves commands appended by shells launched after this instance.
-        let mut merged = read_entries_or_empty(&self.file_path)?;
+        let mut merged = read_entries_or_empty(&self.file_path, MAX_HISTORY_ENTRIES)?;
         let mut seen: HashSet<HistoryEntry> = merged.iter().cloned().collect();
         for entry in &self.entries {
             if seen.insert(entry.clone()) {
@@ -212,7 +248,7 @@ impl History {
         // different shell pruned the file. Timestamp ordering keeps those old
         // records at the front so the shared limit remains meaningful.
         merged.sort_by_key(|entry| entry.timestamp);
-        trim_to_limit(&mut merged, self.max_size);
+        trim_to_storage_limits(&mut merged, self.max_size, MAX_HISTORY_FILE_BYTES)?;
         write_entries_atomically(&self.file_path, &merged)
     }
 
@@ -221,6 +257,9 @@ impl History {
     }
 
     pub fn add_with_cwd(&mut self, entry: &str, cwd: Option<&str>) {
+        if self.max_size == 0 {
+            return;
+        }
         let command = entry.trim().to_string();
         if command.is_empty() {
             return;
@@ -234,19 +273,45 @@ impl History {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let he = HistoryEntry {
+        let Some(he) = normalize_history_entry(HistoryEntry {
             command: command.clone(),
             timestamp,
             cwd: cwd.map(|s| s.to_string()),
+        }) else {
+            warn_history_io(
+                "append",
+                &self.file_path,
+                &io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "history command contains terminal-ambiguous text",
+                ),
+            );
+            return;
         };
+        // Never retain a command in memory that this same build refuses to
+        // persist: history expansion must not expose a truncated surrogate.
+        if let Err(error) = encode_entry(&he) {
+            warn_history_io("append", &self.file_path, &error);
+            return;
+        }
 
         self.entries.push(he.clone());
-        if self.entries.len() > self.max_size {
-            self.entries.remove(0);
+        // The in-memory history is a queue too. Keep it under both the entry
+        // ceiling and the same aggregate byte ceiling as the persisted JSONL,
+        // so a stream of individually valid near-1-MiB commands cannot grow a
+        // long-lived interactive shell without bound.
+        if let Err(error) =
+            trim_to_storage_limits(&mut self.entries, self.max_size, MAX_HISTORY_FILE_BYTES)
+        {
+            self.entries.pop();
+            warn_history_io("append", &self.file_path, &error);
+            return;
         }
         self.position = self.entries.len();
 
-        let _ = append_entry(&self.file_path, &he);
+        if let Err(error) = append_entry(&self.file_path, &he, self.max_size) {
+            warn_history_io("append", &self.file_path, &error);
+        }
     }
 
     pub fn last(&self) -> Option<&str> {
@@ -265,6 +330,10 @@ impl History {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn prev(&mut self) -> Option<&str> {
         if self.position > 0 {
             self.position -= 1;
@@ -274,6 +343,7 @@ impl History {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<&str> {
         if !self.entries.is_empty() && self.position + 1 < self.entries.len() {
             self.position += 1;
@@ -344,7 +414,7 @@ impl History {
             return Vec::new();
         }
         let query_lower: Vec<char> = query.to_lowercase().chars().collect();
-        let mut results: Vec<(String, Vec<usize>, i32, u64, Option<String>)> = Vec::new();
+        let mut results: Vec<ScoredHistoryMatch> = Vec::new();
 
         for entry in self.entries.iter().rev() {
             let entry_lower: Vec<char> = entry.command.to_lowercase().chars().collect();
@@ -364,7 +434,7 @@ impl History {
             }
         }
 
-        results.sort_by(|a, b| b.2.cmp(&a.2));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         results
             .into_iter()
             .map(|(cmd, idx, _, ts, cwd)| (cmd, idx, ts, cwd))
@@ -396,49 +466,198 @@ impl History {
     }
 }
 
+fn warn_history_io(operation: &str, path: &Path, error: &io::Error) {
+    if !HISTORY_IO_WARNING_SHOWN.swap(true, Ordering::SeqCst) {
+        eprintln!(
+            "jsh: history {operation} failed for {path:?}: {error}; command execution will continue"
+        );
+    }
+}
+
 fn trim_to_limit(entries: &mut Vec<HistoryEntry>, max_size: usize) {
+    let max_size = max_size.min(MAX_HISTORY_ENTRIES);
     if entries.len() > max_size {
         let remove = entries.len() - max_size;
         entries.drain(..remove);
     }
 }
 
-fn read_entries(path: &Path) -> io::Result<Vec<HistoryEntry>> {
-    let file = File::open(path)?;
-    let reader = io::BufReader::new(file);
-    Ok(reader
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| History::parse_line(&line))
-        .collect())
+/// History is rendered by the interactive editor and can later become an
+/// executable suggestion. Preserve structural newlines, but reject terminal
+/// controls and invisible/bidirectional formatting that could disguise a
+/// recalled command. Unsafe cwd metadata is nonessential, so drop it instead
+/// of losing an otherwise valid command.
+fn normalize_history_entry(mut entry: HistoryEntry) -> Option<HistoryEntry> {
+    if entry.command.trim().is_empty()
+        || entry
+            .command
+            .chars()
+            .any(|ch| ch != '\n' && crate::terminal_text::is_terminal_ambiguous(ch))
+    {
+        return None;
+    }
+    if entry.cwd.as_ref().is_some_and(|cwd| {
+        cwd.len() > MAX_HISTORY_CWD_BYTES
+            || cwd
+                .chars()
+                .any(|ch| ch != '\t' && crate::terminal_text::is_terminal_ambiguous(ch))
+    }) {
+        entry.cwd = None;
+    }
+    Some(entry)
 }
 
-fn read_entries_or_empty(path: &Path) -> io::Result<Vec<HistoryEntry>> {
-    match read_entries(path) {
+fn trim_to_storage_limits(
+    entries: &mut Vec<HistoryEntry>,
+    max_entries: usize,
+    max_bytes: usize,
+) -> io::Result<()> {
+    trim_to_limit(entries, max_entries);
+    let mut retained_bytes = 0usize;
+    let mut keep_from = entries.len();
+    for (index, entry) in entries.iter().enumerate().rev() {
+        let encoded_bytes = encode_entry(entry)?.len();
+        if retained_bytes.saturating_add(encoded_bytes) > max_bytes {
+            break;
+        }
+        retained_bytes += encoded_bytes;
+        keep_from = index;
+    }
+    entries.drain(..keep_from);
+    Ok(())
+}
+
+fn read_entries(path: &Path, max_entries: usize) -> io::Result<Vec<HistoryEntry>> {
+    let mut file = open_regular_file(path, true, false, false)?;
+    set_private_open_file_permissions(&file)?;
+    if file.metadata()?.len() > MAX_HISTORY_FILE_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "history file exceeds size limit",
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take((MAX_HISTORY_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_HISTORY_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "history file grew beyond size limit while being read",
+        ));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("history is not valid UTF-8: {error}"),
+        )
+    })?;
+    let max_entries = max_entries.min(MAX_HISTORY_ENTRIES);
+    let mut entries = VecDeque::with_capacity(max_entries.min(10_000));
+    for line in text.lines() {
+        if line.len().saturating_add(1) > MAX_HISTORY_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "history record exceeds size limit",
+            ));
+        }
+        if let Some(entry) = History::parse_line(line) {
+            if entries.len() == max_entries {
+                entries.pop_front();
+            }
+            if max_entries != 0 {
+                entries.push_back(entry);
+            }
+        }
+    }
+    Ok(entries.into())
+}
+
+fn read_entries_or_empty(path: &Path, max_entries: usize) -> io::Result<Vec<HistoryEntry>> {
+    match read_entries(path, max_entries) {
         Ok(entries) => Ok(entries),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error),
     }
 }
 
-fn append_entry(path: &Path, entry: &HistoryEntry) -> io::Result<()> {
+fn encode_entry(entry: &HistoryEntry) -> io::Result<Vec<u8>> {
+    if normalize_history_entry(entry.clone()).as_ref() != Some(entry) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history entry contains terminal-ambiguous or oversized metadata",
+        ));
+    }
+    let mut record = History::format_entry(entry)?.into_bytes();
+    record.push(b'\n');
+    if record.len() > MAX_HISTORY_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history record exceeds size limit",
+        ));
+    }
+    Ok(record)
+}
+
+fn append_entry(path: &Path, entry: &HistoryEntry, max_entries: usize) -> io::Result<()> {
+    let record = encode_entry(entry)?;
     let _lock = lock_history_file(path)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
-    set_private_file_permissions(path)?;
+    let mut file = open_regular_file(path, true, true, true)?;
+    set_private_open_file_permissions(&file)?;
 
     // Build the complete record first, then issue one append write. O_APPEND
     // plus the sidecar lock prevents updated jsh processes from interleaving
     // JSON records.
-    let mut record = History::format_entry(entry)?.into_bytes();
-    record.push(b'\n');
-    file.write_all(&record)
+    let current_bytes = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let needs_separator = if current_bytes == 0 {
+        false
+    } else {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        last[0] != b'\n'
+    };
+    if current_bytes
+        .saturating_add(usize::from(needs_separator))
+        .saturating_add(record.len())
+        <= MAX_HISTORY_FILE_BYTES
+    {
+        let mut append_record = Vec::with_capacity(record.len() + usize::from(needs_separator));
+        if needs_separator {
+            append_record.push(b'\n');
+        }
+        append_record.extend_from_slice(&record);
+        return file.write_all(&append_record);
+    }
+
+    // Compact while the same process lock is still held. The new command is
+    // retained preferentially and records keep their chronological order.
+    drop(file);
+    let mut entries = read_entries_or_empty(path, MAX_HISTORY_ENTRIES)?;
+    if !entries.contains(entry) {
+        entries.push(entry.clone());
+    }
+    entries.sort_by_key(|candidate| candidate.timestamp);
+    trim_to_storage_limits(&mut entries, max_entries, MAX_HISTORY_FILE_BYTES)?;
+    write_entries_atomically(path, &entries)
 }
 
 fn write_entries_atomically(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
+    let encoded = entries
+        .iter()
+        .map(encode_entry)
+        .collect::<io::Result<Vec<_>>>()?;
+    let encoded_bytes = encoded
+        .iter()
+        .try_fold(0usize, |total, record| total.checked_add(record.len()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "history size overflow"))?;
+    if encoded_bytes > MAX_HISTORY_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history file exceeds size limit",
+        ));
+    }
     let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -454,16 +673,15 @@ fn write_entries_atomically(path: &Path, entries: &[HistoryEntry]) -> io::Result
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
             .mode(0o600)
             .open(&tmp_path)?;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
-        for entry in entries {
-            file.write_all(History::format_entry(entry)?.as_bytes())?;
-            file.write_all(b"\n")?;
+        set_private_open_file_permissions(&file)?;
+        for record in &encoded {
+            file.write_all(record)?;
         }
         file.sync_all()?;
         fs::rename(&tmp_path, path)?;
-        set_private_file_permissions(path)?;
         if let Some(parent) = path.parent() {
             if let Ok(dir) = File::open(parent) {
                 let _ = dir.sync_all();
@@ -477,12 +695,44 @@ fn write_entries_atomically(path: &Path, entries: &[HistoryEntry]) -> io::Result
     result
 }
 
-fn lock_history_file(path: &Path) -> io::Result<Flock<File>> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+struct HistoryFileLock {
+    _directory: Flock<File>,
+    file: Flock<File>,
+}
+
+fn lock_history_file(path: &Path) -> io::Result<HistoryFileLock> {
+    lock_history_file_with_timeout(path, HISTORY_LOCK_TIMEOUT)
+}
+
+fn lock_history_file_with_timeout(path: &Path, timeout: Duration) -> io::Result<HistoryFileLock> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let existed = match fs::symlink_metadata(parent) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if !existed {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(parent)?;
+    ensure_owned_directory(&directory, parent)?;
+    if !existed {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    ensure_non_writable_directory(&directory, parent)?;
+    // Updated peers lock the directory before opening the sidecar, so one of
+    // them cannot rename it and obtain a different lock inode mid-operation.
+    let directory = flock_exclusive_with_timeout(directory, timeout)?;
+
     let mut lock_name = path.as_os_str().to_os_string();
     lock_name.push(".lock");
     let lock_path = PathBuf::from(lock_name);
@@ -490,15 +740,116 @@ fn lock_history_file(path: &Path) -> io::Result<Flock<File>> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
+        .custom_flags(SAFE_FILE_OPEN_FLAGS)
         .mode(0o600)
         .open(&lock_path)?;
-    set_private_file_permissions(&lock_path)?;
-    Flock::lock(file, FlockArg::LockExclusive)
-        .map_err(|(_, errno)| io::Error::from_raw_os_error(errno as i32))
+    ensure_regular_file(&file, &lock_path)?;
+    set_private_open_file_permissions(&file)?;
+    let file = flock_exclusive_with_timeout(file, timeout)?;
+    Ok(HistoryFileLock {
+        _directory: directory,
+        file,
+    })
 }
 
-fn set_private_file_permissions(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+fn flock_exclusive_with_timeout(mut file: File, timeout: Duration) -> io::Result<Flock<File>> {
+    let started = Instant::now();
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(lock),
+            Err((returned, errno)) => {
+                file = returned;
+                if errno != nix::errno::Errno::EAGAIN {
+                    return Err(io::Error::from_raw_os_error(errno as i32));
+                }
+                if started.elapsed() >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "timed out waiting for history lock",
+                    ));
+                }
+                let remaining = timeout
+                    .checked_sub(started.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                std::thread::sleep(HISTORY_LOCK_RETRY.min(remaining));
+            }
+        }
+    }
+}
+
+fn open_regular_file(path: &Path, read: bool, append: bool, create: bool) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(read)
+        .append(append)
+        .create(create)
+        .custom_flags(SAFE_FILE_OPEN_FLAGS)
+        .mode(0o600)
+        .open(path)?;
+    ensure_regular_file(&file, path)?;
+    Ok(file)
+}
+
+fn ensure_regular_file(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{path:?} is not a regular file"),
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} must have exactly one hard link"),
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} is not owned by the current user"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_owned_directory(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{path:?} is not a directory"),
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} is not owned by the current user"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_non_writable_directory(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if file.metadata()?.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} is writable by another user or group"),
+        ));
+    }
+    Ok(())
+}
+
+fn set_private_open_file_permissions(file: &File) -> io::Result<()> {
+    file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
 fn fuzzy_match_score(query: &[char], candidate: &[char]) -> Option<(Vec<usize>, i32)> {
@@ -541,9 +892,16 @@ fn fuzzy_match_score(query: &[char], candidate: &[char]) -> Option<(Vec<usize>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     fn load_test_history(path: &Path, max_size: usize) -> History {
+        if let Some(parent) = path.parent().filter(|parent| parent.is_dir()) {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .expect("private history fixture parent");
+        }
         History::new_with_path(max_size, path.to_path_buf())
     }
 
@@ -737,6 +1095,23 @@ mod tests {
     }
 
     #[test]
+    fn append_after_an_unterminated_tail_keeps_the_new_command_separate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        fs::write(&path, "legacy tail without newline").expect("history fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("history mode");
+        let mut history = load_test_history(&path, 10);
+
+        history.add("echo after-tail");
+
+        let restored = load_test_history(&path, 10);
+        assert_eq!(
+            restored.entries(),
+            vec!["legacy tail without newline", "echo after-tail"]
+        );
+    }
+
+    #[test]
     fn history_and_lock_files_are_private() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("history");
@@ -769,5 +1144,276 @@ mod tests {
         let restored = load_test_history(&path, 10);
         assert_eq!(restored.last(), Some("echo creates-parent"));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn history_rejects_a_group_writable_parent_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("shared");
+        fs::create_dir(&parent).expect("shared parent");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o770))
+            .expect("shared parent mode");
+        let path = parent.join("history");
+        let entry = HistoryEntry {
+            command: "echo private".into(),
+            timestamp: 1,
+            cwd: None,
+        };
+
+        let error = append_entry(&path, &entry, 10).expect_err("unsafe namespace accepted");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn history_file_symlink_never_exposes_commands_or_changes_the_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        let path = dir.path().join("history");
+        fs::write(&victim, "keep me\n").expect("victim");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).expect("victim mode");
+        symlink(&victim, &path).expect("history symlink");
+
+        let mut history = load_test_history(&path, 10);
+        assert!(history.is_empty());
+        history.add("secret command");
+        history.save();
+
+        assert!(fs::symlink_metadata(&path)
+            .expect("history link")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(&victim).expect("victim contents"),
+            "keep me\n"
+        );
+        assert_eq!(
+            fs::metadata(&victim)
+                .expect("victim metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn history_lock_symlink_never_changes_the_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        let path = dir.path().join("history");
+        let lock_path = dir.path().join("history.lock");
+        fs::write(&victim, "keep me\n").expect("victim");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).expect("victim mode");
+        symlink(&victim, &lock_path).expect("lock symlink");
+
+        let mut history = load_test_history(&path, 10);
+        history.add("secret command");
+
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_to_string(&victim).expect("victim contents"),
+            "keep me\n"
+        );
+        assert_eq!(
+            fs::metadata(&victim)
+                .expect("victim metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn history_and_lock_hard_links_are_rejected_before_writing_or_chmod() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history_victim = dir.path().join("history-victim");
+        let history_path = dir.path().join("history");
+        fs::write(&history_victim, "keep history\n").expect("history victim");
+        fs::set_permissions(&history_victim, fs::Permissions::from_mode(0o640))
+            .expect("history victim mode");
+        fs::hard_link(&history_victim, &history_path).expect("history hard link");
+
+        let mut history = load_test_history(&history_path, 10);
+        assert!(history.is_empty());
+        history.add("secret command");
+        history.save();
+        assert_eq!(
+            fs::read_to_string(&history_victim).expect("history victim contents"),
+            "keep history\n"
+        );
+        assert_eq!(
+            fs::metadata(&history_victim)
+                .expect("history victim metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+
+        let lock_victim = dir.path().join("lock-victim");
+        let separate_history = dir.path().join("separate-history");
+        let lock_path = dir.path().join("separate-history.lock");
+        fs::write(&lock_victim, "keep lock\n").expect("lock victim");
+        fs::set_permissions(&lock_victim, fs::Permissions::from_mode(0o640))
+            .expect("lock victim mode");
+        fs::hard_link(&lock_victim, &lock_path).expect("lock hard link");
+
+        assert!(lock_history_file(&separate_history).is_err());
+        assert_eq!(
+            fs::read_to_string(&lock_victim).expect("lock victim contents"),
+            "keep lock\n"
+        );
+        assert_eq!(
+            fs::metadata(&lock_victim)
+                .expect("lock victim metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn history_loader_rejects_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).expect("history fifo");
+
+        let history = load_test_history(&path, 10);
+
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn history_lock_descriptor_closes_across_exec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("private parent");
+        let path = dir.path().join("history");
+        let lock = lock_history_file(&path).expect("history lock");
+
+        let flags = unsafe { nix::libc::fcntl(lock.file.as_raw_fd(), nix::libc::F_GETFD) };
+
+        assert!(flags >= 0, "F_GETFD failed");
+        assert_ne!(flags & nix::libc::FD_CLOEXEC, 0);
+        let directory_flags =
+            unsafe { nix::libc::fcntl(lock._directory.as_raw_fd(), nix::libc::F_GETFD) };
+        assert!(directory_flags >= 0, "directory F_GETFD failed");
+        assert_ne!(directory_flags & nix::libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn history_load_and_save_refuse_an_oversized_file_without_replacing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("history fixture");
+        file.set_len((MAX_HISTORY_FILE_BYTES + 1) as u64)
+            .expect("sparse oversized fixture");
+        drop(file);
+
+        let mut history = load_test_history(&path, 10);
+        assert!(history.is_empty());
+        history.add("echo must not replace oversized history");
+        history.save();
+
+        assert_eq!(
+            fs::metadata(&path).expect("history metadata").len(),
+            (MAX_HISTORY_FILE_BYTES + 1) as u64
+        );
+    }
+
+    #[test]
+    fn oversized_history_records_are_not_retained_or_persisted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        let mut history = load_test_history(&path, 10);
+
+        history.add(&"x".repeat(MAX_HISTORY_RECORD_BYTES));
+
+        assert!(history.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn terminal_ambiguous_commands_are_never_loaded_or_recalled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        let records = [
+            HistoryEntry {
+                command: "echo safe".into(),
+                timestamp: 1,
+                cwd: Some("/tmp/unsafe\nmetadata".into()),
+            },
+            HistoryEntry {
+                command: "echo \x1b]52;c;payload\x07".into(),
+                timestamp: 2,
+                cwd: None,
+            },
+            HistoryEntry {
+                command: "echo \u{202e}hidden".into(),
+                timestamp: 3,
+                cwd: None,
+            },
+        ];
+        let content = records
+            .iter()
+            .map(History::format_entry)
+            .collect::<io::Result<Vec<_>>>()
+            .expect("serialize")
+            .join("\n");
+        fs::write(&path, format!("{content}\n")).expect("fixture");
+
+        let mut history = load_test_history(&path, 10);
+
+        assert_eq!(history.entries(), vec!["echo safe"]);
+        assert_eq!(history.entries[0].cwd, None);
+        history.add("echo \u{200b}hidden");
+        assert_eq!(history.entries(), vec!["echo safe"]);
+    }
+
+    #[test]
+    fn loader_keeps_only_the_newest_requested_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        let records = (0..5)
+            .map(|index| HistoryEntry {
+                command: format!("echo {index}"),
+                timestamp: index,
+                cwd: None,
+            })
+            .collect::<Vec<_>>();
+        write_entries_atomically(&path, &records).expect("history fixture");
+
+        let history = load_test_history(&path, 2);
+
+        assert_eq!(history.entries(), vec!["echo 3", "echo 4"]);
+    }
+
+    #[test]
+    fn lock_wait_is_bounded_and_lock_name_replacement_cannot_bypass_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("private parent");
+        let path = dir.path().join("history");
+        let lock_path = dir.path().join("history.lock");
+        let displaced = dir.path().join("displaced.lock");
+        let first = lock_history_file(&path).expect("first lock");
+        fs::rename(&lock_path, &displaced).expect("replace lock namespace");
+
+        let error = lock_history_file_with_timeout(&path, Duration::ZERO)
+            .err()
+            .expect("second lock must time out");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!lock_path.exists(), "contender created a bypass lock inode");
+
+        drop(first);
+        let second = lock_history_file_with_timeout(&path, Duration::from_millis(50));
+        assert!(second.is_ok(), "lock should recover after owner exits");
     }
 }

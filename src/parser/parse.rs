@@ -847,7 +847,7 @@ impl<'a> Parser<'a> {
 
         let raw = self.input.get(content_start..content_end).unwrap_or("");
         let parts = split_for_header(raw);
-        let init = parts.get(0).cloned().unwrap_or_default();
+        let init = parts.first().cloned().unwrap_or_default();
         let condition = parts.get(1).cloned().unwrap_or_default();
         let update = parts.get(2).cloned().unwrap_or_default();
 
@@ -1193,15 +1193,15 @@ impl<'a> Parser<'a> {
                     let cmd = self.parse_simple_command()?;
                     if let Command::Simple(simple) = cmd {
                         let redirects = self.parse_optional_redirects()?;
-                        return Ok(Command::Compound(CompoundCommand::Coproc {
+                        Ok(Command::Compound(CompoundCommand::Coproc {
                             name: coproc_name,
                             command: Box::new(simple),
                             redirects,
-                        }));
+                        }))
                     } else {
-                        return Err(ParseError::Unexpected(
+                        Err(ParseError::Unexpected(
                             "coproc requires a simple command".into(),
-                        ));
+                        ))
                     }
                 } else {
                     unreachable!()
@@ -2238,7 +2238,7 @@ pub fn parse_word_parts(raw: &str) -> Word {
                 } else if content.contains(',') && !looks_like_json_object(&content) {
                     // Comma-separated brace expansion: {a,b,c}
                     let items: Vec<Vec<WordPart>> =
-                        content.split(',').map(|s| parse_word_parts(s)).collect();
+                        content.split(',').map(parse_word_parts).collect();
                     parts.push(WordPart::BraceExpansion(items));
                 } else {
                     // Not a valid brace expansion (or it's a JSON object) — keep literal.
@@ -2399,42 +2399,6 @@ fn parse_word_parts_inner(input: &str) -> Vec<WordPart> {
     parts
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{parse, parse_word_parts, WordPart};
-
-    #[test]
-    fn command_substitution_keeps_nested_quoted_subshells() {
-        let parts = parse_word_parts(r#"$(dirname "$(dirname "$CONDA_EXE")")"#);
-        assert_eq!(
-            parts,
-            vec![WordPart::CommandSub(
-                r#"dirname "$(dirname "$CONDA_EXE")""#.to_string()
-            )]
-        );
-    }
-
-    #[test]
-    fn double_quoted_command_substitution_keeps_inner_quotes() {
-        let parts = parse_word_parts(r#""$(dirname "$CONDA_EXE")""#);
-        assert_eq!(
-            parts,
-            vec![WordPart::DoubleQuoted(vec![WordPart::CommandSub(
-                r#"dirname "$CONDA_EXE""#.to_string()
-            )])]
-        );
-    }
-
-    #[test]
-    fn if_body_with_nested_command_sub_and_parameter_expansion_parses() {
-        let src = "if true; then\n\
-                    PATH=\"$(\\dirname \"$(\\dirname \"$D\")\")/condabin${PATH:+\":${PATH}\"}\"\n\
-                    echo done\n\
-                   fi\n";
-        assert!(parse(src).is_ok(), "{:?}", parse(src));
-    }
-}
-
 /// Decode ANSI-C escape sequences for $'...' quoting.
 fn decode_ansi_c(s: &str) -> String {
     let mut out = String::new();
@@ -2539,5 +2503,41 @@ fn parse_brace_range(content: &str) -> Option<WordPart> {
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse, parse_word_parts, WordPart};
+
+    #[test]
+    fn command_substitution_keeps_nested_quoted_subshells() {
+        let parts = parse_word_parts(r#"$(dirname "$(dirname "$CONDA_EXE")")"#);
+        assert_eq!(
+            parts,
+            vec![WordPart::CommandSub(
+                r#"dirname "$(dirname "$CONDA_EXE")""#.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn double_quoted_command_substitution_keeps_inner_quotes() {
+        let parts = parse_word_parts(r#""$(dirname "$CONDA_EXE")""#);
+        assert_eq!(
+            parts,
+            vec![WordPart::DoubleQuoted(vec![WordPart::CommandSub(
+                r#"dirname "$CONDA_EXE""#.to_string()
+            )])]
+        );
+    }
+
+    #[test]
+    fn if_body_with_nested_command_sub_and_parameter_expansion_parses() {
+        let src = "if true; then\n\
+                    PATH=\"$(\\dirname \"$(\\dirname \"$D\")\")/condabin${PATH:+\":${PATH}\"}\"\n\
+                    echo done\n\
+                   fi\n";
+        assert!(parse(src).is_ok(), "{:?}", parse(src));
     }
 }

@@ -513,7 +513,7 @@ fn is_value_aware_command(cmd: &Command) -> bool {
 /// Run a pipeline composed entirely of value-aware builtins in-process.
 fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
     use crate::pipeline_data::PipelineData;
-    use std::io::Read;
+    const MAX_VALUE_PIPE_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
     // If our own stdin is a pipe (not a tty), the user is feeding bytes into
     // the first value-aware stage. Read them eagerly. (Phase 5a is non-streaming.)
@@ -534,8 +534,17 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
     let mut data = if first_is_source || std::io::stdin().is_terminal() {
         PipelineData::Empty
     } else {
-        let mut buf = Vec::new();
-        let _ = std::io::stdin().lock().read_to_end(&mut buf);
+        let buf = match crate::io_guard::read_to_end_bounded(
+            std::io::stdin().lock(),
+            MAX_VALUE_PIPE_INPUT_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("jsh: value pipeline stdin: {error}");
+                state.last_exit_code = 1;
+                return 1;
+            }
+        };
         if buf.is_empty() {
             PipelineData::Empty
         } else {
@@ -607,7 +616,7 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
 
     // Phase 5a: if every command is a value-aware builtin with no redirects /
     // assignments / etc., run the whole pipeline in-process without forking.
-    if cmds.iter().all(|c| is_value_aware_command(c)) {
+    if cmds.iter().all(is_value_aware_command) {
         let code = execute_value_pipeline(cmds, state);
         state.pipestatus = vec![code];
         state.set_array("PIPESTATUS", vec![code.to_string()]);
@@ -1097,7 +1106,7 @@ fn parse_cached(source: &str) -> Option<Vec<CompleteCommand>> {
 /// The first / last `Simple` command of a parsed alias body, which is where the
 /// caller's assignment prefix and trailing arguments belong (`alias ll='ls|less'`
 /// plus `ll /tmp` is `ls | less /tmp` in bash).
-fn simple_at<'a>(program: &'a mut [CompleteCommand], last: bool) -> Option<&'a mut SimpleCommand> {
+fn simple_at(program: &mut [CompleteCommand], last: bool) -> Option<&mut SimpleCommand> {
     let cmd = if last {
         program.last_mut()?
     } else {
@@ -1412,7 +1421,7 @@ fn execute_simple_with_mode(
             })
             .collect();
 
-        let code = builtins::run_builtin(cmd_name, &args.to_vec(), state);
+        let code = builtins::run_builtin(cmd_name, args, state);
 
         for (name, old) in saved_vars {
             match old {
@@ -1440,10 +1449,10 @@ fn execute_simple_with_mode(
             .collect();
 
         let _ = execvp(&c_cmd, &c_args);
-        let (msg, code) = exec_error_info(&cmd_name);
+        let (msg, code) = exec_error_info(cmd_name);
         shell_error(&format!("{}: {}", cmd_name, msg));
         if code == 127 {
-            if let Some(suggestion) = suggest_command(&cmd_name, state) {
+            if let Some(suggestion) = suggest_command(cmd_name, state) {
                 shell_command_hint(&suggestion);
             }
         }
@@ -1470,7 +1479,7 @@ fn execute_simple_with_mode(
                 .collect();
 
             let _ = execvp(&c_cmd, &c_args);
-            let (msg, code) = exec_error_info(&cmd_name);
+            let (msg, code) = exec_error_info(cmd_name);
             shell_error(&format!("{}: {}", cmd_name, msg));
             child_exit(code);
         }
@@ -1488,7 +1497,7 @@ fn execute_simple_with_mode(
             };
             signal::set_foreground_pgid(None);
             if exit_code == 127 {
-                if let Some(suggestion) = suggest_command(&cmd_name, state) {
+                if let Some(suggestion) = suggest_command(cmd_name, state) {
                     shell_command_hint(&suggestion);
                 }
             }

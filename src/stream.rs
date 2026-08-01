@@ -1,7 +1,21 @@
 /// Stream processing and utility commands
 /// Adds functional programming style commands to jsh
 /// sum - Add up all numbers in arguments
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal};
+
+fn for_each_stdin_line(command: &str, mut consume: impl FnMut(String)) -> i32 {
+    let stdin = std::io::stdin();
+    for result in stdin.lock().lines() {
+        match result {
+            Ok(line) => consume(line),
+            Err(error) => {
+                eprintln!("jsh: {command}: stdin: {error}");
+                return 1;
+            }
+        }
+    }
+    0
+}
 
 pub fn builtin_sum(args: &[String]) -> i32 {
     let sum: f64 = args.iter().filter_map(|s| s.parse::<f64>().ok()).sum();
@@ -75,16 +89,11 @@ pub fn builtin_lines(_args: &[String]) -> i32 {
         eprintln!("lines: requires piped input, e.g.: cat file | lines");
         return 1;
     }
-    use std::io::BufRead;
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            if !line.trim().is_empty() {
-                println!("{}", line);
-            }
+    for_each_stdin_line("lines", |line| {
+        if !line.trim().is_empty() {
+            println!("{}", line);
         }
-    }
-    0
+    })
 }
 
 /// stats - Show cache and performance statistics
@@ -125,19 +134,17 @@ pub fn builtin_count(args: &[String]) -> i32 {
         eprintln!("count: requires piped input, e.g.: cat file | count");
         return 1;
     }
-    use std::io::BufRead;
-
     let mut lines = 0;
     let mut words = 0;
     let mut chars = 0;
 
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            lines += 1;
-            words += line.split_whitespace().count();
-            chars += line.chars().count();
-        }
+    let status = for_each_stdin_line("count", |line| {
+        lines += 1;
+        words += line.split_whitespace().count();
+        chars += line.chars().count();
+    });
+    if status != 0 {
+        return status;
     }
 
     if args.is_empty() || args[0] == "-l" {
@@ -161,9 +168,11 @@ pub fn builtin_reverse(args: &[String]) -> i32 {
             return 1;
         }
         // Read from stdin
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        let mut lines: Vec<String> = stdin.lock().lines().filter_map(|l| l.ok()).collect();
+        let mut lines = Vec::new();
+        let status = for_each_stdin_line("reverse", |line| lines.push(line));
+        if status != 0 {
+            return status;
+        }
         lines.reverse();
         for line in lines {
             println!("{}", line);
@@ -186,12 +195,11 @@ pub fn builtin_upper(args: &[String]) -> i32 {
             eprintln!("upper: requires piped input or arguments, e.g.: upper hello");
             return 1;
         }
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            if let Ok(line) = line {
-                println!("{}", line.to_uppercase());
-            }
+        let status = for_each_stdin_line("upper", |line| {
+            println!("{}", line.to_uppercase());
+        });
+        if status != 0 {
+            return status;
         }
     } else {
         for arg in args {
@@ -208,12 +216,11 @@ pub fn builtin_lower(args: &[String]) -> i32 {
             eprintln!("lower: requires piped input or arguments, e.g.: lower HELLO");
             return 1;
         }
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            if let Ok(line) = line {
-                println!("{}", line.to_lowercase());
-            }
+        let status = for_each_stdin_line("lower", |line| {
+            println!("{}", line.to_lowercase());
+        });
+        if status != 0 {
+            return status;
         }
     } else {
         for arg in args {

@@ -6,13 +6,13 @@
 
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const EXECUTION_JOURNAL_VERSION: u32 = 1;
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -22,6 +22,11 @@ pub const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub const COMPACTED_JOURNAL_TARGET_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_RETAINED_EXECUTIONS: usize = 2_000;
+const MAX_JOURNAL_READ_BYTES: u64 = MAX_JOURNAL_FILE_BYTES + MAX_EVENT_LINE_BYTES as u64 + 1;
+const JOURNAL_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const JOURNAL_LOCK_RETRY: Duration = Duration::from_millis(10);
+const SAFE_FILE_OPEN_FLAGS: i32 =
+    nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -237,11 +242,18 @@ impl ExecutionJournal {
     /// Fold the append-only event stream into one record per execution.
     /// Malformed, oversized, unknown-version, and orphan events are ignored.
     pub fn records(&self) -> io::Result<Vec<ExecutionRecord>> {
-        if !self.path.exists() {
+        if matches!(
+            fs::symlink_metadata(&self.path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ) {
             return Ok(Vec::new());
         }
         let _lock = self.lock(FlockArg::LockShared)?;
-        read_records(&self.path)
+        match read_records(&self.path) {
+            Ok(records) => Ok(records),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Return records in chronological order, optionally scoped to one
@@ -282,12 +294,25 @@ impl ExecutionJournal {
         encoded.push(b'\n');
 
         let _lock = self.lock(FlockArg::LockExclusive)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.path)?;
-        set_private_file_permissions(&self.path)?;
+        let mut file = open_regular_file(&self.path, true, true, true)?;
+        set_private_open_file_permissions(&file)?;
+        if file.metadata()?.len() > MAX_JOURNAL_FILE_BYTES {
+            drop(file);
+            compact_unlocked(&self.path)?;
+            file = open_regular_file(&self.path, true, true, true)?;
+            set_private_open_file_permissions(&file)?;
+        }
+        // A power loss can leave the prior write without its JSONL newline.
+        // Separate that partial record before appending so one torn tail does
+        // not consume the first valid event after recovery.
+        if file.metadata()?.len() != 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0_u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
         file.write_all(&encoded)?;
         if file.metadata()?.len() > MAX_JOURNAL_FILE_BYTES {
             drop(file);
@@ -296,23 +321,173 @@ impl ExecutionJournal {
         Ok(())
     }
 
-    fn lock(&self, arg: FlockArg) -> io::Result<Flock<File>> {
-        if let Some(parent) = self.path.parent() {
-            let parent_existed = parent.try_exists()?;
-            fs::create_dir_all(parent)?;
-            if !parent_existed || self.harden_existing_parent {
-                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-            }
-        }
+    fn lock(&self, arg: FlockArg) -> io::Result<JournalLock> {
+        let directory = ensure_journal_parent(&self.path, self.harden_existing_parent)?;
+        // Updated peers lock the directory before opening the sidecar, so one
+        // cannot rename it and acquire a different lock inode mid-operation.
+        let directory = flock_with_timeout(directory, arg, JOURNAL_LOCK_TIMEOUT)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
+            .custom_flags(SAFE_FILE_OPEN_FLAGS)
             .mode(0o600)
             .open(&self.lock_path)?;
-        set_private_file_permissions(&self.lock_path)?;
-        Flock::lock(file, arg).map_err(|(_, errno)| io::Error::from_raw_os_error(errno as i32))
+        ensure_regular_file(&file, &self.lock_path)?;
+        set_private_open_file_permissions(&file)?;
+        let file = flock_with_timeout(file, arg, JOURNAL_LOCK_TIMEOUT)?;
+        Ok(JournalLock {
+            _directory: directory,
+            _file: file,
+        })
     }
+}
+
+struct JournalLock {
+    _directory: Flock<File>,
+    _file: Flock<File>,
+}
+
+fn flock_with_timeout(mut file: File, arg: FlockArg, timeout: Duration) -> io::Result<Flock<File>> {
+    let nonblocking = match arg {
+        FlockArg::LockShared | FlockArg::LockSharedNonblock => FlockArg::LockSharedNonblock,
+        FlockArg::LockExclusive | FlockArg::LockExclusiveNonblock => {
+            FlockArg::LockExclusiveNonblock
+        }
+        FlockArg::Unlock => FlockArg::Unlock,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported execution journal lock mode",
+            ));
+        }
+    };
+    let started = Instant::now();
+    loop {
+        match Flock::lock(file, nonblocking) {
+            Ok(lock) => return Ok(lock),
+            Err((returned, errno)) => {
+                file = returned;
+                if errno != nix::errno::Errno::EAGAIN {
+                    return Err(io::Error::from_raw_os_error(errno as i32));
+                }
+                if started.elapsed() >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "timed out waiting for execution journal lock",
+                    ));
+                }
+                let remaining = timeout
+                    .checked_sub(started.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                std::thread::sleep(JOURNAL_LOCK_RETRY.min(remaining));
+            }
+        }
+    }
+}
+
+fn ensure_journal_parent(path: &Path, harden_existing: bool) -> io::Result<File> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let existed = match fs::symlink_metadata(parent) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if !existed {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(parent)?;
+    ensure_owned_directory(&directory, parent)?;
+    if !existed || harden_existing {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    ensure_non_writable_directory(&directory, parent)?;
+    Ok(directory)
+}
+
+fn open_regular_file(path: &Path, read: bool, append: bool, create: bool) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(read)
+        .append(append)
+        .create(create)
+        .truncate(false)
+        .custom_flags(SAFE_FILE_OPEN_FLAGS)
+        .mode(0o600)
+        .open(path)?;
+    ensure_regular_file(&file, path)?;
+    Ok(file)
+}
+
+fn ensure_regular_file(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{path:?} is not a regular file"),
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} must have exactly one hard link"),
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} is not owned by the current user"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_owned_directory(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{path:?} is not a directory"),
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} is not owned by the current user"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_non_writable_directory(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if file.metadata()?.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} is writable by another user or group"),
+        ));
+    }
+    Ok(())
+}
+
+fn set_private_open_file_permissions(file: &File) -> io::Result<()> {
+    file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
 pub fn default_journal_path() -> Option<PathBuf> {
@@ -414,12 +589,24 @@ fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
 }
 
 fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
-    let file = File::open(path)?;
-    let mut records = Vec::<ExecutionRecord>::new();
-    let mut indices = HashMap::<String, usize>::new();
+    let file = open_regular_file(path, true, false, false)?;
+    set_private_open_file_permissions(&file)?;
+    if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "execution journal exceeds size limit",
+        ));
+    }
+    let mut records = VecDeque::<ExecutionRecord>::new();
+    // Logical indices never shift when the front is evicted; this keeps a
+    // hostile stream of tiny unique start events linear rather than O(n^2).
+    let mut indices = HashMap::<String, u64>::new();
+    let mut base_index = 0_u64;
+    let mut next_index = 0_u64;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
-    while let Some(within_limit) = read_bounded_line(&mut reader, &mut line)? {
+    let mut bytes_read = 0_u64;
+    while let Some(within_limit) = read_bounded_line(&mut reader, &mut line, &mut bytes_read)? {
         if !within_limit {
             continue;
         }
@@ -464,10 +651,25 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                     output: None,
                 };
                 if let Some(index) = indices.get(&id).copied() {
-                    records[index] = record;
+                    if let Some(existing) = index
+                        .checked_sub(base_index)
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .and_then(|offset| records.get_mut(offset))
+                    {
+                        *existing = record;
+                    }
                 } else {
-                    indices.insert(id, records.len());
-                    records.push(record);
+                    if records.len() == MAX_RETAINED_EXECUTIONS {
+                        if let Some(evicted) = records.pop_front() {
+                            if indices.get(&evicted.id) == Some(&base_index) {
+                                indices.remove(&evicted.id);
+                            }
+                            base_index = base_index.saturating_add(1);
+                        }
+                    }
+                    indices.insert(id, next_index);
+                    records.push_back(record);
+                    next_index = next_index.saturating_add(1);
                 }
             }
             ExecutionEvent::Finish {
@@ -478,10 +680,15 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                 ended_at_ms,
                 ..
             } => {
-                if cwd_after.len() > MAX_CWD_BYTES {
+                if validate_execution_id(&id).is_err() || cwd_after.len() > MAX_CWD_BYTES {
                     continue;
                 }
-                if let Some(record) = indices.get(&id).and_then(|index| records.get_mut(*index)) {
+                if let Some(record) = indices
+                    .get(&id)
+                    .and_then(|index| index.checked_sub(base_index))
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .and_then(|offset| records.get_mut(offset))
+                {
                     record.exit_code = Some(exit_code);
                     record.duration_ms = Some(duration_ms);
                     record.cwd_after = Some(cwd_after);
@@ -496,10 +703,15 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                 captured_at_ms,
                 ..
             } => {
-                if text.len() > MAX_OUTPUT_BYTES {
+                if validate_execution_id(&id).is_err() || text.len() > MAX_OUTPUT_BYTES {
                     continue;
                 }
-                if let Some(record) = indices.get(&id).and_then(|index| records.get_mut(*index)) {
+                if let Some(record) = indices
+                    .get(&id)
+                    .and_then(|index| index.checked_sub(base_index))
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .and_then(|offset| records.get_mut(offset))
+                {
                     record.output = Some(ExecutionOutput {
                         text,
                         truncated,
@@ -510,12 +722,16 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
             }
         }
     }
-    Ok(records)
+    Ok(records.into())
 }
 
 /// Read and, when necessary, discard one JSONL record without allocating more
 /// than the public per-event limit. `false` denotes an oversized record.
-fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<Option<bool>> {
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    bytes_read: &mut u64,
+) -> io::Result<Option<bool>> {
     line.clear();
     let mut saw_bytes = false;
     let mut oversized = false;
@@ -536,6 +752,13 @@ fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Resul
             }
         }
         reader.consume(consumed);
+        *bytes_read = bytes_read.saturating_add(consumed as u64);
+        if *bytes_read > MAX_JOURNAL_READ_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution journal grew beyond size limit while being read",
+            ));
+        }
         if newline.is_some() {
             return Ok(Some(!oversized));
         }
@@ -560,14 +783,17 @@ fn compact_unlocked(path: &Path) -> io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
             .mode(0o600)
             .open(&tmp_path)?;
+        set_private_open_file_permissions(&file)?;
         for encoded in retained.iter().rev() {
             file.write_all(encoded)?;
         }
         file.sync_all()?;
         fs::rename(&tmp_path, path)?;
-        set_private_file_permissions(path)
+        let directory = ensure_journal_parent(path, false)?;
+        directory.sync_all()
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
@@ -629,16 +855,16 @@ fn write_compacted_event(file: &mut impl Write, event: &ExecutionEvent) -> io::R
     file.write_all(b"\n")
 }
 
-fn set_private_file_permissions(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use std::os::unix::fs::symlink;
 
     fn journal() -> (tempfile::TempDir, ExecutionJournal) {
         let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let journal = ExecutionJournal::with_path(dir.path().join("executions.jsonl"));
         (dir, journal)
     }
@@ -712,6 +938,21 @@ mod tests {
     }
 
     #[test]
+    fn append_after_a_torn_tail_preserves_the_new_event() {
+        let (_dir, journal) = journal();
+        fs::write(journal.path(), br#"{"event":"start"#).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        journal
+            .record_start("jsh-after-torn", None, 1, "echo recovered", "/tmp", 1)
+            .unwrap();
+
+        let records = journal.records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "jsh-after-torn");
+    }
+
+    #[test]
     fn output_and_commands_are_hard_bounded_and_files_private() {
         let (dir, journal) = journal();
         let command = "x".repeat(MAX_COMMAND_BYTES + 100);
@@ -753,6 +994,22 @@ mod tests {
             fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+
+    #[test]
+    fn group_writable_custom_parent_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("shared");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o770)).unwrap();
+        let journal = ExecutionJournal::with_path(parent.join("custom.jsonl"));
+
+        let error = journal
+            .record_start("jsh-custom", None, 1, "true", "/tmp", 1)
+            .expect_err("unsafe namespace accepted");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!journal.path().exists());
     }
 
     #[test]
@@ -830,6 +1087,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(true)
             .mode(0o600)
             .open(journal.path())
             .unwrap();
@@ -868,6 +1126,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(true)
             .mode(0o600)
             .open(journal.path())
             .unwrap();
@@ -913,5 +1172,150 @@ mod tests {
         assert!(!records.is_empty());
         assert!(records.len() < 100);
         assert_eq!(records.last().unwrap().seq, 99);
+    }
+
+    #[test]
+    fn journal_symlinks_hard_links_and_fifos_are_rejected_without_touching_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let symlink_path = dir.path().join("symlink.jsonl");
+        symlink(&victim, &symlink_path).unwrap();
+        let symlink_journal = ExecutionJournal::with_path(symlink_path);
+        assert!(symlink_journal
+            .record_start("jsh-link", None, 1, "true", "/tmp", 1)
+            .is_err());
+
+        let hardlink_path = dir.path().join("hardlink.jsonl");
+        fs::hard_link(&victim, &hardlink_path).unwrap();
+        let hardlink_journal = ExecutionJournal::with_path(hardlink_path);
+        assert!(hardlink_journal.records().is_err());
+
+        let fifo_path = dir.path().join("fifo.jsonl");
+        mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let fifo_journal = ExecutionJournal::with_path(fifo_path);
+        assert!(fifo_journal.records().is_err());
+        assert!(fifo_journal
+            .record_start("jsh-fifo", None, 1, "true", "/tmp", 1)
+            .is_err());
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me\n");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn journal_lock_special_files_never_block_or_change_a_target() {
+        for kind in ["symlink", "hardlink", "fifo"] {
+            let dir = tempfile::tempdir().unwrap();
+            let victim = dir.path().join("victim");
+            let journal = ExecutionJournal::with_path(dir.path().join("events.jsonl"));
+            fs::write(&victim, "keep lock\n").unwrap();
+            fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).unwrap();
+            match kind {
+                "symlink" => symlink(&victim, &journal.lock_path).unwrap(),
+                "hardlink" => fs::hard_link(&victim, &journal.lock_path).unwrap(),
+                "fifo" => {
+                    fs::remove_file(&victim).unwrap();
+                    mkfifo(&journal.lock_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(journal
+                .record_start("jsh-lock", None, 1, "true", "/tmp", 1)
+                .is_err());
+            assert!(!journal.path().exists());
+            if kind != "fifo" {
+                assert_eq!(fs::read_to_string(&victim).unwrap(), "keep lock\n");
+                assert_eq!(
+                    fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn journal_parent_symlink_is_rejected_without_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        let linked_parent = dir.path().join("linked");
+        fs::create_dir(&real_parent).unwrap();
+        fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o750)).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+        let journal = ExecutionJournal::with_path(linked_parent.join("events.jsonl"));
+
+        assert!(journal
+            .record_start("jsh-parent", None, 1, "true", "/tmp", 1)
+            .is_err());
+        assert!(!real_parent.join("events.jsonl").exists());
+        assert!(!real_parent.join("executions.lock").exists());
+        assert_eq!(
+            fs::metadata(&real_parent).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
+
+    #[test]
+    fn journal_reader_rejects_a_file_beyond_the_recovery_budget() {
+        let (_dir, journal) = journal();
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(journal.path())
+            .unwrap();
+        file.set_len(MAX_JOURNAL_READ_BYTES + 1).unwrap();
+        drop(file);
+
+        assert!(journal.records().is_err());
+        assert!(journal
+            .record_start("jsh-too-large", None, 1, "true", "/tmp", 1)
+            .is_err());
+        assert_eq!(
+            fs::metadata(journal.path()).unwrap().len(),
+            MAX_JOURNAL_READ_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn decoder_retains_only_the_newest_bounded_execution_set() {
+        let (_dir, journal) = journal();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(journal.path())
+            .unwrap();
+        for seq in 0..(MAX_RETAINED_EXECUTIONS as u64 + 5) {
+            write_compacted_event(
+                &mut file,
+                &ExecutionEvent::Start {
+                    jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                    id: format!("jsh-bounded-{seq}"),
+                    session_id: None,
+                    seq,
+                    command: "true".into(),
+                    command_truncated: false,
+                    cwd: "/tmp".into(),
+                    started_at_ms: seq,
+                },
+            )
+            .unwrap();
+        }
+        drop(file);
+
+        let records = journal.records().unwrap();
+        assert_eq!(records.len(), MAX_RETAINED_EXECUTIONS);
+        assert_eq!(records.first().unwrap().seq, 5);
+        assert_eq!(
+            records.last().unwrap().seq,
+            MAX_RETAINED_EXECUTIONS as u64 + 4
+        );
     }
 }

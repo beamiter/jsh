@@ -8,6 +8,56 @@ use serde::{Deserialize, Serialize};
 use crate::job::JobTable;
 use crate::parser::ast::CompoundCommand;
 
+const PATH_SCAN_QUEUE_CAPACITY: usize = 1;
+const MAX_PATH_SCAN_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_PATH_CACHE_ENTRIES: usize = 65_536;
+const MAX_PATH_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+fn bounded_path_value(value: &str) -> String {
+    if value.len() <= MAX_PATH_SCAN_VALUE_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_PATH_SCAN_VALUE_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn scan_path_commands(path: &str) -> Vec<String> {
+    scan_path_commands_with_limits(path, MAX_PATH_CACHE_ENTRIES, MAX_PATH_CACHE_BYTES)
+}
+
+fn scan_path_commands_with_limits(path: &str, max_entries: usize, max_bytes: usize) -> Vec<String> {
+    let mut cache = Vec::new();
+    let mut bytes = 0usize;
+    'directories: for dir in path.split(':') {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_file() || ft.is_symlink() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if !crate::terminal_text::is_safe_inline(name) {
+                                continue;
+                            }
+                            if cache.len() >= max_entries
+                                || bytes.saturating_add(name.len()) > max_bytes
+                            {
+                                break 'directories;
+                            }
+                            bytes += name.len();
+                            cache.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cache.sort_unstable();
+    cache.dedup();
+    cache
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EditingMode {
     Emacs,
@@ -20,18 +70,13 @@ pub enum ConfigSource {
     Jshrc,  // 使用 .jshrc，用 jsh 解析器执行
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PromptStyle {
     Full,    // user@host ~/path (branch) took duration ❯
     Compact, // user ~/path (branch) ❯
     Minimal, // ~/path ❯
-    Auto,    // Automatically choose based on terminal width
-}
-
-impl Default for PromptStyle {
-    fn default() -> Self {
-        PromptStyle::Auto
-    }
+    #[default]
+    Auto, // Automatically choose based on terminal width
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,9 +466,8 @@ impl ShellState {
     }
 
     pub fn get_var(&self, name: &str) -> Option<&str> {
-        match name {
-            "?" => return None, // handled by expand
-            _ => {}
+        if name == "?" {
+            return None; // handled by expand
         }
         // Check local_vars_stack from top to bottom
         for scope in self.local_vars_stack.iter().rev() {
@@ -439,23 +483,18 @@ impl ShellState {
         // Try COLUMNS environment variable first
         if let Ok(cols_str) = env::var("COLUMNS") {
             if let Ok(cols) = cols_str.parse::<usize>() {
-                if cols > 0 {
+                if (1..=u16::MAX as usize).contains(&cols) {
                     return cols;
                 }
             }
         }
 
-        // Try stty size
-        if let Ok(output) = std::process::Command::new("stty").arg("size").output() {
-            if let Ok(output_str) = String::from_utf8(output.stdout) {
-                let parts: Vec<&str> = output_str.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(cols) = parts[1].parse::<usize>() {
-                        if cols > 0 {
-                            return cols;
-                        }
-                    }
-                }
+        // Query the terminal directly; resolving an external `stty` through a
+        // user-controlled PATH made shell construction an unnecessary process
+        // and unbounded-output boundary.
+        if let Ok((columns, _)) = crossterm::terminal::size() {
+            if columns > 0 {
+                return columns as usize;
             }
         }
 
@@ -527,37 +566,37 @@ impl ShellState {
         }
 
         // Check for completed background scan
-        if let Some(ref rx) = self.path_scan_rx {
-            if let Ok(result) = rx.try_recv() {
+        let scan_result = self.path_scan_rx.as_ref().map(mpsc::Receiver::try_recv);
+        match scan_result {
+            Some(Ok(result)) => {
                 self.path_cache = Some(result);
                 self.path_scan_rx = None;
             }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.path_scan_rx = None;
+            }
+            _ => {}
         }
 
         if self.path_cache.is_none() && self.path_scan_rx.is_none() {
             // Start async scan
-            let path_val = self.env_vars.get("PATH").cloned().unwrap_or_default();
-            let (tx, rx) = mpsc::channel();
-            self.path_scan_rx = Some(rx);
-            std::thread::spawn(move || {
-                let mut cache = Vec::new();
-                for dir in path_val.split(':') {
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            if let Ok(ft) = entry.file_type() {
-                                if ft.is_file() || ft.is_symlink() {
-                                    if let Some(name) = entry.file_name().to_str() {
-                                        cache.push(name.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                cache.sort_unstable();
-                cache.dedup();
-                let _ = tx.send(cache);
-            });
+            let path_val = bounded_path_value(
+                self.env_vars
+                    .get("PATH")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            );
+            let (tx, rx) = mpsc::sync_channel(PATH_SCAN_QUEUE_CAPACITY);
+            let worker_path = path_val.clone();
+            match std::thread::Builder::new()
+                .name("jsh-path-scan".to_string())
+                .spawn(move || {
+                    let cache = scan_path_commands(&worker_path);
+                    let _ = tx.send(cache);
+                }) {
+                Ok(_) => self.path_scan_rx = Some(rx),
+                Err(_) => self.path_cache = Some(scan_path_commands(&path_val)),
+            }
             // Return empty vec on first call (scan is in progress)
             // For immediate use, do a synchronous scan as fallback
             if self.path_cache.is_none() {
@@ -682,5 +721,32 @@ impl ShellState {
     /// Pop the current local variable scope (for function exit)
     pub fn pop_local_scope(&mut self) {
         self.local_vars_stack.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_path_value, scan_path_commands_with_limits, MAX_PATH_SCAN_VALUE_BYTES};
+
+    #[test]
+    fn path_scan_payload_has_entry_and_byte_bounds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::write(temp.path().join(name), "").expect("PATH fixture");
+        }
+        let path = temp.path().to_str().expect("UTF-8 tempdir");
+
+        assert_eq!(scan_path_commands_with_limits(path, 2, 100).len(), 2);
+        let byte_bounded = scan_path_commands_with_limits(path, 10, 5);
+        assert_eq!(byte_bounded.len(), 1);
+        assert!(byte_bounded.iter().map(String::len).sum::<usize>() <= 5);
+    }
+
+    #[test]
+    fn path_value_crossing_thread_is_utf8_safely_bounded() {
+        let value = "雪".repeat(MAX_PATH_SCAN_VALUE_BYTES);
+        let bounded = bounded_path_value(&value);
+        assert!(bounded.len() <= MAX_PATH_SCAN_VALUE_BYTES);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
     }
 }

@@ -1,6 +1,12 @@
 /// Z-jump: frecency-based directory jumping.
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_Z_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_Z_ENTRIES: usize = 200;
+const MAX_Z_PATH_BYTES: usize = 16 * 1024;
+static Z_IO_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 struct ZEntry {
@@ -28,11 +34,19 @@ impl ZDatabase {
     }
 
     fn load(&mut self) {
-        if let Ok(content) = std::fs::read_to_string(&self.file_path) {
-            for line in content.lines() {
-                let parts: Vec<&str> = line.splitn(3, '|').collect();
-                if parts.len() == 3 {
-                    if let (Ok(rank), Ok(ts)) = (parts[1].parse::<f64>(), parts[2].parse::<u64>()) {
+        let content = match crate::io_guard::read_private_text(&self.file_path, MAX_Z_FILE_BYTES) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                warn_z_io("load", &self.file_path, &error);
+                return;
+            }
+        };
+        for line in content.lines().take(MAX_Z_ENTRIES) {
+            let parts: Vec<&str> = line.splitn(3, '|').collect();
+            if parts.len() == 3 && valid_z_path(parts[0]) {
+                if let (Ok(rank), Ok(ts)) = (parts[1].parse::<f64>(), parts[2].parse::<u64>()) {
+                    if rank.is_finite() && rank > 0.0 {
                         self.entries.push(ZEntry {
                             path: parts[0].to_string(),
                             rank,
@@ -52,7 +66,13 @@ impl ZDatabase {
                 entry.path, entry.rank, entry.last_access
             ));
         }
-        std::fs::write(&self.file_path, content).ok();
+        if let Err(error) = crate::io_guard::write_private_file_atomic(
+            &self.file_path,
+            content.as_bytes(),
+            MAX_Z_FILE_BYTES,
+        ) {
+            warn_z_io("save", &self.file_path, &error);
+        }
     }
 
     fn now() -> u64 {
@@ -63,6 +83,9 @@ impl ZDatabase {
     }
 
     pub fn add(&mut self, path: &str) {
+        if !valid_z_path(path) {
+            return;
+        }
         let now = Self::now();
         if let Some(entry) = self.entries.iter_mut().find(|e| e.path == path) {
             entry.rank += 1.0;
@@ -75,7 +98,7 @@ impl ZDatabase {
             });
         }
         // Prune entries with very low frecency (keep top 100)
-        if self.entries.len() > 200 {
+        if self.entries.len() > MAX_Z_ENTRIES {
             let now = Self::now();
             self.entries.sort_by(|a, b| {
                 frecency(b, now)
@@ -135,6 +158,19 @@ impl ZDatabase {
     }
 }
 
+fn valid_z_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_Z_PATH_BYTES
+        && !path.contains('|')
+        && crate::terminal_text::is_safe_inline(path)
+}
+
+fn warn_z_io(operation: &str, path: &std::path::Path, error: &std::io::Error) {
+    if !Z_IO_WARNING_SHOWN.swap(true, Ordering::SeqCst) {
+        eprintln!("jsh: z-jump {operation} failed for {path:?}: {error}");
+    }
+}
+
 fn frecency(entry: &ZEntry, now: u64) -> f64 {
     let age_secs = now.saturating_sub(entry.last_access);
     let weight = if age_secs < 3600 {
@@ -156,4 +192,30 @@ static Z_DB: OnceLock<Mutex<ZDatabase>> = OnceLock::new();
 
 pub fn get_z_db() -> &'static Mutex<ZDatabase> {
     Z_DB.get_or_init(|| Mutex::new(ZDatabase::load_default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn persisted_z_entries_are_bounded_and_terminal_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("z");
+        crate::io_guard::write_private_file_atomic(
+            &path,
+            "/safe|2|10\n/hidden\u{202e}|3|11\n/nan|NaN|12\n".as_bytes(),
+            MAX_Z_FILE_BYTES,
+        )
+        .unwrap();
+        let mut db = ZDatabase {
+            entries: Vec::new(),
+            file_path: path,
+        };
+        db.load();
+        assert_eq!(db.entries.len(), 1);
+        assert_eq!(db.entries[0].path, "/safe");
+    }
 }

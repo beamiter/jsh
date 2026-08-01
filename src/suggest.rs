@@ -171,8 +171,7 @@ pub fn suggest(buffer: &str, history: &History, ctx: &SuggestionContext) -> Opti
     }
 
     // 3. For "cd " commands, suggest from z-jump database
-    if buffer.starts_with("cd ") {
-        let current_arg = &buffer[3..];
+    if let Some(current_arg) = buffer.strip_prefix("cd ") {
         let query = current_arg.trim();
         if !query.is_empty() {
             if let Ok(db) = crate::zjump::get_z_db().lock() {
@@ -214,7 +213,7 @@ fn probe_filesystem_suggestion(buffer: &str) -> Option<String> {
 
     // Get the last argument being typed (handle pipes, semicolons, etc.)
     let last_arg = args_part
-        .rsplit(|c: char| c == ' ' || c == '\t' || c == '|' || c == ';' || c == '&')
+        .rsplit([' ', '\t', '|', ';', '&'])
         .next()
         .unwrap_or("")
         .trim();
@@ -409,8 +408,8 @@ fn suggest_from_history_chains(last_cmd: &str, history: &History) -> Option<Stri
     // Count successor commands
     let mut successors: HashMap<&str, u32> = HashMap::new();
     for window in entries.windows(2) {
-        if command_base(&window[0]) == last_base {
-            *successors.entry(&window[1]).or_insert(0) += 1;
+        if command_base(window[0]) == last_base {
+            *successors.entry(window[1]).or_insert(0) += 1;
         }
     }
 

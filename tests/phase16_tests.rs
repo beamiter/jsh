@@ -140,9 +140,35 @@ fn spawn_stub_server(
     let url = format!("http://{}/", addr);
     let handle = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().ok()?;
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .ok()?;
+        let mut request = Vec::new();
         let mut buf = [0u8; 4096];
-        let n = sock.read(&mut buf).ok()?;
-        let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+        loop {
+            let n = sock.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.len() > 64 * 1024 {
+                return None;
+            }
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            if request.len() >= body_start + content_length.unwrap_or(0) {
+                break;
+            }
+        }
+        let req = String::from_utf8_lossy(&request).into_owned();
         let body = response_body.as_bytes();
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

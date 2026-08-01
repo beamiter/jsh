@@ -399,7 +399,7 @@ fn single_line_preview(value: &str, max_chars: usize) -> (String, bool) {
             '\n' => preview.push_str("\\n"),
             '\r' => preview.push_str("\\r"),
             '\t' => preview.push_str("\\t"),
-            ch if ch.is_control() => {
+            ch if crate::terminal_text::is_terminal_ambiguous(ch) => {
                 let _ = write!(preview, "\\u{{{:x}}}", u32::from(ch));
             }
             ch => preview.push(ch),
@@ -422,10 +422,10 @@ fn append_human_safe(output: &mut String, value: &str) {
             '\n' => output.push('\n'),
             '\t' => output.push_str("\\t"),
             '\r' => output.push_str("\\r"),
-            ch if ch.is_control() && u32::from(ch) <= 0x7f => {
+            ch if crate::terminal_text::is_terminal_ambiguous(ch) && u32::from(ch) <= 0x7f => {
                 let _ = write!(output, "\\x{:02x}", u32::from(ch));
             }
-            ch if ch.is_control() => {
+            ch if crate::terminal_text::is_terminal_ambiguous(ch) => {
                 let _ = write!(output, "\\u{{{:x}}}", u32::from(ch));
             }
             ch => output.push(ch),
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn human_show_escapes_terminal_controls_but_json_remains_exact() {
-        let control = "before\x1b]133;A\x07after\nnext\u{0085}";
+        let control = "before\x1b]133;A\x07after\nnext\u{0085}\u{202e}\u{200b}";
         let mut unsafe_record = record(Some(1), Some(control));
         unsafe_record.command = control.to_string();
 
@@ -778,7 +778,9 @@ mod tests {
         assert!(!human.contains('\x1b'));
         assert!(!human.contains('\x07'));
         assert!(!human.contains('\u{0085}'));
-        assert!(human.contains("before\\x1b]133;A\\x07after\nnext\\u{85}"));
+        assert!(!human.contains('\u{202e}'));
+        assert!(!human.contains('\u{200b}'));
+        assert!(human.contains("before\\x1b]133;A\\x07after\nnext\\u{85}\\u{202e}\\u{200b}"));
 
         let json = render(QueryResult::Show(unsafe_record), true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

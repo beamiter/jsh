@@ -110,7 +110,12 @@ fn bench_reduce(c: &mut Criterion) {
                 },
                 |(mut state, data)| {
                     let f = VALUE_BUILTINS.get("reduce").unwrap();
-                    let out = f(data, &[String::from("0"), String::from("f")], &mut state).unwrap();
+                    let out = f(
+                        data,
+                        &[String::from("-i"), String::from("0"), String::from("f")],
+                        &mut state,
+                    )
+                    .unwrap();
                     black_box(out);
                 },
             )

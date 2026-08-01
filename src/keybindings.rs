@@ -134,6 +134,12 @@ pub struct SearchEngine {
     pub whole_word: bool,
 }
 
+impl Default for SearchEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SearchEngine {
     pub fn new() -> Self {
         SearchEngine {

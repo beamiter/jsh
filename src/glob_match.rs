@@ -1,5 +1,5 @@
-/// Shared glob pattern matching using an iterative algorithm.
-/// Replaces the three duplicate recursive implementations.
+//! Shared glob pattern matching using an iterative algorithm.
+//! Replaces the three duplicate recursive implementations.
 
 /// Match a value against a glob pattern supporting `*`, `?`, and `[...]`.
 pub fn glob_match(pattern: &str, value: &str) -> bool {

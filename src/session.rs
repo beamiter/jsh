@@ -5,8 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,6 +15,21 @@ use crate::parser::ast::CompoundCommand;
 
 /// Snapshot format version. Bump when adding fields (use #[serde(default)] for compat).
 const SNAPSHOT_VERSION: u32 = 1;
+const MAX_SESSION_ID_BYTES: usize = 128;
+const MAX_SESSION_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SESSION_JSON_TOKENS: usize = 16 * 1024;
+const MAX_SESSION_JSON_DEPTH: usize = 64;
+const MAX_SESSION_STRING_BYTES: usize = 256 * 1024;
+const MAX_SESSION_TOTAL_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SESSION_LOGICAL_ITEMS: usize = 8 * 1024;
+const MAX_SESSION_MAP_ITEMS: usize = 2 * 1024;
+const MAX_SESSION_FUNCTIONS: usize = 256;
+const MAX_SESSION_COMPLETION_SPECS: usize = 1024;
+const MAX_SESSION_VECTOR_ITEMS: usize = 4 * 1024;
+const MAX_SESSION_HOOK_ITEMS: usize = 256;
+const MAX_SESSION_DIR_STACK_ITEMS: usize = 256;
+const SAFE_FILE_OPEN_FLAGS: i32 =
+    nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Environment variables that should NOT be persisted across sessions.
@@ -54,6 +69,13 @@ const SKIP_ENV_VARS: &[&str] = &[
     // Internal
     "JSH_SESSION_ID",
     "TERM_SESSION_ID",
+    // One-shot Agent child transport. These paths are capabilities for a
+    // private snapshot/report directory and must never survive into a command
+    // or a persisted terminal session.
+    "JSH_AGENT_CHILD_STATE_DIR",
+    "JSH_AGENT_CHILD_CWD",
+    "JSH_AGENT_CHILD_REPORT",
+    "JSH_AGENT_CHILD_COMMAND",
 ];
 
 /// Environment variable names that are likely to hold credentials. Session
@@ -97,13 +119,38 @@ fn is_likely_secret_env(name: &str) -> bool {
         || upper.ends_with("_DATABASE_URL")
 }
 
-fn should_persist_env(name: &str) -> bool {
-    !SKIP_ENV_VARS.contains(&name) && !is_likely_secret_env(name)
+fn has_embedded_url_credentials(value: &str) -> bool {
+    value.split("://").skip(1).any(|remainder| {
+        let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+        authority
+            .rsplit_once('@')
+            .is_some_and(|(userinfo, host)| !userinfo.is_empty() && !host.is_empty())
+    })
+}
+
+fn has_private_key_material(value: &str) -> bool {
+    [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+}
+
+fn should_persist_env(name: &str, value: &str) -> bool {
+    !SKIP_ENV_VARS.contains(&name)
+        && !is_likely_secret_env(name)
+        && !has_embedded_url_credentials(value)
+        && !has_private_key_material(value)
 }
 
 /// Detected environment context for re-activation on restore.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum EnvironmentContext {
+    #[default]
     Plain,
     PythonVenv {
         virtual_env: String,
@@ -119,12 +166,6 @@ pub enum EnvironmentContext {
     Ssh {
         ssh_connection: String,
     },
-}
-
-impl Default for EnvironmentContext {
-    fn default() -> Self {
-        EnvironmentContext::Plain
-    }
 }
 
 /// Serializable snapshot of shell session state.
@@ -158,7 +199,14 @@ pub struct SessionSnapshot {
 fn sessions_dir() -> PathBuf {
     crate::config::migrate_legacy_rsh_data();
     dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(|| {
+            // Do not make the first user without a discoverable home own a
+            // process-global /tmp/.jsh namespace. A per-UID fallback prevents
+            // cross-user denial of service and accidental snapshot sharing.
+            // SAFETY: geteuid has no preconditions and only reads process state.
+            let uid = unsafe { nix::libc::geteuid() };
+            std::env::temp_dir().join(format!("jsh-{uid}"))
+        })
         .join(".jsh")
         .join("sessions")
 }
@@ -171,50 +219,379 @@ fn session_file(session_id: &str) -> PathBuf {
 fn sanitize_session_id(session_id: &str) -> String {
     session_id
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect()
 }
 
 fn session_file_in(dir: &Path, session_id: &str) -> io::Result<PathBuf> {
     let safe_id = sanitize_session_id(session_id);
-    if safe_id.is_empty() || safe_id != session_id {
+    if safe_id.is_empty() || safe_id != session_id || session_id.len() > MAX_SESSION_ID_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session ID may contain only letters, digits, '-' and '_'",
+            "session ID must be at most 128 bytes and contain only ASCII letters, digits, '-' and '_'",
         ));
     }
     Ok(dir.join(format!("{}.json", safe_id)))
 }
 
 fn ensure_private_directory(dir: &Path) -> io::Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(dir) {
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session directory must not be a symlink",
-            ));
-        }
+    if !dir.try_exists()? {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
-    fs::create_dir_all(dir)?;
-    let metadata = fs::symlink_metadata(dir)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(dir)?;
+    let metadata = directory.metadata()?;
     if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "session path is not a directory",
         ));
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session directory is not owned by the current user",
+        ));
+    }
+    directory.set_permissions(fs::Permissions::from_mode(0o700))
 }
 
-fn ensure_private_file(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+fn open_private_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::MetadataExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(SAFE_FILE_OPEN_FLAGS)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "session snapshot must be a regular file",
         ));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    if metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session snapshot must have exactly one hard link",
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session snapshot is not owned by the current user",
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+/// Allocation-free structural preflight for untrusted snapshot JSON. The file
+/// byte cap alone is insufficient: a few MiB of empty strings/objects can ask
+/// serde to allocate hundreds of thousands of collection entries before a
+/// post-deserialization validator gets a chance to run.
+fn validate_snapshot_json_shape(json: &[u8]) -> io::Result<()> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    let mut tokens = 0usize;
+    let mut string_bytes = 0usize;
+
+    while index < json.len() {
+        match json[index] {
+            b' ' | b'\t' | b'\r' | b'\n' | b',' | b':' => index += 1,
+            b'{' | b'[' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("session snapshot JSON nesting overflow"))?;
+                if depth > MAX_SESSION_JSON_DEPTH {
+                    return Err(invalid("session snapshot JSON is nested too deeply"));
+                }
+                tokens = tokens.saturating_add(1);
+                index += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    return Err(invalid("session snapshot JSON has unbalanced delimiters"));
+                }
+                depth -= 1;
+                index += 1;
+            }
+            b'"' => {
+                tokens = tokens.saturating_add(1);
+                index += 1;
+                let start = index;
+                let mut escaped = false;
+                loop {
+                    let Some(&byte) = json.get(index) else {
+                        return Err(invalid("session snapshot JSON has an unterminated string"));
+                    };
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        break;
+                    }
+                    index += 1;
+                }
+                let len = index.saturating_sub(start);
+                if len > MAX_SESSION_STRING_BYTES {
+                    return Err(invalid("session snapshot contains an oversized string"));
+                }
+                string_bytes = string_bytes
+                    .checked_add(len)
+                    .ok_or_else(|| invalid("session snapshot string budget overflow"))?;
+                if string_bytes > MAX_SESSION_TOTAL_TEXT_BYTES {
+                    return Err(invalid(
+                        "session snapshot exceeds its cumulative text budget",
+                    ));
+                }
+                index += 1;
+            }
+            _ => {
+                // Number, true, false, or null. Full lexical validation remains
+                // serde_json's job; this pass only counts allocation-driving
+                // values before serde is allowed to allocate them.
+                tokens = tokens.saturating_add(1);
+                while index < json.len()
+                    && !matches!(
+                        json[index],
+                        b' ' | b'\t' | b'\r' | b'\n' | b',' | b':' | b'{' | b'}' | b'[' | b']'
+                    )
+                {
+                    index += 1;
+                }
+            }
+        }
+        if tokens > MAX_SESSION_JSON_TOKENS {
+            return Err(invalid("session snapshot contains too many JSON values"));
+        }
+    }
+    if depth != 0 {
+        return Err(invalid("session snapshot JSON has unbalanced delimiters"));
+    }
+    Ok(())
+}
+
+struct SnapshotBudget {
+    items: usize,
+    text_bytes: usize,
+}
+
+impl SnapshotBudget {
+    fn items(&mut self, count: usize) -> io::Result<()> {
+        self.items = self
+            .items
+            .checked_add(count)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "snapshot item overflow"))?;
+        if self.items > MAX_SESSION_LOGICAL_ITEMS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot contains too many collection items",
+            ));
+        }
+        Ok(())
+    }
+
+    fn text(&mut self, value: &str) -> io::Result<()> {
+        if value.len() > MAX_SESSION_STRING_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot contains an oversized string",
+            ));
+        }
+        self.text_bytes = self.text_bytes.checked_add(value.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "snapshot text budget overflow")
+        })?;
+        if self.text_bytes > MAX_SESSION_TOTAL_TEXT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot exceeds its cumulative text budget",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_snapshot_logical(snapshot: &SessionSnapshot) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let limit = |ok: bool, message: &'static str| {
+        ok.then_some(())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, message))
+    };
+    limit(
+        snapshot.env_vars.len() <= MAX_SESSION_MAP_ITEMS
+            && snapshot.aliases.len() <= MAX_SESSION_MAP_ITEMS
+            && snapshot.functions.len() <= MAX_SESSION_FUNCTIONS
+            && snapshot.arrays.len() <= MAX_SESSION_MAP_ITEMS
+            && snapshot.assoc_arrays.len() <= MAX_SESSION_MAP_ITEMS
+            && snapshot.traps.len() <= MAX_SESSION_MAP_ITEMS
+            && snapshot.shell_opts.tracked_opts.len() <= MAX_SESSION_MAP_ITEMS
+            && snapshot.shell_opts.shopt_opts.len() <= MAX_SESSION_MAP_ITEMS
+            && snapshot.completion_specs.len() <= MAX_SESSION_COMPLETION_SPECS,
+        "session snapshot map exceeds its entry limit",
+    )?;
+    limit(
+        snapshot.hooks.precmd.len() <= MAX_SESSION_HOOK_ITEMS
+            && snapshot.hooks.preexec.len() <= MAX_SESSION_HOOK_ITEMS
+            && snapshot.hooks.chpwd.len() <= MAX_SESSION_HOOK_ITEMS
+            && snapshot.dir_stack.len() <= MAX_SESSION_DIR_STACK_ITEMS,
+        "session snapshot list exceeds its entry limit",
+    )?;
+
+    let mut budget = SnapshotBudget {
+        items: 0,
+        text_bytes: 0,
+    };
+    budget.text(&snapshot.session_id)?;
+    budget.text(&snapshot.cwd)?;
+    for map in [&snapshot.env_vars, &snapshot.aliases, &snapshot.traps] {
+        budget.items(map.len())?;
+        for (name, value) in map {
+            budget.text(name)?;
+            budget.text(value)?;
+        }
+    }
+    budget.items(snapshot.functions.len())?;
+    for name in snapshot.functions.keys() {
+        budget.text(name)?;
+    }
+    for (name, values) in &snapshot.arrays {
+        limit(
+            values.len() <= MAX_SESSION_VECTOR_ITEMS,
+            "session array exceeds its item limit",
+        )?;
+        budget.items(values.len().saturating_add(1))?;
+        budget.text(name)?;
+        for value in values {
+            budget.text(value)?;
+        }
+    }
+    for (name, values) in &snapshot.assoc_arrays {
+        limit(
+            values.len() <= MAX_SESSION_MAP_ITEMS,
+            "session associative array exceeds its item limit",
+        )?;
+        budget.items(values.len().saturating_add(1))?;
+        budget.text(name)?;
+        for (key, value) in values {
+            budget.text(key)?;
+            budget.text(value)?;
+        }
+    }
+    for map in [
+        &snapshot.shell_opts.tracked_opts,
+        &snapshot.shell_opts.shopt_opts,
+    ] {
+        budget.items(map.len())?;
+        for name in map.keys() {
+            budget.text(name)?;
+        }
+    }
+    for hooks in [
+        &snapshot.hooks.precmd,
+        &snapshot.hooks.preexec,
+        &snapshot.hooks.chpwd,
+    ] {
+        budget.items(hooks.len())?;
+        for hook in hooks {
+            budget.text(hook)?;
+        }
+    }
+    budget.items(snapshot.completion_specs.len())?;
+    for (name, spec) in &snapshot.completion_specs {
+        budget.text(name)?;
+        budget.text(&spec.command)?;
+        if let Some(words) = &spec.word_list {
+            limit(
+                words.len() <= MAX_SESSION_VECTOR_ITEMS,
+                "session completion word list exceeds its item limit",
+            )?;
+            budget.items(words.len())?;
+            for word in words {
+                budget.text(word)?;
+            }
+        }
+        for value in [
+            spec.function.as_deref(),
+            spec.glob_pattern.as_deref(),
+            spec.filter_pattern.as_deref(),
+            spec.prefix.as_deref(),
+            spec.suffix.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            budget.text(value)?;
+        }
+    }
+    budget.items(snapshot.dir_stack.len())?;
+    for path in &snapshot.dir_stack {
+        let bytes = path.as_os_str().as_bytes();
+        limit(
+            bytes.len() <= MAX_SESSION_STRING_BYTES,
+            "session directory path exceeds its byte limit",
+        )?;
+        budget.text_bytes = budget.text_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "snapshot text budget overflow")
+        })?;
+    }
+    match &snapshot.environment_context {
+        EnvironmentContext::Plain => {}
+        EnvironmentContext::PythonVenv { virtual_env } => budget.text(virtual_env)?,
+        EnvironmentContext::NixShell {
+            flake_dir,
+            nix_build_top,
+        } => {
+            if let Some(value) = flake_dir {
+                budget.text(value)?;
+            }
+            if let Some(value) = nix_build_top {
+                budget.text(value)?;
+            }
+        }
+        EnvironmentContext::Docker { container_id } => {
+            if let Some(value) = container_id {
+                budget.text(value)?;
+            }
+        }
+        EnvironmentContext::Ssh { ssh_connection } => budget.text(ssh_connection)?,
+    }
+    limit(
+        budget.text_bytes <= MAX_SESSION_TOTAL_TEXT_BYTES,
+        "session snapshot exceeds its cumulative text budget",
+    )
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > MAX_SESSION_SNAPSHOT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot exceeds size limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl SessionSnapshot {
@@ -228,7 +605,7 @@ impl SessionSnapshot {
         let env_vars: HashMap<String, String> = state
             .env_vars
             .iter()
-            .filter(|(k, _)| should_persist_env(k))
+            .filter(|(k, v)| should_persist_env(k, v))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
@@ -258,12 +635,12 @@ impl SessionSnapshot {
     pub fn apply(self, state: &mut ShellState) {
         // Restore CWD
         if let Err(e) = std::env::set_current_dir(&self.cwd) {
-            eprintln!("jsh: session restore: failed to cd to {}: {}", self.cwd, e);
+            eprintln!("jsh: session restore: failed to cd to {:?}: {e}", self.cwd);
         }
 
         // Merge env vars: snapshot values override, but keep process-inherited vars for SKIP list
         for (k, v) in &self.env_vars {
-            if should_persist_env(k) {
+            if should_persist_env(k, v) {
                 state.env_vars.insert(k.clone(), v.clone());
                 std::env::set_var(k, v);
             }
@@ -290,7 +667,7 @@ impl SessionSnapshot {
         self.save_to_dir(&sessions_dir())
     }
 
-    fn save_to_dir(&self, dir: &Path) -> io::Result<()> {
+    pub(crate) fn save_to_dir(&self, dir: &Path) -> io::Result<()> {
         if self.version != SNAPSHOT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -320,27 +697,36 @@ impl SessionSnapshot {
         let mut persisted = self.clone();
         persisted
             .env_vars
-            .retain(|name, _| should_persist_env(name));
-        let json = serde_json::to_string_pretty(&persisted).map_err(io::Error::other)?;
+            .retain(|name, value| should_persist_env(name, value));
+        validate_snapshot_logical(&persisted)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let mut writer = BoundedJsonWriter { bytes: Vec::new() };
+        serde_json::to_writer_pretty(&mut writer, &persisted)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        validate_snapshot_json_shape(&writer.bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let json = writer.bytes;
 
         let result = (|| {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
                 .mode(0o600)
                 .open(&tmp_path)?;
-            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
-            file.write_all(json.as_bytes())?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(&json)?;
             file.sync_all()?;
 
             // On Unix, rename replaces an existing regular file atomically.
             // Do not unlink the old snapshot first: doing so creates a window
             // where a crash would leave no recoverable state.
             fs::rename(&tmp_path, &path)?;
-            ensure_private_file(&path)?;
-            if let Ok(directory) = File::open(dir) {
-                let _ = directory.sync_all();
-            }
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+                .open(dir)?;
+            directory.sync_all()?;
             Ok(())
         })();
         if result.is_err() {
@@ -354,14 +740,35 @@ impl SessionSnapshot {
         Self::load_from_dir(session_id, &sessions_dir())
     }
 
-    fn load_from_dir(session_id: &str, dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn load_from_dir(
+        session_id: &str,
+        dir: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if dir.exists() {
             ensure_private_directory(dir)?;
         }
         let path = session_file_in(dir, session_id)?;
-        ensure_private_file(&path)?;
-        let json = fs::read_to_string(&path)?;
-        let mut snapshot: SessionSnapshot = serde_json::from_str(&json)?;
+        let mut file = open_private_file(&path)?;
+        if file.metadata()?.len() > MAX_SESSION_SNAPSHOT_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot exceeds size limit",
+            )
+            .into());
+        }
+        let mut json = Vec::new();
+        (&mut file)
+            .take((MAX_SESSION_SNAPSHOT_BYTES + 1) as u64)
+            .read_to_end(&mut json)?;
+        if json.len() > MAX_SESSION_SNAPSHOT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot grew beyond size limit while being read",
+            )
+            .into());
+        }
+        validate_snapshot_json_shape(&json)?;
+        let mut snapshot: SessionSnapshot = serde_json::from_slice(&json)?;
         if snapshot.version != SNAPSHOT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -372,9 +779,19 @@ impl SessionSnapshot {
             )
             .into());
         }
+        if snapshot.session_id != session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot identity does not match its file name",
+            )
+            .into());
+        }
+        validate_snapshot_logical(&snapshot)?;
         // Old version-1 snapshots may predate secret filtering. Never return
         // those stale credentials to the restore path.
-        snapshot.env_vars.retain(|name, _| should_persist_env(name));
+        snapshot
+            .env_vars
+            .retain(|name, value| should_persist_env(name, value));
         Ok(snapshot)
     }
 
@@ -391,7 +808,7 @@ fn delete_from_dir(dir: &Path, session_id: &str) {
     let Ok(path) = session_file_in(dir, session_id) else {
         return;
     };
-    if ensure_private_file(&path).is_ok() {
+    if open_private_file(&path).is_ok() {
         let _ = fs::remove_file(path);
     }
 }
@@ -475,10 +892,7 @@ pub fn reactivate_environment(ctx: &EnvironmentContext, state: &mut ShellState) 
                     }
                 }
             } else {
-                eprintln!(
-                    "jsh: session restore: venv {} no longer exists",
-                    virtual_env
-                );
+                eprintln!("jsh: session restore: venv {virtual_env:?} no longer exists");
             }
         }
         EnvironmentContext::NixShell { .. } => {
@@ -533,7 +947,9 @@ fn cleanup_stale_sessions_in(dir: &Path, max_age: std::time::Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     /// A snapshot is portable between terminals, so every variable naming the
     /// terminal that captured it has to be left behind on restore.
@@ -547,11 +963,11 @@ mod tests {
             "VTE_VERSION",
         ] {
             assert!(
-                !should_persist_env(name),
+                !should_persist_env(name, "test-value"),
                 "{name} would survive a restore into a different terminal"
             );
         }
-        assert!(should_persist_env("EDITOR"));
+        assert!(should_persist_env("EDITOR", "vim"));
     }
 
     #[test]
@@ -572,7 +988,7 @@ mod tests {
         assert_eq!(restored.session_id, "test-roundtrip");
         assert_eq!(restored.aliases.get("ll"), Some(&"ls -la".to_string()));
         assert_eq!(restored.env_vars.get("MY_VAR"), Some(&"hello".to_string()));
-        assert_eq!(restored.shell_opts.extglob, true);
+        assert!(restored.shell_opts.extglob);
         assert_eq!(restored.hooks.precmd, vec!["echo hi".to_string()]);
         assert_eq!(restored.traps.get("EXIT"), Some(&"echo bye".to_string()));
     }
@@ -609,6 +1025,18 @@ mod tests {
         state.env_vars.insert(
             "DATABASE_URL".to_string(),
             "postgres://user:pass@host/db".to_string(),
+        );
+        state.env_vars.insert(
+            "REDIS_URL".to_string(),
+            "redis://cache-user:cache-password@example.invalid/0".to_string(),
+        );
+        state.env_vars.insert(
+            "PUBLIC_URL".to_string(),
+            "https://example.invalid/public".to_string(),
+        );
+        state.env_vars.insert(
+            "CERT_BLOB".to_string(),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret".to_string(),
         );
         state.env_vars.insert(
             "SENTRY_DSN".to_string(),
@@ -649,6 +1077,12 @@ mod tests {
         assert!(!snapshot.env_vars.contains_key("GITHUB_PAT"));
         assert!(!snapshot.env_vars.contains_key("SIGNING_PRIVATE_KEY"));
         assert!(!snapshot.env_vars.contains_key("DATABASE_URL"));
+        assert!(!snapshot.env_vars.contains_key("REDIS_URL"));
+        assert!(!snapshot.env_vars.contains_key("CERT_BLOB"));
+        assert_eq!(
+            snapshot.env_vars.get("PUBLIC_URL"),
+            Some(&"https://example.invalid/public".to_string())
+        );
         assert!(!snapshot.env_vars.contains_key("SENTRY_DSN"));
         assert!(!snapshot.env_vars.contains_key("PGPASSWORD"));
         assert!(!snapshot.env_vars.contains_key("MYSQL_PWD"));
@@ -820,12 +1254,19 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+
+        let snapshot = SessionSnapshot::capture(&state, "终端");
+        assert_eq!(
+            snapshot
+                .save_to_dir(temp.path())
+                .expect_err("non-ASCII session ID")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
     fn stale_cleanup_never_traverses_directory_or_entry_symlinks() {
-        use std::os::unix::fs::symlink;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = temp.path().join("outside");
         fs::create_dir(&outside).expect("outside dir");
@@ -846,6 +1287,113 @@ mod tests {
         assert!(victim.exists(), "cleanup followed a symlinked JSON entry");
         delete_from_dir(&sessions, "linked");
         assert!(victim.exists(), "delete followed a symlinked JSON entry");
+    }
+
+    #[test]
+    fn snapshot_links_and_fifos_are_rejected_without_blocking_or_chmodding_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("sessions");
+        ensure_private_directory(&dir).expect("session dir");
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").expect("victim");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).expect("victim mode");
+
+        symlink(&victim, dir.join("linked.json")).expect("snapshot symlink");
+        assert!(SessionSnapshot::load_from_dir("linked", &dir).is_err());
+
+        fs::hard_link(&victim, dir.join("hard.json")).expect("snapshot hard link");
+        assert!(SessionSnapshot::load_from_dir("hard", &dir).is_err());
+        delete_from_dir(&dir, "hard");
+        assert!(dir.join("hard.json").exists());
+
+        mkfifo(&dir.join("fifo.json"), Mode::S_IRUSR | Mode::S_IWUSR).expect("snapshot fifo");
+        assert!(SessionSnapshot::load_from_dir("fifo", &dir).is_err());
+
+        assert_eq!(fs::read_to_string(&victim).expect("victim"), "keep me\n");
+        assert_eq!(
+            fs::metadata(&victim)
+                .expect("victim metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn atomic_snapshot_save_replaces_a_symlink_without_touching_its_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("sessions");
+        ensure_private_directory(&dir).expect("session dir");
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").expect("victim");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).expect("victim mode");
+        symlink(&victim, dir.join("replace-link.json")).expect("snapshot symlink");
+        let snapshot = SessionSnapshot::capture(&ShellState::new(false), "replace-link");
+
+        snapshot.save_to_dir(&dir).expect("safe atomic replacement");
+
+        assert!(!fs::symlink_metadata(dir.join("replace-link.json"))
+            .expect("snapshot metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&victim).expect("victim"), "keep me\n");
+        assert_eq!(
+            fs::metadata(&victim)
+                .expect("victim metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn snapshot_size_limits_preserve_the_last_good_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("sessions");
+        let state = ShellState::new(false);
+        let mut snapshot = SessionSnapshot::capture(&state, "bounded");
+        snapshot.aliases.insert("keep".into(), "true".into());
+        snapshot.save_to_dir(&dir).expect("initial snapshot");
+
+        snapshot
+            .aliases
+            .insert("oversized".into(), "x".repeat(MAX_SESSION_SNAPSHOT_BYTES));
+        assert!(snapshot.save_to_dir(&dir).is_err());
+
+        let restored = SessionSnapshot::load_from_dir("bounded", &dir).expect("last good");
+        assert_eq!(
+            restored.aliases.get("keep").map(String::as_str),
+            Some("true")
+        );
+        assert!(!restored.aliases.contains_key("oversized"));
+
+        let path = session_file_in(&dir, "bounded").expect("snapshot path");
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("oversized fixture");
+        file.set_len((MAX_SESSION_SNAPSHOT_BYTES + 1) as u64)
+            .expect("sparse snapshot");
+        drop(file);
+        assert!(SessionSnapshot::load_from_dir("bounded", &dir).is_err());
+    }
+
+    #[test]
+    fn snapshot_identity_must_match_the_requested_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("sessions");
+        ensure_private_directory(&dir).expect("session dir");
+        let snapshot = SessionSnapshot::capture(&ShellState::new(false), "another-session");
+        let path = session_file_in(&dir, "requested-session").expect("snapshot path");
+        fs::write(&path, serde_json::to_vec(&snapshot).expect("serialize")).expect("fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("fixture mode");
+
+        let error = SessionSnapshot::load_from_dir("requested-session", &dir)
+            .expect_err("identity mismatch");
+        assert!(error.to_string().contains("identity does not match"));
     }
 
     #[test]

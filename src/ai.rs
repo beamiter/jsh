@@ -25,8 +25,8 @@ use std::thread;
 use jagent::prompt::{agent_user_prompt_tagged, BlockContext, EnvironmentMeta};
 #[cfg(feature = "ai")]
 use jagent::provider::{
-    bound_history_with, build_chat_request, parse_chat_response_full, ChatConfig, HttpRequest,
-    Message, Provider, ProviderError, Role,
+    bound_history_with, build_chat_request, parse_chat_response_full, ChatConfig, ChatResponse,
+    HttpRequest, Message, Provider, ProviderError, Role, MAX_MODEL_TEXT_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,24 +177,52 @@ pub enum AiResponse {
     Error(String),
 }
 
+const AI_QUEUE_CAPACITY: usize = 1;
+const MAX_AI_REQUEST_PROMPT_BYTES: usize = 16 * 1024;
+const MAX_AI_CWD_BYTES: usize = 4 * 1024;
+const MAX_AI_OS_BYTES: usize = 128;
+const MAX_AI_ERROR_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_AI_ERROR_OUTPUT_BYTES: usize = 32 * 1024;
+const MAX_AI_ERROR_BYTES: usize = 16 * 1024;
+#[cfg(feature = "ai")]
+const MAX_AI_API_KEY_BYTES: usize = 16 * 1024;
+#[cfg(feature = "ai")]
+const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
+#[cfg(feature = "ai")]
+const MAX_AI_MODEL_BYTES: usize = 1024;
+#[cfg(feature = "ai")]
+const MAX_AI_HEADERS: usize = 16;
+#[cfg(feature = "ai")]
+const MAX_AI_HEADER_BYTES: usize = 32 * 1024;
+#[cfg(feature = "ai")]
+const MAX_AI_RESPONSE_BODY_BYTES: u64 = 1024 * 1024;
+
 pub struct AiWorker {
-    tx: mpsc::Sender<AiRequest>,
+    tx: mpsc::SyncSender<AiRequest>,
     pub rx: mpsc::Receiver<AiResponse>,
 }
 
 impl AiWorker {
     pub fn new(config: AiConfig) -> Self {
-        let (req_tx, req_rx) = mpsc::channel::<AiRequest>();
-        let (resp_tx, resp_rx) = mpsc::channel::<AiResponse>();
+        // Exactly one request may be in flight and exactly one response may
+        // await the editor. Keeping these channels bounded makes that UI
+        // invariant a memory-safety property rather than merely convention.
+        let (req_tx, req_rx) = mpsc::sync_channel::<AiRequest>(AI_QUEUE_CAPACITY);
+        let (resp_tx, resp_rx) = mpsc::sync_channel::<AiResponse>(AI_QUEUE_CAPACITY);
 
-        thread::spawn(move || {
-            while let Ok(request) = req_rx.recv() {
-                let response = process_request(&config, &request);
-                if resp_tx.send(response).is_err() {
-                    break;
+        // Thread creation can fail under process or address-space pressure.
+        // Keep construction non-panicking: a disconnected request channel is
+        // reported to the editor by `request` returning false.
+        let _ = thread::Builder::new()
+            .name("jsh-ai-worker".to_string())
+            .spawn(move || {
+                while let Ok(request) = req_rx.recv() {
+                    let response = process_request(&config, &request);
+                    if resp_tx.send(response).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            });
 
         AiWorker {
             tx: req_tx,
@@ -202,13 +230,33 @@ impl AiWorker {
         }
     }
 
-    pub fn request(&self, req: AiRequest) {
-        let _ = self.tx.send(req);
+    pub fn request(&self, req: AiRequest) -> bool {
+        self.tx.try_send(bound_ai_request(req)).is_ok()
     }
 
     pub fn try_recv(&self) -> Option<AiResponse> {
         self.rx.try_recv().ok()
     }
+}
+
+fn bound_ai_request(mut request: AiRequest) -> AiRequest {
+    request.prompt = bound_bytes(&request.prompt, MAX_AI_REQUEST_PROMPT_BYTES);
+    request.context.cwd = bound_bytes(&request.context.cwd, MAX_AI_CWD_BYTES);
+    request.context.os = bound_bytes(&request.context.os, MAX_AI_OS_BYTES);
+    request.context.recent_history.truncate(MAX_HISTORY_LINES);
+    for line in &mut request.context.recent_history {
+        *line = bound_bytes(line, MAX_HISTORY_LINE_BYTES);
+    }
+    request.context.git_status = request
+        .context
+        .git_status
+        .as_deref()
+        .map(|status| bound_bytes(status, MAX_GIT_STATUS_BYTES));
+    if let Some((command, output, _)) = request.context.last_error.as_mut() {
+        *command = bound_bytes(command, MAX_AI_ERROR_COMMAND_BYTES);
+        *output = bound_bytes(output, MAX_AI_ERROR_OUTPUT_BYTES);
+    }
+    request
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +285,10 @@ pub enum SuggestionError {
     /// the terminal as a live CSI/OSC sequence the moment the suggestion is
     /// painted as ghost text.
     ControlCharacter { code: u32 },
+    /// A non-control Unicode character could reorder or conceal the command
+    /// while ghost text is rendered (bidi overrides, zero-width characters,
+    /// variation selectors, tags, non-ASCII whitespace, and fillers).
+    InvisibleOrAmbiguous { code: u32 },
 }
 
 impl std::fmt::Display for SuggestionError {
@@ -252,6 +304,11 @@ impl std::fmt::Display for SuggestionError {
                 f,
                 "model reply contains control character U+{code:04X}; refusing to put it on \
                  the prompt"
+            ),
+            Self::InvisibleOrAmbiguous { code } => write!(
+                f,
+                "model reply contains invisible or display-ambiguous character U+{code:04X}; \
+                 refusing to put it on the prompt"
             ),
         }
     }
@@ -302,6 +359,9 @@ pub fn validate_suggestion(raw: &str) -> Result<String, SuggestionError> {
         }
         if ch.is_control() {
             return Err(SuggestionError::ControlCharacter { code: ch as u32 });
+        }
+        if crate::terminal_text::is_terminal_ambiguous(ch) {
+            return Err(SuggestionError::InvisibleOrAmbiguous { code: ch as u32 });
         }
         if pending_space {
             flattened.push(' ');
@@ -457,7 +517,6 @@ fn shell_context_json(ctx: &AiContext) -> Option<serde_json::Value> {
 }
 
 /// Truncate at a UTF-8 boundary, marking that bytes were dropped.
-#[cfg(feature = "ai")]
 fn bound_bytes(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
@@ -484,7 +543,7 @@ fn bound_bytes(text: &str, max_bytes: usize) -> String {
 /// JWT. Both belong in jagent's `redact` module; jsh composes them on top so no
 /// outbound payload has to wait for that to land upstream.
 #[cfg(feature = "ai")]
-fn redact_outbound(text: &str) -> String {
+pub(crate) fn redact_sensitive_text(text: &str) -> String {
     let mut current = jagent::redact_secrets(text);
     for (replacement, pattern) in supplemental_secret_patterns() {
         if pattern.is_match(&current) {
@@ -528,7 +587,7 @@ fn supplemental_secret_patterns() -> &'static [(&'static str, regex::Regex)] {
 /// The ONLY path from jsh data to an outbound AI request.
 ///
 /// Redaction is structural here rather than a call bolted onto each site: the
-/// system text and every history turn pass through [`redact_outbound`] inside
+/// system text and every history turn pass through `redact_sensitive_text` inside
 /// `jagent::bound_history_with`, which applies the hook *before* the byte
 /// budget elides a turn so the budget measures what is actually sent. A future
 /// code path cannot forget to redact because there is no other way to reach the
@@ -541,8 +600,9 @@ pub fn build_redacted_chat_request(
     system: Option<&str>,
     history: &[Message],
 ) -> Result<HttpRequest, ProviderError> {
-    let mut system = system.map(redact_outbound);
-    let (bounded, omitted) = bound_history_with(history, redact_outbound);
+    validate_transport_config(chat)?;
+    let mut system = system.map(redact_sensitive_text);
+    let (bounded, omitted) = bound_history_with(history, redact_sensitive_text);
     if omitted > 0 {
         // Tell the model the window is incomplete so it does not answer as if
         // it had seen turns jsh's budget dropped.
@@ -558,7 +618,181 @@ pub fn build_redacted_chat_request(
             None => system = Some(note),
         }
     }
-    build_chat_request(chat, system.as_deref(), &bounded)
+    let request = build_chat_request(chat, system.as_deref(), &bounded)?;
+    validate_outbound_request(&request)?;
+    Ok(request)
+}
+
+/// Backport the credential/header validation from the current jagent source at
+/// jsh's single request funnel while Cargo remains pinned to a published,
+/// reproducible commit. `http` header values must never be constructed from a
+/// control-bearing or effectively unbounded environment variable.
+#[cfg(feature = "ai")]
+fn validate_transport_config(chat: &ChatConfig) -> Result<(), ProviderError> {
+    let model = chat.model.trim();
+    if model.is_empty()
+        || model.len() > MAX_AI_MODEL_BYTES
+        || model
+            .chars()
+            .any(crate::terminal_text::is_terminal_ambiguous)
+    {
+        return Err(ProviderError::InvalidConfiguration(
+            "model is empty, unsafe, or exceeds its byte limit".into(),
+        ));
+    }
+    validate_ai_base_url(chat.provider, chat.base_url.trim())?;
+    if let Some(api_key) = chat.api_key.as_deref() {
+        let api_key = api_key.trim();
+        if api_key.len() > MAX_AI_API_KEY_BYTES {
+            return Err(ProviderError::InvalidConfiguration(
+                "API key exceeds its byte limit".into(),
+            ));
+        }
+        if api_key.chars().any(char::is_control) {
+            return Err(ProviderError::InvalidConfiguration(
+                "API key contains a control character".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ai")]
+fn validate_ai_base_url(provider: Provider, base_url: &str) -> Result<(), ProviderError> {
+    let invalid = || {
+        ProviderError::InvalidConfiguration(
+            "base URL must be a bounded absolute HTTPS URL without credentials, query, \
+             fragment, backslashes, controls, or ambiguous Unicode (HTTP is allowed only for a \
+             loopback Ollama endpoint)"
+                .into(),
+        )
+    };
+    if base_url.is_empty()
+        || base_url.len() > MAX_AI_BASE_URL_BYTES
+        || base_url.contains('\\')
+        || base_url.contains('#')
+        || base_url.contains('?')
+        || !crate::terminal_text::is_safe_inline(base_url)
+    {
+        return Err(invalid());
+    }
+    let uri: ureq::http::Uri = base_url.parse().map_err(|_| invalid())?;
+    let scheme = uri.scheme_str().ok_or_else(invalid)?;
+    let host = uri
+        .host()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(invalid)?;
+    if uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+        || uri.query().is_some()
+    {
+        return Err(invalid());
+    }
+    match scheme {
+        "https" => Ok(()),
+        "http"
+            if provider == Provider::Ollama
+                && (host.eq_ignore_ascii_case("localhost")
+                    || host == "127.0.0.1"
+                    || host == "::1") =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+#[cfg(feature = "ai")]
+fn validate_outbound_request(request: &HttpRequest) -> Result<(), ProviderError> {
+    let header_bytes = request
+        .headers
+        .iter()
+        .try_fold(0usize, |total, (name, value)| {
+            total.checked_add(name.len())?.checked_add(value.len())
+        });
+    if request.headers.len() > MAX_AI_HEADERS
+        || header_bytes.is_none_or(|bytes| bytes > MAX_AI_HEADER_BYTES)
+        || request.headers.iter().any(|(name, value)| {
+            name.is_empty()
+                || name.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+                || value.chars().any(char::is_control)
+        })
+    {
+        return Err(ProviderError::InvalidConfiguration(
+            "outbound AI headers are malformed or exceed their count/byte limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse one provider response after enforcing the cumulative assistant-text
+/// budget before jagent's pinned parser joins block arrays. The pinned parser
+/// checks the final string, but its older join path can allocate the complete
+/// aggregate first; this preflight mirrors jagent's current bounded join.
+#[cfg(feature = "ai")]
+pub(crate) fn parse_bounded_chat_response(
+    provider: Provider,
+    response: &serde_json::Value,
+) -> Result<ChatResponse, ProviderError> {
+    let mut total = 0usize;
+    let mut parts = 0usize;
+    let mut account = |text: &str| -> Result<(), ProviderError> {
+        let separator = usize::from(parts > 0);
+        total = total
+            .checked_add(separator)
+            .and_then(|value| value.checked_add(text.len()))
+            .ok_or(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES,
+            })?;
+        if total > MAX_MODEL_TEXT_BYTES {
+            return Err(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES,
+            });
+        }
+        parts += 1;
+        Ok(())
+    };
+
+    match provider {
+        Provider::Anthropic => {
+            if let Some(blocks) = response
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+            {
+                for block in blocks {
+                    if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+                            account(text)?;
+                        }
+                    }
+                }
+            }
+        }
+        Provider::OpenAiCompatible => {
+            if let Some(content) = response.pointer("/choices/0/message/content") {
+                if let Some(text) = content.as_str() {
+                    account(text)?;
+                } else if let Some(blocks) = content.as_array() {
+                    for block in blocks {
+                        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+                            account(text)?;
+                        }
+                    }
+                }
+            }
+        }
+        Provider::Ollama => {
+            if let Some(text) = response
+                .pointer("/message/content")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| response.get("response").and_then(serde_json::Value::as_str))
+            {
+                account(text)?;
+            }
+        }
+    }
+    parse_chat_response_full(provider, response)
 }
 
 #[cfg(feature = "ai")]
@@ -580,28 +814,36 @@ fn process_request(config: &AiConfig, request: &AiRequest) -> AiResponse {
         }],
     ) {
         Ok(http) => http,
-        Err(error) => return AiResponse::Error(error.to_string()),
+        Err(error) => return ai_error_response(error),
     };
 
     let json = match post_json(&http) {
         Ok(json) => json,
-        Err(error) => return AiResponse::Error(error),
+        Err(error) => return ai_error_response(error),
     };
-    let parsed = match parse_chat_response_full(chat.provider, &json) {
+    let parsed = match parse_bounded_chat_response(chat.provider, &json) {
         Ok(parsed) => parsed,
-        Err(error) => return AiResponse::Error(error.to_string()),
+        Err(error) => return ai_error_response(error),
     };
     // A reply cut off at the token limit is a partial command line; running it
     // is worse than not offering it.
     if parsed.reached_token_limit {
-        return AiResponse::Error(format!(
+        return ai_error_response(format!(
             "model stopped at the {AI_MAX_TOKENS}-token output limit; the command is truncated"
         ));
     }
     match validate_suggestion(&parsed.text) {
         Ok(command) => AiResponse::Suggestion(command),
-        Err(error) => AiResponse::Error(error.to_string()),
+        Err(error) => ai_error_response(error),
     }
+}
+
+#[cfg(feature = "ai")]
+fn ai_error_response(error: impl std::fmt::Display) -> AiResponse {
+    AiResponse::Error(bound_bytes(
+        &redact_sensitive_text(&error.to_string()),
+        MAX_AI_ERROR_BYTES,
+    ))
 }
 
 #[cfg(not(feature = "ai"))]
@@ -612,6 +854,9 @@ fn process_request(_config: &AiConfig, _request: &AiRequest) -> AiResponse {
 #[cfg(feature = "ai")]
 fn ai_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
+        // Provider credentials include custom headers such as `x-api-key`;
+        // ureq cannot know to strip all of them on a cross-origin redirect.
+        .max_redirects(0)
         .timeout_connect(Some(std::time::Duration::from_secs(5)))
         .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
         .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
@@ -636,6 +881,8 @@ fn post_json(request: &HttpRequest) -> Result<serde_json::Value, String> {
     let status = response.status();
     let text = response
         .body_mut()
+        .with_config()
+        .limit(MAX_AI_RESPONSE_BODY_BYTES)
         .read_to_string()
         .map_err(|error| format!("Read error: {error}"))?;
     let json = match serde_json::from_str::<serde_json::Value>(&text) {
@@ -762,6 +1009,21 @@ mod tests {
     }
 
     #[test]
+    fn invisible_and_bidirectional_suggestions_are_rejected() {
+        for (text, code) in [
+            ("git status\u{00ad}", 0x00ad),
+            ("printf x\u{202e}", 0x202e),
+            ("echo x\u{e0020}", 0xe0020),
+            ("echo\u{00a0}x", 0x00a0),
+        ] {
+            assert_eq!(
+                validate_suggestion(text),
+                Err(SuggestionError::InvisibleOrAmbiguous { code })
+            );
+        }
+    }
+
+    #[test]
     fn markdown_fences_are_stripped() {
         assert_eq!(
             validate_suggestion("```bash\nls -la\n```").unwrap(),
@@ -817,6 +1079,44 @@ mod tests {
             "grep '编译失败' 日志.txt"
         );
     }
+
+    #[test]
+    fn cross_thread_ai_request_has_entry_and_byte_bounds() {
+        let request = bound_ai_request(AiRequest {
+            prompt: "雪".repeat(MAX_AI_REQUEST_PROMPT_BYTES),
+            context: AiContext {
+                cwd: "路".repeat(MAX_AI_CWD_BYTES),
+                os: "o".repeat(MAX_AI_OS_BYTES + 1),
+                recent_history: (0..MAX_HISTORY_LINES + 3)
+                    .map(|_| "历".repeat(MAX_HISTORY_LINE_BYTES))
+                    .collect(),
+                git_status: Some("g".repeat(MAX_GIT_STATUS_BYTES + 1)),
+                last_error: Some((
+                    "c".repeat(MAX_AI_ERROR_COMMAND_BYTES + 1),
+                    "e".repeat(MAX_AI_ERROR_OUTPUT_BYTES + 1),
+                    1,
+                )),
+            },
+        });
+
+        assert!(request.prompt.len() <= MAX_AI_REQUEST_PROMPT_BYTES);
+        assert!(request.context.cwd.len() <= MAX_AI_CWD_BYTES);
+        assert!(request.context.os.len() <= MAX_AI_OS_BYTES);
+        assert_eq!(request.context.recent_history.len(), MAX_HISTORY_LINES);
+        assert!(request
+            .context
+            .recent_history
+            .iter()
+            .all(|line| line.len() <= MAX_HISTORY_LINE_BYTES));
+        assert!(request
+            .context
+            .git_status
+            .as_ref()
+            .is_some_and(|status| status.len() <= MAX_GIT_STATUS_BYTES));
+        let (command, output, _) = request.context.last_error.expect("error context");
+        assert!(command.len() <= MAX_AI_ERROR_COMMAND_BYTES);
+        assert!(output.len() <= MAX_AI_ERROR_OUTPUT_BYTES);
+    }
 }
 
 #[cfg(all(test, feature = "ai"))]
@@ -842,6 +1142,68 @@ mod ai_tests {
             share_context: true,
         }
         .chat_config(AI_MAX_TOKENS, Some(0.1))
+    }
+
+    #[test]
+    fn pinned_provider_gaps_are_closed_at_the_request_and_response_funnel() {
+        let mut invalid = chat();
+        invalid.api_key = Some("safe-prefix\r\nx-injected: yes".to_string());
+        let error = build_redacted_chat_request(&invalid, None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("control character"));
+        assert!(!error.contains("safe-prefix"));
+
+        invalid.api_key = Some("x".repeat(MAX_AI_API_KEY_BYTES + 1));
+        assert!(build_redacted_chat_request(&invalid, None, &[]).is_err());
+
+        let half = "x".repeat(MAX_MODEL_TEXT_BYTES / 2);
+        let response = serde_json::json!({
+            "content": [
+                {"type": "text", "text": half},
+                {"type": "text", "text": half},
+            ]
+        });
+        assert!(matches!(
+            parse_bounded_chat_response(Provider::Anthropic, &response),
+            Err(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn outbound_ai_transport_rejects_ambiguous_endpoints_and_redirects() {
+        assert_eq!(ai_agent().config().max_redirects(), 0);
+
+        let invalid = [
+            "http://api.openai.com/v1",
+            "https://user:secret@example.com",
+            "https://example.com/v1?redirect=evil",
+            "https://example.com/v1#fragment",
+            "https://example.com\\@evil.test",
+            "https://example.com/\u{202e}hidden",
+        ];
+        for base_url in invalid {
+            let mut config = chat();
+            config.base_url = base_url.to_string();
+            assert!(
+                build_redacted_chat_request(&config, None, &[]).is_err(),
+                "accepted {base_url:?}"
+            );
+        }
+
+        let mut oversized = chat();
+        oversized.base_url = format!("https://example.com/{}", "x".repeat(MAX_AI_BASE_URL_BYTES));
+        assert!(build_redacted_chat_request(&oversized, None, &[]).is_err());
+
+        let mut local = chat();
+        local.provider = Provider::Ollama;
+        local.api_key = None;
+        local.base_url = "http://localhost:11434".to_string();
+        assert!(build_redacted_chat_request(&local, None, &[]).is_ok());
+        local.base_url = "http://example.com:11434".to_string();
+        assert!(build_redacted_chat_request(&local, None, &[]).is_err());
     }
 
     // -- prompt-injection surface -----------------------------------------
@@ -981,8 +1343,21 @@ mod ai_tests {
             "curl http://127.0.0.1:8080/health",
             "ssh git@github.com:beamiter/jsh.git",
         ] {
-            assert_eq!(redact_outbound(benign), benign);
+            assert_eq!(redact_sensitive_text(benign), benign);
         }
+    }
+
+    #[test]
+    fn local_ai_error_diagnostics_are_redacted_too() {
+        let response = ai_error_response(
+            "provider echoed postgres://svc:hunter2@db.internal/app in its error",
+        );
+        let AiResponse::Error(message) = response else {
+            panic!("expected an AI error response");
+        };
+
+        assert!(!message.contains("hunter2"));
+        assert!(message.contains("[REDACTED:url-password]"));
     }
 
     #[test]

@@ -110,6 +110,11 @@ pub fn parse_env() -> Result<ParseResult, CliError> {
 
 /// Parse the process command line, dispatch it, and return the process status.
 pub fn entrypoint() -> i32 {
+    #[cfg(feature = "ai")]
+    if let Some(status) = crate::agent::internal_child_entrypoint() {
+        return status;
+    }
+
     match parse_env() {
         Ok(ParseResult::Help) => {
             print!("{HELP}");
@@ -166,7 +171,10 @@ pub fn run(invocation: Invocation) -> i32 {
 fn check_input(input: &Input) -> i32 {
     let (source, label) = match input {
         Input::Command { command, .. } => (command.clone(), None),
-        Input::Script { path, .. } => match std::fs::read_to_string(path) {
+        Input::Script { path, .. } => match crate::io_guard::read_regular_text_following(
+            path,
+            crate::shell::MAX_PROGRAM_BYTES,
+        ) {
             Ok(content) => {
                 let source = content
                     .strip_prefix("#!")
@@ -185,8 +193,17 @@ fn check_input(input: &Input) -> i32 {
         },
         Input::Stdin { .. } | Input::Auto => {
             let mut source = String::new();
-            if let Err(error) = std::io::stdin().read_to_string(&mut source) {
+            let mut stdin =
+                std::io::stdin().take(crate::shell::MAX_PROGRAM_BYTES.saturating_add(1) as u64);
+            if let Err(error) = stdin.read_to_string(&mut source) {
                 eprintln!("jsh: stdin: {error}");
+                return 1;
+            }
+            if source.len() > crate::shell::MAX_PROGRAM_BYTES {
+                eprintln!(
+                    "jsh: stdin: program exceeds the {} byte limit",
+                    crate::shell::MAX_PROGRAM_BYTES
+                );
                 return 1;
             }
             (source, Some("stdin".to_string()))

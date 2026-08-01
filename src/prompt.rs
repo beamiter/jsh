@@ -2,6 +2,10 @@
 use crate::environment::{PromptStyle, ShellState};
 use crossterm::style::{Color, Stylize};
 use std::env;
+use std::path::Path;
+
+const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const MAX_GIT_PROMPT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct GitContext {
@@ -43,11 +47,17 @@ pub fn render_prompt(state: &ShellState) -> String {
 
 /// Full prompt: user@host ~/path (branch) took duration ❯
 fn render_prompt_full(state: &ShellState) -> String {
-    let user = env::var("USER").unwrap_or_else(|_| String::from("user"));
-    let hostname = &state.hostname;
+    let user = crate::terminal_text::escape_inline(
+        &env::var("USER").unwrap_or_else(|_| String::from("user")),
+        256,
+    );
+    let hostname = crate::terminal_text::escape_inline(&state.hostname, 256);
     let cwd = get_short_cwd(state);
-    let git_branch = state.cached_git_branch.as_deref();
-    let env_hint = get_env_hint();
+    let git_branch = state
+        .cached_git_branch
+        .as_deref()
+        .map(|branch| crate::terminal_text::escape_inline(branch, 1024));
+    let env_hint = get_env_hint().map(|hint| crate::terminal_text::escape_inline(&hint, 1024));
     let exit_indicator = if state.last_exit_code == 0 {
         "❯".green().bold().to_string()
     } else {
@@ -85,7 +95,7 @@ fn render_prompt_full(state: &ShellState) -> String {
     ));
 
     // Git branch in magenta
-    if let Some(branch) = git_branch {
+    if let Some(branch) = git_branch.as_deref() {
         prompt.push_str(&format!(" {}", format!("({})", branch).magenta()));
     }
 
@@ -109,10 +119,16 @@ fn render_prompt_full(state: &ShellState) -> String {
 
 /// Compact prompt: user ~/path (branch) ❯
 fn render_prompt_compact(state: &ShellState) -> String {
-    let user = env::var("USER").unwrap_or_else(|_| String::from("user"));
+    let user = crate::terminal_text::escape_inline(
+        &env::var("USER").unwrap_or_else(|_| String::from("user")),
+        256,
+    );
     let cwd = get_short_cwd(state);
-    let git_branch = state.cached_git_branch.as_deref();
-    let env_hint = get_env_hint();
+    let git_branch = state
+        .cached_git_branch
+        .as_deref()
+        .map(|branch| crate::terminal_text::escape_inline(branch, 1024));
+    let env_hint = get_env_hint().map(|hint| crate::terminal_text::escape_inline(&hint, 1024));
     let exit_indicator = if state.last_exit_code == 0 {
         "❯".green().bold().to_string()
     } else {
@@ -149,7 +165,7 @@ fn render_prompt_compact(state: &ShellState) -> String {
     ));
 
     // Git branch in magenta
-    if let Some(branch) = git_branch {
+    if let Some(branch) = git_branch.as_deref() {
         prompt.push_str(&format!(" {}", format!("({})", branch).magenta()));
     }
 
@@ -163,7 +179,7 @@ fn render_prompt_compact(state: &ShellState) -> String {
 /// Minimal prompt: ~/path ❯
 fn render_prompt_minimal(state: &ShellState) -> String {
     let cwd = get_short_cwd(state);
-    let env_hint = get_env_hint();
+    let env_hint = get_env_hint().map(|hint| crate::terminal_text::escape_inline(&hint, 1024));
     let exit_indicator = if state.last_exit_code == 0 {
         "❯".green().bold().to_string()
     } else {
@@ -200,26 +216,46 @@ pub fn get_short_cwd(state: &ShellState) -> String {
         .unwrap_or_else(|_| String::from("?"));
 
     let home = state.home_dir.to_string_lossy();
-    if cwd.starts_with(home.as_ref()) {
+    let short = if cwd.starts_with(home.as_ref()) {
         format!("~{}", &cwd[home.len()..])
     } else {
         cwd
-    }
+    };
+    crate::terminal_text::escape_inline(&short, 16 * 1024)
 }
 
 /// Discover the current branch and its tracking remote with one Git process.
 /// `status --porcelain=v2 --branch` works for normal repositories, worktrees,
 /// submodules, and repositories whose `.git` directory lives elsewhere.
 pub fn probe_git_context() -> GitContext {
-    let output = match std::process::Command::new("git")
-        .args(["status", "--porcelain=v2", "--branch"])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return GitContext::default(),
+    let Some(output) = bounded_git_stdout(
+        Path::new("."),
+        &["status", "--porcelain=v2", "--branch"],
+        MAX_GIT_PROMPT_BYTES,
+    ) else {
+        return GitContext::default();
     };
 
-    parse_git_status_header(&String::from_utf8_lossy(&output.stdout))
+    parse_git_status_header(&String::from_utf8_lossy(&output))
+}
+
+/// Run a read-only Git probe without letting a large worktree pin the prompt
+/// or allocate an unbounded `Command::output` buffer.
+pub(crate) fn bounded_git_stdout(cwd: &Path, args: &[&str], max_bytes: usize) -> Option<Vec<u8>> {
+    let git = crate::io_guard::automatic_system_helper("git")?;
+    let mut command = std::process::Command::new(git);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let output = crate::io_guard::bounded_command_output(
+        &mut command,
+        max_bytes,
+        64 * 1024,
+        GIT_PROBE_TIMEOUT,
+    )
+    .ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 fn parse_git_status_header(status: &str) -> GitContext {
@@ -319,7 +355,7 @@ pub fn format_duration(d: std::time::Duration) -> String {
     } else if secs >= 1 {
         format!("{:.1}s", d.as_secs_f64())
     } else {
-        return String::new(); // Don't show for sub-second
+        String::new() // Don't show for sub-second
     }
 }
 

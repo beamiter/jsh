@@ -192,13 +192,14 @@ pub fn highlight(buffer: &str, state: &mut ShellState) -> Vec<StyledSpan> {
         && !trailing.ends_with("||")
         && !trailing.ends_with('\\');
 
-    if looks_complete && !crate::parser::is_incomplete(buffer) {
-        if crate::parser::parse(buffer).is_err() {
-            // Mark the last token/span as error
-            if let Some(last_span) = spans.last_mut() {
-                last_span.fg = Some(Color::Red);
-                last_span.underline = true;
-            }
+    if looks_complete
+        && !crate::parser::is_incomplete(buffer)
+        && crate::parser::parse(buffer).is_err()
+    {
+        // Mark the last token/span as error
+        if let Some(last_span) = spans.last_mut() {
+            last_span.fg = Some(Color::Red);
+            last_span.underline = true;
         }
     }
 

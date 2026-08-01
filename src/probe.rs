@@ -161,11 +161,11 @@ fn resolve_scan_target<'a>(partial: &'a str, cwd: &Path) -> (PathBuf, &'a str) {
         let scan_dir = if dir_part.starts_with('/') {
             // Absolute path
             PathBuf::from(dir_part)
-        } else if dir_part.starts_with("~/") {
+        } else if let Some(home_relative) = dir_part.strip_prefix("~/") {
             // Home directory
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/"))
-                .join(&dir_part[2..])
+                .join(home_relative)
         } else {
             // Relative path
             cwd.join(dir_part)

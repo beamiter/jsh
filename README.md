@@ -201,7 +201,8 @@ captured-output records also have hard size limits.
 The journal can contain sensitive commands, paths, and terminal output. Set
 `JSH_EXECUTION_JOURNAL=0` to disable disk journaling while retaining OSC
 integration for the terminal UI. Set `JSH_EXECUTION_JOURNAL_PATH` to override
-the location; the value must be an absolute path, and a relative value is
+the location; the value must be an absolute path whose parent is owned by the
+current user and is not group/world-writable. Relative or unsafe locations are
 rejected.
 
 ## AI, explicitly opt-in
@@ -246,14 +247,22 @@ The agent keeps its own working directory: an approved `cd` carries into the
 following turns (shown as `cwd → …`), while the interactive shell's cwd is
 never touched.
 
-Additional environment switches: `JSH_AGENT_MAX_TURNS` (default 16) bounds the
-model-turn budget, and `JSH_AGENT_AUTO_APPROVE_READONLY=1` opts in to
-auto-running only commands on a conservative read-only allowlist (`ls`,
-`git status`, …); everything else still prompts. Git branch/dirty metadata is
-attached only under the same `JSH_AI_SHARE_CONTEXT` rules as other cloud
-context. Agent commands run in a forked child, so `export` and shell variables
-do not change the interactive shell's state (`cd` persists only within the
-agent session).
+`JSH_AGENT_MAX_TURNS` (default 16) bounds the model-turn budget. The former
+`JSH_AGENT_AUTO_APPROVE_READONLY` switch is retired: command text cannot prove
+what aliases, functions, Git helpers, or tool flags will actually execute, nor
+whether a seemingly harmless read would disclose a secret to the model. If the
+old switch is still set, jsh warns and continues to require approval for every
+proposal. Git branch/dirty metadata is attached only under the same
+`JSH_AI_SHARE_CONTEXT` rules as other cloud context. Agent commands run in a
+fresh one-shot jsh child initialized from a private, size-bounded snapshot that
+is atomically claimed by only one child process. Aliases, functions, variables,
+and shell options are therefore available without letting `export` or other
+mutations change the interactive shell's state (`cd` persists only within the
+agent session). AI worker queues hold at most one bounded request and response;
+a detached descendant inheriting the output pipe cannot hold the Agent turn
+open after the direct child exits. `Ctrl-C` also releases the Agent promptly
+while a provider connection is stalled; until that bounded socket request has
+finished shutting down, jsh refuses to start a second Agent request.
 
 Local context queries never send journal data over the network. Local Ollama
 may use the most recent failed execution's captured terminal output for command

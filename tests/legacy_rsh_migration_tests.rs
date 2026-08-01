@@ -6,6 +6,7 @@
 //! developer's shell data.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -42,6 +43,7 @@ fn write_legacy_home(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let home = root.join("home");
     let state = root.join("state");
     fs::create_dir_all(&home).expect("home");
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("private home");
     fs::create_dir_all(state.join("rsh")).expect("legacy state dir");
     fs::write(home.join(".rsh_history"), OLD_HISTORY).expect("legacy history");
     fs::write(home.join(".rsh_bookmarks"), "proj|/p\ndl|/d\n").expect("legacy bookmarks");
@@ -153,8 +155,6 @@ fn a_corrupt_legacy_file_does_not_stop_startup() {
 
 #[test]
 fn an_unreadable_legacy_file_is_a_warning_not_a_failure() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let (home, state) = write_legacy_home(temp.path());
     fs::set_permissions(home.join(".rsh_history"), fs::Permissions::from_mode(0o000))

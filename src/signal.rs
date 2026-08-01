@@ -58,12 +58,18 @@ pub fn reset_pending_signals() {
     set_foreground_pgid(None);
 }
 
-/// Consume a pending terminating signal and return its shell exit status.
+/// Return a pending signal's shell exit status.
+///
+/// Interactive `SIGINT` is consumable because it cancels only the current
+/// prompt or program. `SIGHUP` and `SIGTERM` are process-termination requests:
+/// keep their status latched until the next explicit signal reset so an early
+/// executor check cannot accidentally turn a later orderly shutdown into exit
+/// status 0.
 pub fn take_pending_status() -> Option<i32> {
     if SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
         return Some(128 + libc::SIGINT);
     }
-    let signal = TERMINATION_SIGNAL.swap(0, Ordering::SeqCst);
+    let signal = TERMINATION_SIGNAL.load(Ordering::SeqCst);
     (signal != 0).then_some(128 + signal)
 }
 

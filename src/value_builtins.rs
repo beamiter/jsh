@@ -8,11 +8,18 @@ use crate::value::{render_table, ClosureData, Value};
 use indexmap::IndexMap;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-#[cfg(feature = "ai")]
-use std::io::{Read, Write};
-#[cfg(feature = "ai")]
-use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
+
+const MAX_OPEN_FILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MODULE_FILE_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "ai")]
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "ai")]
+const MAX_HTTP_URL_BYTES: usize = 16 * 1024;
+#[cfg(feature = "ai")]
+const MAX_HTTP_HEADERS: usize = 128;
+#[cfg(feature = "ai")]
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 
 pub type ValueBuiltin = fn(PipelineData, &[String], &mut ShellState) -> Result<PipelineData, i32>;
 
@@ -367,7 +374,7 @@ fn vb_par_each(
 
     // Static chunking — simpler than a work-stealing queue and good enough for
     // the typical "expensive but uniform" workload.
-    let chunk = (n + workers - 1) / workers;
+    let chunk = n.div_ceil(workers);
     let work: Vec<(usize, Value)> = vs.into_iter().enumerate().collect();
 
     let mut handles = Vec::with_capacity(workers);
@@ -380,33 +387,44 @@ fn vb_par_each(
         let slice = work[start..end].to_vec();
         let results = results.clone();
         let err_slot = err_slot.clone();
+        let spawn_error_slot = err_slot.clone();
         let body = body.clone();
         let captured = captured.clone();
         let param = param.clone();
-        handles.push(std::thread::spawn(move || {
-            for (idx, val) in slice {
-                if err_slot.lock().unwrap().is_some() {
-                    return;
-                }
-                let mut vars: std::collections::HashMap<String, Value> = (*captured).clone();
-                vars.insert((*param).clone(), val.clone());
-                vars.insert("in".to_string(), val);
-                match crate::closure_expr::try_eval(&body, &vars) {
-                    Ok(Some(v)) => {
-                        results.lock().unwrap()[idx] = v;
-                    }
-                    Ok(None) => {
-                        *err_slot.lock().unwrap() =
-                            Some("par-each: closure body is not a pure expression".to_string());
+        let worker = std::thread::Builder::new()
+            .name(format!("jsh-par-each-{w}"))
+            .spawn(move || {
+                for (idx, val) in slice {
+                    if err_slot.lock().unwrap().is_some() {
                         return;
                     }
-                    Err(msg) => {
-                        *err_slot.lock().unwrap() = Some(msg);
-                        return;
+                    let mut vars: std::collections::HashMap<String, Value> = (*captured).clone();
+                    vars.insert((*param).clone(), val.clone());
+                    vars.insert("in".to_string(), val);
+                    match crate::closure_expr::try_eval(&body, &vars) {
+                        Ok(Some(v)) => {
+                            results.lock().unwrap()[idx] = v;
+                        }
+                        Ok(None) => {
+                            *err_slot.lock().unwrap() =
+                                Some("par-each: closure body is not a pure expression".to_string());
+                            return;
+                        }
+                        Err(msg) => {
+                            *err_slot.lock().unwrap() = Some(msg);
+                            return;
+                        }
                     }
                 }
+            });
+        match worker {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                *spawn_error_slot.lock().unwrap() =
+                    Some(format!("par-each: could not start worker thread: {error}"));
+                break;
             }
-        }));
+        }
     }
     for h in handles {
         let _ = h.join();
@@ -662,7 +680,7 @@ fn vb_math(
             let mut sorted = nums.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = sorted.len();
-            if n % 2 == 0 {
+            if n.is_multiple_of(2) {
                 (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
             } else {
                 sorted[n / 2]
@@ -1365,7 +1383,10 @@ fn vb_open(
             return Err(1);
         }
     };
-    let bytes = match std::fs::read(path) {
+    let bytes = match crate::io_guard::read_regular_file_following(
+        std::path::Path::new(path),
+        MAX_OPEN_FILE_BYTES,
+    ) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("open: {}: {}", path, e);
@@ -1802,7 +1823,7 @@ fn vb_str(
                 let width: usize = rest.first().and_then(|x| x.parse().ok()).unwrap_or(0);
                 let ch = rest.get(1).and_then(|x| x.chars().next()).unwrap_or(' ');
                 let need = width.saturating_sub(s.chars().count());
-                let pad: String = std::iter::repeat(ch).take(need).collect();
+                let pad: String = std::iter::repeat_n(ch, need).collect();
                 if sub == "pad-left" {
                     format!("{}{}", pad, s)
                 } else {
@@ -1917,7 +1938,7 @@ fn parse_cell_path(s: &str) -> Vec<crate::parser::ast::PathSeg> {
     out
 }
 
-fn resolve_cell_path<'a>(v: &'a Value, path: &[crate::parser::ast::PathSeg]) -> Option<Value> {
+fn resolve_cell_path(v: &Value, path: &[crate::parser::ast::PathSeg]) -> Option<Value> {
     use crate::parser::ast::PathSeg;
     let mut cur = v.clone();
     for seg in path {
@@ -2395,7 +2416,7 @@ fn vb_zip(
     let vs = input.into_values()?;
     let out: Vec<Value> = vs
         .into_iter()
-        .zip(other.into_iter())
+        .zip(other)
         .map(|(a, b)| Value::List(vec![a, b]))
         .collect();
     Ok(PipelineData::Values(out))
@@ -2559,7 +2580,7 @@ fn vb_merge(
         serde_json::Value::Array(arr) => {
             let others: Vec<Value> = arr.into_iter().map(Value::from_json).collect();
             vs.into_iter()
-                .zip(others.into_iter())
+                .zip(others)
                 .map(|(a, b)| merge_one(a, &b))
                 .collect()
         }
@@ -2758,7 +2779,7 @@ fn vb_path(
     let from_input_or_args =
         |input: PipelineData, fallback: &[String]| -> Result<Vec<String>, i32> {
             if !fallback.is_empty() {
-                return Ok(fallback.iter().cloned().collect());
+                return Ok(fallback.to_vec());
             }
             let vs = input.into_values()?;
             Ok(vs.into_iter().map(|v| v.to_display_string()).collect())
@@ -2767,7 +2788,7 @@ fn vb_path(
         "join" => {
             // `path join a b c` → "a/b/c"
             let pieces: Vec<String> = if !rest.is_empty() {
-                rest.iter().cloned().collect()
+                rest.to_vec()
             } else {
                 let vs = input.into_values()?;
                 vs.into_iter().map(|v| v.to_display_string()).collect()
@@ -2793,11 +2814,7 @@ fn vb_path(
                     )
                 })
                 .collect();
-            if out.len() == 1 {
-                Ok(PipelineData::Values(out))
-            } else {
-                Ok(PipelineData::Values(out))
-            }
+            Ok(PipelineData::Values(out))
         }
         "dirname" => {
             let inputs = from_input_or_args(input, rest)?;
@@ -3450,7 +3467,7 @@ fn input_as_bytes(input: PipelineData) -> Vec<u8> {
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
     for c in chunks.by_ref() {
         let n = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32);
@@ -3521,7 +3538,7 @@ fn hex_encode(input: &[u8]) -> String {
 
 fn hex_decode(input: &str) -> Result<Vec<u8>, String> {
     let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         return Err("odd number of hex digits".into());
     }
     let from_hex = |b: u8| -> Result<u8, String> {
@@ -3943,14 +3960,14 @@ fn vb_histogram(
         entry.1 += 1;
     }
     let mut rows: Vec<(Value, usize)> = buckets.into_iter().map(|(_, v)| v).collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1));
     let max = rows.iter().map(|r| r.1).max().unwrap_or(1).max(1);
     let out: Vec<Value> = rows
         .into_iter()
         .map(|(val, count)| {
             let freq = count as f64 / total as f64;
             let bar_len = ((count as f64 / max as f64) * 30.0).round() as usize;
-            let bar: String = std::iter::repeat('*').take(bar_len).collect();
+            let bar: String = std::iter::repeat_n('*', bar_len).collect();
             let mut rec: IndexMap<String, Value> = IndexMap::new();
             rec.insert("value".to_string(), val);
             rec.insert("count".to_string(), Value::Int(count as i64));
@@ -4176,18 +4193,18 @@ fn vb_fill(
         let need = width - n;
         match align.as_str() {
             "right" | "r" => {
-                let pad: String = std::iter::repeat(ch).take(need).collect();
+                let pad: String = std::iter::repeat_n(ch, need).collect();
                 format!("{}{}", pad, s)
             }
             "center" | "c" => {
                 let l = need / 2;
                 let r = need - l;
-                let lp: String = std::iter::repeat(ch).take(l).collect();
-                let rp: String = std::iter::repeat(ch).take(r).collect();
+                let lp: String = std::iter::repeat_n(ch, l).collect();
+                let rp: String = std::iter::repeat_n(ch, r).collect();
                 format!("{}{}{}", lp, s, rp)
             }
             _ => {
-                let pad: String = std::iter::repeat(ch).take(need).collect();
+                let pad: String = std::iter::repeat_n(ch, need).collect();
                 format!("{}{}", s, pad)
             }
         }
@@ -4369,7 +4386,10 @@ fn vb_use(
             return Err(1);
         }
     };
-    let content = match std::fs::read_to_string(path) {
+    let content = match crate::io_guard::read_regular_text_following(
+        std::path::Path::new(path),
+        MAX_MODULE_FILE_BYTES,
+    ) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("use: cannot read `{}`: {}", path, e);
@@ -4558,86 +4578,6 @@ fn vb_help(
 ///
 /// Returns a record `{status: int, headers: record, body: string|value}`. If
 /// the response content type is JSON the body is auto-parsed into a Value.
-#[cfg(feature = "ai")]
-fn http_request_over_tcp(
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> Result<(i64, indexmap::IndexMap<String, Value>, String), String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| "http: unsupported URL scheme".to_string())?;
-    let (authority, path_and_more) = rest.split_once('/').unwrap_or((rest, ""));
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && !p.is_empty() => {
-            let port = p
-                .parse::<u16>()
-                .map_err(|e| format!("http: invalid port in URL: {}", e))?;
-            (h, port)
-        }
-        _ if !authority.is_empty() => (authority, 80),
-        _ => return Err("http: missing host".to_string()),
-    };
-
-    let path = if path_and_more.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", path_and_more)
-    };
-
-    let mut request = Vec::new();
-    request.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method, path).as_bytes());
-    request.extend_from_slice(format!("Host: {}\r\n", authority).as_bytes());
-    request.extend_from_slice(b"User-Agent: ureq/2.12.1\r\n");
-    request.extend_from_slice(b"Accept: */*\r\n");
-    request.extend_from_slice(b"Connection: close\r\n");
-    for (k, v) in headers {
-        request.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
-    }
-    request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    request.extend_from_slice(b"\r\n");
-    request.extend_from_slice(body);
-
-    let mut stream =
-        TcpStream::connect((host, port)).map_err(|e| format!("http: request failed: {}", e))?;
-    stream
-        .write_all(&request)
-        .map_err(|e| format!("http: request failed: {}", e))?;
-    let _ = stream.shutdown(Shutdown::Write);
-
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| format!("http: body read failed: {}", e))?;
-
-    let header_end = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "http: malformed response".to_string())?;
-    let header_text = String::from_utf8_lossy(&response[..header_end]);
-    let mut lines = header_text.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| "http: malformed response".to_string())?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "http: malformed response".to_string())?
-        .parse::<i64>()
-        .map_err(|e| format!("http: malformed response status: {}", e))?;
-
-    let mut header_rec = indexmap::IndexMap::new();
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            header_rec.insert(k.trim().to_string(), Value::String(v.trim().to_string()));
-        }
-    }
-
-    let body_string = String::from_utf8_lossy(&response[header_end + 4..]).into_owned();
-    Ok((status, header_rec, body_string))
-}
-
 /// Append `--query` pairs to a URL, percent-encoding anything outside the
 /// unreserved set. ureq 3 drives requests through `http::Uri`, which has no
 /// query builder of its own, so the encoding lives here.
@@ -4670,6 +4610,60 @@ fn push_query_encoded(out: &mut String, value: &str) {
     }
 }
 
+/// Serialize typed pipeline input incrementally so an infinite stream or one
+/// with a very large prefix cannot grow an HTTP request body without bound.
+#[cfg(feature = "ai")]
+fn bounded_http_values(values: impl Iterator<Item = Value>) -> Result<Option<Vec<u8>>, String> {
+    bounded_http_values_with_limit(values, MAX_HTTP_BODY_BYTES)
+}
+
+#[cfg(feature = "ai")]
+fn bounded_http_values_with_limit(
+    values: impl Iterator<Item = Value>,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    struct BoundedBody {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+
+    impl std::io::Write for BoundedBody {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.bytes.len().saturating_add(bytes.len()) > self.limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request body byte limit exceeded",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut body = BoundedBody {
+        bytes: Vec::new(),
+        limit,
+    };
+    let mut count = 0usize;
+    std::io::Write::write_all(&mut body, b"[").map_err(|error| error.to_string())?;
+    for value in values {
+        if count != 0 {
+            std::io::Write::write_all(&mut body, b",").map_err(|error| error.to_string())?;
+        }
+        serde_json::to_writer(&mut body, &value.to_json()).map_err(|error| error.to_string())?;
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    std::io::Write::write_all(&mut body, b"]\n").map_err(|error| error.to_string())?;
+    Ok(Some(body.bytes))
+}
+
 #[cfg(feature = "ai")]
 fn vb_http(
     input: PipelineData,
@@ -4699,6 +4693,12 @@ fn vb_http(
             return Err(1);
         }
     };
+    if url.len() > MAX_HTTP_URL_BYTES || url.chars().any(char::is_control) {
+        let msg = "http: URL contains a control character or exceeds its byte limit".to_string();
+        eprintln!("{}", msg);
+        state.set_error(msg, 1);
+        return Err(1);
+    }
 
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut body_arg: Option<String> = None;
@@ -4738,75 +4738,76 @@ fn vb_http(
     if as_json {
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
     }
+    let header_bytes = headers.iter().fold(0usize, |total, (name, value)| {
+        total.saturating_add(name.len()).saturating_add(value.len())
+    });
+    if headers.len() > MAX_HTTP_HEADERS
+        || header_bytes > MAX_HTTP_HEADER_BYTES
+        || headers.iter().any(|(name, value)| {
+            name.is_empty()
+                || name.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+                || value.chars().any(char::is_control)
+        })
+    {
+        let msg = "http: headers are malformed or exceed their count/byte limit".to_string();
+        eprintln!("{}", msg);
+        state.set_error(msg, 1);
+        return Err(1);
+    }
 
     // Body: explicit -d wins; else use the pipeline input if non-empty.
     let body_bytes: Option<Vec<u8>> = if let Some(b) = body_arg {
+        if b.len() > MAX_HTTP_BODY_BYTES {
+            let msg = format!("http: request body exceeds the {MAX_HTTP_BODY_BYTES} byte limit");
+            eprintln!("{}", msg);
+            state.set_error(msg, 1);
+            return Err(1);
+        }
         Some(b.into_bytes())
     } else {
         match input {
             PipelineData::Empty => None,
+            PipelineData::Bytes(b) if b.len() > MAX_HTTP_BODY_BYTES => {
+                let msg =
+                    format!("http: request body exceeds the {MAX_HTTP_BODY_BYTES} byte limit");
+                eprintln!("{}", msg);
+                state.set_error(msg, 1);
+                return Err(1);
+            }
             PipelineData::Bytes(b) if !b.is_empty() => Some(b),
             PipelineData::Bytes(_) => None,
-            PipelineData::Values(vs) if !vs.is_empty() => {
-                Some(PipelineData::Values(vs).into_bytes())
-            }
-            PipelineData::Values(_) => None,
-            PipelineData::Stream(it) => {
-                let vs: Vec<Value> = it.collect();
-                if vs.is_empty() {
-                    None
-                } else {
-                    Some(PipelineData::Values(vs).into_bytes())
-                }
-            }
+            PipelineData::Values(vs) => bounded_http_values(vs.into_iter()).map_err(|error| {
+                let msg = format!("http: request body serialization failed: {error}");
+                eprintln!("{msg}");
+                state.set_error(msg, 1);
+                1
+            })?,
+            PipelineData::Stream(it) => bounded_http_values(it).map_err(|error| {
+                let msg = format!("http: request body serialization failed: {error}");
+                eprintln!("{msg}");
+                state.set_error(msg, 1);
+                1
+            })?,
         }
     };
 
-    let (status, header_rec, body_string) = if body_bytes.is_some() && url.starts_with("http://") {
-        let mut full_url = url.clone();
-        if !query.is_empty() {
-            let sep = if full_url.contains('?') { '&' } else { '?' };
-            full_url.push(sep);
-            for (idx, (k, v)) in query.iter().enumerate() {
-                if idx > 0 {
-                    full_url.push('&');
-                }
-                full_url.push_str(k);
-                full_url.push('=');
-                full_url.push_str(v);
-            }
-        }
-        match body_bytes.as_ref() {
-            Some(b) => match http_request_over_tcp(method, &full_url, &headers, b) {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    state.set_error(e, 1);
-                    return Err(1);
-                }
-            },
-            None => unreachable!(),
-        }
-    } else {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(std::time::Duration::from_secs(10)))
-            .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
-            .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
-            // Surface non-2xx as an ordinary response rather than an error, so
-            // both outcomes produce the same record shape (status code captured)
-            // instead of failing the pipeline — callers can `where status >= 400`.
-            .http_status_as_error(false)
-            .build()
-            .into();
+    let request_url = append_query(&url, &query);
+    if request_url.len() > MAX_HTTP_URL_BYTES {
+        let msg =
+            format!("http: URL exceeds the {MAX_HTTP_URL_BYTES} byte limit after query encoding");
+        eprintln!("{}", msg);
+        state.set_error(msg, 1);
+        return Err(1);
+    }
+
+    let (status, header_rec, body_string) = {
+        let agent = http_agent();
 
         let mut builder = ureq::http::Request::builder()
             .method(method)
-            .uri(append_query(&url, &query));
+            .uri(request_url);
         for (k, v) in &headers {
             builder = builder.header(k.as_str(), v.as_str());
-        }
-        if as_json {
-            builder = builder.header("Content-Type", "application/json");
         }
 
         let response = match body_bytes.as_deref() {
@@ -4838,7 +4839,12 @@ fn vb_http(
                 Value::String(value.to_str().unwrap_or_default().to_string()),
             );
         }
-        let body_string = match resp.body_mut().read_to_string() {
+        let body_string = match resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_HTTP_BODY_BYTES as u64)
+            .read_to_string()
+        {
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("http: body read failed: {}", e);
@@ -4877,6 +4883,20 @@ fn vb_http(
     Ok(PipelineData::Values(vec![Value::Record(rec)]))
 }
 
+#[cfg(feature = "ai")]
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        // User-supplied headers may be credentials unknown to ureq. Return a
+        // 3xx record and let the script explicitly choose the next origin.
+        .max_redirects(0)
+        .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
 #[cfg(not(feature = "ai"))]
 fn vb_http(
     _input: PipelineData,
@@ -4887,4 +4907,28 @@ fn vb_http(
     eprintln!("{}", msg);
     state.set_error(msg, 1);
     Err(1)
+}
+
+#[cfg(all(test, feature = "ai"))]
+mod http_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn typed_http_bodies_are_incrementally_bounded() {
+        assert_eq!(http_agent().config().max_redirects(), 0);
+        let values = std::iter::repeat_with(|| Value::String("12345678".to_string()));
+        assert!(bounded_http_values_with_limit(values, 64).is_err());
+
+        let body = bounded_http_values_with_limit(
+            [Value::Int(1), Value::String("two".to_string())].into_iter(),
+            64,
+        )
+        .expect("bounded serialization")
+        .expect("nonempty body");
+        assert_eq!(
+            body,
+            br#"[1,"two"]
+"#
+        );
+    }
 }

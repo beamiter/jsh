@@ -4,7 +4,7 @@ use crate::environment::ShellState;
 use crate::parser::ast::{InterpPart, PathSeg, ProcessSubKind, Word, WordPart};
 use crate::value::Value;
 
-/// Expand a Word (Vec<WordPart>) into a list of strings.
+/// Expand a Word (`Vec<WordPart>`) into a list of strings.
 /// Word splitting and globbing may produce multiple strings from one Word.
 pub fn expand_word(word: &Word, state: &mut ShellState) -> Vec<String> {
     // Array expansions produce one field per element: ${arr[@]} and ${arr[*]},
@@ -859,8 +859,8 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
             // Handle array slicing: ${arr[@]:offset:length} or ${arr[*]:offset:length}
             if subscript_part == "@" || subscript_part == "*" {
                 // Check if there's slicing syntax after the bracket
-                if after_bracket.starts_with(':') {
-                    let slice_part = &after_bracket[1..]; // Remove the ':'
+                if let Some(slice_part) = after_bracket.strip_prefix(':') {
+                    // Remove the ':'
                     let parts: Vec<&str> = slice_part.split(':').collect();
                     if let Ok(offset) = parts[0].parse::<usize>() {
                         let arr_vals = state.array_values(var_name);
@@ -2260,8 +2260,8 @@ fn expand_with_extglob(pattern: &str, state: &mut ShellState) -> Vec<String> {
     // Get the directory to search
     let search_dir = if dir_path.is_empty() || dir_path == "." {
         std::env::current_dir().unwrap_or_default()
-    } else if dir_path.starts_with('~') {
-        dirs::home_dir().unwrap_or_default().join(&dir_path[1..])
+    } else if let Some(home_relative) = dir_path.strip_prefix('~') {
+        dirs::home_dir().unwrap_or_default().join(home_relative)
     } else {
         std::path::PathBuf::from(&dir_path)
     };

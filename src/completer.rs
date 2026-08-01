@@ -3,6 +3,12 @@
 use crate::environment::ShellState;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
+
+const MAX_COMPLETION_ITEMS: usize = 4096;
+const MAX_COMPLETION_TEXT_BYTES: usize = 16 * 1024;
+const MAX_COMPLETION_PROJECT_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GIT_COMPLETION_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionKind {
@@ -132,8 +138,8 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     // Create cache key based on context
     let cache_key = if is_cmd_pos {
         format!("cmd:{}", word)
-    } else if word.starts_with('$') {
-        format!("var:{}", &word[1..])
+    } else if let Some(variable) = word.strip_prefix('$') {
+        format!("var:{variable}")
     } else {
         // Argument completion depends on the full command and repository
         // context, not just the last word (which is often empty after a space).
@@ -157,7 +163,7 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     // Check user-defined completion specs first
     if !is_cmd_pos {
         if let Some(spec) = state.completion_specs.get(&cmd).cloned() {
-            let completions = apply_completion_spec(&spec, &word, state);
+            let completions = finalize_completions(apply_completion_spec(&spec, &word, state));
             if !completions.is_empty() {
                 COMPLETION_CACHE.with(|cache| {
                     cache.borrow_mut().insert(cache_key, completions.clone());
@@ -173,8 +179,8 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
         before.ends_with('|') && !before.ends_with("||")
     };
 
-    let completions = if word.starts_with('$') {
-        complete_variable(&word[1..], state)
+    let completions = if let Some(variable) = word.strip_prefix('$') {
+        complete_variable(variable, state)
     } else if is_cmd_pos && after_pipe {
         // Smart pipe completion: recommend based on preceding command
         let mut pipe_completions = complete_pipe_targets(buf, &word);
@@ -207,12 +213,38 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
         complete_path(&word, state)
     };
 
+    let completions = finalize_completions(completions);
+
     // Store in cache
     COMPLETION_CACHE.with(|cache| {
         cache.borrow_mut().insert(cache_key, completions.clone());
     });
 
     (word_start, completions)
+}
+
+/// Central terminal/execution boundary for every completion source. Candidate
+/// text is later inserted into the editable command line, so values containing
+/// controls or invisible Unicode are dropped rather than displayed as an
+/// escaped spelling and executed as something else. Display-only metadata is
+/// escaped and byte-bounded.
+fn finalize_completions(completions: Vec<Completion>) -> Vec<Completion> {
+    completions
+        .into_iter()
+        .filter(|completion| {
+            completion.text.len() <= MAX_COMPLETION_TEXT_BYTES
+                && crate::terminal_text::is_safe_inline(&completion.text)
+        })
+        .take(MAX_COMPLETION_ITEMS)
+        .map(|mut completion| {
+            completion.display =
+                crate::terminal_text::escape_inline(&completion.display, MAX_COMPLETION_TEXT_BYTES);
+            completion.description = completion.description.as_deref().map(|description| {
+                crate::terminal_text::escape_inline(description, MAX_COMPLETION_TEXT_BYTES)
+            });
+            completion
+        })
+        .collect()
 }
 
 fn apply_completion_spec(
@@ -1068,19 +1100,18 @@ fn promote_git_context(
 }
 
 fn complete_git_refs(prefix: &str) -> Vec<Completion> {
-    if let Ok(output) = std::process::Command::new("git")
-        .args([
+    if let Some(output) = crate::prompt::bounded_git_stdout(
+        Path::new("."),
+        &[
             "for-each-ref",
             "--format=%(refname)",
             "refs/heads",
             "refs/remotes",
             "refs/tags",
-        ])
-        .output()
-    {
-        if output.status.success() {
-            return parse_git_refs(&String::from_utf8_lossy(&output.stdout), prefix);
-        }
+        ],
+        MAX_GIT_COMPLETION_BYTES,
+    ) {
+        return parse_git_refs(&String::from_utf8_lossy(&output), prefix);
     }
     Vec::new()
 }
@@ -1088,6 +1119,9 @@ fn complete_git_refs(prefix: &str) -> Vec<Completion> {
 fn parse_git_refs(output: &str, prefix: &str) -> Vec<Completion> {
     let mut completions = Vec::new();
     for reference in output.lines().map(str::trim) {
+        if completions.len() >= MAX_COMPLETION_ITEMS {
+            break;
+        }
         if let Some(branch) = reference.strip_prefix("refs/heads/") {
             if branch.starts_with(prefix) {
                 completions.push(Completion {
@@ -1099,16 +1133,14 @@ fn parse_git_refs(output: &str, prefix: &str) -> Vec<Completion> {
                 });
             }
         } else if let Some(tag) = reference.strip_prefix("refs/tags/") {
-            if tag.starts_with(prefix) {
-                if !completions.iter().any(|item| item.text == tag) {
-                    completions.push(Completion {
-                        text: tag.to_string(),
-                        display: tag.to_string(),
-                        description: Some("tag".to_string()),
-                        kind: CompletionKind::Other,
-                        is_dir: false,
-                    });
-                }
+            if tag.starts_with(prefix) && !completions.iter().any(|item| item.text == tag) {
+                completions.push(Completion {
+                    text: tag.to_string(),
+                    display: tag.to_string(),
+                    description: Some("tag".to_string()),
+                    kind: CompletionKind::Other,
+                    is_dir: false,
+                });
             }
         } else if let Some(branch) = reference.strip_prefix("refs/remotes/") {
             let Some((remote, short)) = split_remote_branch(branch) else {
@@ -1171,25 +1203,27 @@ fn split_remote_branch(branch: &str) -> Option<(&str, &str)> {
 
 fn complete_git_dirty_files(prefix: &str, context: &str) -> Vec<Completion> {
     let mut completions = Vec::new();
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["status", "--porcelain=v1", "-z"])
-        .output()
-    {
-        if output.status.success() {
-            let decoded_prefix = unescape_shell_word(prefix);
-            for (status, file) in parse_git_status_entries(&output.stdout) {
-                if !file.starts_with(&decoded_prefix) {
-                    continue;
-                }
-                if let Some(desc) = git_file_description(status, context) {
-                    completions.push(Completion {
-                        text: escape_shell_word(&file),
-                        display: file,
-                        description: Some(desc.to_string()),
-                        kind: CompletionKind::File,
-                        is_dir: false,
-                    });
-                }
+    if let Some(output) = crate::prompt::bounded_git_stdout(
+        Path::new("."),
+        &["status", "--porcelain=v1", "-z"],
+        MAX_GIT_COMPLETION_BYTES,
+    ) {
+        let decoded_prefix = unescape_shell_word(prefix);
+        for (status, file) in parse_git_status_entries(&output) {
+            if completions.len() >= MAX_COMPLETION_ITEMS {
+                break;
+            }
+            if !file.starts_with(&decoded_prefix) {
+                continue;
+            }
+            if let Some(desc) = git_file_description(status, context) {
+                completions.push(Completion {
+                    text: escape_shell_word(&file),
+                    display: file,
+                    description: Some(desc.to_string()),
+                    kind: CompletionKind::File,
+                    is_dir: false,
+                });
             }
         }
     }
@@ -1199,53 +1233,52 @@ fn complete_git_dirty_files(prefix: &str, context: &str) -> Vec<Completion> {
 /// Parse `git status --porcelain=v1 -z`. Rename/copy records contain a second
 /// NUL-delimited source path; completion should insert the destination path.
 fn parse_git_status_entries(output: &[u8]) -> Vec<([u8; 2], String)> {
-    let fields: Vec<&[u8]> = output
+    let mut fields = output
         .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty())
-        .collect();
+        .filter(|field| !field.is_empty());
     let mut entries = Vec::new();
-    let mut index = 0;
-    while index < fields.len() {
-        let field = fields[index];
+    while let Some(field) = fields.next() {
+        if entries.len() >= MAX_COMPLETION_ITEMS {
+            break;
+        }
         if field.len() < 4 || field[2] != b' ' {
-            index += 1;
             continue;
         }
         let status = [field[0], field[1]];
         entries.push((status, String::from_utf8_lossy(&field[3..]).into_owned()));
-        index += if status.iter().any(|code| matches!(code, b'R' | b'C')) {
-            2
-        } else {
-            1
-        };
+        if status.iter().any(|code| matches!(code, b'R' | b'C')) {
+            let _ = fields.next();
+        }
     }
     entries
 }
 
 fn complete_git_stashes(prefix: &str) -> Vec<Completion> {
     let mut completions = Vec::new();
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["stash", "list", "--format=%gd|%gs"])
-        .output()
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.splitn(2, '|').collect();
-                let (ref_name, msg) = if parts.len() == 2 {
-                    (parts[0], parts[1])
-                } else {
-                    (line, "")
-                };
-                if ref_name.starts_with(prefix) || prefix.is_empty() {
-                    completions.push(Completion {
-                        text: ref_name.to_string(),
-                        display: ref_name.to_string(),
-                        description: Some(msg.to_string()),
-                        kind: CompletionKind::Other,
-                        is_dir: false,
-                    });
-                }
+    if let Some(output) = crate::prompt::bounded_git_stdout(
+        Path::new("."),
+        &["stash", "list", "--format=%gd|%gs"],
+        MAX_GIT_COMPLETION_BYTES,
+    ) {
+        let stdout = String::from_utf8_lossy(&output);
+        for line in stdout.lines() {
+            if completions.len() >= MAX_COMPLETION_ITEMS {
+                break;
+            }
+            let parts: Vec<&str> = line.splitn(2, '|').collect();
+            let (ref_name, msg) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                (line, "")
+            };
+            if ref_name.starts_with(prefix) || prefix.is_empty() {
+                completions.push(Completion {
+                    text: ref_name.to_string(),
+                    display: ref_name.to_string(),
+                    description: Some(msg.to_string()),
+                    kind: CompletionKind::Other,
+                    is_dir: false,
+                });
             }
         }
     }
@@ -1254,33 +1287,32 @@ fn complete_git_stashes(prefix: &str) -> Vec<Completion> {
 
 fn complete_git_recent_commits(prefix: &str) -> Vec<Completion> {
     let mut completions = Vec::new();
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["log", "--oneline", "-20", "--format=%h|%s"])
-        .output()
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.splitn(2, '|').collect();
-                let (hash, msg) = if parts.len() == 2 {
-                    (parts[0], parts[1])
+    if let Some(output) = crate::prompt::bounded_git_stdout(
+        Path::new("."),
+        &["log", "--oneline", "-20", "--format=%h|%s"],
+        MAX_GIT_COMPLETION_BYTES,
+    ) {
+        let stdout = String::from_utf8_lossy(&output);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.splitn(2, '|').collect();
+            let (hash, msg) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                (line, "")
+            };
+            if hash.starts_with(prefix) || prefix.is_empty() {
+                let desc = if msg.len() > 40 {
+                    format!("{}…", msg.chars().take(39).collect::<String>())
                 } else {
-                    (line, "")
+                    msg.to_string()
                 };
-                if hash.starts_with(prefix) || prefix.is_empty() {
-                    let desc = if msg.len() > 40 {
-                        format!("{}…", &msg[..39])
-                    } else {
-                        msg.to_string()
-                    };
-                    completions.push(Completion {
-                        text: hash.to_string(),
-                        display: hash.to_string(),
-                        description: Some(desc),
-                        kind: CompletionKind::Other,
-                        is_dir: false,
-                    });
-                }
+                completions.push(Completion {
+                    text: hash.to_string(),
+                    display: hash.to_string(),
+                    description: Some(desc),
+                    kind: CompletionKind::Other,
+                    is_dir: false,
+                });
             }
         }
     }
@@ -1289,20 +1321,23 @@ fn complete_git_recent_commits(prefix: &str) -> Vec<Completion> {
 
 fn complete_git_remotes(prefix: &str) -> Vec<Completion> {
     let mut completions = Vec::new();
-    if let Ok(output) = std::process::Command::new("git").args(["remote"]).output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for remote in stdout.lines() {
-                let remote = remote.trim();
-                if !remote.is_empty() && remote.starts_with(prefix) {
-                    completions.push(Completion {
-                        text: remote.to_string(),
-                        display: remote.to_string(),
-                        description: Some("remote".to_string()),
-                        kind: CompletionKind::Other,
-                        is_dir: false,
-                    });
-                }
+    if let Some(output) =
+        crate::prompt::bounded_git_stdout(Path::new("."), &["remote"], MAX_GIT_COMPLETION_BYTES)
+    {
+        let stdout = String::from_utf8_lossy(&output);
+        for remote in stdout.lines() {
+            if completions.len() >= MAX_COMPLETION_ITEMS {
+                break;
+            }
+            let remote = remote.trim();
+            if !remote.is_empty() && remote.starts_with(prefix) {
+                completions.push(Completion {
+                    text: remote.to_string(),
+                    display: remote.to_string(),
+                    description: Some("remote".to_string()),
+                    kind: CompletionKind::Other,
+                    is_dir: false,
+                });
             }
         }
     }
@@ -1619,12 +1654,12 @@ fn format_file_size(bytes: u64) -> String {
 
 fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
     let lookup_prefix = unescape_shell_word(prefix);
-    let expanded = if lookup_prefix.starts_with('~') {
+    let expanded = if let Some(home_relative) = lookup_prefix.strip_prefix('~') {
         let home = state.home_dir.to_string_lossy();
         if lookup_prefix == "~" {
             format!("{}/", home)
         } else {
-            format!("{}{}", home, &lookup_prefix[1..])
+            format!("{home}{home_relative}")
         }
     } else {
         lookup_prefix.clone()
@@ -1642,7 +1677,7 @@ fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
     let mut completions = Vec::new();
 
     if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
+        for entry in entries.flatten().take(MAX_COMPLETION_ITEMS) {
             let name = entry.file_name().to_string_lossy().to_string();
             if !name.starts_with(file_prefix) {
                 continue;
@@ -2004,7 +2039,7 @@ fn complete_history_entries(
 
 /// Smart pipe completion: recommend pipe targets based on preceding command
 pub fn complete_pipe_targets(buf: &str, prefix: &str) -> Vec<Completion> {
-    let before_pipe = buf.rsplitn(2, '|').nth(1).unwrap_or("").trim();
+    let before_pipe = buf.rsplit_once('|').map(|x| x.0).unwrap_or("").trim();
     let prev_cmd = before_pipe.split_whitespace().next().unwrap_or("");
     let prev_cmd_base = prev_cmd.rsplit('/').next().unwrap_or(prev_cmd);
 
@@ -2126,7 +2161,8 @@ fn complete_npm_scripts(prefix: &str) -> Vec<Completion> {
 }
 
 fn npm_scripts_from_path(path: &std::path::Path, prefix: &str) -> Vec<Completion> {
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(content) = crate::io_guard::read_regular_text(path, MAX_COMPLETION_PROJECT_FILE_BYTES)
+    else {
         return Vec::new();
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -2193,7 +2229,9 @@ fn cargo_values_from_manifest(
     prefix: &str,
     kind: CargoArgKind,
 ) -> Vec<String> {
-    let Ok(content) = fs::read_to_string(manifest_path) else {
+    let Ok(content) =
+        crate::io_guard::read_regular_text(manifest_path, MAX_COMPLETION_PROJECT_FILE_BYTES)
+    else {
         return Vec::new();
     };
     let Ok(manifest) = toml::from_str::<toml::Value>(&content) else {
@@ -2249,8 +2287,11 @@ fn cargo_values_from_manifest(
                         continue;
                     };
                     if let Ok(paths) = glob::glob(pattern) {
-                        for path in paths.flatten() {
-                            if let Ok(content) = fs::read_to_string(path) {
+                        for path in paths.flatten().take(MAX_COMPLETION_ITEMS) {
+                            if let Ok(content) = crate::io_guard::read_regular_text(
+                                &path,
+                                MAX_COMPLETION_PROJECT_FILE_BYTES,
+                            ) {
                                 if let Ok(value) = toml::from_str::<toml::Value>(&content) {
                                     if let Some(name) = value
                                         .get("package")
@@ -2294,6 +2335,7 @@ fn rust_target_names(dir: &std::path::Path) -> Vec<String> {
     };
     entries
         .flatten()
+        .take(MAX_COMPLETION_ITEMS)
         .filter_map(|entry| {
             let path = entry.path();
             if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
@@ -2323,11 +2365,15 @@ fn complete_make_targets(prefix: &str) -> Vec<Completion> {
 }
 
 fn make_targets_from_path(path: &std::path::Path, prefix: &str) -> Vec<String> {
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(content) = crate::io_guard::read_regular_text(path, MAX_COMPLETION_PROJECT_FILE_BYTES)
+    else {
         return Vec::new();
     };
     let mut targets = Vec::new();
     for line in content.lines() {
+        if targets.len() >= MAX_COMPLETION_ITEMS {
+            break;
+        }
         if line.chars().next().is_some_and(char::is_whitespace) || line.starts_with('#') {
             continue;
         }
@@ -2486,6 +2532,33 @@ mod tests {
             .unwrap();
         assert_eq!(secret.description.as_deref(), Some("environment variable"));
         assert!(!format!("{:?}", secret.description).contains("super-secret-token"));
+    }
+
+    #[test]
+    fn completion_boundary_rejects_hidden_insertions_and_escapes_metadata() {
+        let completions = finalize_completions(vec![
+            Completion {
+                text: "safe".into(),
+                display: "safe\x1b]52;c;bad\x07".into(),
+                description: Some("left\u{202e}right".into()),
+                kind: CompletionKind::Other,
+                is_dir: false,
+            },
+            Completion {
+                text: "hidden\u{2066}".into(),
+                display: "hidden".into(),
+                description: None,
+                kind: CompletionKind::Other,
+                is_dir: false,
+            },
+        ]);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].text, "safe");
+        assert!(completions[0].display.contains("\\x1b"));
+        assert!(completions[0]
+            .description
+            .as_deref()
+            .is_some_and(|value| value.contains("\\u{202e}")));
     }
 
     #[test]
@@ -2718,7 +2791,7 @@ mod tests {
 
         let word_start = "false || ".len();
         let before = "false || "[..word_start].trim_end();
-        assert!(!(before.ends_with('|') && !before.ends_with("||")));
+        assert!(!before.ends_with('|') || before.ends_with("||"));
     }
 
     #[test]

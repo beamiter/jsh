@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- Retired `JSH_AGENT_AUTO_APPROVE_READONLY`: command text alone cannot prove
+  that aliases, functions, Git helpers, or flag-dependent tools are read-only,
+  so every Agent proposal now requires explicit approval.
+- The complete all-target benchmark suite runs again: the reduce benchmark now
+  passes its initializer through the supported `-i` interface.
+- Cleared the strict all-feature Clippy backlog and made stdin line processors
+  stop on persistent I/O errors instead of repeatedly discarding them. An
+  unterminated quoted associative-array initializer now fails closed instead
+  of constructing an invalid slice.
+- Hardened history persistence: history and lock files no longer follow
+  symlinks or block on special files, only regular files are accepted, and
+  their descriptors close across `exec`. Per-record/file/entry limits bound
+  startup and compaction memory, lock waits are finite, and a renamed lock
+  sidecar cannot split cooperating writers onto different lock inodes.
+  Newly created state directories start private and writable shared parent
+  namespaces are rejected.
+- Applied the same descriptor, ownership, hard-link, size, and bounded-lock
+  rules to the structured execution journal; decoding retains a fixed newest
+  window and atomic compaction never publishes an oversized journal.
+- Session snapshots now use no-follow, nonblocking descriptor I/O, reject
+  hard links and identity mismatches, enforce a 4 MiB read/write ceiling, and
+  preserve the last good snapshot when a replacement exceeds that ceiling.
+  Credential-bearing URLs and private-key material are filtered even when the
+  environment-variable name itself does not look secret.
+- Agent provider envelopes are capped before JSON decoding, and detached
+  descendants, including continuous writers, can no longer keep an approved
+  command's capture pipe open indefinitely after the direct jsh child exits.
+  Approved commands now execute in a fresh one-shot jsh process initialized
+  from a private bounded snapshot that is atomically claimed by exactly one
+  child, preserving aliases, functions, variables, and options without running
+  Rust code after a fork in the threaded shell. AI request/response channels
+  and their history/output payloads now have explicit entry and byte ceilings.
+  Model prose, provider errors, and displayed working directories are
+  control-escaped and display-bounded before they reach the terminal; approval
+  cards also expose invisible/bidirectional Unicode and require the deliberate
+  dangerous-command confirmation for it. High-confidence secrets are redacted
+  from local AI diagnostics too, and Agent prompts now respond promptly to
+  terminal interrupts, including while a provider socket is stalled; only one
+  timed-out request worker may remain in flight. HUP/TERM status stays latched
+  through orderly cleanup, preventing an early executor check from turning
+  termination into exit 0.
+- Git dependencies are pinned to immutable revisions so a moving branch cannot
+  silently change a locked build.
+
 - `source ~/.nvm/nvm.sh` no longer recurses until the stack overflows, and
   `nvm` runs. Three fixes: `$-` now reports the enabled options instead of
   expanding to the literal text `$-` (nvm's "is errexit set?" guard was always

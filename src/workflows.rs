@@ -3,6 +3,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+const MAX_WORKFLOW_FILE_BYTES: usize = 1024 * 1024;
+const MAX_WORKFLOW_FILES: usize = 256;
+const MAX_WORKFLOWS: usize = 4096;
+const MAX_WORKFLOW_TEXT_BYTES: usize = 16 * 1024;
+const MAX_WORKFLOW_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_WORKFLOW_PARAMETERS: usize = 128;
+const MAX_WORKFLOW_SUGGESTIONS: usize = 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
     pub name: String,
@@ -30,6 +38,12 @@ pub struct WorkflowRegistry {
     user_dir: PathBuf,
 }
 
+impl Default for WorkflowRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkflowRegistry {
     pub fn new() -> Self {
         let user_dir = dirs::home_dir()
@@ -49,7 +63,7 @@ impl WorkflowRegistry {
     fn load_builtin(&mut self) {
         let builtin: &str = include_str!("specs/workflows.json");
         if let Ok(wfs) = serde_json::from_str::<Vec<Workflow>>(builtin) {
-            self.workflows.extend(wfs);
+            self.extend_validated(wfs);
         }
     }
 
@@ -58,17 +72,30 @@ impl WorkflowRegistry {
             return;
         }
         if let Ok(entries) = std::fs::read_dir(&self.user_dir) {
-            for entry in entries.flatten() {
+            for entry in entries.flatten().take(MAX_WORKFLOW_FILES) {
                 let path = entry.path();
                 if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(content) =
+                        crate::io_guard::read_regular_text(&path, MAX_WORKFLOW_FILE_BYTES)
+                    {
                         if let Ok(wf) = serde_json::from_str::<Workflow>(&content) {
-                            self.workflows.push(wf);
+                            self.extend_validated(std::iter::once(wf));
                         } else if let Ok(wfs) = serde_json::from_str::<Vec<Workflow>>(&content) {
-                            self.workflows.extend(wfs);
+                            self.extend_validated(wfs);
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn extend_validated(&mut self, workflows: impl IntoIterator<Item = Workflow>) {
+        for workflow in workflows {
+            if self.workflows.len() >= MAX_WORKFLOWS {
+                break;
+            }
+            if workflow_is_safe_and_bounded(&workflow) {
+                self.workflows.push(workflow);
             }
         }
     }
@@ -120,13 +147,45 @@ impl WorkflowRegistry {
             }
         }
 
-        results.sort_by(|a, b| b.1.cmp(&a.1));
+        results.sort_by_key(|result| std::cmp::Reverse(result.1));
         results.into_iter().map(|(wf, _)| wf).collect()
     }
 
     pub fn count(&self) -> usize {
         self.workflows.len()
     }
+}
+
+fn bounded_safe_text(value: &str, max_bytes: usize) -> bool {
+    value.len() <= max_bytes && crate::terminal_text::is_safe_inline(value)
+}
+
+fn workflow_is_safe_and_bounded(workflow: &Workflow) -> bool {
+    bounded_safe_text(&workflow.name, MAX_WORKFLOW_TEXT_BYTES)
+        && bounded_safe_text(&workflow.description, MAX_WORKFLOW_TEXT_BYTES)
+        && bounded_safe_text(&workflow.command, MAX_WORKFLOW_COMMAND_BYTES)
+        && workflow.tags.len() <= MAX_WORKFLOW_SUGGESTIONS
+        && workflow
+            .tags
+            .iter()
+            .all(|tag| bounded_safe_text(tag, MAX_WORKFLOW_TEXT_BYTES))
+        && workflow.parameters.len() <= MAX_WORKFLOW_PARAMETERS
+        && workflow.parameters.iter().all(|parameter| {
+            bounded_safe_text(&parameter.name, MAX_WORKFLOW_TEXT_BYTES)
+                && parameter
+                    .description
+                    .as_deref()
+                    .is_none_or(|value| bounded_safe_text(value, MAX_WORKFLOW_TEXT_BYTES))
+                && parameter
+                    .default
+                    .as_deref()
+                    .is_none_or(|value| bounded_safe_text(value, MAX_WORKFLOW_TEXT_BYTES))
+                && parameter.suggestions.len() <= MAX_WORKFLOW_SUGGESTIONS
+                && parameter
+                    .suggestions
+                    .iter()
+                    .all(|value| bounded_safe_text(value, MAX_WORKFLOW_TEXT_BYTES))
+        })
 }
 
 /// Extract parameter placeholders from a workflow command template.
@@ -210,5 +269,30 @@ impl WorkflowSession {
 
     pub fn is_complete(&self) -> bool {
         self.current_param >= self.workflow.parameters.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_workflow_text_is_rejected_before_it_reaches_the_editor() {
+        let safe = Workflow {
+            name: "status".into(),
+            description: "show status".into(),
+            command: "git status".into(),
+            parameters: Vec::new(),
+            tags: Vec::new(),
+        };
+        assert!(workflow_is_safe_and_bounded(&safe));
+        assert!(!workflow_is_safe_and_bounded(&Workflow {
+            command: "git\u{202e} status".into(),
+            ..safe.clone()
+        }));
+        assert!(!workflow_is_safe_and_bounded(&Workflow {
+            description: "first\nsecond".into(),
+            ..safe
+        }));
     }
 }

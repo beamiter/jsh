@@ -1,0 +1,506 @@
+//! Bounded Unix file/process I/O used at persistence and helper-process
+//! boundaries. These helpers are intentionally small and policy-free: callers
+//! choose limits, while this module guarantees no symlink/FIFO reads, no
+//! partial in-place persistence writes, and no unbounded `Command::output`.
+
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+const SAFE_READ_FLAGS: i32 = nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC;
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve helpers that jsh may start automatically without consulting the
+/// mutable shell `PATH`. Candidates are fixed system locations and both the
+/// executable and its containing namespace must not be writable by this user
+/// (nor group/world-writable).
+pub(crate) fn automatic_system_helper(name: &str) -> Option<&'static Path> {
+    let candidates: &[&'static str] = match name {
+        "bash" => &["/usr/bin/bash", "/bin/bash"],
+        "git" => &["/usr/bin/git", "/bin/git", "/usr/local/bin/git"],
+        "notify-send" => &["/usr/bin/notify-send", "/bin/notify-send"],
+        _ => return None,
+    };
+    candidates.iter().find_map(|candidate| {
+        let path = Path::new(candidate);
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_file()
+            || writable_by_current_user(&metadata)
+            || metadata.mode() & 0o111 == 0
+        {
+            return None;
+        }
+        let parent = path.parent()?.metadata().ok()?;
+        (parent.is_dir() && !writable_by_current_user(&parent)).then_some(path)
+    })
+}
+
+fn writable_by_current_user(metadata: &fs::Metadata) -> bool {
+    let mode = metadata.mode();
+    mode & 0o022 != 0 || (metadata.uid() == unsafe { nix::libc::geteuid() } && mode & 0o200 != 0)
+}
+
+/// Validate an explicitly configured executable without falling back to PATH.
+pub(crate) fn explicit_absolute_executable(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    path.metadata().is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.mode() & 0o111 != 0
+            && (metadata.uid() == unsafe { nix::libc::geteuid() } || metadata.mode() & 0o022 == 0)
+    })
+}
+
+/// Read a regular file with a byte cap. Symlinks and special files are refused
+/// so a startup/completion probe cannot block on a FIFO or silently traverse a
+/// link to unrelated data.
+pub(crate) fn read_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    read_regular_file_with_policy(path, max_bytes, false, true)
+}
+
+/// Read a regular file through an explicitly supplied symlink. This is for
+/// command/script operands where symlinks are normal shell semantics; special
+/// files remain non-blocking and are rejected after open.
+pub(crate) fn read_regular_file_following(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    read_regular_file_with_policy(path, max_bytes, false, false)
+}
+
+/// As [`read_regular_file`], additionally requiring a single-link file owned
+/// by the effective user. Use this for private shell persistence.
+pub(crate) fn read_private_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    read_regular_file_with_policy(path, max_bytes, true, true)
+}
+
+pub(crate) fn read_regular_text(path: &Path, max_bytes: usize) -> io::Result<String> {
+    String::from_utf8(read_regular_file(path, max_bytes)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn read_regular_text_following(path: &Path, max_bytes: usize) -> io::Result<String> {
+    String::from_utf8(read_regular_file_following(path, max_bytes)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn read_private_text(path: &Path, max_bytes: usize) -> io::Result<String> {
+    String::from_utf8(read_private_file(path, max_bytes)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn read_to_end_bounded(mut reader: impl Read, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("input exceeds the {max_bytes} byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_regular_file_with_policy(
+    path: &Path,
+    max_bytes: usize,
+    private: bool,
+    nofollow: bool,
+) -> io::Result<Vec<u8>> {
+    let flags = if nofollow {
+        SAFE_READ_FLAGS
+    } else {
+        nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC
+    };
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refusing to read a non-regular file",
+        ));
+    }
+    if private && metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private data file has multiple hard links",
+        ));
+    }
+    if private && metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private data file is not owned by the current user",
+        ));
+    }
+    if private && metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private data file is writable by another user",
+        ));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds the {max_bytes} byte limit"),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
+    Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds the {max_bytes} byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Atomically replace one private persistence file. Data is written to a
+/// create-new 0600 sibling, synced, renamed, and followed by a directory sync.
+/// Replacing a symlink changes the link itself and never follows its target.
+pub(crate) fn write_private_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> io::Result<()> {
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("data exceeds the {max_bytes} byte limit"),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(parent)?;
+    let directory_metadata = directory.metadata()?;
+    if !directory_metadata.is_dir()
+        || directory_metadata.uid() != unsafe { nix::libc::geteuid() }
+        || directory_metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "persistence directory is not a current-user-owned private namespace \
+                 (owner {}, effective user {}, mode {:04o})",
+                directory_metadata.uid(),
+                unsafe { nix::libc::geteuid() },
+                directory_metadata.mode() & 0o7777
+            ),
+        ));
+    }
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut last_collision = None;
+    for _ in 0..32 {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".{}.jsh-tmp-{}-{counter}",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .mode(0o600)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                last_collision = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            file.write_all(bytes)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.sync_all()?;
+            fs::rename(&temp, path)?;
+            directory.sync_all()
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        return result;
+    }
+    Err(last_collision.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate persistence temporary file",
+        )
+    }))
+}
+
+/// Run a helper process while concurrently draining both output pipes. Either
+/// stream exceeding its independent cap, or the deadline expiring, kills and
+/// reaps the direct child and returns an error.
+pub(crate) fn bounded_command_output(
+    command: &mut Command,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Duration,
+) -> io::Result<Output> {
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // A helper that forks must not escape timeout cleanup merely by
+        // leaving a descendant holding one of the capture pipes open.
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_and_reap(&mut child);
+            return Err(io::Error::other("helper stdout pipe was not created"));
+        }
+    };
+    let mut stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            kill_and_reap(&mut child);
+            return Err(io::Error::other("helper stderr pipe was not created"));
+        }
+    };
+    if let Err(error) =
+        set_nonblocking(stdout.as_raw_fd()).and_then(|()| set_nonblocking(stderr.as_raw_fd()))
+    {
+        kill_and_reap(&mut child);
+        return Err(error);
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut status = None;
+
+    loop {
+        let result = (|| {
+            drain_pipe(
+                &mut stdout,
+                &mut stdout_bytes,
+                stdout_limit,
+                &mut stdout_closed,
+            )?;
+            drain_pipe(
+                &mut stderr,
+                &mut stderr_bytes,
+                stderr_limit,
+                &mut stderr_closed,
+            )
+        })();
+        if let Err(error) = result {
+            kill_and_reap(&mut child);
+            return Err(error);
+        }
+
+        if status.is_none() {
+            status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    kill_and_reap(&mut child);
+                    return Err(error);
+                }
+            };
+        }
+        if let Some(status) = status {
+            if stdout_closed && stderr_closed {
+                return Ok(Output {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                });
+            }
+        }
+
+        if Instant::now() >= deadline {
+            kill_and_reap(&mut child);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "helper process exceeded its time limit",
+            ));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_ms = remaining.as_millis().min(100).try_into().unwrap_or(100);
+        let mut descriptors = Vec::with_capacity(2);
+        if !stdout_closed {
+            descriptors.push(nix::libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: nix::libc::POLLIN | nix::libc::POLLHUP | nix::libc::POLLERR,
+                revents: 0,
+            });
+        }
+        if !stderr_closed {
+            descriptors.push(nix::libc::pollfd {
+                fd: stderr.as_raw_fd(),
+                events: nix::libc::POLLIN | nix::libc::POLLHUP | nix::libc::POLLERR,
+                revents: 0,
+            });
+        }
+        let polled = unsafe {
+            nix::libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len().try_into().unwrap_or(0),
+                timeout_ms,
+            )
+        };
+        if polled < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                kill_and_reap(&mut child);
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn kill_and_reap(child: &mut Child) {
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        // The child is the leader of the process group configured above.
+        let _ = unsafe { nix::libc::kill(-process_group, nix::libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn set_nonblocking(fd: i32) -> io::Result<()> {
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_pipe(
+    reader: &mut impl Read,
+    output: &mut Vec<u8>,
+    limit: usize,
+    closed: &mut bool,
+) -> io::Result<()> {
+    if *closed {
+        return Ok(());
+    }
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                *closed = true;
+                return Ok(());
+            }
+            Ok(read) => {
+                if output.len().saturating_add(read) > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("helper output exceeds the {limit} byte limit"),
+                    ));
+                }
+                output.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn private_persistence_is_bounded_atomic_and_does_not_follow_symlinks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("private tempdir");
+        let path = temp.path().join("state");
+        write_private_file_atomic(&path, b"first", 32).expect("initial write");
+        assert_eq!(read_private_file(&path, 32).unwrap(), b"first");
+        assert!(read_private_file(&path, 4).is_err());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o622)).expect("unsafe mode");
+        assert!(read_private_file(&path, 32).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
+
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep").expect("victim");
+        fs::remove_file(&path).expect("remove state");
+        symlink(&victim, &path).expect("state symlink");
+        assert!(read_private_file(&path, 32).is_err());
+        write_private_file_atomic(&path, b"second", 32).expect("replace link");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(read_private_file(&path, 32).unwrap(), b"second");
+    }
+
+    #[test]
+    fn helper_output_is_bounded() {
+        let output = bounded_command_output(
+            Command::new("printf").arg("hello"),
+            5,
+            0,
+            Duration::from_secs(2),
+        )
+        .expect("bounded helper");
+        assert_eq!(output.stdout, b"hello");
+
+        assert!(bounded_command_output(
+            Command::new("printf").arg("too-large"),
+            4,
+            0,
+            Duration::from_secs(2),
+        )
+        .is_err());
+
+        let started = Instant::now();
+        assert!(bounded_command_output(
+            Command::new("/bin/sh").args(["-c", "sleep 5 & exit 0"]),
+            16,
+            16,
+            Duration::from_millis(50),
+        )
+        .is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn automatic_helpers_never_resolve_through_path() {
+        assert!(automatic_system_helper("not-a-helper").is_none());
+        if let Some(git) = automatic_system_helper("git") {
+            assert!(git.is_absolute());
+            assert_ne!(git, Path::new("git"));
+        }
+        assert!(!explicit_absolute_executable(Path::new("relative-helper")));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let configured = temp.path().join("configured-helper");
+        fs::write(&configured, "#!/bin/sh\n").expect("helper fixture");
+        fs::set_permissions(&configured, fs::Permissions::from_mode(0o700))
+            .expect("executable mode");
+        assert!(explicit_absolute_executable(&configured));
+    }
+}

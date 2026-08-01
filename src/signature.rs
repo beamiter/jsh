@@ -1079,15 +1079,15 @@ fn segment_around(buffer: &str, cursor: usize) -> (usize, usize) {
     let bytes = buffer.as_bytes();
     let cursor = cursor.min(buffer.len());
     let mut start = 0usize;
-    for i in 0..cursor {
-        let c = bytes[i] as char;
+    for (i, &byte) in bytes.iter().enumerate().take(cursor) {
+        let c = byte as char;
         if c == '|' || c == ';' || c == '\n' {
             start = i + 1;
         }
     }
     let mut end = buffer.len();
-    for i in cursor..buffer.len() {
-        let c = bytes[i] as char;
+    for (i, &byte) in bytes.iter().enumerate().skip(cursor) {
+        let c = byte as char;
         if c == '|' || c == ';' || c == '\n' {
             end = i;
             break;

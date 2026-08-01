@@ -11,8 +11,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const MAX_STARTUP_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONFIG_HELPER_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONFIG_HELPER_STDERR_BYTES: usize = 512 * 1024;
+const CONFIG_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn load_config(state: &mut ShellState) {
     // Startup may source a ~/.jshrc that only exists once the pre-rename
@@ -54,7 +58,7 @@ fn load_jshrc(state: &mut ShellState) {
 
 /// Load bash file with lenient error handling - use bash as fallback for complex scripts
 fn source_file_lenient(path: &Path, state: &mut ShellState) {
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(content) = crate::io_guard::read_regular_text(path, MAX_STARTUP_FILE_BYTES) else {
         return; // Missing default startup files are normal.
     };
     // Try parsing the entire file first.
@@ -101,31 +105,49 @@ shopt 2>/dev/null || true
 "#;
 
     // Execute bash script to capture the environment, aliases, and functions
-    if let Ok(output) = std::process::Command::new("bash")
+    let Some(bash) = crate::io_guard::automatic_system_helper("bash") else {
+        eprintln!("jsh: Bash startup import unavailable: no trusted system Bash");
+        return;
+    };
+    let mut command = std::process::Command::new(bash);
+    command
         .arg("-c")
         .arg(bash_script)
         .arg("jsh-config")
-        .arg(path)
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        parse_bash_output(&stdout, state);
+        .arg(path);
+    match crate::io_guard::bounded_command_output(
+        &mut command,
+        MAX_CONFIG_HELPER_STDOUT_BYTES,
+        MAX_CONFIG_HELPER_STDERR_BYTES,
+        CONFIG_HELPER_TIMEOUT,
+    ) {
+        Ok(output) => parse_bash_output(&String::from_utf8_lossy(&output.stdout), state),
+        Err(error) => eprintln!("jsh: bash startup import failed for {path:?}: {error}"),
     }
 }
 
 /// If conda is present after importing bashrc state, load its POSIX shell hook
 /// into the current jsh process so `conda activate` works interactively.
 fn load_conda_hook(state: &mut ShellState) {
-    let conda_cmd = state
+    let Some(conda_cmd) = state
         .get_var("CONDA_EXE")
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "conda".to_string());
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    if !crate::io_guard::explicit_absolute_executable(&conda_cmd) {
+        return;
+    }
 
-    let output = match Command::new(&conda_cmd)
-        .args(["shell.posix", "hook"])
-        .output()
-    {
+    let mut command = std::process::Command::new(&conda_cmd);
+    command.args(["shell.posix", "hook"]);
+    let output = match crate::io_guard::bounded_command_output(
+        &mut command,
+        MAX_CONFIG_HELPER_STDOUT_BYTES,
+        MAX_CONFIG_HELPER_STDERR_BYTES,
+        CONFIG_HELPER_TIMEOUT,
+    ) {
         Ok(output) if output.status.success() => output,
         _ => return,
     };
@@ -560,9 +582,9 @@ globstar        on"#;
         let mut state = ShellState::new(false);
         parse_bash_output(output, &mut state);
 
-        assert_eq!(state.shell_opts.extglob, true);
-        assert_eq!(state.shell_opts.dotglob, false);
-        assert_eq!(state.shell_opts.globstar, true);
+        assert!(state.shell_opts.extglob);
+        assert!(!state.shell_opts.dotglob);
+        assert!(state.shell_opts.globstar);
     }
 
     #[test]
@@ -580,7 +602,7 @@ extglob         on"#;
 
         assert_eq!(state.get_var("APP_NAME"), Some("myapp"));
         assert_eq!(state.aliases.get("ll"), Some(&"ls -lah".to_string()));
-        assert_eq!(state.shell_opts.extglob, true);
+        assert!(state.shell_opts.extglob);
     }
 
     #[test]

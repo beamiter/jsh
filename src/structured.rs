@@ -195,12 +195,7 @@ pub fn to_table(records: &[Value]) -> String {
     for record in records {
         let row: Vec<String> = columns
             .iter()
-            .map(|col| {
-                record
-                    .get(col)
-                    .map(|v| value_to_string(v))
-                    .unwrap_or_default()
-            })
+            .map(|col| record.get(col).map(value_to_string).unwrap_or_default())
             .collect();
         rows.push(row);
     }
@@ -316,7 +311,7 @@ pub fn group_by(records: &[Value], field: &str) -> Value {
     for record in records {
         let key = record
             .get(field)
-            .map(|v| value_to_string(v))
+            .map(value_to_string)
             .unwrap_or_else(|| "null".to_string());
         let entry = groups
             .entry(key)

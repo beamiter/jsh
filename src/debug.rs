@@ -16,6 +16,7 @@ pub struct DebugInfo {
 }
 
 /// Debugger configuration
+#[derive(Default)]
 pub struct DebugConfig {
     pub trace: bool,      // set -x: trace command execution
     pub timing: bool,     // Show execution time
@@ -23,19 +24,6 @@ pub struct DebugConfig {
     pub var_watch: bool,  // Monitor variable changes
     pub call_stack: bool, // Show function call stack
     pub verbose: bool,    // Verbose output
-}
-
-impl Default for DebugConfig {
-    fn default() -> Self {
-        DebugConfig {
-            trace: false,
-            timing: false,
-            profile: false,
-            var_watch: false,
-            call_stack: false,
-            verbose: false,
-        }
-    }
 }
 
 /// Debug session tracker

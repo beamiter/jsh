@@ -146,6 +146,37 @@ fn test_declare_assoc_array() {
 }
 
 #[test]
+fn invalid_assoc_initializer_fails_without_partial_mutation() {
+    let mut state = make_state();
+    state
+        .assoc_arrays
+        .entry("mymap".into())
+        .or_default()
+        .insert("existing".into(), "keep".into());
+
+    let status = run_builtin(
+        "declare",
+        &[
+            "-A".into(),
+            "mymap=([first]=temporary [broken]=\"unterminated)".into(),
+        ],
+        &mut state,
+    );
+
+    assert_eq!(status, 1);
+    assert_eq!(state.assoc_arrays["mymap"].len(), 1);
+    assert_eq!(state.assoc_arrays["mymap"]["existing"], "keep");
+
+    let status = run_builtin(
+        "declare",
+        &["-A".into(), "newmap=([broken]=\"unterminated)".into()],
+        &mut state,
+    );
+    assert_eq!(status, 1);
+    assert!(!state.assoc_arrays.contains_key("newmap"));
+}
+
+#[test]
 fn test_hook_add_remove() {
     let mut state = make_state();
     assert!(state.hooks.precmd.is_empty());

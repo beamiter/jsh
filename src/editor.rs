@@ -27,6 +27,7 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
 const MAX_AI_EXECUTION_OUTPUT_BYTES: usize = 32 * 1024;
+const MAX_AI_GIT_STATUS_PROBE_BYTES: usize = 4 * 1024;
 const AI_OUTPUT_TRUNCATION_MARKER: &str = "\n... [terminal output truncated for AI context] ...\n";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +96,12 @@ struct SearchMode {
     results: Vec<(String, Vec<usize>)>,
     rich_results: Vec<(String, Vec<usize>, u64, Option<String>)>,
     selected: usize,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Editor {
@@ -277,16 +284,17 @@ impl Editor {
                         // subsequent key dismisses it while leaving the restored
                         // command buffer intact.
                         self.ai_error = None;
-                        if key.code != KeyCode::Tab && key.code != KeyCode::BackTab {
-                            if key.code != KeyCode::Enter {
-                                if let Some(menu) = self.completion_menu.take() {
-                                    if key.code == KeyCode::Esc {
-                                        self.buffer.replace_range(
-                                            menu.word_start..self.cursor,
-                                            &menu.original_word,
-                                        );
-                                        self.cursor = menu.word_start + menu.original_word.len();
-                                    }
+                        if key.code != KeyCode::Tab
+                            && key.code != KeyCode::BackTab
+                            && key.code != KeyCode::Enter
+                        {
+                            if let Some(menu) = self.completion_menu.take() {
+                                if key.code == KeyCode::Esc {
+                                    self.buffer.replace_range(
+                                        menu.word_start..self.cursor,
+                                        &menu.original_word,
+                                    );
+                                    self.cursor = menu.word_start + menu.original_word.len();
                                 }
                             }
                         }
@@ -321,8 +329,16 @@ impl Editor {
                     }
                     Event::Paste(text) => {
                         self.ai_error = None;
-                        self.buffer.insert_str(self.cursor, &text);
-                        self.cursor += text.len();
+                        if text.chars().all(|ch| {
+                            ch == '\n' || !crate::terminal_text::is_terminal_ambiguous(ch)
+                        }) {
+                            self.buffer.insert_str(self.cursor, &text);
+                            self.cursor += text.len();
+                        } else {
+                            self.ai_error = Some(
+                                "Paste rejected: invisible or terminal-control text".to_string(),
+                            );
+                        }
                         self.update_suggestion(history, state);
                         self.repaint(state)?;
                     }
@@ -612,7 +628,9 @@ impl Editor {
                 let new_pos = self.prev_word_boundary();
                 self.cursor = new_pos;
             }
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if !crate::terminal_text::is_terminal_ambiguous(c) =>
+            {
                 self.buffer.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
             }
@@ -956,7 +974,9 @@ impl Editor {
             'r' => {
                 // Replace single character
                 if let KeyCode::Char(c) = key.code {
-                    if self.cursor < self.buffer.len() {
+                    if self.cursor < self.buffer.len()
+                        && !crate::terminal_text::is_terminal_ambiguous(c)
+                    {
                         let old_char = self.buffer[self.cursor..].chars().next().unwrap();
                         self.buffer.replace_range(
                             self.cursor..self.cursor + old_char.len_utf8(),
@@ -1033,6 +1053,9 @@ impl Editor {
             KeyCode::Char(c)
                 if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
             {
+                if crate::terminal_text::is_terminal_ambiguous(c) {
+                    return Ok(KeyAction::Continue);
+                }
                 search.query.push(c);
                 search.rich_results = history.search_fuzzy_rich(&search.query);
                 search.results = search
@@ -1107,6 +1130,9 @@ impl Editor {
             KeyCode::Char(c)
                 if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
             {
+                if crate::terminal_text::is_terminal_ambiguous(c) {
+                    return Ok(KeyAction::Continue);
+                }
                 wf_mode.query.push(c);
                 wf_mode.results = state
                     .workflow_registry
@@ -1171,9 +1197,8 @@ impl Editor {
     }
 
     fn build_ai_context(&self, _state: &ShellState, history: &History) -> AiContext {
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
+        let cwd_path = std::env::current_dir().unwrap_or_default();
+        let cwd = cwd_path.display().to_string();
         let os = std::env::consts::OS.to_string();
         let recent_history = if self.ai_include_extended_context {
             history
@@ -1187,12 +1212,13 @@ impl Editor {
             Vec::new()
         };
         let git_status = if self.ai_include_extended_context {
-            std::process::Command::new("git")
-                .args(["status", "--short"])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .filter(|s| !s.is_empty())
+            crate::prompt::bounded_git_stdout(
+                &cwd_path,
+                &["status", "--short"],
+                MAX_AI_GIT_STATUS_PROBE_BYTES,
+            )
+            .and_then(|output| String::from_utf8(output).ok())
+            .filter(|s| !s.is_empty())
         } else {
             None
         };
@@ -1240,11 +1266,13 @@ impl Editor {
             return false;
         }
         let ctx = self.build_ai_context(state, history);
-        self.snapshot_ai_input();
-        self.ai_worker.as_ref().unwrap().request(AiRequest {
+        if !self.ai_worker.as_ref().unwrap().request(AiRequest {
             prompt: prompt_text.to_string(),
             context: ctx,
-        });
+        }) {
+            return false;
+        }
+        self.snapshot_ai_input();
         self.ai_pending = true;
         self.buffer.clear();
         self.buffer.push_str("[AI...]");
@@ -1257,11 +1285,13 @@ impl Editor {
             return false;
         }
         let ctx = self.build_ai_context(state, history);
-        self.snapshot_ai_input();
-        self.ai_worker.as_ref().unwrap().request(AiRequest {
+        if !self.ai_worker.as_ref().unwrap().request(AiRequest {
             prompt: String::new(),
             context: ctx,
-        });
+        }) {
+            return false;
+        }
+        self.snapshot_ai_input();
         self.ai_pending = true;
         self.buffer.clear();
         self.buffer.push_str("[AI fixing...]");
@@ -1279,11 +1309,13 @@ impl Editor {
             "Explain this shell command briefly (one line per flag/component): {}",
             self.buffer
         );
-        self.snapshot_ai_input();
-        self.ai_worker.as_ref().unwrap().request(AiRequest {
+        if !self.ai_worker.as_ref().unwrap().request(AiRequest {
             prompt,
             context: ctx,
-        });
+        }) {
+            return false;
+        }
+        self.snapshot_ai_input();
         self.ai_pending = true;
         self.ai_explain_mode = true;
         true
@@ -1294,6 +1326,16 @@ impl Editor {
         self.ai_explain_mode = false;
         match response {
             AiResponse::Suggestion(command) => {
+                if !crate::terminal_text::is_safe_inline(&command) {
+                    if let Some(saved) = self.ai_saved_input.take() {
+                        self.buffer = saved.buffer;
+                        self.cursor = saved.cursor.min(self.buffer.len());
+                        self.suggestion = saved.suggestion;
+                    }
+                    self.ai_error =
+                        Some("AI error: suggestion contained invisible terminal text".to_string());
+                    return;
+                }
                 self.ai_saved_input = None;
                 self.ai_error = None;
                 self.buffer.clear();
@@ -1327,7 +1369,8 @@ impl Editor {
             last_command: state.last_command.as_deref(),
             last_exit_code: state.last_exit_code,
         };
-        self.suggestion = suggest::suggest(&self.buffer, history, &ctx);
+        self.suggestion = suggest::suggest(&self.buffer, history, &ctx)
+            .filter(|suggestion| crate::terminal_text::is_safe_inline(suggestion));
     }
 
     fn repaint(&mut self, state: &mut ShellState) -> io::Result<()> {
@@ -1410,7 +1453,11 @@ impl Editor {
             out.queue(SetForegroundColor(Color::Yellow))?;
             out.queue(Print(format!("[{}/{}] ", sel, count)))?;
             out.queue(ResetColor)?;
-            out.queue(Print(format!("❯ {}", search.query)))?;
+            let (query_display, query_width) = history_panel_text(
+                &search.query,
+                (self.terminal_width as usize).saturating_sub(12),
+            );
+            out.queue(Print(format!("❯ {query_display}")))?;
             out.queue(Print("\r\n"))?;
             rendered_lines += 1;
 
@@ -1433,7 +1480,7 @@ impl Editor {
 
                 // Time + cwd (right-aligned info)
                 let time_str = History::format_relative_time(*ts);
-                let cwd_str = cwd
+                let cwd = cwd
                     .as_ref()
                     .map(|c| {
                         let home = dirs::home_dir().unwrap_or_default();
@@ -1445,32 +1492,29 @@ impl Editor {
                         }
                     })
                     .unwrap_or_default();
+                let (cwd_str, cwd_width) = history_panel_text(&cwd, (tw / 3).min(40));
 
                 // Command with match highlighting
-                let cmd_max = tw.saturating_sub(time_str.len() + cwd_str.len() + 8);
-                let cmd_display: String = if cmd.len() > cmd_max {
-                    format!("{}…", &cmd[..cmd_max.saturating_sub(1)])
-                } else {
-                    cmd.clone()
-                };
+                let cmd_max = tw.saturating_sub(time_str.len() + cwd_width + 8);
+                let (cmd_fragments, cmd_width) = history_panel_fragments(cmd, indices, cmd_max);
 
                 if is_sel {
                     out.queue(SetAttribute(Attribute::Bold))?;
                 }
 
                 // Render command with highlighted match chars
-                for (ci, ch) in cmd_display.chars().enumerate() {
-                    if indices.contains(&ci) {
+                for (fragment, matched) in &cmd_fragments {
+                    if *matched {
                         out.queue(SetForegroundColor(Color::Yellow))?;
                         out.queue(SetAttribute(Attribute::Bold))?;
-                        out.queue(Print(format!("{}", ch)))?;
+                        out.queue(Print(fragment))?;
                         if is_sel {
                             out.queue(SetForegroundColor(Color::Green))?;
                         } else {
                             out.queue(ResetColor)?;
                         }
                     } else {
-                        out.queue(Print(format!("{}", ch)))?;
+                        out.queue(Print(fragment))?;
                     }
                 }
 
@@ -1478,8 +1522,7 @@ impl Editor {
 
                 // Metadata (dim, right side)
                 if !time_str.is_empty() || !cwd_str.is_empty() {
-                    let pad =
-                        tw.saturating_sub(cmd_display.len() + time_str.len() + cwd_str.len() + 6);
+                    let pad = tw.saturating_sub(cmd_width + time_str.len() + cwd_width + 6);
                     if pad > 0 && pad < tw {
                         out.queue(Print(" ".repeat(pad.min(40))))?;
                     }
@@ -1508,7 +1551,7 @@ impl Editor {
                 rendered_lines += 1;
             }
 
-            cursor_col = (10 + search.query.len()) as u16;
+            cursor_col = (10 + query_width) as u16;
             cursor_row = 0;
         } else {
             // Render prompt (cached — only recomputed at read_line entry)
@@ -1775,11 +1818,12 @@ impl Editor {
 
                 // Display name
                 let name_width = 20usize.min(self.terminal_width as usize / 3);
-                out.queue(Print(format!(
-                    "{:<width$}",
-                    item.comp.display,
-                    width = name_width
-                )))?;
+                let (display_name, display_name_width) =
+                    history_panel_text(&item.comp.display, name_width);
+                out.queue(Print(display_name))?;
+                out.queue(Print(
+                    " ".repeat(name_width.saturating_sub(display_name_width)),
+                ))?;
 
                 if is_selected {
                     out.queue(SetBackgroundColor(Color::Reset))?;
@@ -1797,12 +1841,8 @@ impl Editor {
                             out.queue(SetForegroundColor(Color::White))?;
                             let max_desc =
                                 (self.terminal_width as usize).saturating_sub(name_width + 5);
-                            let truncated = if d.len() > max_desc {
-                                &d[..max_desc]
-                            } else {
-                                d.as_str()
-                            };
-                            out.queue(Print(truncated))?;
+                            let (description, _) = history_panel_text(d, max_desc);
+                            out.queue(Print(description))?;
                             out.queue(ResetColor)?;
                         }
                     }
@@ -1841,7 +1881,9 @@ impl Editor {
                 wf_mode.results.len()
             )))?;
             out.queue(ResetColor)?;
-            out.queue(Print(format!("❯ {}", wf_mode.query)))?;
+            let query_width = (self.terminal_width as usize).saturating_sub(2);
+            let (query, _) = history_panel_text(&wf_mode.query, query_width);
+            out.queue(Print(format!("❯ {query}")))?;
             out.queue(Print("\r\n"))?;
             rendered_lines += 1;
 
@@ -1864,17 +1906,15 @@ impl Editor {
                     Color::Cyan
                 }))?;
                 out.queue(SetAttribute(Attribute::Bold))?;
-                out.queue(Print(format!("{:<20}", wf.name)))?;
+                let (name, name_width) = history_panel_text(&wf.name, 20);
+                out.queue(Print(name))?;
+                out.queue(Print(" ".repeat(20usize.saturating_sub(name_width))))?;
                 out.queue(ResetColor)?;
 
                 // Description
                 out.queue(SetAttribute(Attribute::Dim))?;
                 let max_desc = (self.terminal_width as usize).saturating_sub(25);
-                let desc = if wf.description.len() > max_desc {
-                    format!("{}…", &wf.description[..max_desc - 1])
-                } else {
-                    wf.description.clone()
-                };
+                let (desc, _) = history_panel_text(&wf.description, max_desc);
                 out.queue(Print(&desc))?;
                 out.queue(ResetColor)?;
 
@@ -1886,11 +1926,10 @@ impl Editor {
                     out.queue(Print("    "))?;
                     out.queue(SetAttribute(Attribute::Dim))?;
                     out.queue(SetForegroundColor(Color::White))?;
-                    let cmd_preview = if wf.command.len() > (self.terminal_width as usize - 6) {
-                        format!("{}…", &wf.command[..(self.terminal_width as usize - 7)])
-                    } else {
-                        wf.command.clone()
-                    };
+                    let (cmd_preview, _) = history_panel_text(
+                        &wf.command,
+                        (self.terminal_width as usize).saturating_sub(6),
+                    );
                     out.queue(Print(&cmd_preview))?;
                     out.queue(ResetColor)?;
                     out.queue(Print("\r\n"))?;
@@ -1962,7 +2001,7 @@ impl Editor {
     fn prev_word_boundary(&self) -> usize {
         let buf = &self.buffer[..self.cursor];
         let trimmed = buf.trim_end();
-        match trimmed.rfind(|c: char| c == ' ' || c == '\t' || c == '/') {
+        match trimmed.rfind([' ', '\t', '/']) {
             Some(pos) => pos + 1,
             None => 0,
         }
@@ -2200,6 +2239,8 @@ fn bounded_ai_execution_output(output: String) -> String {
 }
 
 fn format_ai_error(error: &str) -> String {
+    use std::fmt::Write as _;
+
     let mut clean = String::new();
     let mut in_escape = false;
     for ch in error.chars() {
@@ -2211,9 +2252,13 @@ fn format_ai_error(error: &str) -> String {
         }
         if ch == '\x1b' {
             in_escape = true;
-        } else if ch.is_control() {
+        } else if crate::terminal_text::is_terminal_ambiguous(ch) {
             if ch.is_whitespace() {
                 clean.push(' ');
+            } else if u32::from(ch) <= 0x7f {
+                let _ = write!(clean, "\\x{:02x}", u32::from(ch));
+            } else {
+                let _ = write!(clean, "\\u{{{:x}}}", u32::from(ch));
             }
         } else {
             clean.push(ch);
@@ -2255,6 +2300,65 @@ fn compute_indent(buffer: &str) -> usize {
         }
     }
     depth.max(0) as usize
+}
+
+/// Render one-line history UI text without emitting terminal controls,
+/// invisible Unicode formatting, or embedded newlines. Fragments retain the
+/// source character's match state so fuzzy-search highlighting remains exact
+/// even when one source character expands to an escape such as `\\u{202e}`.
+fn history_panel_fragments(
+    value: &str,
+    matched_indices: &[usize],
+    max_width: usize,
+) -> (Vec<(String, bool)>, usize) {
+    let mut fragments = Vec::new();
+    let mut width = 0usize;
+    let mut chars = value.chars().enumerate().peekable();
+    let mut truncated = false;
+
+    while let Some((index, ch)) = chars.next() {
+        let fragment = match ch {
+            '\n' => "\\n".to_string(),
+            '\t' => "\\t".to_string(),
+            '\r' => "\\r".to_string(),
+            ch if crate::terminal_text::is_terminal_ambiguous(ch) && u32::from(ch) <= 0x7f => {
+                format!("\\x{:02x}", u32::from(ch))
+            }
+            ch if crate::terminal_text::is_terminal_ambiguous(ch) => {
+                format!("\\u{{{:x}}}", u32::from(ch))
+            }
+            ch => ch.to_string(),
+        };
+        let fragment_width = display_width_raw(&fragment);
+        let ellipsis_reserve = usize::from(chars.peek().is_some());
+        if width
+            .saturating_add(fragment_width)
+            .saturating_add(ellipsis_reserve)
+            > max_width
+        {
+            truncated = true;
+            break;
+        }
+        width += fragment_width;
+        fragments.push((fragment, matched_indices.contains(&index)));
+    }
+
+    if truncated && width < max_width {
+        fragments.push(("…".to_string(), false));
+        width += 1;
+    }
+    (fragments, width)
+}
+
+fn history_panel_text(value: &str, max_width: usize) -> (String, usize) {
+    let (fragments, width) = history_panel_fragments(value, &[], max_width);
+    (
+        fragments
+            .into_iter()
+            .map(|(fragment, _)| fragment)
+            .collect(),
+        width,
+    )
 }
 
 /// Calculate display width of a string, stripping ANSI escape sequences.
@@ -2337,7 +2441,7 @@ mod tests {
         editor.ai_pending = true;
 
         editor.apply_ai_response(AiResponse::Error(
-            "\x1b[31mservice unavailable\x1b[0m\ntry again".to_string(),
+            "\x1b[31mservice unavailable\x1b[0m\ntry again\u{202e}\u{200b}".to_string(),
         ));
 
         assert_eq!(editor.buffer, "# list project files");
@@ -2345,7 +2449,7 @@ mod tests {
         assert_eq!(editor.suggestion.as_deref(), Some(" previous suggestion"));
         assert_eq!(
             editor.ai_error.as_deref(),
-            Some("AI error: service unavailable try again")
+            Some("AI error: service unavailable try again\\u{202e}\\u{200b}")
         );
         assert!(!editor.ai_pending);
     }
@@ -2420,5 +2524,24 @@ mod tests {
         let output = "x".repeat(MAX_AI_EXECUTION_OUTPUT_BYTES);
 
         assert_eq!(bounded_ai_execution_output(output.clone()), output);
+    }
+
+    #[test]
+    fn history_panel_escapes_controls_bidi_and_multiline_without_utf8_slicing() {
+        let hostile = "雪\x1b\u{202e}\nend";
+        let (display, width) = history_panel_text(hostile, 80);
+
+        assert_eq!(display, "雪\\x1b\\u{202e}\\nend");
+        assert_eq!(width, display_width_raw(&display));
+        assert!(!display.contains('\x1b'));
+        assert!(!display.contains('\u{202e}'));
+        assert!(!display.contains('\n'));
+
+        let (truncated, truncated_width) = history_panel_text("雪雪雪", 3);
+        assert_eq!(truncated, "雪…");
+        assert_eq!(truncated_width, 3);
+
+        let (fragments, _) = history_panel_fragments("a\u{202e}", &[1], 40);
+        assert_eq!(fragments[1], ("\\u{202e}".to_string(), true));
     }
 }

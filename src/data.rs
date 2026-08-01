@@ -2,7 +2,21 @@
 /// Provides CSV, JSON, filtering, aggregation, and transformation utilities
 use crate::environment::ShellState;
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal};
+
+fn for_each_stdin_line(command: &str, mut consume: impl FnMut(String)) -> i32 {
+    let stdin = std::io::stdin();
+    for result in stdin.lock().lines() {
+        match result {
+            Ok(line) => consume(line),
+            Err(error) => {
+                eprintln!("jsh: {command}: stdin: {error}");
+                return 1;
+            }
+        }
+    }
+    0
+}
 
 /// filter - Keep only lines matching a pattern
 pub fn builtin_filter(args: &[String]) -> i32 {
@@ -16,17 +30,11 @@ pub fn builtin_filter(args: &[String]) -> i32 {
     }
 
     let pattern = &args[0];
-    use std::io::BufRead;
-
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            if line.contains(pattern) {
-                println!("{}", line);
-            }
+    for_each_stdin_line("filter", |line| {
+        if line.contains(pattern) {
+            println!("{}", line);
         }
-    }
-    0
+    })
 }
 
 /// map - Transform each line using a pattern
@@ -41,21 +49,15 @@ pub fn builtin_map(args: &[String]) -> i32 {
     }
 
     let _pattern = &args[0];
-    use std::io::BufRead;
-
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            // Simple substitution: replace {x} with field x
-            let mut result = line.clone();
-            for (i, field) in line.split_whitespace().enumerate() {
-                let placeholder = format!("{{{}}}", i);
-                result = result.replace(&placeholder, field);
-            }
-            println!("{}", result);
+    for_each_stdin_line("map", |line| {
+        // Simple substitution: replace {x} with field x
+        let mut result = line.clone();
+        for (i, field) in line.split_whitespace().enumerate() {
+            let placeholder = format!("{{{}}}", i);
+            result = result.replace(&placeholder, field);
         }
-    }
-    0
+        println!("{}", result);
+    })
 }
 
 /// group-by - Group lines by a field
@@ -77,21 +79,20 @@ pub fn builtin_group_by(args: &[String], _state: &mut ShellState) -> i32 {
         }
     };
 
-    use std::io::BufRead;
     let mut groups: HashMap<String, Vec<String>> = HashMap::new();
 
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let key = if field_idx < fields.len() {
-                fields[field_idx].to_string()
-            } else {
-                "unknown".to_string()
-            };
+    let status = for_each_stdin_line("group-by", |line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let key = if field_idx < fields.len() {
+            fields[field_idx].to_string()
+        } else {
+            "unknown".to_string()
+        };
 
-            groups.entry(key).or_insert_with(Vec::new).push(line);
-        }
+        groups.entry(key).or_default().push(line);
+    });
+    if status != 0 {
+        return status;
     }
 
     for (key, lines) in groups {
@@ -122,22 +123,15 @@ pub fn builtin_select(args: &[String]) -> i32 {
         return 1;
     }
 
-    use std::io::BufRead;
+    for_each_stdin_line("select", |line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let selected: Vec<&str> = indices
+            .iter()
+            .filter_map(|&i| fields.get(i).copied())
+            .collect();
 
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let selected: Vec<&str> = indices
-                .iter()
-                .filter_map(|&i| fields.get(i).copied())
-                .collect();
-
-            println!("{}", selected.join(" "));
-        }
-    }
-
-    0
+        println!("{}", selected.join(" "));
+    })
 }
 
 /// uniq - Remove duplicate consecutive lines
@@ -148,28 +142,26 @@ pub fn builtin_uniq(args: &[String]) -> i32 {
     }
     let count = args.iter().any(|a| a == "-c");
 
-    use std::io::BufRead;
-
-    let stdin = std::io::stdin();
     let mut prev = String::new();
     let mut count_val = 0;
 
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            if line == prev {
-                count_val += 1;
-            } else {
-                if !prev.is_empty() {
-                    if count {
-                        println!("{} {}", count_val, prev);
-                    } else {
-                        println!("{}", prev);
-                    }
+    let status = for_each_stdin_line("uniq", |line| {
+        if line == prev {
+            count_val += 1;
+        } else {
+            if !prev.is_empty() {
+                if count {
+                    println!("{} {}", count_val, prev);
+                } else {
+                    println!("{}", prev);
                 }
-                prev = line;
-                count_val = 1;
             }
+            prev = line;
+            count_val = 1;
         }
+    });
+    if status != 0 {
+        return status;
     }
 
     if !prev.is_empty() {
@@ -189,10 +181,11 @@ pub fn builtin_shuffle(_args: &[String]) -> i32 {
         eprintln!("shuffle: requires piped input, e.g.: cat file | shuffle");
         return 1;
     }
-    use std::io::BufRead;
-
-    let stdin = std::io::stdin();
-    let mut lines: Vec<String> = stdin.lock().lines().filter_map(Result::ok).collect();
+    let mut lines = Vec::new();
+    let status = for_each_stdin_line("shuffle", |line| lines.push(line));
+    if status != 0 {
+        return status;
+    }
 
     // Simple shuffle using XORShift
     let seed = std::time::SystemTime::now()
@@ -221,18 +214,11 @@ pub fn builtin_dedupe(_args: &[String]) -> i32 {
         return 1;
     }
     use std::collections::HashSet;
-    use std::io::BufRead;
-
-    let stdin = std::io::stdin();
     let mut seen = HashSet::new();
 
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            if seen.insert(line.clone()) {
-                println!("{}", line);
-            }
+    for_each_stdin_line("dedupe", |line| {
+        if seen.insert(line.clone()) {
+            println!("{}", line);
         }
-    }
-
-    0
+    })
 }

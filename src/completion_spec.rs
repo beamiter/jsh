@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+const MAX_SPEC_FILE_BYTES: usize = 1024 * 1024;
+const MAX_SPEC_FILES: usize = 256;
+const MAX_SPECS: usize = 4096;
+const MAX_SPEC_NODES: usize = 4096;
+const MAX_SPEC_DEPTH: usize = 32;
+const MAX_SPEC_COLLECTION: usize = 1024;
+const MAX_SPEC_TEXT_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandSpec {
     pub name: String,
@@ -76,6 +84,12 @@ pub struct SpecRegistry {
     user_dir: PathBuf,
 }
 
+impl Default for SpecRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SpecRegistry {
     pub fn new() -> Self {
         let user_dir = dirs::home_dir()
@@ -104,7 +118,9 @@ impl SpecRegistry {
 
         for (name, json) in builtin_specs {
             if let Ok(spec) = serde_json::from_str::<CommandSpec>(json) {
-                self.specs.insert(name.to_string(), spec);
+                if command_spec_is_safe_and_bounded(&spec) {
+                    self.specs.insert(name.to_string(), spec);
+                }
             }
         }
     }
@@ -114,12 +130,19 @@ impl SpecRegistry {
             return;
         }
         if let Ok(entries) = std::fs::read_dir(&self.user_dir) {
-            for entry in entries.flatten() {
+            for entry in entries.flatten().take(MAX_SPEC_FILES) {
                 let path = entry.path();
                 if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
+                    if self.specs.len() >= MAX_SPECS {
+                        break;
+                    }
+                    if let Ok(content) =
+                        crate::io_guard::read_regular_text(&path, MAX_SPEC_FILE_BYTES)
+                    {
                         if let Ok(spec) = serde_json::from_str::<CommandSpec>(&content) {
-                            self.specs.insert(spec.name.clone(), spec);
+                            if command_spec_is_safe_and_bounded(&spec) {
+                                self.specs.insert(spec.name.clone(), spec);
+                            }
                         }
                     }
                 }
@@ -174,6 +197,72 @@ impl SpecRegistry {
             depth,
         })
     }
+}
+
+fn safe_spec_text(value: &str) -> bool {
+    value.len() <= MAX_SPEC_TEXT_BYTES && crate::terminal_text::is_safe_inline(value)
+}
+
+fn safe_optional_text(value: Option<&str>) -> bool {
+    value.is_none_or(safe_spec_text)
+}
+
+fn safe_args(args: &[ArgSpec]) -> bool {
+    args.len() <= MAX_SPEC_COLLECTION
+        && args.iter().all(|arg| {
+            safe_optional_text(arg.name.as_deref())
+                && safe_optional_text(arg.description.as_deref())
+                && arg.suggestions.len() <= MAX_SPEC_COLLECTION
+                && arg.suggestions.iter().all(|value| safe_spec_text(value))
+                && match &arg.template {
+                    ArgTemplate::Generator(command) => safe_spec_text(command),
+                    _ => true,
+                }
+        })
+}
+
+fn safe_options(options: &[OptionSpec]) -> bool {
+    options.len() <= MAX_SPEC_COLLECTION
+        && options.iter().all(|option| {
+            !option.names.is_empty()
+                && option.names.len() <= MAX_SPEC_COLLECTION
+                && option.names.iter().all(|name| safe_spec_text(name))
+                && safe_optional_text(option.description.as_deref())
+                && safe_args(&option.args)
+                && option.exclusive_on.len() <= MAX_SPEC_COLLECTION
+                && option
+                    .exclusive_on
+                    .iter()
+                    .all(|value| safe_spec_text(value))
+        })
+}
+
+fn safe_subcommands(subcommands: &[SubcommandSpec], depth: usize, nodes: &mut usize) -> bool {
+    if depth > MAX_SPEC_DEPTH || subcommands.len() > MAX_SPEC_COLLECTION {
+        return false;
+    }
+    for subcommand in subcommands {
+        *nodes = nodes.saturating_add(1);
+        if *nodes > MAX_SPEC_NODES
+            || !safe_spec_text(&subcommand.name)
+            || !safe_optional_text(subcommand.description.as_deref())
+            || !safe_options(&subcommand.options)
+            || !safe_args(&subcommand.args)
+            || !safe_subcommands(&subcommand.subcommands, depth + 1, nodes)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn command_spec_is_safe_and_bounded(spec: &CommandSpec) -> bool {
+    let mut nodes = 1usize;
+    safe_spec_text(&spec.name)
+        && safe_optional_text(spec.description.as_deref())
+        && safe_options(&spec.options)
+        && safe_args(&spec.args)
+        && safe_subcommands(&spec.subcommands, 1, &mut nodes)
 }
 
 pub struct CompletionContext<'a> {
@@ -238,4 +327,23 @@ pub enum SpecCompletionKind {
     Subcommand,
     Option,
     Argument,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_completion_spec_text_is_rejected() {
+        let mut spec = CommandSpec {
+            name: "tool".into(),
+            description: Some("safe".into()),
+            subcommands: Vec::new(),
+            options: Vec::new(),
+            args: Vec::new(),
+        };
+        assert!(command_spec_is_safe_and_bounded(&spec));
+        spec.description = Some("hidden\u{2066}text".into());
+        assert!(!command_spec_is_safe_and_bounded(&spec));
+    }
 }

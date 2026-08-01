@@ -201,10 +201,24 @@ fn send_notification(command: &str, exit_code: i32, elapsed: Duration) {
         &body,
         crate::osc::notify_osc777,
         |summary, body| {
-            std::process::Command::new("notify-send")
-                .args([summary, body])
-                .spawn()
-                .ok();
+            let summary = summary.to_string();
+            let body = body.to_string();
+            let _ = std::thread::Builder::new()
+                .name("jsh-notify-send".to_string())
+                .spawn(move || {
+                    let Some(notify_send) = crate::io_guard::automatic_system_helper("notify-send")
+                    else {
+                        return;
+                    };
+                    let mut command = std::process::Command::new(notify_send);
+                    command.args([summary, body]);
+                    let _ = crate::io_guard::bounded_command_output(
+                        &mut command,
+                        16 * 1024,
+                        16 * 1024,
+                        Duration::from_secs(10),
+                    );
+                });
         },
     );
 }

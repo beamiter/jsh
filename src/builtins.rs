@@ -295,10 +295,20 @@ fn run_value_builtin_in_fork(
     state: &mut ShellState,
 ) -> i32 {
     use crate::pipeline_data::PipelineData;
-    use std::io::{Read, Write};
+    use std::io::Write;
+    const MAX_VALUE_PIPE_INPUT_BYTES: usize = 64 * 1024 * 1024;
     let mut buf = Vec::new();
     if !std::io::stdin().is_terminal() {
-        let _ = std::io::stdin().lock().read_to_end(&mut buf);
+        buf = match crate::io_guard::read_to_end_bounded(
+            std::io::stdin().lock(),
+            MAX_VALUE_PIPE_INPUT_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("jsh: value pipeline stdin: {error}");
+                return 1;
+            }
+        };
     }
     let input = if buf.is_empty() {
         PipelineData::Empty
@@ -883,6 +893,8 @@ fn command_describe(names: &[String], verbose: bool, state: &ShellState) -> i32 
 /// Use bash to source a script file when jsh's parser can't handle it,
 /// then reload environment variables and simple functions back into jsh.
 fn source_via_bash(path: &str, source_args: &[String], state: &mut ShellState) -> i32 {
+    const MAX_SOURCE_HELPER_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_SOURCE_HELPER_STDERR_BYTES: usize = 1024 * 1024;
     // Create a bash script that sources the file and outputs environment variables
     let bash_script = r#"
 set -a
@@ -900,21 +912,33 @@ declare -F | awk '{print $3}'
 "#;
 
     // Execute bash script to capture the environment
-    let mut command = std::process::Command::new("bash");
+    let Some(bash) = crate::io_guard::automatic_system_helper("bash") else {
+        eprintln!("jsh: source: no trusted system Bash is available");
+        return 1;
+    };
+    let mut command = std::process::Command::new(bash);
     command
         .arg("-c")
         .arg(bash_script)
         .arg("jsh-source")
         .arg(path)
         .args(source_args);
-    match command.output() {
+    match crate::io_guard::bounded_command_output(
+        &mut command,
+        MAX_SOURCE_HELPER_OUTPUT_BYTES,
+        MAX_SOURCE_HELPER_STDERR_BYTES,
+        std::time::Duration::from_secs(300),
+    ) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
 
             // If bash had errors, print them but continue
             if !stderr.is_empty() && !stderr.contains("warning") {
-                eprintln!("jsh: bash source warnings: {}", stderr.trim());
+                eprintln!(
+                    "jsh: bash source warnings: {}",
+                    crate::terminal_text::escape_inline(stderr.trim(), 16 * 1024)
+                );
             }
 
             // Parse exported variables from bash output
@@ -1003,7 +1027,10 @@ fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
     state.set_array("BASH_SOURCE", frames);
 
     state.return_depth += 1;
-    let result = match std::fs::read_to_string(&resolved_path) {
+    let result = match crate::io_guard::read_regular_text(
+        std::path::Path::new(&resolved_path),
+        16 * 1024 * 1024,
+    ) {
         Ok(content) => {
             match parser::parse(&content) {
                 Ok(commands) => {
@@ -1140,12 +1167,7 @@ fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
         std::io::stderr().flush().ok();
     }
 
-    if silent {
-        std::process::Command::new("stty")
-            .arg("-echo")
-            .status()
-            .ok();
-    }
+    let echo_guard = silent.then(StdinEchoGuard::disable).flatten();
 
     let result = if let Some(count) = exact_count {
         // Read exactly N characters
@@ -1158,12 +1180,38 @@ fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
         read_line_with_delimiter(delim, raw, &var_names, read_array, state)
     };
 
+    drop(echo_guard);
     if silent {
-        std::process::Command::new("stty").arg("echo").status().ok();
         eprintln!();
     }
 
     result
+}
+
+/// Restores the exact terminal mode even when a silent read exits early.
+struct StdinEchoGuard(nix::sys::termios::Termios);
+
+impl StdinEchoGuard {
+    fn disable() -> Option<Self> {
+        use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
+
+        let stdin = std::io::stdin();
+        let original = tcgetattr(&stdin).ok()?;
+        let mut hidden = original.clone();
+        hidden.local_flags.remove(LocalFlags::ECHO);
+        tcsetattr(&stdin, SetArg::TCSANOW, &hidden).ok()?;
+        Some(Self(original))
+    }
+}
+
+impl Drop for StdinEchoGuard {
+    fn drop(&mut self) {
+        let _ = nix::sys::termios::tcsetattr(
+            std::io::stdin(),
+            nix::sys::termios::SetArg::TCSANOW,
+            &self.0,
+        );
+    }
 }
 
 fn read_exact_chars(
@@ -2155,7 +2203,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
     fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> Result<(), String> {
         unsafe {
             match nix::libc::dup2(oldfd, newfd) {
-                -1 => Err(format!("dup2 failed")),
+                -1 => Err("dup2 failed".to_string()),
                 _ => Ok(()),
             }
         }
@@ -2210,7 +2258,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                 match File::open(target) {
                     Ok(file) => {
                         let src_fd = file.into_raw_fd();
-                        if let Err(_) = dup2_raw(src_fd, fd) {
+                        if dup2_raw(src_fd, fd).is_err() {
                             eprintln!("jsh: exec: dup2 failed");
                             return 1;
                         }
@@ -2229,7 +2277,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                 match File::create(target) {
                     Ok(file) => {
                         let src_fd = file.into_raw_fd();
-                        if let Err(_) = dup2_raw(src_fd, fd) {
+                        if dup2_raw(src_fd, fd).is_err() {
                             eprintln!("jsh: exec: dup2 failed");
                             return 1;
                         }
@@ -2248,7 +2296,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                 match OpenOptions::new().create(true).append(true).open(target) {
                     Ok(file) => {
                         let src_fd = file.into_raw_fd();
-                        if let Err(_) = dup2_raw(src_fd, fd) {
+                        if dup2_raw(src_fd, fd).is_err() {
                             eprintln!("jsh: exec: dup2 failed");
                             return 1;
                         }
@@ -2270,7 +2318,7 @@ fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
                     // Duplicate FD
                     match target.parse::<i32>() {
                         Ok(target_fd) => {
-                            if let Err(_) = dup2_raw(target_fd, fd) {
+                            if dup2_raw(target_fd, fd).is_err() {
                                 eprintln!("jsh: exec: dup2 failed");
                                 return 1;
                             }
@@ -2779,24 +2827,38 @@ fn builtin_declare(args: &[String], state: &mut ShellState) -> i32 {
         };
 
         if associative {
-            if !state.assoc_arrays.contains_key(var_name) {
-                state
-                    .assoc_arrays
-                    .insert(var_name.to_string(), std::collections::HashMap::new());
-            }
-
             // Parse initialization value like: ([key1]=val1 [key2]=val2)
-            if let Some(val) = value {
-                if val.starts_with('(') && val.ends_with(')') {
+            match value {
+                Some(val) if val.starts_with('(') && val.ends_with(')') => {
                     let inner = &val[1..val.len() - 1].trim();
-                    parse_assoc_array_init(var_name, inner, state);
-                } else if !val.is_empty() && !val.starts_with('(') {
+                    match parse_assoc_array_init(inner) {
+                        Ok(values) => {
+                            state
+                                .assoc_arrays
+                                .entry(var_name.to_string())
+                                .or_default()
+                                .extend(values);
+                        }
+                        Err(error) => {
+                            eprintln!("jsh: declare: {var_name}: {error}");
+                            return 1;
+                        }
+                    }
+                }
+                Some(val) if val.starts_with('(') => {
+                    eprintln!("jsh: declare: {var_name}: unterminated array initializer");
+                    return 1;
+                }
+                Some(val) if !val.is_empty() => {
                     // Handle single value assignment (rare for assoc arrays)
                     state
                         .assoc_arrays
-                        .get_mut(var_name)
-                        .unwrap()
+                        .entry(var_name.to_string())
+                        .or_default()
                         .insert("0".to_string(), val.to_string());
+                }
+                _ => {
+                    state.assoc_arrays.entry(var_name.to_string()).or_default();
                 }
             }
         } else if indexed {
@@ -2830,70 +2892,73 @@ fn builtin_declare(args: &[String], state: &mut ShellState) -> i32 {
     0
 }
 
-fn parse_assoc_array_init(var_name: &str, input: &str, state: &mut ShellState) {
+fn parse_assoc_array_init(
+    input: &str,
+) -> Result<std::collections::HashMap<String, String>, &'static str> {
     // Parse input like: [key1]=val1 [key2]=val2
     let mut current = input;
-    while !current.is_empty() {
+    let mut values = std::collections::HashMap::new();
+    loop {
         current = current.trim_start();
+        if current.is_empty() {
+            return Ok(values);
+        }
         if !current.starts_with('[') {
-            break;
+            return Err("expected '[key]=value' in associative-array initializer");
         }
 
         // Find closing bracket
         if let Some(bracket_end) = current.find(']') {
             let key = &current[1..bracket_end];
+            if key.is_empty() {
+                return Err("associative-array key cannot be empty");
+            }
             let rest = &current[bracket_end + 1..];
 
             // Skip = sign
-            if rest.starts_with('=') {
-                let value_part = &rest[1..].trim_start();
+            if let Some(value_part) = rest.strip_prefix('=') {
+                let value_part = value_part.trim_start();
 
                 // Extract value (quoted or unquoted)
-                let (value, next_pos) = if value_part.starts_with('"') {
+                let (value, next_pos) = if let Some(quoted) = value_part.strip_prefix('"') {
                     // Quoted value
                     let mut escaped = false;
-                    let mut end_pos = 1;
-                    for (i, ch) in value_part[1..].char_indices() {
+                    let mut closing_quote = None;
+                    for (i, ch) in quoted.char_indices() {
                         if escaped {
                             escaped = false;
                         } else if ch == '\\' {
                             escaped = true;
                         } else if ch == '"' {
-                            end_pos = i + 2;
+                            closing_quote = Some(i);
                             break;
                         }
                     }
-                    let val = &value_part[1..end_pos - 1];
-                    (val.to_string(), end_pos)
-                } else if value_part.starts_with('\'') {
+                    let Some(end) = closing_quote else {
+                        return Err("unterminated double-quoted value");
+                    };
+                    (quoted[..end].to_string(), end + 2)
+                } else if let Some(quoted) = value_part.strip_prefix('\'') {
                     // Single-quoted value
-                    if let Some(end) = value_part[1..].find('\'') {
-                        let val = &value_part[1..end + 1];
-                        (val.to_string(), end + 2)
+                    if let Some(end) = quoted.find('\'') {
+                        (quoted[..end].to_string(), end + 2)
                     } else {
-                        break;
+                        return Err("unterminated single-quoted value");
                     }
                 } else {
                     // Unquoted value (until space or next bracket)
-                    let end_pos = value_part
-                        .find(|c: char| c == ' ' || c == '[')
-                        .unwrap_or(value_part.len());
+                    let end_pos = value_part.find([' ', '[']).unwrap_or(value_part.len());
                     (value_part[..end_pos].to_string(), end_pos)
                 };
 
-                // Store in associative array
-                state
-                    .assoc_arrays
-                    .get_mut(var_name)
-                    .unwrap()
-                    .insert(key.to_string(), value);
+                values.insert(key.to_string(), value);
 
                 current = &value_part[next_pos..];
             } else {
-                break;
+                return Err("expected '=' after associative-array key");
             }
         } else {
-            break;
+            return Err("unterminated associative-array key");
         }
     }
 }
@@ -3351,13 +3416,10 @@ fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
     use nix::unistd::Pid;
 
     if args.is_empty() {
-        loop {
-            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
-                    state.jobs.jobs.retain(|j| j.pid != pid);
-                }
-                _ => break,
-            }
+        while let Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) =
+            waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
+        {
+            state.jobs.jobs.retain(|j| j.pid != pid);
         }
         return state.last_exit_code;
     }
@@ -3731,14 +3793,20 @@ fn builtin_bookmark(args: &[String], state: &mut ShellState) -> i32 {
                     return 1;
                 }
             };
-            let path = args.get(2).map(|p| p.clone()).unwrap_or_else(|| {
+            let path = args.get(2).cloned().unwrap_or_else(|| {
                 std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| ".".to_string())
             });
             if let Ok(mut db) = crate::bookmarks::get_bookmark_db().lock() {
-                db.add(&name, &path);
-                println!("Bookmark '{}' -> {}", name, path);
+                if !db.add(&name, &path) {
+                    return 1;
+                }
+                println!(
+                    "Bookmark '{}' -> {}",
+                    crate::terminal_text::escape_inline(&name, 16 * 1024),
+                    crate::terminal_text::escape_inline(&path, 16 * 1024)
+                );
             }
             0
         }

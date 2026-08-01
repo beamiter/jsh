@@ -34,6 +34,8 @@ pub struct Shell {
     execution_seq: u64,
 }
 
+pub(crate) const MAX_PROGRAM_BYTES: usize = 64 * 1024 * 1024;
+
 fn execute_text(source: &str, state: &mut ShellState) -> i32 {
     match parser::parse(source) {
         Ok(commands) => executor::execute_program(&commands, state),
@@ -68,6 +70,13 @@ enum ProgramReadError {
 /// Any bytes received before a terminating signal are intentionally discarded:
 /// a shell must never execute a truncated program.
 fn read_program_interruptibly(mut reader: impl Read) -> Result<String, ProgramReadError> {
+    read_program_interruptibly_with_limit(&mut reader, MAX_PROGRAM_BYTES)
+}
+
+fn read_program_interruptibly_with_limit(
+    mut reader: impl Read,
+    max_bytes: usize,
+) -> Result<String, ProgramReadError> {
     let mut input = Vec::new();
     let mut buffer = [0_u8; 8192];
 
@@ -77,7 +86,15 @@ fn read_program_interruptibly(mut reader: impl Read) -> Result<String, ProgramRe
         }
         match reader.read(&mut buffer) {
             Ok(0) => break,
-            Ok(read) => input.extend_from_slice(&buffer[..read]),
+            Ok(read) => {
+                if input.len().saturating_add(read) > max_bytes {
+                    return Err(ProgramReadError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("program exceeds the {max_bytes} byte limit"),
+                    )));
+                }
+                input.extend_from_slice(&buffer[..read]);
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 if let Some(status) = signal::take_pending_status() {
                     return Err(ProgramReadError::Signaled(status));
@@ -341,6 +358,12 @@ fn run_exit_trap(state: &mut ShellState) -> i32 {
     state.abort_current_program = prior_abort;
     state.last_exit_code = final_status;
     final_status
+}
+
+impl Default for Shell {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Shell {
@@ -736,5 +759,11 @@ mod tests {
             resolve_script_in(Path::new("onpath.sh"), None),
             PathBuf::from("onpath.sh")
         );
+    }
+
+    #[test]
+    fn complete_program_reads_are_bounded_before_parsing() {
+        let error = read_program_interruptibly_with_limit(&b"12345"[..], 4).unwrap_err();
+        assert!(matches!(error, ProgramReadError::Io(_)));
     }
 }
