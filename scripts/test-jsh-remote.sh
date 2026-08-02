@@ -244,15 +244,37 @@ indent "${out}"
 assert "exit nonzero" [ ${rc} -ne 0 ]
 assert "names what it got" matches "${out}" 'reports 9\.9\.9'
 
-echo "== --no-deploy falls back, or fails on request =="
-out="$(run --no-deploy 2>&1)"
+echo "== when nothing can be deployed, shell integration is the middle tier =="
+# Deployment needs a directory that can execute a file; integration needs one
+# that can merely be written to, because `bash --rcfile` reads its argument and
+# never runs it. That is a whole extra tier on a noexec destination, and the
+# terminal keeps blocks, cwd tracking and exit codes even though jsh is absent.
+printf 'echo DESTINATION_BASHRC_RAN\n' > "${CTR_HOME}/.bashrc"
+out="$(run --no-deploy -v 2>&1)"
 rc=$?
 indent "${out}"
-assert "falls back to the container shell" matches "${out}" 'falling back to the destination.s own shell'
+assert "exit 0" [ ${rc} -eq 0 ]
+assert "announces the tier" matches "${out}" 'falling back to shell integration'
+assert "starts the destination's own bash" matches "${out}" 'with shell integration'
+assert "the destination's bashrc still runs" matches "${out}" 'DESTINATION_BASHRC_RAN'
+assert "no jsh was pushed" lacks "${out}" 'pushing .*/jsh'
+assert "sandbox torn down" [ -z "$(ctr_sandboxes)" ]
+assert "no rc file survives" [ -z "$(find "${CTR_HOME}" -name 'integration.bash' 2> /dev/null)" ]
+assert "the destination's bashrc is untouched" \
+    [ "$(cat "${CTR_HOME}/.bashrc")" = "echo DESTINATION_BASHRC_RAN" ]
+
+echo "== the other two fallbacks are still available =="
+out="$(run --no-deploy --fallback bash 2>&1)"
+indent "${out}"
+assert "plain shell on request" matches "${out}" 'falling back to the destination.s own shell'
+assert "no integration rc is pushed" lacks "${out}" 'shell integration'
 out="$(run --no-deploy --fallback fail 2>&1)"
 rc=$?
 assert "exit nonzero with --fallback fail" [ ${rc} -ne 0 ]
 assert "states the reason" matches "${out}" 'no-deploy'
+out="$(run --no-deploy --fallback sideways 2>&1)"
+assert "an unknown tier is refused" matches "${out}" 'expected integration, bash, or fail'
+rm -f "${CTR_HOME}/.bashrc"
 
 echo "== an abandoned sandbox is swept, a live one is not =="
 # Sweeping happens in the directory the launcher actually chose, which in

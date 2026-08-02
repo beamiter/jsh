@@ -159,6 +159,30 @@ a newline-safe JSONL format while retaining compatibility with the previous
 tab-separated format. Session snapshots exclude process-specific variables and
 names that look like credentials, tokens, passwords, or secrets.
 
+### Helper programs
+
+A few features start a system program: `bash` for the `~/.bashrc` import and for
+`source` of a script jsh's own parser cannot read, `git` for the prompt, and
+`notify-send` for background-job notifications. jsh looks for these at fixed
+absolute paths and never through `PATH`, which is mutable shell state any
+sourced script can rewrite.
+
+On a layout that does not use those paths — Nix, a Homebrew-style prefix, an
+immutable root — say where the program is:
+
+```sh
+export JSH_HELPER_GIT=/run/current-system/sw/bin/git
+export JSH_HELPER_BASH=/run/current-system/sw/bin/bash
+export JSH_HELPER_NOTIFY_SEND=/run/current-system/sw/bin/notify-send
+```
+
+The variable name is `JSH_HELPER_` plus the program name uppercased, with `-`
+becoming `_`. The path must be absolute and, after symlinks are resolved, must
+be an executable file that no third party can replace — neither it nor any
+directory above it may be group- or world-writable or owned by another user.
+A path that fails those checks disables that integration and says so once; it
+does not quietly fall back to a different binary than the one you named.
+
 ## Remote hosts and containers
 
 `scripts/jsh-remote.sh` runs jsh on a machine that does not have jsh installed.
@@ -200,10 +224,20 @@ still cannot escape it. Set it yourself and the same split applies; leave it
 unset, or set it to something that is not an existing absolute directory, and
 nothing changes.
 
+When a destination cannot execute a file at all — everything writable is
+mounted `noexec` — there is still a middle tier, and it is the default. `bash
+--rcfile` *reads* its argument and never runs it, and `noexec` refuses `execve`
+while permitting `write`, so jsh can hand the destination's own bash a
+throwaway startup file that emits the same OSC 133 and OSC 7 marks jsh does.
+The terminal keeps blocks, cwd tracking and exit codes; jsh's completion and
+structured pipelines are not there, because jsh is not there. The destination's
+own `~/.bashrc` still runs first, and the file is deleted with the sandbox.
+`--fallback bash` asks for the unmodified shell instead, and `--fallback fail`
+refuses to connect.
+
 Useful options: `--session ID` to forward a terminal session id, `--rcfile FILE`
 to push a startup file, `--artifact FILE` to ship a binary you built yourself,
-`--dry-run` to see the plan, and `--fallback fail` to refuse the destination's
-own shell when deployment is impossible. `--help` lists the rest.
+and `--dry-run` to see the plan. `--help` lists the rest.
 
 Any of the four jterm terminals can use this without changes — run it in a pane,
 or configure it as the command for a tab.

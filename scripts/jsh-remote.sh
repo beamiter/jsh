@@ -68,7 +68,7 @@ artifact=""
 session_id=""
 rcfile=""
 no_rc=0
-fallback="bash"
+fallback="integration"
 deploy=1
 keep_sandbox=0
 docker_user=""
@@ -79,6 +79,7 @@ local_jsh=""
 
 # Filled in as the connection proceeds; the trap reads them.
 sandbox=""
+tmp_rc=""
 cleanup_done=0
 
 usage() {
@@ -104,7 +105,12 @@ Options:
   --rcfile FILE        push FILE and start from it (default in --incognito:
                        ~/.jshrc here, else the destination's ~/.bashrc)
   --no-rc              start with --norc
-  --fallback MODE      when deployment is impossible: bash (default) or fail
+  --fallback MODE      when deployment is impossible:
+                         integration (default) shell integration only, with no
+                           file executed on the destination; blocks, cwd and
+                           exit codes work, jsh's own features do not
+                         bash        the destination's own shell, unmodified
+                         fail        refuse to connect
   --no-deploy          never push; use a jsh already on the destination or fall
                        back
   --keep-sandbox       leave the sandbox behind (debugging)
@@ -221,8 +227,8 @@ done
     exit 1
 }
 case "${fallback}" in
-    bash | fail) ;;
-    *) die "unknown --fallback: ${fallback} (expected bash or fail)" ;;
+    integration | bash | fail) ;;
+    *) die "unknown --fallback: ${fallback} (expected integration, bash, or fail)" ;;
 esac
 [ "${no_rc}" -eq 0 ] || [ -z "${rcfile}" ] || die "--no-rc and --rcfile conflict"
 if [ -n "${rcfile}" ]; then
@@ -369,6 +375,7 @@ rm -rf "$d" 2>/dev/null || :
 cleanup() {
     [ "${cleanup_done}" -eq 0 ] || return 0
     cleanup_done=1
+    [ -n "${tmp_rc}" ] && rm -f "${tmp_rc}" 2> /dev/null
     [ -n "${sandbox}" ] || return 0
     if [ "${keep_sandbox}" -eq 1 ]; then
         warn "sandbox kept at ${sandbox}"
@@ -457,7 +464,21 @@ else
 fi
 for d do
     case "$d" in ""|"/.cache") continue ;; esac
+    # Writable and executable are different questions, and the difference is a
+    # whole tier of degradation. A noexec mount refuses execve; it does not
+    # refuse write(2), and `bash --rcfile FILE` only ever *reads* FILE. So a
+    # destination where nothing can be executed can still be given shell
+    # integration, which is most of what the terminal wants.
+    if [ -d "$d" ] && [ -w "$d" ]; then printf "writedir=%s\n" "$d"; fi
     if exec_ok "$d"; then printf "execdir=%s\n" "$d"; fi
+done
+
+# Integration needs a bash on the far side; ash has neither PROMPT_COMMAND nor
+# a DEBUG trap, so there is nothing to hook there.
+for b in "${BASH:-}" /bin/bash /usr/bin/bash /usr/local/bin/bash; do
+    [ -n "$b" ] && [ -x "$b" ] || continue
+    printf "bash=%s\n" "$b"
+    break
 done
 '
 
@@ -482,8 +503,11 @@ remote_jsh="$(probe_field jsh_path)"
 remote_jsh_version="$(probe_field jsh_version)"
 exec_dirs="$(printf '%s\n' "${probe_out}" | sed -n 's/^execdir=//p')"
 exec_dir="$(printf '%s\n' "${exec_dirs}" | head -1)"
+write_dir="$(printf '%s\n' "${probe_out}" | sed -n 's/^writedir=//p' | head -1)"
+remote_bash="$(probe_field bash)"
 
-note "os=${remote_os} arch=${remote_arch} home=${remote_home} execdir=${exec_dir:-none}"
+note "os=${remote_os} arch=${remote_arch} home=${remote_home}" \
+    "execdir=${exec_dir:-none} writedir=${write_dir:-none} bash=${remote_bash:-none}"
 
 # --- step 2: decide what to deploy -------------------------------------------
 
@@ -624,24 +648,6 @@ if [ "${dry_run}" -eq 1 ]; then
     exit 0
 fi
 
-# --- step 5: fall back when there is nothing to deploy -----------------------
-
-if [ -z "${reuse_existing}" ] && [ -n "${skip_reason}" ]; then
-    [ "${fallback}" = "bash" ] || die "${skip_reason}"
-    warn "${skip_reason}; falling back to the destination's own shell"
-    if [ "${transport}" = "ssh" ]; then
-        # shellcheck disable=SC2086 # ssh_opts/ssh_extra are deliberately split
-        exec ssh ${ssh_opts} ${ssh_extra} -t -- "${destination}"
-    fi
-    # shellcheck disable=SC2086 # docker_user_opt is deliberately split
-    exec docker exec -it ${docker_user_opt} "${destination}" /bin/sh -lc 'exec ${SHELL:-/bin/sh}'
-fi
-
-# --- step 6: prepare the destination -----------------------------------------
-#
-# Creates the sandbox, reports whether the cache already holds this exact
-# binary, and sweeps sandboxes whose owning process is gone.
-
 PREPARE_SCRIPT='
 set -u
 execdir="$1"
@@ -708,6 +714,120 @@ fi
 printf "binpath=%s\n" "$sandbox/jsh"
 printf "cached=0\n"
 '
+
+# --- step 5: fall back when there is nothing to deploy -----------------------
+#
+# Three tiers, not two. Deployment needs a directory that can *execute* a file;
+# integration needs one that can merely be *written* to, because `bash --rcfile`
+# reads its argument and never runs it. A noexec mount refuses execve and
+# permits write(2), so the middle tier survives exactly the case that strands
+# the first one.
+#
+# What integration buys back is the terminal half: OSC 133 blocks, cwd tracking
+# and exit codes, which come from marks a shell emits rather than from jsh
+# itself. It buys back none of jsh — no completion, no structured pipelines —
+# so it is a fallback and not an alternative.
+
+# Shell integration for a bash that has never heard of jsh. Read once by
+# --rcfile and deleted with the sandbox; nothing is installed, and the
+# destination's own ~/.bashrc still runs first so aliases and prompt survive.
+INTEGRATION_RC='# jsh remote shell integration (temporary; removed on exit)
+case $- in *i*) ;; *) return 0 ;; esac
+if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+
+# OSC 7 carries a file:// URI, so the path is percent-encoded exactly as
+# jsh does it. LC_ALL=C makes ${s:i:1} step over bytes rather than characters,
+# which is what percent-encoding is defined in terms of.
+__jsh_url_pwd() {
+    local LC_ALL=C s=$PWD out= i c
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        case $c in
+            [-A-Za-z0-9/._~]) out+=$c ;;
+            *) printf -v c "%%%02X" "$(printf "%d" "'"'"'$c")"; out+=$c ;;
+        esac
+    done
+    printf "%s" "$out"
+}
+
+__jsh_precmd() {
+    local status=$?
+    # No D before the first command: the mark closes a block, and at the first
+    # prompt there is nothing open to close.
+    if [ -n "${__jsh_seen-}" ]; then
+        printf "\033]133;D;%s\007" "$status"
+    fi
+    __jsh_seen=1
+    printf "\033]7;file://%s%s\007" "${HOSTNAME-}" "$(__jsh_url_pwd)"
+}
+
+PROMPT_COMMAND="__jsh_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+PS1="\[\033]133;A\007\]${PS1-}\[\033]133;B\007\]"
+
+# C marks where output begins, and the block state machine needs it to leave
+# AwaitingCommand. PS0 is printed after a command is read and before it runs,
+# which is that point exactly — and unlike a DEBUG trap it fires once per
+# command line with no guards against firing for PROMPT_COMMAND itself.
+if [ "${BASH_VERSINFO[0]-0}" -gt 4 ] ||
+    { [ "${BASH_VERSINFO[0]-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]-0}" -ge 4 ]; }; then
+    PS0=$'"'"'\033]133;C\007'"'"'
+fi
+'
+
+start_integration_session() {
+    # start_integration_session -> execs, or returns 1 when this tier cannot run
+    [ "${remote_bash}" != "" ] || return 1
+    [ "${write_dir}" != "" ] || return 1
+    valid_remote_path "${remote_bash}" || return 1
+    valid_remote_path "${write_dir}" || return 1
+
+    prep_out="$(remote_sh "${PREPARE_SCRIPT}" "${write_dir}" "0" "" "0" "${remote_home}")" \
+        || return 1
+    sandbox="$(printf '%s\n' "${prep_out}" | sed -n 's/^sandbox=//p' | head -1)"
+    valid_remote_path "${sandbox}" || return 1
+    case "${sandbox}" in
+        */jsh-remote.*) ;;
+        *) return 1 ;;
+    esac
+
+    rc_path="${sandbox}/integration.bash"
+    printf '%s' "${INTEGRATION_RC}" > "${tmp_rc}" || return 1
+    remote_put "${tmp_rc}" "${rc_path}" || return 1
+
+    note "starting ${remote_bash} with shell integration on ${destination}"
+    set +e
+    remote_exec 'printf "%s\n" "$$" > "$1/pid" 2>/dev/null || :
+exec "$2" --rcfile "$3" -i' "${sandbox}" "${remote_bash}" "${rc_path}"
+    rc=$?
+    set -e
+    cleanup
+    exit "${rc}"
+}
+
+if [ -z "${reuse_existing}" ] && [ -n "${skip_reason}" ]; then
+    [ "${fallback}" != "fail" ] || die "${skip_reason}"
+    if [ "${fallback}" = "integration" ]; then
+        warn "${skip_reason}; falling back to shell integration without deploying"
+        tmp_rc="$(mktemp "${TMPDIR:-/tmp}/jsh-remote-rc.XXXXXX")" \
+            || die "cannot stage the integration rc"
+        start_integration_session \
+            || warn "shell integration is unavailable on ${destination} (needs bash and a writable directory)"
+    else
+        warn "${skip_reason}; falling back to the destination's own shell"
+    fi
+    if [ "${transport}" = "ssh" ]; then
+        # shellcheck disable=SC2086 # ssh_opts/ssh_extra are deliberately split
+        exec ssh ${ssh_opts} ${ssh_extra} -t -- "${destination}"
+    fi
+    # shellcheck disable=SC2086 # docker_user_opt is deliberately split
+    exec docker exec -it ${docker_user_opt} "${destination}" /bin/sh -lc 'exec ${SHELL:-/bin/sh}'
+fi
+
+# --- step 6: prepare the destination -----------------------------------------
+#
+# Creates the sandbox, reports whether the cache already holds this exact
+# binary, and sweeps sandboxes whose owning process is gone.
+
 
 want_cache=0
 [ "${mode}" = "persist" ] && want_cache=1
