@@ -65,8 +65,33 @@ fn source_file_lenient(path: &Path, state: &mut ShellState) {
     match parser::parse(&content) {
         Ok(commands) => {
             // Execute the startup file as one program so exit, failglob, and
-            // errexit stop the remaining rc commands.
+            // errexit stop the remaining rc commands — but as a *sourced* one.
+            // Every distribution's rc opens with a guard like
+            // `[ -z "$PS1" ] && return`, and `return` there means "stop reading
+            // this file". Without the depth it is an error printed on every
+            // start of every shell whose rc was written for bash, which is all
+            // of them; `--rcfile` made that the first line of a remote session.
+            //
+            // `BASH_SOURCE` comes with that: a startup file that locates its
+            // own directory is a normal shape, and with the array empty
+            // `$(dirname "${BASH_SOURCE[0]}")` silently resolves to the
+            // working directory the shell happened to start in.
+            let outer_bash_source = state.arrays.get("BASH_SOURCE").cloned();
+            let mut frames = outer_bash_source.clone().unwrap_or_default();
+            frames.insert(0, path.display().to_string());
+            state.set_array("BASH_SOURCE", frames);
+            state.return_depth += 1;
             executor::execute_program(&commands, state);
+            state.return_depth -= 1;
+            // A return consumed here must not leak into the first command the
+            // user types, exactly as in the `source` builtin.
+            state.return_requested = false;
+            match outer_bash_source {
+                Some(frames) => state.set_array("BASH_SOURCE", frames),
+                None => {
+                    state.arrays.remove("BASH_SOURCE");
+                }
+            }
         }
         Err(_) => {
             // Full parse failed, use bash as fallback for complex scripts.

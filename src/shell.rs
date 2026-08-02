@@ -443,6 +443,15 @@ impl Shell {
         self.state.interactive = stdin_is_tty;
 
         if stdin_is_tty {
+            // jsh draws its own prompt and never reads PS1, but every rc ever
+            // written tests it — `[ -z "$PS1" ] && return` is how a startup
+            // file decides it is talking to an interactive shell. Leaving it
+            // unset makes jsh look non-interactive to the file it is about to
+            // read, so the aliases and settings below that line never load. A
+            // user's own PS1 assignment overwrites this, as it does in bash.
+            if self.state.get_var("PS1").is_none() {
+                self.state.set_var("PS1", "$ ");
+            }
             // Only interactive shells load startup configuration. A restored
             // snapshot already contains the accumulated startup state.
             if self.load_startup_config && !self.session_restored {

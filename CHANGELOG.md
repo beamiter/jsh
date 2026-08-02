@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A startup file is a sourced script. `return` at the top level of one now
+  ends the file instead of printing "can only return from a function or sourced
+  script" and reading on, and `${BASH_SOURCE[0]}` names the file rather than
+  being empty — an rc that locates itself with
+  `$(dirname "${BASH_SOURCE[0]}")` was resolving to whatever directory the
+  shell started in. `PS1` is also set for an interactive shell, because
+  `[ -z "$PS1" ] && return` is how a distribution rc asks whether anyone is
+  listening; unset, it made jsh look non-interactive to the file it was about
+  to read. Together these are what every stock `.bashrc` opens with, and
+  `jsh-remote.sh --incognito` passes exactly such a file with `--rcfile`, so a
+  container session began with an error on every start.
 - A root shell trusts the system helpers it could write. "Can the current user
   replace this binary" is a trust signal only for an unprivileged user; root
   can write every file on the system, so the automatic-helper check answered

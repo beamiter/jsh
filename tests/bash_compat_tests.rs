@@ -590,3 +590,116 @@ fn complete_registers_every_command_it_names() {
     assert!(err.is_empty(), "unexpected stderr: {}", err);
     assert_eq!(code, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Startup files are sourced scripts
+//
+// These need a real terminal because startup files only load for an
+// interactive shell, so they drive jsh through `script`'s pty and let the rc
+// itself report what it reached. Markers go to a directory named by the
+// environment rather than one the rc derives, so a test cannot pass or fail on
+// the very self-location it is checking.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn interactive_rc_session(rc_body: &str) -> (String, tempfile::TempDir) {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rc = dir.path().join("rc.bash");
+    std::fs::write(&rc, rc_body).expect("write rc");
+    let command = format!("{} --rcfile {}", jsh_bin(), rc.display());
+    let mut child = Command::new("script")
+        .args(["-qfec", &command, "/dev/null"])
+        .env("JSH_TEST_MARKERS", dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn interactive jsh");
+
+    // Long enough for the rc to finish and the editor to take the terminal,
+    // which is what makes the keystrokes below land in the line editor rather
+    // than in a terminal that is still in canonical mode.
+    std::thread::sleep(Duration::from_millis(600));
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"exit\r")
+        .expect("ask the shell to leave");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait().expect("wait for jsh") {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let out = child.wait_with_output().expect("collect jsh output");
+    (String::from_utf8_lossy(&out.stdout).into_owned(), dir)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_distribution_guard_neither_errors_nor_truncates_a_startup_file() {
+    // The two lines every stock rc opens with. Under bash neither fires in an
+    // interactive shell. jsh printed an error for the first — a startup file
+    // was executed as a program, where `return` is illegal — and read PS1 as
+    // empty, so the shell looked non-interactive to the file it was reading.
+    let (output, dir) = interactive_rc_session(
+        "[ -z \"$PS1\" ] && return\n\
+         case $- in *i*) ;; *) return;; esac\n\
+         : > \"$JSH_TEST_MARKERS/tail-reached\"\n",
+    );
+    assert!(
+        !output.contains("can only return"),
+        "startup file reported an illegal return: {output}"
+    );
+    assert!(
+        dir.path().join("tail-reached").exists(),
+        "the rc stopped at its own guard: {output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn return_in_a_startup_file_stops_reading_it() {
+    // The other half of the same semantics: `return` is not merely tolerated,
+    // it ends the file, so a guard that *does* fire skips the rest.
+    let (output, dir) = interactive_rc_session(
+        ": > \"$JSH_TEST_MARKERS/head-reached\"\n\
+         return\n\
+         : > \"$JSH_TEST_MARKERS/tail-reached\"\n",
+    );
+    assert!(
+        dir.path().join("head-reached").exists(),
+        "the rc did not run at all: {output}"
+    );
+    assert!(
+        !dir.path().join("tail-reached").exists(),
+        "return did not stop the startup file: {output}"
+    );
+    assert!(
+        !output.contains("can only return"),
+        "return was still reported as illegal: {output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_startup_file_can_locate_itself() {
+    // `$(dirname "${BASH_SOURCE[0]}")` is how an rc finds what sits next to
+    // it. With the array empty it resolved to the working directory the shell
+    // was started in, and the rc wrote its files there.
+    let (output, dir) =
+        interactive_rc_session("printf '%s' \"${BASH_SOURCE[0]}\" > \"$JSH_TEST_MARKERS/self\"\n");
+    let recorded = std::fs::read_to_string(dir.path().join("self"))
+        .unwrap_or_else(|err| panic!("rc did not record BASH_SOURCE ({err}): {output}"));
+    assert_eq!(recorded, dir.path().join("rc.bash").display().to_string());
+}
