@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- A root shell trusts the system helpers it could write. "Can the current user
+  replace this binary" is a trust signal only for an unprivileged user; root
+  can write every file on the system, so the automatic-helper check answered
+  yes for `/usr/bin/git` and `/usr/bin/bash` on every root shell and silently
+  dropped Git completion, the Git prompt, desktop notifications and the
+  `.bashrc` import. Containers run as root by default, which is where this
+  showed: the same image reached through `--docker-user` had all of it. For
+  euid 0 the question is now whether some *other* user owns the path, matching
+  the rule an explicitly configured `JSH_HELPER_*` already used. Group- and
+  world-writable is still refused for everyone, and unprivileged behaviour is
+  unchanged.
+- `jsh-remote.sh` forwards `TERM` and `COLORTERM` into a container. ssh sends
+  them for us; `docker exec` sends nothing and the daemon substitutes its own
+  default, so a container session drew in 8 colours while every other tab in
+  the same terminal drew in 16 million. Only a bare terminal name is
+  forwarded, and `LANG` deliberately is not: naming a locale the image never
+  generated is worse than inheriting none.
+
 - Retired `JSH_AGENT_AUTO_APPROVE_READONLY`: command text alone cannot prove
   that aliases, functions, Git helpers, or flag-dependent tools are read-only,
   so every Agent proposal now requires explicit approval.

@@ -53,17 +53,19 @@ indent() { printf '    %s\n' "${1//$'\n'/$'\n'    }"; }
 
 # --- stubs -------------------------------------------------------------------
 
-# `docker exec [-i|-t|-it] [-u USER] CONTAINER CMD...` -> run CMD here, with the
-# container's own HOME so the remote side really does see a different home than
-# the local side.
+# `docker exec [-i|-t|-it] [-u USER] [-e K=V]... CONTAINER CMD...` -> run CMD
+# here, with the container's own HOME so the remote side really does see a
+# different home than the local side.
 cat > "${STUB}/docker" <<EOF
 #!/bin/sh
 [ "\$1" = exec ] || { echo "stub docker: unsupported: \$*" >&2; exit 1; }
 shift
+passed=""
 while [ \$# -gt 0 ]; do
     case "\$1" in
         -i|-t|-it|-ti) shift ;;
         -u) shift 2 ;;
+        -e) passed="\${passed} \$2"; shift 2 ;;
         *) break ;;
     esac
 done
@@ -71,10 +73,12 @@ container="\$1"; shift
 [ "\${container}" = "testctr" ] || { echo "No such container: \${container}" >&2; exit 1; }
 # env -i, because a container does not inherit the launcher's environment. In
 # particular it must not see the stub jsh on the launcher's PATH, or every
-# deployment would "discover" a jsh that is already there.
+# deployment would "discover" a jsh that is already there. TERM is what the
+# daemon substitutes when nobody says otherwise, so anything -e carries has to
+# come after it to win.
 exec env -i HOME="${CTR_HOME}" \\
     PATH="\${FAKE_DOCKER_PATH:-/usr/local/bin:/usr/bin:/bin}" \\
-    TERM=xterm-256color "\$@"
+    TERM=xterm \${passed} "\$@"
 EOF
 chmod +x "${STUB}/docker"
 
@@ -93,6 +97,8 @@ case "\$1" in
       echo "PWD=\$(pwd)"
       echo "JSH_REAL_HOME=\${JSH_REAL_HOME:-}"
       echo "XDG_STATE_HOME=\${XDG_STATE_HOME:-}"
+      echo "TERM=\${TERM:-}"
+      echo "COLORTERM=\${COLORTERM:-}"
     } > "${LOG}"
     ;;
 esac
@@ -125,7 +131,8 @@ FAKE_DOCKER_PATH="/usr/local/bin:/usr/bin:/bin"
 
 run() {
     rm -f "${LOG}"
-    env -i HOME="${LOCAL_HOME}" PATH="${PATH_FOR_RUN}" TERM=xterm-256color \
+    env -i HOME="${LOCAL_HOME}" PATH="${PATH_FOR_RUN}" \
+        TERM="${FAKE_TERM-xterm-256color}" COLORTERM="${FAKE_COLORTERM-truecolor}" \
         XDG_CACHE_HOME="${LOCAL_HOME}/.cache" \
         JSH_INSTALL_BASE_URL="file://${REL}" \
         FAKE_DOCKER_PATH="${FAKE_DOCKER_PATH}" \
@@ -168,6 +175,15 @@ assert "cache directory is content addressed" matches "${cached_bin}" '/bin/[0-9
 assert "cache directory is private" [ "$(stat -c %a "$(dirname "${cached_bin}")")" = "700" ]
 assert "no incoming file left behind" [ ! -e "${cached_bin}.incoming" ]
 assert "sandbox torn down" [ -z "$(ctr_sandboxes)" ]
+
+echo "== the terminal the tab is drawn in crosses into the container =="
+assert "TERM forwarded" [ "$(session_field TERM)" = "xterm-256color" ]
+assert "COLORTERM forwarded" [ "$(session_field COLORTERM)" = "truecolor" ]
+out="$(FAKE_TERM='x; rm -rf /' FAKE_COLORTERM='' run 2>&1)"
+indent "${out}"
+assert "a value that is not a terminal name is dropped" \
+    [ "$(session_field TERM)" = "xterm" ]
+assert "an unset variable is not forwarded as empty" [ -z "$(session_field COLORTERM)" ]
 
 echo "== persist again: cache hit, no transfer =="
 before="$(stat -c %Y "${cached_bin}")"

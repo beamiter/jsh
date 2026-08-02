@@ -17,9 +17,9 @@ const SAFE_READ_FLAGS: i32 = nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Resolve helpers that jsh may start automatically without consulting the
-/// mutable shell `PATH`. Candidates are fixed system locations and both the
-/// executable and its containing namespace must not be writable by this user
-/// (nor group/world-writable).
+/// mutable shell `PATH`. Candidates are fixed system locations and neither the
+/// executable nor its containing namespace may be replaceable by anyone but
+/// the party this shell already trusts — see [`replaceable_by_others`].
 pub(crate) fn automatic_system_helper(name: &str) -> Option<&'static Path> {
     let candidates: &[&'static str] = match name {
         "bash" => &["/usr/bin/bash", "/bin/bash"],
@@ -30,20 +30,50 @@ pub(crate) fn automatic_system_helper(name: &str) -> Option<&'static Path> {
     candidates.iter().find_map(|candidate| {
         let path = Path::new(candidate);
         let metadata = path.metadata().ok()?;
-        if !metadata.is_file()
-            || writable_by_current_user(&metadata)
-            || metadata.mode() & 0o111 == 0
-        {
+        if !metadata.is_file() || replaceable_by_others(&metadata) || metadata.mode() & 0o111 == 0 {
             return None;
         }
         let parent = path.parent()?.metadata().ok()?;
-        (parent.is_dir() && !writable_by_current_user(&parent)).then_some(path)
+        (parent.is_dir() && !replaceable_by_others(&parent)).then_some(path)
     })
 }
 
-fn writable_by_current_user(metadata: &fs::Metadata) -> bool {
-    let mode = metadata.mode();
-    mode & 0o022 != 0 || (metadata.uid() == unsafe { nix::libc::geteuid() } && mode & 0o200 != 0)
+fn replaceable_by_others(metadata: &fs::Metadata) -> bool {
+    replaceable(metadata.mode(), metadata.uid(), unsafe {
+        nix::libc::geteuid()
+    })
+}
+
+/// Could someone other than the party this shell already trusts put a different
+/// binary at this path before it is executed?
+///
+/// Group- and world-writable is always yes: anyone in the group, or anyone at
+/// all, can write through it.
+///
+/// For an unprivileged shell, so is a path this user owns and can write. That
+/// is not about the user attacking themselves — it is that such a path is
+/// reachable by anything already running as them, which a system location is
+/// supposed not to be.
+///
+/// Root is the case that rule cannot express. Root can write every file on the
+/// system, so asking "can the current user write it" answers yes for
+/// `/usr/bin/git` and `/usr/bin/bash` on every root shell — and a container is
+/// a root shell by default, which is where this was found: Git completion, the
+/// Git prompt and the `.bashrc` import all disappeared inside `docker exec`
+/// while working locally. For euid 0 the meaningful question is instead whether
+/// some *other* user owns the path, which is the same rule
+/// [`trusted_path_component`] applies to an explicitly configured helper.
+///
+/// Split from [`replaceable_by_others`] so the euid-0 branch can be asserted by
+/// a test suite that does not run as root.
+fn replaceable(mode: u32, owner: u32, euid: u32) -> bool {
+    if mode & 0o022 != 0 {
+        return true;
+    }
+    if euid == 0 {
+        return owner != 0;
+    }
+    owner == euid && mode & 0o200 != 0
 }
 
 /// Validate an explicitly configured executable without falling back to PATH.
@@ -661,6 +691,30 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn a_root_shell_still_trusts_the_system_helpers_it_could_write() {
+        const ROOT: u32 = 0;
+        const USER: u32 = 1000;
+
+        // What a distribution actually ships. Under the old rule root matched
+        // "owner, and owner can write", so every automatic helper was refused
+        // in a container and Git completion silently went missing.
+        assert!(!replaceable(0o755, ROOT, ROOT), "root-owned /usr/bin/git");
+        assert!(!replaceable(0o755, ROOT, USER), "the same path as a user");
+
+        // Root gains nothing else: a helper some other account owns is still
+        // that account's to replace, and group/world-writable is still refused
+        // no matter who is asking.
+        assert!(replaceable(0o755, USER, ROOT), "owned by another user");
+        assert!(replaceable(0o775, ROOT, ROOT), "group-writable");
+        assert!(replaceable(0o757, ROOT, ROOT), "world-writable");
+
+        // Unprivileged behaviour is unchanged: a path this user owns and can
+        // write is reachable by anything already running as them.
+        assert!(replaceable(0o755, USER, USER), "self-owned and writable");
+        assert!(!replaceable(0o555, USER, USER), "self-owned, read-only");
+    }
 
     #[test]
     fn private_persistence_is_bounded_atomic_and_does_not_follow_symlinks() {

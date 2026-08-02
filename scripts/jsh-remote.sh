@@ -307,6 +307,23 @@ fi
 docker_user_opt=""
 [ -z "${docker_user}" ] || docker_user_opt="-u ${docker_user}"
 
+# ssh sends TERM for us; docker exec sends nothing and the daemon substitutes
+# its own default, so without this a container session runs at TERM=xterm with
+# no COLORTERM and everything in it draws in 8 colours while every other tab in
+# the same terminal draws in 16 million. Only a bare terminal name is
+# forwarded: these become arguments, and a value carrying a space or a quote is
+# not a terminal name. LANG is deliberately not forwarded — naming a locale the
+# image never generated is worse than inheriting none.
+docker_env_opt=""
+forward_to_container() {
+    case "$2" in
+        '' | *[!A-Za-z0-9._-]*) return 0 ;;
+    esac
+    docker_env_opt="${docker_env_opt} -e $1=$2"
+}
+forward_to_container TERM "${TERM-}"
+forward_to_container COLORTERM "${COLORTERM-}"
+
 # remote_sh SCRIPT [ARG...]
 #
 # Runs SCRIPT on the destination with the arguments in $1.., reading the script
@@ -353,8 +370,8 @@ remote_exec() {
         # shellcheck disable=SC2086 # ssh_opts/ssh_extra are deliberately split
         ssh ${ssh_opts} ${ssh_extra} -t -- "${destination}" "${re_cmd}"
     else
-        # shellcheck disable=SC2086 # docker_user_opt is deliberately split
-        docker exec -it ${docker_user_opt} "${destination}" \
+        # shellcheck disable=SC2086 # docker_user_opt/docker_env_opt are deliberately split
+        docker exec -it ${docker_user_opt} ${docker_env_opt} "${destination}" \
             /bin/sh -c "${re_script}" jsh-remote "$@"
     fi
 }
@@ -819,8 +836,9 @@ if [ -z "${reuse_existing}" ] && [ -n "${skip_reason}" ]; then
         # shellcheck disable=SC2086 # ssh_opts/ssh_extra are deliberately split
         exec ssh ${ssh_opts} ${ssh_extra} -t -- "${destination}"
     fi
-    # shellcheck disable=SC2086 # docker_user_opt is deliberately split
-    exec docker exec -it ${docker_user_opt} "${destination}" /bin/sh -lc 'exec ${SHELL:-/bin/sh}'
+    # shellcheck disable=SC2086 # docker_user_opt/docker_env_opt are deliberately split
+    exec docker exec -it ${docker_user_opt} ${docker_env_opt} "${destination}" \
+        /bin/sh -lc 'exec ${SHELL:-/bin/sh}'
 fi
 
 # --- step 6: prepare the destination -----------------------------------------
