@@ -10,6 +10,7 @@ pub mod closure_expr;
 pub mod completer;
 pub mod completion_spec;
 pub mod config;
+pub mod container;
 pub mod data;
 pub mod debug;
 pub mod editor;

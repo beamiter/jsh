@@ -195,6 +195,31 @@ fn trusted_path_component(metadata: &fs::Metadata) -> bool {
         && (metadata.uid() == 0 || metadata.uid() == unsafe { nix::libc::geteuid() })
 }
 
+/// Read the first bytes of a regular file, with the same refusals as
+/// [`read_regular_file`] but without its size limit.
+///
+/// The limit in the others means "this file is not allowed to be bigger than
+/// that". Reading a header is the opposite question: an ELF is megabytes long
+/// and only its first hundred bytes are being asked about, so a cap that
+/// rejects the file would answer "no" for every real binary.
+pub(crate) fn read_regular_file_prefix(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(SAFE_READ_FLAGS)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refusing to read a non-regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(max_bytes as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Read a regular file with a byte cap. Symlinks and special files are refused
 /// so a startup/completion probe cannot block on a FIFO or silently traverse a
 /// link to unrelated data.

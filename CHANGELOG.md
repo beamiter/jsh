@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Containers you just walk into. `docker run -it ubuntu bash` and `docker exec
+  -it web bash` now give you jsh, with nothing installed in the container and
+  nothing configured anywhere: for `run` the shell is a read-only bind mount of
+  a static jsh over a path in the container's `/dev` — a tmpfs the runtime
+  creates, so the image's writable layer never sees it and `docker diff` stays
+  empty — and for a container already running, where a mount cannot be added,
+  the binary is streamed into that same tmpfs. Any image works, including ones
+  with no libc and no bash. Rewriting a typed command fails closed everywhere
+  it is not obviously right: no terminal, a real command rather than a bare
+  shell, an image with its own entrypoint, a remote `DOCKER_HOST` (whose `-v`
+  would name someone else's filesystem), a platform this host has no binary
+  for, or any flag that could be hiding where the image name is. `command
+  docker …` and `JSH_CONTAINER_SHELL=off` are the ways out.
+- An incognito container session now sandboxes itself in `/dev` rather than
+  `/var/tmp`: same tmpfs, so nothing it does reaches the image's writable
+  layer. Real machines are unaffected — there `/dev` is devtmpfs, and only the
+  docker transport is offered it.
 - A startup file is a sourced script. `return` at the top level of one now
   ends the file instead of printing "can only return from a function or sourced
   script" and reading on, and `${BASH_SOURCE[0]}` names the file rather than

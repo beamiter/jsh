@@ -1433,6 +1433,14 @@ fn execute_simple_with_mode(
         return code;
     }
 
+    // A command that enters a container has its shell replaced first. This
+    // sits on the final argv, so it sees exactly what would have run, and it
+    // is deliberately not on the `spawn_external` path: `command docker …` is
+    // how a person says "run the one I typed".
+    let upgraded = crate::container::upgrade_entry(&expanded, state);
+    let expanded: &[String] = upgraded.as_deref().unwrap_or(&expanded);
+    let cmd_name = &expanded[0];
+
     // External command - fork and exec
     if !fork_external {
         apply_redirects_in_child(&cmd.redirects, state);

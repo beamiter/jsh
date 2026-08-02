@@ -449,6 +449,7 @@ PROBE_SCRIPT='
 set -u
 want_mode="$1"
 may_create="$2"
+transport_kind="${3:-ssh}"
 
 printf "os=%s\n" "$(uname -s 2>/dev/null || echo unknown)"
 printf "arch=%s\n" "$(uname -m 2>/dev/null || echo unknown)"
@@ -497,7 +498,22 @@ exec_ok() {
 # containing a space would otherwise split into two candidates, and the real one
 # would never be tested.
 if [ "$want_mode" = incognito ]; then
-    set -- /var/tmp /tmp /dev/shm "${HOME:-}/.cache" "${HOME:-}"
+    # In a container /dev is a tmpfs the runtime made, and it is the only
+    # writable place there that both executes files and stays out of the
+    # image writable layer: a sandbox in it never appears in docker diff and
+    # is gone when the container stops, which is what incognito promises.
+    # Containers only: on a real machine /dev is devtmpfs, and putting a 5 MiB
+    # binary in the RAM-backed /dev of somebody else machine is not a thing to
+    # do quietly. /dev/shm stays below for the reason it always failed there:
+    # it is mounted noexec.
+    #
+    # (No apostrophes in this comment on purpose: the whole probe travels as a
+    # single-quoted string, and one would end it.)
+    if [ "$transport_kind" = docker ]; then
+        set -- /dev /var/tmp /tmp /dev/shm "${HOME:-}/.cache" "${HOME:-}"
+    else
+        set -- /var/tmp /tmp /dev/shm "${HOME:-}/.cache" "${HOME:-}"
+    fi
 else
     # Persist mode may create the XDG cache directory if it is missing, which
     # keeps sandboxes and the binary cache out of the top of $HOME. Incognito
@@ -532,7 +548,7 @@ done
 note "probing ${destination}"
 may_create=1
 [ "${dry_run}" -eq 0 ] || may_create=0
-probe_out="$(remote_sh "${PROBE_SCRIPT}" "${mode}" "${may_create}" 2> /dev/null)" || {
+probe_out="$(remote_sh "${PROBE_SCRIPT}" "${mode}" "${may_create}" "${transport}" 2> /dev/null)" || {
     if [ "${transport}" = "ssh" ]; then
         die "cannot reach ${destination} over ssh"
     fi

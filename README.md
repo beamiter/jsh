@@ -183,6 +183,49 @@ directory above it may be group- or world-writable or owned by another user.
 A path that fails those checks disables that integration and says so once; it
 does not quietly fall back to a different binary than the one you named.
 
+## Containers you just walk into
+
+Typing `docker run -it ubuntu bash` gives you jsh, without anything being
+installed in the container and without configuring anything anywhere:
+
+```
+$ docker run -it ubuntu bash
+jsh: entering the container as jsh (read-only mount, nothing installed)
+user@f8cb8dfe26b7 / ❯
+```
+
+The shell is a read-only bind mount of a static jsh over a path in the
+container's `/dev`. That is a tmpfs the runtime creates, and one of the few
+places in a container that both executes files and stays out of the image's
+writable layer, so `docker diff` on the container is empty afterwards. A
+container that is already running cannot be given a mount, so `docker exec -it
+web bash` streams the same binary into that same tmpfs instead — still nothing
+in the writable layer, and gone when the container stops.
+
+It works on any image, including ones with no libc and no bash: a static binary
+needs nothing from the image. Alpine, distroless, and Ubuntu all behave the
+same, and the container starts as fast as it did before.
+
+This only happens for a command that is plainly someone going in to look
+around, and every rule fails closed:
+
+| | |
+|---|---|
+| rewritten | `docker run -it IMAGE bash`, `docker exec -it NAME sh`, `docker run -it IMAGE` when the image's own default command is a shell — and the same for `podman` and `nerdctl` |
+| left alone | no `-t`; a real command (`docker run -it img bash -c …`); an image with its own `ENTRYPOINT`; an explicit `--entrypoint`; a `--platform` this machine has no binary for; a remote `DOCKER_HOST`; any flag this shell does not recognise, since one of those could be hiding where the image name is |
+
+`command docker …` runs exactly what you typed, and
+`JSH_CONTAINER_SHELL=off` turns the whole thing off. The binary jsh injects is
+itself, when jsh is a static build; otherwise the artifact
+`scripts/jsh-remote.sh` stages, or whatever `JSH_CONTAINER_BINARY` names. When
+none of those is static, nothing is rewritten — a dynamically linked shell
+would fail inside the image with a "no such file or directory" naming a file
+that is plainly there.
+
+Once inside, jsh behaves like the shell it replaced: it reads the container's
+own `~/.bashrc` and keeps its history in the container's home, exactly where
+bash keeps `.bash_history`. Only the binary is a guest.
+
 ## Remote hosts and containers
 
 `scripts/jsh-remote.sh` runs jsh on a machine that does not have jsh installed.
