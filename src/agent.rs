@@ -23,7 +23,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEFAULT_MAX_TURNS: u32 = 16;
 const AGENT_MAX_TOKENS: u32 = 1024;
@@ -56,15 +56,24 @@ const AGENT_CHILD_REPORT_ENV: &str = "JSH_AGENT_CHILD_REPORT";
 const AGENT_CHILD_COMMAND_ENV: &str = "JSH_AGENT_CHILD_COMMAND";
 const AGENT_CHILD_CLAIM_DIR: &str = "claimed";
 static AGENT_CHILD_COUNTER: AtomicU64 = AtomicU64::new(0);
-static AGENT_HTTP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-
-struct AgentHttpInFlightGuard;
-
-impl Drop for AgentHttpInFlightGuard {
-    fn drop(&mut self) {
-        AGENT_HTTP_IN_FLIGHT.store(false, Ordering::Release);
-    }
-}
+/// Argument that turns this binary into a one-shot HTTP transport for its own
+/// parent. See [`model_request`].
+const INTERNAL_MODEL_REQUEST_FLAG: &str = "--jsh-internal-model-request";
+/// Ceiling on the request envelope the parent writes to the child's stdin.
+/// A chat request carries the system prompt, the transcript and the observation
+/// sample, all of which jagent already bounds; this is the framing backstop.
+const MAX_MODEL_REQUEST_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
+/// Wall clock for one model request, including process startup. Comfortably
+/// above the transport's own read timeout so the deadline is the outer bound
+/// rather than the usual one.
+const MODEL_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+/// The child answers on stdout with one status byte and then the payload, so a
+/// provider error is distinguishable from a transport error without parsing
+/// prose. stderr stays empty and is only captured to keep a stuck child from
+/// blocking on a full pipe.
+const MODEL_CHILD_OK: u8 = b'+';
+const MODEL_CHILD_ERR: u8 = b'-';
+const MAX_MODEL_CHILD_STDERR_BYTES: usize = 8 * 1024;
 
 pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
     let Some(ai_config) = AiConfig::from_env() else {
@@ -581,40 +590,193 @@ fn request_model(
     )
     .map_err(|error| error.to_string())?;
 
-    // ureq is intentionally blocking. Keep that blocking socket work off the
-    // interactive shell thread so INT/HUP/TERM can cancel the Agent UI within
-    // one poll interval instead of waiting for the provider's 120-second read
-    // timeout. Dropping the receiver detaches at most this one bounded request;
-    // process exit terminates it, and a continuing shell lets its timeout reap
-    // it naturally.
-    if AGENT_HTTP_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err("a previous model request is still shutting down".to_string());
+    model_request(request, chat.provider)
+}
+
+/// Perform one model request in a child process, so cancelling it ends it.
+///
+/// ureq is intentionally blocking, and a blocking socket read cannot be
+/// interrupted in place. Running it on a worker *thread* therefore only ever
+/// achieved half the job: INT released the foreground promptly, but the request
+/// itself kept running — still connected, still being billed, and still holding
+/// the single-flight slot — until the provider's own read timeout expired, and
+/// a second request in that window was refused outright.
+///
+/// A child process has a handle the parent can actually use. `SIGKILL` to the
+/// process group ends the request now, which is why there is no in-flight gate
+/// here any more: there is never a previous request left to wait for.
+///
+/// The child is this same binary. That matters: TLS verification, the redirect
+/// policy, the response header caps and the body ceiling are all the code in
+/// [`perform_model_request`], unchanged and unduplicated. Only *where* it runs
+/// moved.
+///
+/// The envelope travels on stdin rather than argv because it carries the API
+/// key, and argv is world-readable through `/proc`.
+fn model_request(request: HttpRequest, provider: Provider) -> Result<String, String> {
+    if crate::signal::pending_status().is_some() {
+        return Err("interrupted".to_string());
     }
-    let provider = chat.provider;
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let worker = std::thread::Builder::new()
-        .name("jsh-agent-http".to_string())
-        .spawn(move || {
-            let _in_flight = AgentHttpInFlightGuard;
-            let _ = tx.send(perform_model_request(request, provider));
-        });
-    if let Err(error) = worker {
-        AGENT_HTTP_IN_FLIGHT.store(false, Ordering::Release);
-        return Err(format!("could not start model request: {error}"));
+    let envelope = encode_model_request(&request, provider);
+    if envelope.len() > MAX_MODEL_REQUEST_ENVELOPE_BYTES {
+        return Err("model request is too large to send".to_string());
     }
-    loop {
-        if crate::signal::pending_status().is_some() {
-            return Err("interrupted".to_string());
+
+    let executable =
+        std::env::current_exe().map_err(|error| format!("could not locate jsh: {error}"))?;
+    let mut command = std::process::Command::new(executable);
+    command.arg(INTERNAL_MODEL_REQUEST_FLAG);
+
+    let cancelled = || crate::signal::pending_status().is_some();
+    let output = crate::io_guard::bounded_command_session(
+        &mut command,
+        crate::io_guard::BoundedCommand {
+            // One status byte of framing on top of the transport's own ceiling.
+            stdout_limit: MAX_AGENT_RESPONSE_BYTES as usize + 1,
+            stderr_limit: MAX_MODEL_CHILD_STDERR_BYTES,
+            timeout: MODEL_REQUEST_DEADLINE,
+            stdin: Some(envelope.as_bytes()),
+            cancel: Some(&cancelled),
+            // A shell that is killed outright must not leave a request running
+            // against the provider with nobody to read the answer.
+            die_with_parent: true,
+        },
+    );
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            return Err("interrupted".to_string())
         }
-        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(result) => return result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("model request worker stopped unexpectedly".to_string());
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return Err("model request timed out".to_string())
+        }
+        Err(error) => return Err(format!("could not run the model request: {error}")),
+    };
+
+    match output.stdout.split_first() {
+        Some((&MODEL_CHILD_OK, body)) => Ok(String::from_utf8_lossy(body).into_owned()),
+        Some((&MODEL_CHILD_ERR, message)) => Err(String::from_utf8_lossy(message).into_owned()),
+        // No framing byte at all means the child died before it could answer —
+        // a signal, or a binary that is not this jsh. Its stderr is untrusted
+        // and is deliberately not echoed.
+        _ => Err("the model request did not complete".to_string()),
+    }
+}
+
+/// Serialize a request for the child. Deliberately jsh's own small envelope
+/// rather than serde on jagent's types: the wire format is private to this pair
+/// of processes, and it should not move when a dependency adds a field.
+fn encode_model_request(request: &HttpRequest, provider: Provider) -> String {
+    serde_json::json!({
+        "v": 1,
+        "provider": provider.as_config_value(),
+        "url": request.url,
+        "headers": request.headers,
+        "body": request.body,
+    })
+    .to_string()
+}
+
+fn decode_model_request(envelope: &str) -> Result<(HttpRequest, Provider), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(envelope).map_err(|error| format!("malformed request: {error}"))?;
+    if value.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("unsupported request version".to_string());
+    }
+    let text = |key: &str| -> Result<String, String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("request is missing {key}"))
+    };
+    let provider = match text("provider")?.as_str() {
+        "anthropic" => Provider::Anthropic,
+        "openai-compatible" => Provider::OpenAiCompatible,
+        "ollama" => Provider::Ollama,
+        other => return Err(format!("unknown provider: {other}")),
+    };
+    let mut headers = Vec::new();
+    for entry in value
+        .get("headers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "request is missing headers".to_string())?
+    {
+        let pair = entry
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or_else(|| "malformed header".to_string())?;
+        let name = pair[0]
+            .as_str()
+            .ok_or_else(|| "malformed header name".to_string())?;
+        let value = pair[1]
+            .as_str()
+            .ok_or_else(|| "malformed header value".to_string())?;
+        headers.push((name.to_string(), value.to_string()));
+    }
+    Ok((
+        HttpRequest {
+            url: text("url")?,
+            headers,
+            body: text("body")?,
+        },
+        provider,
+    ))
+}
+
+/// Child entry point for [`INTERNAL_MODEL_REQUEST_FLAG`]. Returns the process
+/// exit code, or `None` when this invocation is not a model-request child.
+///
+/// Dispatched before any startup file, history, or session work: this process
+/// exists to perform exactly one HTTP request and then die.
+pub(crate) fn run_internal_model_request(args: &[std::ffi::OsString]) -> Option<i32> {
+    if args.get(1).and_then(|arg| arg.to_str()) != Some(INTERNAL_MODEL_REQUEST_FLAG) {
+        return None;
+    }
+    if args.len() != 2 {
+        eprintln!("jsh: internal model request received unexpected arguments");
+        return Some(2);
+    }
+    let answer = |marker: u8, payload: &str| {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&[marker]);
+        let _ = stdout.write_all(payload.as_bytes());
+        let _ = stdout.flush();
+    };
+
+    let envelope = match crate::io_guard::read_to_end_bounded(
+        std::io::stdin().lock(),
+        MAX_MODEL_REQUEST_ENVELOPE_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            answer(MODEL_CHILD_ERR, &format!("could not read request: {error}"));
+            return Some(1);
+        }
+    };
+    let envelope = match String::from_utf8(envelope) {
+        Ok(text) => text,
+        Err(_) => {
+            answer(MODEL_CHILD_ERR, "request was not valid UTF-8");
+            return Some(1);
+        }
+    };
+    match decode_model_request(&envelope) {
+        Ok((request, provider)) => match perform_model_request(request, provider) {
+            Ok(reply) => {
+                answer(MODEL_CHILD_OK, &reply);
+                Some(0)
             }
+            Err(error) => {
+                answer(MODEL_CHILD_ERR, &error);
+                Some(1)
+            }
+        },
+        Err(error) => {
+            answer(MODEL_CHILD_ERR, &error);
+            Some(1)
         }
     }
 }
@@ -810,6 +972,12 @@ impl Drop for AgentChildTransport {
 /// be present and the snapshot loader enforces ownership/link/size rules.
 pub(crate) fn internal_child_entrypoint() -> Option<i32> {
     let args = std::env::args_os().collect::<Vec<_>>();
+    // The transport child is dispatched from the same place, and before the
+    // Agent child, so that neither mode can reach startup-file, history, or
+    // session work. Both exist to do one bounded thing and exit.
+    if let Some(status) = run_internal_model_request(&args) {
+        return Some(status);
+    }
     if args.get(1).and_then(|arg| arg.to_str()) != Some(INTERNAL_AGENT_CHILD_FLAG) {
         return None;
     }
@@ -1339,14 +1507,82 @@ mod tests {
     use super::{
         agent_child_command, agent_http_client, agent_reply_within_budget, bounded_git_stdout,
         configured_max_turns, current_danger, git_meta, git_worktree_dirty, run_captured,
-        run_captured_to, run_internal_agent_child, terminal_safe_inline_text,
-        terminal_safe_message, terminal_safe_text, AgentChildTransport, AGENT_CHILD_COMMAND_ENV,
-        MAX_AGENT_ACTION_JSON_BYTES, MAX_AGENT_COMMAND_DISPLAY_BYTES, MAX_AGENT_DISPLAY_BYTES,
-        MAX_AGENT_SESSION_TURNS,
+        run_captured_to, run_internal_agent_child, run_internal_model_request,
+        terminal_safe_inline_text, terminal_safe_message, terminal_safe_text, AgentChildTransport,
+        AGENT_CHILD_COMMAND_ENV, MAX_AGENT_ACTION_JSON_BYTES, MAX_AGENT_COMMAND_DISPLAY_BYTES,
+        MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_SESSION_TURNS,
     };
+    use super::{decode_model_request, encode_model_request};
     use crate::environment::ShellState;
+    use jagent::provider::{HttpRequest, Provider};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_model_request_envelope_round_trips() {
+        let request = HttpRequest {
+            url: "https://api.example.test/v1/messages".to_string(),
+            headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-api-key".to_string(), "sk-secret".to_string()),
+            ],
+            body: r#"{"model":"m","messages":[]}"#.to_string(),
+        };
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            let encoded = encode_model_request(&request, provider);
+            let (decoded, decoded_provider) = decode_model_request(&encoded).expect("round trip");
+            assert_eq!(decoded, request);
+            assert_eq!(decoded_provider, provider);
+        }
+    }
+
+    #[test]
+    fn a_malformed_envelope_is_refused_rather_than_guessed() {
+        // The envelope carries a URL and an API key into a request this process
+        // is about to make. Every field is required; none is defaulted.
+        for envelope in [
+            "",
+            "not json",
+            r#"{"v":2,"provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":1,"provider":"unknown","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","headers":[],"body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":1}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[["only-one"]],"body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[[1,2]],"body":"{}"}"#,
+        ] {
+            assert!(
+                decode_model_request(envelope).is_err(),
+                "accepted {envelope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_transport_child_only_answers_to_its_own_flag() {
+        let args = |values: &[&str]| -> Vec<std::ffi::OsString> {
+            values.iter().map(std::ffi::OsString::from).collect()
+        };
+        assert_eq!(run_internal_model_request(&args(&["jsh"])), None);
+        assert_eq!(
+            run_internal_model_request(&args(&["jsh", "-c", "echo"])),
+            None
+        );
+        assert_eq!(
+            run_internal_model_request(&args(&["jsh", "--jsh-internal-agent-child", "x"])),
+            None
+        );
+        // Right flag, extra operands: refused rather than ignored, so a stray
+        // argument can never be read as part of the request.
+        assert_eq!(
+            run_internal_model_request(&args(&["jsh", "--jsh-internal-model-request", "extra"])),
+            Some(2)
+        );
+    }
 
     #[test]
     fn agent_provider_credentials_never_cross_redirects() {

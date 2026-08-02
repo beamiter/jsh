@@ -260,31 +260,144 @@ pub(crate) fn bounded_command_output(
     stderr_limit: usize,
     timeout: Duration,
 ) -> io::Result<Output> {
+    bounded_command_session(
+        command,
+        BoundedCommand {
+            stdout_limit,
+            stderr_limit,
+            timeout,
+            stdin: None,
+            cancel: None,
+            die_with_parent: false,
+        },
+    )
+}
+
+/// Everything [`bounded_command_session`] needs beyond the command itself.
+#[derive(Default)]
+pub(crate) struct BoundedCommand<'a> {
+    pub stdout_limit: usize,
+    pub stderr_limit: usize,
+    pub timeout: Duration,
+    /// Bytes to hand the child on stdin. Written from a helper thread, because
+    /// a payload larger than the pipe buffer would otherwise deadlock against
+    /// our own drain loop: the child cannot read while it is blocked writing
+    /// output nobody is consuming.
+    pub stdin: Option<&'a [u8]>,
+    /// Polled once per drain iteration — at most 100 ms apart. Returning true
+    /// kills the process group and reports `Interrupted`.
+    ///
+    /// This is what makes a helper genuinely cancellable rather than merely
+    /// abandoned. Dropping a channel and walking away leaves the work running,
+    /// still holding whatever single-flight slot it was given, until its own
+    /// timeout expires; killing the process group ends it now.
+    pub cancel: Option<&'a (dyn Fn() -> bool + Sync)>,
+    /// Ask the kernel to `SIGKILL` the child if this process dies.
+    ///
+    /// Every kill path here needs a live parent to run it, so a shell that is
+    /// itself `SIGKILL`ed would otherwise orphan a helper that keeps holding a
+    /// connection open. Work that used to run on a thread died with the process
+    /// for free; a child has to be told. There is an unavoidable race — the
+    /// parent can die between fork and `prctl` — so a helper still needs its own
+    /// timeout as the backstop, but the window shrinks from minutes to
+    /// microseconds.
+    pub die_with_parent: bool,
+}
+
+/// [`bounded_command_output`] with a stdin payload and a cancellation predicate.
+pub(crate) fn bounded_command_session(
+    command: &mut Command,
+    options: BoundedCommand<'_>,
+) -> io::Result<Output> {
+    let BoundedCommand {
+        stdout_limit,
+        stderr_limit,
+        timeout,
+        stdin: stdin_payload,
+        cancel,
+        die_with_parent,
+    } = options;
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(if stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         // A helper that forks must not escape timeout cleanup merely by
         // leaving a descendant holding one of the capture pipes open.
         .process_group(0);
+    if die_with_parent {
+        // SAFETY: runs between fork and exec in the child. prctl is a single
+        // async-signal-safe syscall and touches no allocator or lock, which is
+        // the whole requirement for pre_exec.
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = command.spawn()?;
+
+    // Scoped so the writer is joined on every exit path, including the kills
+    // below: a detached writer would outlive the child holding a copy of
+    // whatever secret the payload carries.
+    let mut stdin_writer = None;
+    if let Some(payload) = stdin_payload {
+        match child.stdin.take() {
+            Some(mut pipe) => {
+                let bytes = payload.to_vec();
+                stdin_writer = std::thread::Builder::new()
+                    .name("jsh-helper-stdin".to_string())
+                    .spawn(move || {
+                        // EPIPE is the expected outcome when the child is
+                        // killed mid-write, and is not worth reporting.
+                        let _ = pipe.write_all(&bytes);
+                    })
+                    .ok();
+            }
+            None => {
+                kill_and_reap(&mut child);
+                return Err(io::Error::other("helper stdin pipe was not created"));
+            }
+        }
+    }
+    let result = bounded_command_drain(&mut child, stdout_limit, stderr_limit, timeout, cancel);
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
+    result
+}
+
+fn bounded_command_drain(
+    child: &mut Child,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Duration,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
+) -> io::Result<Output> {
     let mut stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            kill_and_reap(&mut child);
+            kill_and_reap(child);
             return Err(io::Error::other("helper stdout pipe was not created"));
         }
     };
     let mut stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            kill_and_reap(&mut child);
+            kill_and_reap(child);
             return Err(io::Error::other("helper stderr pipe was not created"));
         }
     };
     if let Err(error) =
         set_nonblocking(stdout.as_raw_fd()).and_then(|()| set_nonblocking(stderr.as_raw_fd()))
     {
-        kill_and_reap(&mut child);
+        kill_and_reap(child);
         return Err(error);
     }
 
@@ -311,7 +424,7 @@ pub(crate) fn bounded_command_output(
             )
         })();
         if let Err(error) = result {
-            kill_and_reap(&mut child);
+            kill_and_reap(child);
             return Err(error);
         }
 
@@ -319,7 +432,7 @@ pub(crate) fn bounded_command_output(
             status = match child.try_wait() {
                 Ok(status) => status,
                 Err(error) => {
-                    kill_and_reap(&mut child);
+                    kill_and_reap(child);
                     return Err(error);
                 }
             };
@@ -334,8 +447,16 @@ pub(crate) fn bounded_command_output(
             }
         }
 
+        if cancel.is_some_and(|predicate| predicate()) {
+            kill_and_reap(child);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "helper process was cancelled",
+            ));
+        }
+
         if Instant::now() >= deadline {
-            kill_and_reap(&mut child);
+            kill_and_reap(child);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "helper process exceeded its time limit",
@@ -369,7 +490,7 @@ pub(crate) fn bounded_command_output(
         if polled < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
-                kill_and_reap(&mut child);
+                kill_and_reap(child);
                 return Err(error);
             }
         }
@@ -432,6 +553,7 @@ fn drain_pipe(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn private_persistence_is_bounded_atomic_and_does_not_follow_symlinks() {
@@ -455,6 +577,107 @@ mod tests {
         write_private_file_atomic(&path, b"second", 32).expect("replace link");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(read_private_file(&path, 32).unwrap(), b"second");
+    }
+
+    #[test]
+    fn a_cancelled_helper_dies_promptly_instead_of_running_to_its_deadline() {
+        // The point of the predicate: without it the only way out of a helper
+        // that has stopped being wanted is its own timeout, which for a model
+        // request is measured in minutes.
+        let started = Instant::now();
+        let cancel = AtomicBool::new(false);
+        let predicate = move || {
+            // False once, so the helper is genuinely running when it is killed
+            // rather than being refused before it starts.
+            !cancel.swap(true, Ordering::SeqCst)
+        };
+        let error = bounded_command_session(
+            Command::new("sleep").arg("120"),
+            BoundedCommand {
+                stdout_limit: 64,
+                stderr_limit: 64,
+                timeout: Duration::from_secs(120),
+                stdin: None,
+                cancel: Some(&predicate),
+                die_with_parent: false,
+            },
+        )
+        .expect_err("cancelled helper must not succeed");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancellation waited for the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_uncancelled_helper_still_runs_to_completion() {
+        let never = || false;
+        let output = bounded_command_session(
+            Command::new("printf").arg("done"),
+            BoundedCommand {
+                stdout_limit: 16,
+                stderr_limit: 16,
+                timeout: Duration::from_secs(10),
+                stdin: None,
+                cancel: Some(&never),
+                die_with_parent: false,
+            },
+        )
+        .expect("helper");
+        assert_eq!(output.stdout, b"done");
+    }
+
+    #[test]
+    fn a_stdin_payload_larger_than_the_pipe_buffer_does_not_deadlock() {
+        // 1 MiB is far past any pipe buffer, so a child that reads its input
+        // only while we are draining its output is the whole test: writing the
+        // payload inline from this thread would wedge both sides forever.
+        let payload = vec![b'x'; 1024 * 1024];
+        let output = bounded_command_session(
+            Command::new("wc").arg("-c"),
+            BoundedCommand {
+                stdout_limit: 64,
+                stderr_limit: 64,
+                timeout: Duration::from_secs(30),
+                stdin: Some(&payload),
+                cancel: None,
+                die_with_parent: false,
+            },
+        )
+        .expect("helper");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            payload.len().to_string()
+        );
+    }
+
+    #[test]
+    fn killing_a_helper_mid_payload_does_not_wedge_the_writer() {
+        // The child exits without reading, so the writer thread meets EPIPE.
+        // The session must still return rather than blocking on the join.
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let started = Instant::now();
+        let output = bounded_command_session(
+            &mut Command::new("true"),
+            BoundedCommand {
+                stdout_limit: 64,
+                stderr_limit: 64,
+                timeout: Duration::from_secs(30),
+                stdin: Some(&payload),
+                cancel: None,
+                die_with_parent: false,
+            },
+        )
+        .expect("helper");
+        assert!(output.status.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "writer join blocked: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
