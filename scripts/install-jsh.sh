@@ -27,8 +27,6 @@ STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
 # interval instead of one per terminal.
 CACHE_FILE="${CACHE_HOME}/jsh/update-check.json"
 ROLLBACK_DIR="${STATE_HOME}/jsh/rollback"
-# glibc floor of the prebuilt gnu artifacts (built on Ubuntu 22.04).
-GNU_GLIBC_MIN="2.35"
 # Ceilings for anything downloaded. A release archive is a few tens of MiB; a
 # manifest or checksum is a few hundred bytes. Without a ceiling a hostile or
 # broken mirror can fill the user's disk while the script waits patiently.
@@ -247,43 +245,6 @@ fi
 
 # --- platform detection ------------------------------------------------------
 
-version_ge() {
-    # version_ge A B -> true when A >= B, comparing dot-separated numbers.
-    [ "$1" = "$2" ] && return 0
-    lo="$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)"
-    [ "${lo}" = "$2" ]
-}
-
-detect_libc() {
-    # musl is the portability fallback: static, no glibc floor, slower malloc.
-    if have getconf && getconf GNU_LIBC_VERSION > /dev/null 2>&1; then
-        glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
-    elif have ldd; then
-        first="$(ldd --version 2>&1 | head -1)"
-        case "${first}" in
-            *musl*)
-                printf 'musl\n'
-                return 0
-                ;;
-        esac
-        glibc="$(printf '%s\n' "${first}" | awk '{print $NF}')"
-    else
-        printf 'musl\n'
-        return 0
-    fi
-    case "${glibc}" in
-        '' | *[!0-9.]*)
-            printf 'musl\n'
-            return 0
-            ;;
-    esac
-    if version_ge "${glibc}" "${GNU_GLIBC_MIN}"; then
-        printf 'gnu\n'
-    else
-        printf 'musl\n'
-    fi
-}
-
 detect_target() {
     if [ -n "${JSH_INSTALL_TARGET:-}" ]; then
         printf '%s\n' "${JSH_INSTALL_TARGET}"
@@ -297,7 +258,13 @@ detect_target() {
         *) arch="" ;;
     esac
     if [ "${os}" = "Linux" ] && [ -n "${arch}" ]; then
-        printf '%s-unknown-linux-%s\n' "${arch}" "$(detect_libc)"
+        # Static musl, always. It runs on every distribution and libc, and a
+        # static jsh can lend itself out: entering a container or an ssh host
+        # bind-mounts or pushes the very binary that is running, which a
+        # dynamically linked one cannot do. The gnu artifacts are still
+        # published for anyone who wants glibc's allocator back —
+        # JSH_INSTALL_TARGET=<arch>-unknown-linux-gnu selects one explicitly.
+        printf '%s-unknown-linux-musl\n' "${arch}"
     fi
     return 0
 }
