@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- The Linux install is the static musl build. The installer used to pick a
+  glibc artifact whenever the host's glibc was new enough, which produced a jsh
+  that could not lend itself out: container entry bind-mounts the running
+  binary and ssh entry pushes it, and both need it to be static. musl runs on
+  every distribution and libc, `jsh-remote.sh` has only ever deployed musl,
+  and now what you install is the same thing you deploy. The gnu artifacts are
+  still published; `JSH_INSTALL_TARGET=<arch>-unknown-linux-gnu` selects one.
+- `ssh build-box`, typed, arrives as jsh. An interactive ssh session with no
+  remote command is routed through `jsh-remote.sh` — which travels inside the
+  binary and is published to the cache on first use — with the running jsh as
+  the artifact. The destination keeps its own login shell, and jsh's files
+  land exactly where the launcher's persist mode has always put them: dot-files
+  in the remote `$HOME`, the binary cached so the next connection skips the
+  transfer. Everything else fails closed: a remote command, forwarding flags,
+  any flag this shell does not recognise, a value the launcher would re-split,
+  or a non-static running binary all leave the command exactly as typed.
+  `command ssh …` bypasses it; `JSH_SSH_SHELL=off` ends it.
 - Containers you just walk into. `docker run -it ubuntu bash` and `docker exec
   -it web bash` now give you jsh, with nothing installed in the container and
   nothing configured anywhere: for `run` the shell is a read-only bind mount of

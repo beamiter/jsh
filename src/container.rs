@@ -427,7 +427,7 @@ fn terminal_env_flags() -> Vec<String> {
 
 /// A jsh that will run in any container: statically linked, so it needs
 /// nothing from the image — not even a libc.
-fn static_jsh() -> Option<PathBuf> {
+pub(crate) fn static_jsh() -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os("JSH_CONTAINER_BINARY") {
         let path = PathBuf::from(configured);
         return is_static_elf(&path)

@@ -1437,7 +1437,8 @@ fn execute_simple_with_mode(
     // sits on the final argv, so it sees exactly what would have run, and it
     // is deliberately not on the `spawn_external` path: `command docker …` is
     // how a person says "run the one I typed".
-    let upgraded = crate::container::upgrade_entry(&expanded, state);
+    let upgraded = crate::container::upgrade_entry(&expanded, state)
+        .or_else(|| crate::ssh_entry::upgrade_entry(&expanded, state));
     let expanded: &[String] = upgraded.as_deref().unwrap_or(&expanded);
     let cmd_name = &expanded[0];
 

@@ -226,6 +226,27 @@ Once inside, jsh behaves like the shell it replaced: it reads the container's
 own `~/.bashrc` and keeps its history in the container's home, exactly where
 bash keeps `.bash_history`. Only the binary is a guest.
 
+## ssh hosts you just walk into
+
+The same idea works over ssh, where there is no mount to add but there has
+always been a push:
+
+```
+$ ssh build-box
+jsh: bringing jsh to build-box for this session (`command ssh` connects plain)
+yj@build-box ~ ❯
+```
+
+An interactive `ssh destination` — no remote command, only session flags this
+shell recognises (`-p`, `-i`, `-l`, `-o`, `-J`, …) — is routed through
+`jsh-remote.sh` with the running binary as the artifact, so nothing is fetched
+from anywhere. The destination keeps its own login shell; jsh's dot-files and a
+cached copy of the binary land in your remote `$HOME`, so the next connection
+skips the transfer. Anything else — `ssh host ls`, port forwarding, `-N`,
+`-W`, a flag this shell does not know — runs exactly as typed, as does
+`command ssh …`, and `JSH_SSH_SHELL=off` turns it off. This needs the running
+jsh to be static, which the released Linux binaries now are.
+
 ## Remote hosts and containers
 
 `scripts/jsh-remote.sh` runs jsh on a machine that does not have jsh installed.
