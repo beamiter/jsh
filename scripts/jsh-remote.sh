@@ -386,6 +386,36 @@ case "$d" in
     *) exit 0 ;;
 esac
 [ -d "$d" ] || exit 0
+
+# ssh takes the session down with it: closing the connection hangs up the
+# remote pty and everything on it. `docker exec` has no equivalent — the
+# process it started keeps running after its client is gone — so closing a
+# container tab left a jsh running in the container with its sandbox unlinked
+# underneath it, and every open and close added another one.
+#
+# The recorded pid alone is not something to kill on, because pids are reused.
+# The environment is the proof: the sandbox name is unique to this session and
+# the process carries it. A destination without /proc, or without tr or grep,
+# simply skips this and behaves as it did before.
+p=""
+[ -f "$d/pid" ] && p=$(cat "$d/pid" 2>/dev/null || :)
+case "$p" in
+    "" | *[!0-9]*) p="" ;;
+esac
+if [ -n "$p" ] && [ -r "/proc/$p/environ" ] &&
+    tr "\0" "\n" < "/proc/$p/environ" 2>/dev/null |
+    grep -qxF "JSH_REMOTE_SANDBOX=$d" 2>/dev/null; then
+    # HUP is what a terminal going away means, and jsh answers it by saving its
+    # session and leaving. KILL is the backstop for a shell that will not, not
+    # the opening move.
+    kill -HUP "$p" 2>/dev/null || :
+    i=0
+    while [ "$i" -lt 2 ] && kill -0 "$p" 2>/dev/null; do
+        sleep 1
+        i=$((i + 1))
+    done
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || :
+fi
 rm -rf "$d" 2>/dev/null || :
 '
 
@@ -814,6 +844,8 @@ start_integration_session() {
     note "starting ${remote_bash} with shell integration on ${destination}"
     set +e
     remote_exec 'printf "%s\n" "$$" > "$1/pid" 2>/dev/null || :
+JSH_REMOTE_SANDBOX="$1"
+export JSH_REMOTE_SANDBOX
 exec "$2" --rcfile "$3" -i' "${sandbox}" "${remote_bash}" "${rc_path}"
     rc=$?
     set -e
@@ -980,6 +1012,11 @@ norc="$7"
 # Written before exec so the next connection can tell a live sandbox from an
 # abandoned one. exec() keeps the pid, so this stays true for the whole session.
 printf "%s\n" "$$" > "$sandbox/pid" 2>/dev/null || :
+# Carried in the environment so the teardown can prove a still-running process
+# is this session before it signals it; pids alone are reused. See
+# CLEANUP_SCRIPT.
+JSH_REMOTE_SANDBOX="$sandbox"
+export JSH_REMOTE_SANDBOX
 
 if [ "$want_mode" = incognito ]; then
     mkdir -p "$sandbox/home" "$sandbox/cache" "$sandbox/state" \

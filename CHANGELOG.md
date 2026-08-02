@@ -13,6 +13,15 @@
   to read. Together these are what every stock `.bashrc` opens with, and
   `jsh-remote.sh --incognito` passes exactly such a file with `--rcfile`, so a
   container session began with an error on every start.
+- `jsh-remote.sh` takes its session down with it on the docker transport. ssh
+  hangs up the remote pty when it goes; `docker exec` leaves what it started
+  running, so a closed tab left a jsh in the container with its sandbox
+  unlinked underneath it, and every open and close added another. Teardown now
+  signals the recorded pid — but only after proving, through the sandbox name
+  the session carries in its environment, that the process is really this
+  session and not a reused pid. HUP first, since that is what a terminal going
+  away means and jsh answers it by saving its session; KILL only for a shell
+  that will not leave.
 - A root shell trusts the system helpers it could write. "Can the current user
   replace this binary" is a trust signal only for an unprivileged user; root
   can write every file on the system, so the automatic-helper check answered

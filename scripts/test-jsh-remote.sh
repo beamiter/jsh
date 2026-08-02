@@ -76,9 +76,22 @@ container="\$1"; shift
 # deployment would "discover" a jsh that is already there. TERM is what the
 # daemon substitutes when nobody says otherwise, so anything -e carries has to
 # come after it to win.
-exec env -i HOME="${CTR_HOME}" \\
-    PATH="\${FAKE_DOCKER_PATH:-/usr/local/bin:/usr/bin:/bin}" \\
-    TERM=xterm \${passed} "\$@"
+run_it() {
+    env -i HOME="${CTR_HOME}" \\
+        PATH="\${FAKE_DOCKER_PATH:-/usr/local/bin:/usr/bin:/bin}" \\
+        TERM=xterm \${passed} "\$@"
+}
+# The real \`docker exec\` does not take its process down when the client goes
+# away — that is what leaves a shell running in the container after a tab is
+# closed. FAKE_DOCKER_DETACH reproduces it: start the session, return without
+# it, and give it a moment to record its pid the way a real session has by the
+# time anyone tears it down.
+if [ -n "\${FAKE_DOCKER_DETACH:-}" ]; then
+    run_it "\$@" > /dev/null 2>&1 < /dev/null &
+    sleep 1
+    exit 0
+fi
+run_it "\$@"
 EOF
 chmod +x "${STUB}/docker"
 
@@ -99,7 +112,12 @@ case "\$1" in
       echo "XDG_STATE_HOME=\${XDG_STATE_HOME:-}"
       echo "TERM=\${TERM:-}"
       echo "COLORTERM=\${COLORTERM:-}"
+      echo "SANDBOX=\${JSH_REMOTE_SANDBOX:-}"
+      echo "SESSION_PID=\$\$"
     } > "${LOG}"
+    # A real session lasts as long as the tab; the stub only needs to outlive
+    # the launcher, which is what makes the teardown observable.
+    if [ -f "${STUB}/linger" ]; then exec sleep 30; fi
     ;;
 esac
 EOF
@@ -175,6 +193,40 @@ assert "cache directory is content addressed" matches "${cached_bin}" '/bin/[0-9
 assert "cache directory is private" [ "$(stat -c %a "$(dirname "${cached_bin}")")" = "700" ]
 assert "no incoming file left behind" [ ! -e "${cached_bin}.incoming" ]
 assert "sandbox torn down" [ -z "$(ctr_sandboxes)" ]
+
+echo "== a session that outlives its client is taken down with its sandbox =="
+# `docker exec` does not kill what it started when the client goes away, so
+# without the teardown below a closed tab leaves a shell running in the
+# container forever — and the next connection's sweep is right to leave it
+# alone, because its pid is genuinely alive.
+touch "${STUB}/linger"
+out="$(FAKE_DOCKER_DETACH=1 run 2>&1)"
+indent "${out}"
+session_pid="$(session_field SESSION_PID)"
+sandbox_path="$(session_field SANDBOX)"
+assert "the detached session started" [ -n "${session_pid}" ]
+assert "the session knows its own sandbox" matches "${sandbox_path}" 'jsh-remote\.'
+# The teardown gives the shell a second to leave on its own before insisting.
+for _ in 1 2 3 4 5 6; do
+    kill -0 "${session_pid}" 2> /dev/null || break
+    sleep 0.5
+done
+assert "the orphaned session was signalled" [ ! -e "/proc/${session_pid}" ]
+assert "its sandbox is gone too" [ ! -d "${sandbox_path}" ]
+rm -f "${STUB}/linger"
+
+echo "== a live session belonging to someone else is never signalled =="
+# The pid file is not proof of ownership: pids get reused. Only a process whose
+# environment names this exact sandbox may be signalled.
+sleep 300 &
+bystander=$!
+mkdir -p "${CTR_HOME}/.cache/jsh-remote.impostor"
+printf '%s\n' "${bystander}" > "${CTR_HOME}/.cache/jsh-remote.impostor/pid"
+out="$(run 2>&1)"
+indent "${out}"
+assert "the bystander survived the sweep" kill -0 "${bystander}"
+{ kill -9 "${bystander}"; wait "${bystander}"; } 2> /dev/null
+rm -rf "${CTR_HOME}/.cache/jsh-remote.impostor"
 
 echo "== the terminal the tab is drawn in crosses into the container =="
 assert "TERM forwarded" [ "$(session_field TERM)" = "xterm-256color" ]
