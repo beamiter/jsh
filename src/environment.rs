@@ -13,6 +13,47 @@ const MAX_PATH_SCAN_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_PATH_CACHE_ENTRIES: usize = 65_536;
 const MAX_PATH_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Longest `JSH_REAL_HOME` that will be honoured. A home directory is a path
+/// like any other; the bound only stops a pathological value from propagating
+/// into every expanded word for the rest of the session.
+const MAX_REAL_HOME_BYTES: usize = 4096;
+
+/// The home directory for paths a *person* writes: `~`, `cd` with no argument,
+/// the `~/…` abbreviation in the prompt and in completions.
+///
+/// This is deliberately not the same question as "where does this shell keep
+/// its own state". `dirs::home_dir` answers the second one, and history,
+/// session snapshots, bookmarks and the frecency database all keep asking it.
+/// The two answers differ in exactly one situation: `jsh-remote.sh --incognito`
+/// points `HOME` at a sandbox so that nothing jsh writes can survive the
+/// session, and sets `JSH_REAL_HOME` to the account's actual home so that the
+/// person at the keyboard still gets `cd ~` and a `~/project` prompt.
+///
+/// Reading a startup file from the real home follows the same rule: reading it
+/// changes nothing, and anything inside it that *writes* to `$HOME` still lands
+/// in the sandbox, because `$HOME` itself is untouched by this function.
+///
+/// A value that is not an absolute path to an existing directory is ignored
+/// rather than rejected: an unusable override must not stop a shell starting.
+fn resolve_home_dir() -> PathBuf {
+    real_home_override(env::var_os("JSH_REAL_HOME").as_deref())
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")))
+}
+
+/// The override half of [`resolve_home_dir`], parameterised on the raw value so
+/// it is testable without mutating the process environment.
+fn real_home_override(raw: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let raw = raw?;
+    if raw.is_empty() || raw.len() > MAX_REAL_HOME_BYTES {
+        return None;
+    }
+    let candidate = PathBuf::from(raw);
+    if !candidate.is_absolute() || !candidate.is_dir() {
+        return None;
+    }
+    Some(candidate)
+}
+
 fn bounded_path_value(value: &str) -> String {
     if value.len() <= MAX_PATH_SCAN_VALUE_BYTES {
         return value.to_string();
@@ -331,7 +372,7 @@ impl ShellState {
             aliases.insert("la".to_string(), "ls -A --color=auto".to_string());
         }
 
-        let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let home_dir = resolve_home_dir();
         let hostname = std::fs::read_to_string("/etc/hostname")
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| String::from("localhost"));
@@ -726,7 +767,42 @@ impl ShellState {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_path_value, scan_path_commands_with_limits, MAX_PATH_SCAN_VALUE_BYTES};
+    use super::{
+        bounded_path_value, real_home_override, scan_path_commands_with_limits,
+        MAX_PATH_SCAN_VALUE_BYTES, MAX_REAL_HOME_BYTES,
+    };
+    use std::ffi::OsStr;
+
+    #[test]
+    fn real_home_override_accepts_only_an_absolute_existing_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        let file = dir.join("not-a-directory");
+        std::fs::write(&file, "").expect("fixture file");
+
+        assert_eq!(
+            real_home_override(Some(dir.as_os_str())).as_deref(),
+            Some(dir)
+        );
+
+        // Everything an unusable value can be. None of these may stop a shell
+        // from starting, so each one falls back rather than failing.
+        assert_eq!(real_home_override(None), None);
+        assert_eq!(real_home_override(Some(OsStr::new(""))), None);
+        assert_eq!(real_home_override(Some(OsStr::new("relative/home"))), None);
+        assert_eq!(
+            real_home_override(Some(OsStr::new("/no/such/directory/anywhere"))),
+            None
+        );
+        assert_eq!(
+            real_home_override(Some(file.as_os_str())),
+            None,
+            "a regular file is not a home"
+        );
+
+        let overlong = format!("/{}", "a".repeat(MAX_REAL_HOME_BYTES));
+        assert_eq!(real_home_override(Some(OsStr::new(&overlong))), None);
+    }
 
     #[test]
     fn path_scan_payload_has_entry_and_byte_bounds() {

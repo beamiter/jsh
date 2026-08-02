@@ -43,6 +43,7 @@ Re-running it is how you update. Useful options:
 ```sh
 ./scripts/install-jsh.sh --check          # compare installed against latest
 ./scripts/install-jsh.sh --channel source # build from git instead
+./scripts/install-jsh.sh --stage-dir DIR --target TRIPLE   # verify only, install nothing
 ./scripts/install-jsh.sh --help           # bin directory, pinned version, dry run
 ```
 
@@ -157,6 +158,55 @@ History is stored at `~/.jsh_history`; named session snapshots live under
 a newline-safe JSONL format while retaining compatibility with the previous
 tab-separated format. Session snapshots exclude process-specific variables and
 names that look like credentials, tokens, passwords, or secrets.
+
+## Remote hosts and containers
+
+`scripts/jsh-remote.sh` runs jsh on a machine that does not have jsh installed.
+It places a static musl build there, executes it, and takes it away again:
+
+```sh
+./scripts/jsh-remote.sh build-box            # ssh
+./scripts/jsh-remote.sh --docker my-service  # a running container
+```
+
+Completion, the prompt, history search, workflows, and the OSC 133 marks that
+drive a terminal's Commands timeline all behave exactly as they do locally,
+because the shell doing the work really is jsh.
+
+The destination keeps its own shell. Nothing edits `.bashrc`, `.profile`,
+`.zshrc`, `/etc/profile.d`, or the login shell in `/etc/passwd`; nothing needs
+root or a package manager; and nothing is downloaded on the far side — the
+release artifact is fetched and verified here by `install-jsh.sh --stage-dir`
+and then pushed over the same connection, so an air-gapped host works too.
+
+Two modes, because "install nothing" means two different things:
+
+| | `--persist` (default) | `--incognito` |
+|---|---|---|
+| remote `$HOME` | keeps `~/.jsh_history`, `~/.jsh/`, and a cached binary under `~/.cache`, all private to your account | never written to |
+| history across sessions | kept | discarded |
+| repeat connections | skip the transfer | transfer each time |
+| use it when | the account is yours | the account is shared |
+
+`--incognito` points `HOME` and the XDG variables at a sandbox that is deleted
+when the session ends, and sets `JSH_REAL_HOME` to the account's actual home.
+
+That variable separates two questions that are normally the same one. `~`, `cd`
+with no argument, the `~/…` abbreviation in the prompt and in completions, and
+the startup file all follow `JSH_REAL_HOME`, because those are paths a person
+writes. `$HOME` keeps pointing at the sandbox, because that is where programs
+write — so history, session snapshots, bookmarks, and the frecency database
+still cannot escape it. Set it yourself and the same split applies; leave it
+unset, or set it to something that is not an existing absolute directory, and
+nothing changes.
+
+Useful options: `--session ID` to forward a terminal session id, `--rcfile FILE`
+to push a startup file, `--artifact FILE` to ship a binary you built yourself,
+`--dry-run` to see the plan, and `--fallback fail` to refuse the destination's
+own shell when deployment is impossible. `--help` lists the rest.
+
+Any of the four jterm terminals can use this without changes — run it in a pane,
+or configure it as the command for a tab.
 
 ## Semantic commands and execution context
 

@@ -69,6 +69,10 @@ const SKIP_ENV_VARS: &[&str] = &[
     // Internal
     "JSH_SESSION_ID",
     "TERM_SESSION_ID",
+    // Set by jsh-remote.sh for one connection to one machine. Persisting it
+    // would carry another host's home directory into a later local session,
+    // where `~` would then point somewhere that does not exist here.
+    "JSH_REAL_HOME",
     // One-shot Agent child transport. These paths are capabilities for a
     // private snapshot/report directory and must never survive into a command
     // or a persisted terminal session.
