@@ -13,6 +13,9 @@
 #     keep the inode they started with and are never disturbed.
 #   * Nothing here edits shell startup files. If PATH resolves to the wrong jsh
 #     we say so and print the fix; we do not silently rewrite the user's config.
+#   * `--stage-dir` stops after "downloaded and verified", so jsh-remote.sh can
+#     ship a binary to a machine that has no network without growing a second
+#     copy of the download-and-verify logic.
 
 set -eu
 
@@ -44,6 +47,8 @@ force=0
 dry_run=0
 max_age=0
 tmp_dir=""
+stage_dir=""
+check_requested=0
 
 usage() {
     cat <<'USAGE'
@@ -58,6 +63,9 @@ Options:
   --channel CHANNEL    release (prebuilt, default) or source (cargo build)
   --prefix PATH        Install root; binary lands in PATH/bin
   --bin-dir PATH       Install directory for the binary (overrides --prefix)
+  --target TRIPLE      Fetch for this target instead of the detected one
+  --stage-dir PATH     Download and verify only; leave the binary in PATH and
+                       exit without installing anything
   --force              Reinstall even when the wanted version is present
   --dry-run            Print what would happen, change nothing
   -h, --help           Show this help
@@ -101,7 +109,10 @@ need_arg() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --check) mode="check" ;;
+        --check)
+            mode="check"
+            check_requested=1
+            ;;
         --json) json=1 ;;
         --max-age)
             need_arg "$1" $#
@@ -128,6 +139,18 @@ while [ $# -gt 0 ]; do
             bin_dir="$2"
             shift
             ;;
+        --target)
+            need_arg "$1" $#
+            JSH_INSTALL_TARGET="$2"
+            export JSH_INSTALL_TARGET
+            shift
+            ;;
+        --stage-dir)
+            need_arg "$1" $#
+            stage_dir="$2"
+            mode="stage"
+            shift
+            ;;
         --force) force=1 ;;
         --dry-run) dry_run=1 ;;
         -h | --help)
@@ -146,6 +169,21 @@ esac
 case "${max_age}" in
     '' | *[!0-9]*) die "--max-age expects whole seconds" ;;
 esac
+if [ -n "${stage_dir}" ]; then
+    # Staging exists to hand a *verified release artifact* to another machine.
+    # Building from source would produce a binary for this host instead, which
+    # is exactly the wrong answer, so the combination is refused rather than
+    # silently reinterpreted.
+    [ "${channel}" = "release" ] || die "--stage-dir needs --channel release"
+    # Order-independent: `--check --stage-dir` and `--stage-dir --check` must
+    # both be refused, not resolved by whichever flag was written last.
+    [ "${check_requested}" -eq 0 ] || die "--stage-dir and --check are mutually exclusive"
+    mode="stage"
+    case "${stage_dir}" in
+        /*) ;;
+        *) die "--stage-dir must be an absolute path: ${stage_dir}" ;;
+    esac
+fi
 [ -n "${HOME:-}" ] || die "HOME is not set"
 
 # --- untrusted input grammar -------------------------------------------------
@@ -494,14 +532,27 @@ resolve_bin_dir() {
 make_tmp
 
 target="$(detect_target)"
-dest_dir="$(resolve_bin_dir)"
-dest="${dest_dir}/jsh"
-installed_version="$(jsh_version_of "${dest}")"
 
-on_path="$(path_jsh)"
-shadowed_by=""
-if [ -n "${on_path}" ] && [ "${on_path}" != "${dest}" ]; then
-    shadowed_by="${on_path}"
+if [ "${mode}" = "stage" ]; then
+    # Staging installs nothing, so there is no destination to resolve and no
+    # local binary to identify. Skipping the probe also keeps `--stage-dir` from
+    # executing an unrelated `jsh` on PATH just to answer a question it will
+    # never use.
+    dest_dir=""
+    dest=""
+    installed_version=""
+    on_path=""
+    shadowed_by=""
+else
+    dest_dir="$(resolve_bin_dir)"
+    dest="${dest_dir}/jsh"
+    installed_version="$(jsh_version_of "${dest}")"
+
+    on_path="$(path_jsh)"
+    shadowed_by=""
+    if [ -n "${on_path}" ] && [ "${on_path}" != "${dest}" ]; then
+        shadowed_by="${on_path}"
+    fi
 fi
 
 # --- check mode --------------------------------------------------------------
@@ -554,6 +605,11 @@ fi
 
 # --- install -----------------------------------------------------------------
 
+if [ "${mode}" = "stage" ] && [ -z "${target}" ]; then
+    # There is no source fallback for staging: the artifact is for another
+    # machine, and building here would produce one for this host.
+    die "no prebuilt target for $(uname -s)/$(uname -m); pass --target explicitly"
+fi
 if [ "${channel}" = "release" ] && [ -z "${target}" ]; then
     warn "no prebuilt binaries for $(uname -s)/$(uname -m); falling back to --channel source"
     channel="source"
@@ -584,12 +640,22 @@ if [ -n "${installed_version}" ] && [ -z "${want_version}" ] && [ "${force}" -eq
 fi
 
 if [ "${dry_run}" -eq 1 ]; then
-    say "would install jsh ${version:-from source} to ${dest} (channel: ${channel}, target: ${target:-n/a})"
+    if [ "${mode}" = "stage" ]; then
+        say "would stage jsh ${version} (${target}) in ${stage_dir}"
+    else
+        say "would install jsh ${version:-from source} to ${dest} (channel: ${channel}, target: ${target:-n/a})"
+    fi
     exit 0
 fi
 
-mkdir -p "${dest_dir}" || die "cannot create ${dest_dir}"
-writable_dir "${dest_dir}" || die "${dest_dir} is not writable"
+if [ "${mode}" = "stage" ]; then
+    mkdir -p "${stage_dir}" || die "cannot create ${stage_dir}"
+    writable_dir "${stage_dir}" || die "${stage_dir} is not writable"
+    chmod 0700 "${stage_dir}" 2> /dev/null || :
+else
+    mkdir -p "${dest_dir}" || die "cannot create ${dest_dir}"
+    writable_dir "${dest_dir}" || die "${dest_dir} is not writable"
+fi
 make_tmp
 staged="${tmp_dir}/jsh"
 
@@ -672,6 +738,39 @@ else
 fi
 
 chmod 0755 "${staged}"
+
+if [ "${mode}" = "stage" ]; then
+    # Deliberately no `--version` probe here. A staged artifact is usually for a
+    # different architecture and simply cannot run on this host, and running it
+    # would prove nothing about the machine it is headed for anyway. The bytes
+    # are already pinned by the published SHA-256 and the archive-member check;
+    # the identity check happens on the destination, after the binary lands.
+    stage_sha="$(sha256_of "${staged}")"
+    valid_sha256 "${stage_sha}" || die "cannot digest the staged binary"
+    # The binary is renamed into place and its digest is written afterwards, so
+    # a reader that trusts the digest file never sees a half-written binary.
+    incoming="$(mktemp "${stage_dir}/.jsh.staging.XXXXXX")" || die "cannot write to ${stage_dir}"
+    cat < "${staged}" > "${incoming}" || {
+        rm -f "${incoming}"
+        die "cannot write to ${stage_dir}"
+    }
+    chmod 0755 "${incoming}"
+    mv -f "${incoming}" "${stage_dir}/jsh" || {
+        rm -f "${incoming}"
+        die "cannot write ${stage_dir}/jsh"
+    }
+    printf 'version=%s\ntarget=%s\nsha256=%s\n' "${version}" "${target}" "${stage_sha}" \
+        > "${stage_dir}/jsh.meta" || die "cannot write ${stage_dir}/jsh.meta"
+    if [ "${json}" -eq 1 ]; then
+        printf '{"schema":1,"version":"%s","target":"%s","path":"%s","sha256":"%s"}\n' \
+            "$(json_str "${version}")" "$(json_str "${target}")" \
+            "$(json_str "${stage_dir}/jsh")" "$(json_str "${stage_sha}")"
+    else
+        say "staged jsh ${version} (${target}) at ${stage_dir}/jsh"
+    fi
+    exit 0
+fi
+
 staged_version="$(jsh_version_of "${staged}")"
 [ -n "${staged_version}" ] || die "the downloaded binary does not identify itself as jsh"
 if [ -n "${version}" ] && [ "${staged_version}" != "${version}" ]; then
