@@ -691,16 +691,86 @@ if [ "${channel}" = "release" ]; then
     mv "${unpacked}" "${staged}"
 else
     have cargo || die "channel 'source' needs cargo (https://rustup.rs)"
-    say "building jsh from source; this takes a few minutes"
-    cargo_root="${tmp_dir}/cargo-root"
-    if [ -n "${version}" ]; then
-        cargo install --git "https://github.com/${REPO}" --tag "v${version}" \
-            --locked --root "${cargo_root}" jsh || die "cargo install failed"
-    else
-        cargo install --git "https://github.com/${REPO}" \
-            --locked --root "${cargo_root}" jsh || die "cargo install failed"
+
+    # A source build aims for the same thing the release channel ships: the
+    # static musl binary. Static is not a packaging nicety here — an installed
+    # jsh lends itself out, bind-mounted into containers and pushed onto ssh
+    # hosts, and only a static binary survives arriving in another libc's
+    # userland. The pieces that takes: the musl std (rustup adds it), and a
+    # musl C compiler for the TLS dependency's C sources.
+    #
+    # When a piece is missing the build falls back to the host toolchain and
+    # says exactly what was missed and what it costs, rather than failing an
+    # install that would otherwise work or silently dropping features.
+    source_target=""
+    source_cc=""
+    source_arch=""
+    if [ "$(uname -s)" = "Linux" ]; then
+        case "$(uname -m)" in
+            x86_64 | amd64) source_arch="x86_64" ;;
+            aarch64 | arm64) source_arch="aarch64" ;;
+            *) source_arch="" ;;
+        esac
+        if [ -n "${JSH_INSTALL_TARGET:-}" ]; then
+            # The explicit triple wins for source exactly as it does for
+            # release: naming a gnu triple is how glibc is asked for.
+            source_target="${JSH_INSTALL_TARGET}"
+        elif [ -n "${source_arch}" ]; then
+            source_target="${source_arch}-unknown-linux-musl"
+        fi
     fi
+    case "${source_target}" in
+        *-musl)
+            for candidate in "${source_arch}-linux-musl-gcc" musl-gcc; do
+                if have "${candidate}"; then
+                    source_cc="${candidate}"
+                    break
+                fi
+            done
+            if [ -z "${source_cc}" ]; then
+                warn "static build needs a musl C compiler (Debian/Ubuntu: sudo apt install musl-tools)"
+                warn "building for the host toolchain instead; the result is dynamically"
+                warn "linked and cannot lend itself into containers or onto ssh hosts"
+                source_target=""
+            elif ! have rustup; then
+                warn "static build needs rustup to add the ${source_target} std; building for the host toolchain instead"
+                source_target=""
+            elif ! rustup target list --installed 2>/dev/null | grep -qx "${source_target}"; then
+                say "adding the ${source_target} toolchain target"
+                rustup target add "${source_target}" || {
+                    warn "cannot add ${source_target}; building for the host toolchain instead"
+                    source_target=""
+                }
+            fi
+            ;;
+    esac
+
+    if [ -n "${source_target}" ]; then
+        say "building jsh from source for ${source_target}; this takes a few minutes"
+    else
+        say "building jsh from source; this takes a few minutes"
+    fi
+    cargo_root="${tmp_dir}/cargo-root"
+    set -- --locked --root "${cargo_root}"
+    [ -z "${version}" ] || set -- "$@" --tag "v${version}"
+    if [ -n "${source_target}" ]; then
+        set -- "$@" --target "${source_target}"
+        # The variable name cc-rs actually reads for a cross target; the same
+        # one the release workflow sets.
+        CC_x86_64_unknown_linux_musl="${source_cc}"
+        CC_aarch64_unknown_linux_musl="${source_cc}"
+        export CC_x86_64_unknown_linux_musl CC_aarch64_unknown_linux_musl
+    fi
+    cargo install --git "https://github.com/${REPO}" "$@" jsh || die "cargo install failed"
     [ -f "${cargo_root}/bin/jsh" ] || die "cargo did not produce a binary"
+    if [ -n "${source_target}" ] && have ldd; then
+        # Confirmation, not enforcement: the triple already decides linkage,
+        # and ldd's wording for a static PIE varies. Worth one line because
+        # static is the entire point of preferring this target.
+        if ldd "${cargo_root}/bin/jsh" 2>&1 | grep -qi "statically\|not a dynamic"; then
+            say "built ${source_target}: statically linked"
+        fi
+    fi
     mv "${cargo_root}/bin/jsh" "${staged}"
 fi
 

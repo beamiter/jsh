@@ -39,7 +39,8 @@ assert() {
 }
 
 # matches <text> <extended regex>
-matches() { grep -qE "$2" <<< "$1"; }
+matches() { grep -qE -- "$2" <<< "$1"; }
+lacks_target() { ! grep -q -- "--target" "${SRCLOG}"; }
 
 # version_is <binary> <expected --version output>
 version_is() { [ "$("$1" --version)" = "$2" ]; }
@@ -323,6 +324,119 @@ before="$("${ALT}/jsh" --version)"
 out="$(run --dry-run 2>&1)"
 indent "${out}"
 assert "binary untouched" version_is "${ALT}/jsh" "${before}"
+
+echo "== a source build aims for the static musl target =="
+# Stubs stand in for the toolchain: cargo records its arguments and the CC
+# environment it was given, rustup records target additions. The point under
+# test is what the installer asks for, not what rustc does with it.
+STUB="${ROOT}/toolchain-stub"
+SRCLOG="${ROOT}/source-build.log"
+mkdir -p "${STUB}"
+case "$(uname -m)" in
+    aarch64 | arm64) SRC_ARCH="aarch64" ;;
+    *) SRC_ARCH="x86_64" ;;
+esac
+MUSL_TRIPLE="${SRC_ARCH}-unknown-linux-musl"
+
+cat > "${STUB}/cargo" <<EOF
+#!/bin/sh
+root=""
+prev=""
+for a in "\$@"; do
+    [ "\$prev" = "--root" ] && root="\$a"
+    prev="\$a"
+done
+{
+    echo "argv=\$*"
+    echo "cc_x86=\${CC_x86_64_unknown_linux_musl:-}"
+    echo "cc_arm=\${CC_aarch64_unknown_linux_musl:-}"
+} > "${SRCLOG}"
+mkdir -p "\$root/bin"
+printf '#!/bin/sh\necho "jsh 9.9.9 (stub source build)"\n' > "\$root/bin/jsh"
+chmod +x "\$root/bin/jsh"
+EOF
+chmod +x "${STUB}/cargo"
+
+cat > "${STUB}/rustup" <<EOF
+#!/bin/sh
+case "\$1 \$2" in
+    "target list") [ -f "${STUB}/target-added" ] && echo "${MUSL_TRIPLE}" ;;
+    "target add") : > "${STUB}/target-added"; echo "rustup-add \$3" >> "${SRCLOG}.rustup" ;;
+esac
+EOF
+chmod +x "${STUB}/rustup"
+# Both spellings the installer probes for, so the assertion does not depend
+# on whether the machine running this suite has real musl compilers.
+printf '#!/bin/sh\nexit 0\n' > "${STUB}/musl-gcc"
+printf '#!/bin/sh\nexit 0\n' > "${STUB}/${SRC_ARCH}-linux-musl-gcc"
+chmod +x "${STUB}/musl-gcc" "${STUB}/${SRC_ARCH}-linux-musl-gcc"
+
+# A PATH with everything the installer needs except a musl compiler, for the
+# fallback case: presence is probed with command -v, so absence can only be
+# simulated by a PATH that genuinely lacks them — a machine that has
+# musl-tools installed would otherwise satisfy the probe behind the stub's
+# back.
+THIN="${ROOT}/thinbin"
+mkdir -p "${THIN}"
+for d in /usr/bin /bin; do
+    for f in "$d"/*; do
+        b="$(basename "$f")"
+        case "$b" in
+            musl-gcc | *-musl-gcc) continue ;;
+        esac
+        [ -e "${THIN}/$b" ] || ln -s "$f" "${THIN}/$b" 2>/dev/null
+    done
+done
+
+# No JSH_INSTALL_TARGET here: the musl default is exactly what is under test.
+run_src() {
+    env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
+        XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
+        JSH_INSTALL_BASE_URL="file://${REL}" \
+        sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin" "$@"
+}
+
+rm -f "${STUB}/target-added" "${SRCLOG}.rustup"
+out="$(run_src 2>&1)"
+rc=$?
+indent "$(grep -E 'adding|building' <<< "${out}")"
+assert "exit 0" [ ${rc} -eq 0 ]
+assert "the std for the target was added first" \
+    matches "$(cat "${SRCLOG}.rustup" 2>/dev/null)" "rustup-add ${MUSL_TRIPLE}"
+assert "cargo builds the musl target" matches "$(cat "${SRCLOG}")" -- "--target ${MUSL_TRIPLE}"
+assert "the musl C compiler reaches the C dependency" \
+    matches "$(cat "${SRCLOG}")" "cc_(x86|arm)=(${SRC_ARCH}-linux-)?musl-gcc"
+assert "the stub build was installed" [ -x "${ROOT}/src-bin/jsh" ]
+
+echo "== without a musl compiler the build says what it lost and still lands =="
+rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
+THINSTUB="${ROOT}/thinstub"
+mkdir -p "${THINSTUB}"
+ln -sf "${STUB}/cargo" "${THINSTUB}/cargo"
+ln -sf "${STUB}/rustup" "${THINSTUB}/rustup"
+out="$(env -i HOME="${FAKE_HOME}" PATH="${THINSTUB}:${THIN}" \
+    XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
+    JSH_INSTALL_BASE_URL="file://${REL}" \
+    sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin" --force 2>&1)"
+rc=$?
+indent "$(grep -E 'musl-tools|lend itself' <<< "${out}")"
+assert "exit 0" [ ${rc} -eq 0 ]
+assert "names the package to install" matches "${out}" "musl-tools"
+assert "says what a dynamic build cannot do" matches "${out}" "lend itself"
+assert "cargo builds without a target override" lacks_target
+assert "the fallback build was installed" [ -x "${ROOT}/src-bin/jsh" ]
+
+echo "== an explicit gnu triple is obeyed for source too =="
+rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
+out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
+    XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
+    JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${SRC_ARCH}-unknown-linux-gnu" \
+    sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin" --force 2>&1)"
+assert "exit 0" [ $? -eq 0 ]
+assert "cargo builds the gnu target" \
+    matches "$(cat "${SRCLOG}")" -- "--target ${SRC_ARCH}-unknown-linux-gnu"
+assert "no musl compiler is exported for a gnu build" \
+    matches "$(cat "${SRCLOG}")" "cc_x86=\$" 
 
 # The installer identifies jsh by its --version banner; make sure a real build
 # still matches that contract when one is lying around.

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- A source build aims for the static musl target too. `--channel source` — and
+  the automatic fallback to it when no prebuilt artifact fits — used to hand
+  cargo the host's default target, so the one install path left produced the
+  one binary that cannot lend itself out. It now targets
+  `<arch>-unknown-linux-musl`, adds the std through rustup when it is missing,
+  and gives the TLS dependency's C sources the musl compiler by the same
+  variable the release workflow uses. When a piece is missing — no musl C
+  compiler, no rustup — it builds for the host toolchain instead and says
+  exactly what was missed (`sudo apt install musl-tools`) and what the dynamic
+  result cannot do, rather than failing an install that would otherwise work.
+  `JSH_INSTALL_TARGET` picks any other triple for source builds exactly as it
+  does for release downloads.
 - The Linux install is the static musl build. The installer used to pick a
   glibc artifact whenever the host's glibc was new enough, which produced a jsh
   that could not lend itself out: container entry bind-mounts the running
