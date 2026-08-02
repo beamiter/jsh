@@ -58,7 +58,9 @@ Options:
   --max-age SECONDS    With --check, reuse a cached result younger than this
   --version VERSION    Install an exact version instead of the latest
   --tag TAG            Same, spelled as a tag (v0.2.0)
-  --channel CHANNEL    release (prebuilt, default) or source (cargo build)
+  --channel CHANNEL    release (prebuilt, default) or source (cargo build).
+                       When no release can be found at all, an install falls
+                       back to source on its own and says so
   --prefix PATH        Install root; binary lands in PATH/bin
   --bin-dir PATH       Install directory for the binary (overrides --prefix)
   --target TRIPLE      Fetch for this target instead of the detected one
@@ -584,7 +586,21 @@ fi
 
 version="${want_version}"
 if [ "${channel}" = "release" ] && [ -z "${version}" ]; then
-    version="$(latest_version)" || die "cannot read the release manifest from ${BASE_URL}"
+    if ! version="$(latest_version)"; then
+        # No manifest means no release to install — the state every repository
+        # is in before its first tag. Staging has no source fallback (the
+        # artifact is for another machine); an install has one, and taking it
+        # automatically is what lets a bare `install-jsh.sh` work against a
+        # repository that has never released. This is a not-found fallback
+        # only: a manifest that resolves but names artifacts that fail their
+        # checksum still dies, because "build something else instead" is not
+        # an answer to failed verification.
+        [ "${mode}" != "stage" ] || die "cannot read the release manifest from ${BASE_URL}"
+        version=""
+        warn "cannot read the release manifest from ${BASE_URL} (no release published yet?)"
+        warn "falling back to --channel source: cargo builds from the repository, which takes a few minutes"
+        channel="source"
+    fi
 fi
 
 if [ -n "${installed_version}" ] && [ "${installed_version}" = "${version}" ] && [ "${force}" -eq 0 ]; then
@@ -599,7 +615,8 @@ fi
 # still honoured, because asking for an older build by name is a real thing to
 # want; what must not happen is a bare `install-jsh.sh` quietly replacing a
 # working shell with an older one.
-if [ -n "${installed_version}" ] && [ -z "${want_version}" ] && [ "${force}" -eq 0 ] \
+if [ -n "${installed_version}" ] && [ -n "${version}" ] && [ -z "${want_version}" ] \
+    && [ "${force}" -eq 0 ] \
     && version_gt "${installed_version}" "${version}"; then
     say "jsh ${installed_version} at ${dest} is newer than the published ${version}"
     say "nothing to do; use --version ${version} to install that build anyway"

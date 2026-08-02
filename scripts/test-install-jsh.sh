@@ -438,6 +438,50 @@ assert "cargo builds the gnu target" \
 assert "no musl compiler is exported for a gnu build" \
     matches "$(cat "${SRCLOG}")" "cc_x86=\$" 
 
+echo "== a bare install against a repository with no releases builds from source =="
+# The state every repository is in before its first tag, and the reason a
+# plain `install-jsh.sh` has to work without one.
+EMPTY_REL="${ROOT}/no-releases"
+mkdir -p "${EMPTY_REL}"
+rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
+out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
+    XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
+    JSH_INSTALL_BASE_URL="file://${EMPTY_REL}" \
+    sh "${INSTALLER}" --bin-dir "${ROOT}/src-bin" 2>&1)"
+rc=$?
+indent "$(grep -E 'falling back|manifest' <<< "${out}")"
+assert "exit 0" [ ${rc} -eq 0 ]
+assert "says why it is not installing a release" matches "${out}" "no release published yet"
+assert "announces the source fallback" matches "${out}" "falling back to --channel source"
+assert "the source build was installed" [ -x "${ROOT}/src-bin/jsh" ]
+
+echo "== failed verification never falls back to source =="
+# "Build something else instead" is not an answer to a checksum mismatch; only
+# not-found is allowed to reroute.
+make_release 0.4.0 corrupt-checksum
+rm -f "${SRCLOG}"
+out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
+    XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
+    JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${TARGET}" \
+    sh "${INSTALLER}" --bin-dir "${ROOT}/src-bin" --force 2>&1)"
+rc=$?
+assert "exit nonzero" [ ${rc} -ne 0 ]
+assert "dies on the checksum" matches "${out}" "checksum mismatch"
+assert "cargo was never consulted" [ ! -f "${SRCLOG}" ]
+make_release 0.3.0
+
+echo "== staging still refuses to fall back =="
+# The staged artifact is for another machine; a build on this one is not it.
+rm -f "${SRCLOG}"
+out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
+    XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
+    JSH_INSTALL_BASE_URL="file://${EMPTY_REL}" JSH_INSTALL_TARGET="${TARGET}" \
+    sh "${INSTALLER}" --stage-dir "${ROOT}/stage-out" 2>&1)"
+rc=$?
+assert "exit nonzero" [ ${rc} -ne 0 ]
+assert "names the unreadable manifest" matches "${out}" "cannot read the release manifest"
+assert "cargo was never consulted" [ ! -f "${SRCLOG}" ]
+
 # The installer identifies jsh by its --version banner; make sure a real build
 # still matches that contract when one is lying around.
 if [ -x "${REPO_ROOT}/target/release/jsh" ]; then
