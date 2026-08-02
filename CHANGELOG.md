@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `jsh-remote.sh` lends the local jsh instead of fetching a release. When the
+  jsh on this machine is static and the destination runs the same
+  architecture, it is the artifact: pushed as-is, verified by its banner after
+  landing, cached on the far side under its own digest. No release lookup, no
+  network, and the far side runs exactly the version that sent it — the same
+  self-lending the shell itself does for a typed `ssh` or `docker` command,
+  now for every terminal that drives the launcher from a host picker.
+  Explicit `--artifact` and `--version` behave as before, a jsh already on
+  the destination is still preferred over any transfer, and a dynamically
+  linked local jsh still goes through published releases.
 - A bare `install-jsh.sh` works before the first release: when the release
   manifest cannot be read it falls back to `--channel source` on its own,
   saying why and what it costs, and switches to verified artifacts the moment

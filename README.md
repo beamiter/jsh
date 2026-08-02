@@ -250,7 +250,11 @@ jsh to be static, which the released Linux binaries now are.
 ## Remote hosts and containers
 
 `scripts/jsh-remote.sh` runs jsh on a machine that does not have jsh installed.
-It places a static musl build there, executes it, and takes it away again:
+It places a static musl build there, executes it, and takes it away again.
+When the jsh running here is itself static — which a Linux install now is —
+that binary is the artifact: nothing is fetched from anywhere, and the far
+side runs exactly the version that sent it. Releases are the fallback for a
+dynamically linked jsh or a different architecture:
 
 ```sh
 ./scripts/jsh-remote.sh build-box            # ssh

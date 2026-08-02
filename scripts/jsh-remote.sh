@@ -621,6 +621,31 @@ if [ -n "${remote_jsh}" ] && valid_remote_path "${remote_jsh}"; then
     fi
 fi
 
+# The local jsh can be its own artifact. A static binary survives arriving in
+# any libc's userland, and the far side then runs exactly the version that
+# sent it — no release lookup, no network, and it works before the first
+# release exists. Only for this machine's architecture, because the local
+# binary is by definition built for it; every other target keeps going
+# through published artifacts. ldd is the judge of static: a dynamically
+# linked jsh would land, fail to find its interpreter, and report a missing
+# file that is plainly there.
+artifact_version=""
+if [ -z "${artifact}" ] && [ -z "${want_version}" ] && [ -z "${skip_reason}" ] \
+    && [ -n "${local_version}" ] && [ -x "${probe_bin:-}" ]; then
+    case "$(uname -m)" in
+        x86_64 | amd64) local_arch="x86_64" ;;
+        aarch64 | arm64) local_arch="aarch64" ;;
+        *) local_arch="" ;;
+    esac
+    if [ -n "${local_arch}" ] && [ "${target}" = "${local_arch}-unknown-linux-musl" ] \
+        && have ldd \
+        && ldd "${probe_bin}" 2>&1 | grep -qiE "statically linked|not a dynamic"; then
+        note "the local jsh is static; lending it instead of fetching a release"
+        artifact="${probe_bin}"
+        artifact_version="${local_version}"
+    fi
+fi
+
 # --- step 3: stage the artifact locally --------------------------------------
 
 staged_bin=""
@@ -665,8 +690,10 @@ if [ -z "${skip_reason}" ] && [ -z "${reuse_existing}" ]; then
         staged_bin="${artifact}"
         # An explicit --version alongside --artifact is an assertion about the
         # file, and the post-landing check is where it is enforced. Without this
-        # the two options would silently ignore each other.
-        staged_version="${want_version}"
+        # the two options would silently ignore each other. A lent local jsh
+        # knows its version from its own banner, which also lets the remote
+        # cache recognise it on the next connection.
+        staged_version="${want_version:-${artifact_version}}"
         if have sha256sum; then
             staged_sha="$(sha256sum "${artifact}" | cut -d' ' -f1)"
         elif have shasum; then

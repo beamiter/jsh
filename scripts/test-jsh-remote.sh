@@ -228,6 +228,40 @@ assert "the bystander survived the sweep" kill -0 "${bystander}"
 { kill -9 "${bystander}"; wait "${bystander}"; } 2> /dev/null
 rm -rf "${CTR_HOME}/.cache/jsh-remote.impostor"
 
+echo "== a static local jsh lends itself; releases are not needed at all =="
+# The stub local jsh reads as lendable (ldd: not a dynamic executable), so
+# pointing the release URL at nothing proves the deployment no longer depends
+# on a release existing anywhere.
+out="$(env -i HOME="${LOCAL_HOME}" PATH="${PATH_FOR_RUN}" \
+    TERM=xterm-256color COLORTERM=truecolor XDG_CACHE_HOME="${LOCAL_HOME}/.cache-empty" \
+    JSH_INSTALL_BASE_URL="file://${ROOT}/no-such-releases" \
+    FAKE_DOCKER_PATH="${FAKE_DOCKER_PATH}" \
+    sh "${REMOTE}" --docker testctr -v 2>&1 < /dev/null)"
+rc=$?
+indent "$(grep -E 'lending|starting' <<< "${out}")"
+assert "exit 0" [ ${rc} -eq 0 ]
+assert "announces the loan" matches "${out}" "lending it instead of fetching a release"
+assert "the lent jsh ran" [ -f "${LOG}" ]
+assert "its version came from its own banner" matches "${out}" "starting jsh ${VERSION}"
+
+echo "== a dynamic local jsh cannot lend itself and uses the release =="
+# Presence is probed with ldd, so a stub ldd that reports dynamic linkage is
+# how a glibc-installed jsh looks to the launcher.
+LDDSTUB="${ROOT}/ldd-dynamic"
+mkdir -p "${LDDSTUB}"
+printf '#!/bin/sh\necho "\tlinux-vdso.so.1 (0x0000)"\n' > "${LDDSTUB}/ldd"
+chmod +x "${LDDSTUB}/ldd"
+out="$(env -i HOME="${LOCAL_HOME}" PATH="${LDDSTUB}:${PATH_FOR_RUN}" \
+    TERM=xterm-256color COLORTERM=truecolor XDG_CACHE_HOME="${LOCAL_HOME}/.cache" \
+    JSH_INSTALL_BASE_URL="file://${REL}" \
+    FAKE_DOCKER_PATH="${FAKE_DOCKER_PATH}" \
+    sh "${REMOTE}" --docker testctr -v 2>&1 < /dev/null)"
+rc=$?
+assert "exit 0" [ ${rc} -eq 0 ]
+assert "no loan is offered" lacks "${out}" "lending it"
+assert "the release artifact was staged instead" matches "${out}" "(staging|reusing staged artifact)"
+assert "the release jsh ran" [ -f "${LOG}" ]
+
 echo "== the terminal the tab is drawn in crosses into the container =="
 assert "TERM forwarded" [ "$(session_field TERM)" = "xterm-256color" ]
 assert "COLORTERM forwarded" [ "$(session_field COLORTERM)" = "truecolor" ]
