@@ -48,14 +48,121 @@ fn writable_by_current_user(metadata: &fs::Metadata) -> bool {
 
 /// Validate an explicitly configured executable without falling back to PATH.
 pub(crate) fn explicit_absolute_executable(path: &Path) -> bool {
+    trusted_explicit_executable(path)
+}
+
+/// Environment variable that names an explicit absolute path for a helper.
+/// `notify-send` becomes `JSH_HELPER_NOTIFY_SEND`.
+fn helper_path_variable(name: &str) -> String {
+    let mut variable = String::from("JSH_HELPER_");
+    for byte in name.bytes() {
+        variable.push(match byte {
+            b'-' => '_',
+            other => other.to_ascii_uppercase() as char,
+        });
+    }
+    variable
+}
+
+/// The helper jsh should start for `name`, or `None` when there is no
+/// trustworthy one.
+///
+/// The fixed candidate list in [`automatic_system_helper`] is deliberately
+/// short and absolute, which costs nothing on a distribution that puts `git` in
+/// `/usr/bin` and everything on one that does not: Nix, Homebrew-style prefixes
+/// and immutable-root images all lose the Git prompt, `.bashrc` import, and
+/// desktop notifications with no way to say where those tools actually are.
+///
+/// `JSH_HELPER_<NAME>` says where. It is not a return to PATH lookup: PATH is
+/// mutable shell state that any script can rewrite, while this is one explicit
+/// absolute path that must still survive [`trusted_explicit_executable`].
+///
+/// A configured path that fails those checks yields no helper at all rather
+/// than quietly falling back to the automatic candidate. Silently starting a
+/// *different* binary than the one that was named is worse than the feature
+/// being missing, and the missing feature is visible.
+pub(crate) fn trusted_helper(name: &str) -> Option<std::path::PathBuf> {
+    if let Some(configured) = std::env::var_os(helper_path_variable(name)) {
+        if !configured.is_empty() {
+            let path = std::path::PathBuf::from(configured);
+            if trusted_explicit_executable(&path) {
+                return Some(path);
+            }
+            warn_once_about_helper(name, &path);
+            return None;
+        }
+    }
+    automatic_system_helper(name).map(Path::to_path_buf)
+}
+
+/// One line per helper per process. These resolve from a prompt callback and a
+/// notification thread, so an unconditional warning would repeat on every
+/// prompt draw.
+fn warn_once_about_helper(name: &str, path: &Path) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let Ok(mut warned) = WARNED.lock() else {
+        return;
+    };
+    if warned
+        .get_or_insert_with(HashSet::new)
+        .insert(name.to_string())
+    {
+        eprintln!(
+            "jsh: {} names {}, which is not a trusted executable; \
+             {name} integration is disabled",
+            helper_path_variable(name),
+            path.display()
+        );
+    }
+}
+
+/// Is this an absolute path to an executable that no third party can replace?
+///
+/// Symlinks are followed rather than refused: `/run/current-system/sw/bin/git`
+/// on Nix and `/etc/alternatives`-style indirection everywhere else are normal,
+/// and what matters is the trustworthiness of what they resolve to.
+///
+/// The check walks the whole resolved directory chain, not just the file. A
+/// binary in a safe directory under a world-writable parent is not safe: the
+/// parent can be renamed out of the way and replaced wholesale, so validating
+/// only the leaf proves nothing about what will be there at exec time.
+fn trusted_explicit_executable(path: &Path) -> bool {
     if !path.is_absolute() {
         return false;
     }
-    path.metadata().is_ok_and(|metadata| {
-        metadata.is_file()
-            && metadata.mode() & 0o111 != 0
-            && (metadata.uid() == unsafe { nix::libc::geteuid() } || metadata.mode() & 0o022 == 0)
-    })
+    // canonicalize resolves every symlink, so the chain walked below is the
+    // chain the kernel will walk, rather than the one the caller typed.
+    let Ok(resolved) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(metadata) = resolved.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 || !trusted_path_component(&metadata) {
+        return false;
+    }
+    let mut directory = resolved.parent();
+    while let Some(current) = directory {
+        let Ok(metadata) = current.metadata() else {
+            return false;
+        };
+        if !metadata.is_dir() || !trusted_path_component(&metadata) {
+            return false;
+        }
+        directory = current.parent();
+    }
+    true
+}
+
+/// Trusted means "only root or this user can change it". Group- and
+/// world-writable are refused outright — that covers the sticky-bit temporary
+/// directories, where anyone can plant a name — and so is ownership by some
+/// third user, who could replace the file between this check and the exec.
+fn trusted_path_component(metadata: &fs::Metadata) -> bool {
+    metadata.mode() & 0o022 == 0
+        && (metadata.uid() == 0 || metadata.uid() == unsafe { nix::libc::geteuid() })
 }
 
 /// Read a regular file with a byte cap. Symlinks and special files are refused
@@ -718,12 +825,70 @@ mod tests {
             assert_ne!(git, Path::new("git"));
         }
         assert!(!explicit_absolute_executable(Path::new("relative-helper")));
+    }
 
+    #[test]
+    fn an_explicit_helper_must_be_trustworthy_all_the_way_down() {
+        // A real system binary: root-owned file under a root-owned chain.
+        for candidate in ["/bin/sh", "/usr/bin/env", "/bin/cat"] {
+            let path = Path::new(candidate);
+            if path.exists() {
+                assert!(
+                    explicit_absolute_executable(path),
+                    "{candidate} should be trusted"
+                );
+            }
+        }
+
+        assert!(!explicit_absolute_executable(Path::new("relative")));
+        assert!(!explicit_absolute_executable(Path::new("/no/such/helper")));
+
+        // The interesting case, and the reason the whole directory chain is
+        // walked: the file itself is private and the directory holding it is
+        // 0700, but it sits under a world-writable /tmp, which can be renamed
+        // out of the way and replaced wholesale. Validating only the leaf would
+        // accept this.
         let temp = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).expect("private dir");
         let configured = temp.path().join("configured-helper");
         fs::write(&configured, "#!/bin/sh\n").expect("helper fixture");
         fs::set_permissions(&configured, fs::Permissions::from_mode(0o700))
             .expect("executable mode");
-        assert!(explicit_absolute_executable(&configured));
+        let under_world_writable = temp.path().ancestors().any(|ancestor| {
+            fs::metadata(ancestor).is_ok_and(|metadata| metadata.mode() & 0o022 != 0)
+        });
+        assert_eq!(
+            explicit_absolute_executable(&configured),
+            !under_world_writable,
+            "chain trust disagreed with the ancestors of {}",
+            configured.display()
+        );
+
+        // A regular file with no execute bit is not a helper.
+        let data = temp.path().join("not-executable");
+        fs::write(&data, "").expect("data fixture");
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o600)).expect("data mode");
+        assert!(!explicit_absolute_executable(&data));
+    }
+
+    #[test]
+    fn helper_variable_names_are_derived_predictably() {
+        assert_eq!(helper_path_variable("git"), "JSH_HELPER_GIT");
+        assert_eq!(helper_path_variable("bash"), "JSH_HELPER_BASH");
+        assert_eq!(
+            helper_path_variable("notify-send"),
+            "JSH_HELPER_NOTIFY_SEND"
+        );
+    }
+
+    #[test]
+    fn an_unset_helper_variable_leaves_the_automatic_candidate_alone() {
+        // No override configured in this process, so resolution must be exactly
+        // what the fixed candidate list already produced.
+        assert_eq!(
+            trusted_helper("git"),
+            automatic_system_helper("git").map(Path::to_path_buf)
+        );
+        assert!(trusted_helper("not-a-helper").is_none());
     }
 }

@@ -105,7 +105,7 @@ shopt 2>/dev/null || true
 "#;
 
     // Execute bash script to capture the environment, aliases, and functions
-    let Some(bash) = crate::io_guard::automatic_system_helper("bash") else {
+    let Some(bash) = crate::io_guard::trusted_helper("bash") else {
         eprintln!("jsh: Bash startup import unavailable: no trusted system Bash");
         return;
     };

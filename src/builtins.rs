@@ -912,7 +912,7 @@ declare -F | awk '{print $3}'
 "#;
 
     // Execute bash script to capture the environment
-    let Some(bash) = crate::io_guard::automatic_system_helper("bash") else {
+    let Some(bash) = crate::io_guard::trusted_helper("bash") else {
         eprintln!("jsh: source: no trusted system Bash is available");
         return 1;
     };

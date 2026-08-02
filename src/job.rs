@@ -206,8 +206,7 @@ fn send_notification(command: &str, exit_code: i32, elapsed: Duration) {
             let _ = std::thread::Builder::new()
                 .name("jsh-notify-send".to_string())
                 .spawn(move || {
-                    let Some(notify_send) = crate::io_guard::automatic_system_helper("notify-send")
-                    else {
+                    let Some(notify_send) = crate::io_guard::trusted_helper("notify-send") else {
                         return;
                     };
                     let mut command = std::process::Command::new(notify_send);

@@ -242,7 +242,7 @@ pub fn probe_git_context() -> GitContext {
 /// Run a read-only Git probe without letting a large worktree pin the prompt
 /// or allocate an unbounded `Command::output` buffer.
 pub(crate) fn bounded_git_stdout(cwd: &Path, args: &[&str], max_bytes: usize) -> Option<Vec<u8>> {
-    let git = crate::io_guard::automatic_system_helper("git")?;
+    let git = crate::io_guard::trusted_helper("git")?;
     let mut command = std::process::Command::new(git);
     command
         .args(args)
