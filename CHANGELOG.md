@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A bare `install-jsh.sh` works before the first release: when the release
+  manifest cannot be read it falls back to `--channel source` on its own,
+  saying why and what it costs, and switches to verified artifacts the moment
+  a release exists. Strictly a not-found fallback — staging still dies (its
+  artifact is for another machine), and failed checksum verification still
+  dies rather than building something else instead.
 - A source build aims for the static musl target too. `--channel source` — and
   the automatic fallback to it when no prebuilt artifact fits — used to hand
   cargo the host's default target, so the one install path left produced the
