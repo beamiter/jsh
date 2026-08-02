@@ -9,6 +9,56 @@ release installer now fails closed, and AI response headers are bounded.
 
 ## Completed since the previous handoff
 
+- `SessionSnapshot` no longer derives `Deserialize`. `decode_snapshot` is the
+  only wire path into one, and it drives `DeserializeSeed`/`Visitor`
+  implementations that charge as they build: every map and sequence stops at the
+  first entry past *its own* limit, every string is measured before it is owned,
+  and the text budget is shared across fields rather than reset per collection.
+  The structural preflight bounded the document; it could not express "8 000
+  functions and 8 000 environment variables are the same shape and only one of
+  them is allowed", so those per-field rules were previously met only after the
+  whole structure existed. `validate_snapshot_logical` is unchanged and is now a
+  backstop rather than the only check. Legacy migration is untouched: unknown
+  fields are still ignored so a snapshot from a newer build restores what this
+  one understands, `environment_context` still defaults, and every other field
+  is still required. Repeated fields are now refused rather than resolved to the
+  last one — two values for `session_id` in one document is not something this
+  build wrote, and picking either is a guess. The limit tests call
+  `decode_snapshot` directly, without the audit, so a rejection there is proof
+  the check moved into decoding rather than merely still existing.
+
+- `jsh-remote.sh` has three tiers rather than two, and the new middle one is the
+  default. Deployment needs a directory that can *execute* a file; integration
+  needs one that can merely be *written* to, because `bash --rcfile` reads its
+  argument and never runs it — `noexec` refuses `execve` and permits `write(2)`,
+  so the middle tier survives precisely the case that strands the first. It
+  hands the destination's own bash a throwaway rc that emits the same OSC 133
+  A/B/C/D and OSC 7 marks `src/osc.rs` does, so the terminal keeps blocks, cwd
+  tracking and exit codes; it buys back none of jsh, because jsh is not there.
+  The destination's `~/.bashrc` is sourced first so aliases and prompt survive,
+  and the file is deleted with the sandbox. `C` comes from `PS0`, not a `DEBUG`
+  trap: `PS0` is printed after a command is read and before it runs, which is
+  that point exactly, and it fires once per command line with no guards against
+  firing for `PROMPT_COMMAND` itself. Below bash 4.4 there is no `PS0`, so the
+  other three marks are installed and blocks do not form; `ash`-only images fall
+  through to the plain shell as before.
+
+- `JSH_HELPER_<NAME>` names an explicit absolute path for a helper program, so a
+  layout that does not use the fixed candidate list — Nix, a Homebrew-style
+  prefix, an immutable root — keeps the `.bashrc` import, the Git prompt and
+  desktop notifications instead of silently losing them. It is not a return to
+  PATH lookup: PATH is mutable shell state any sourced script can rewrite, while
+  this is one path that must still pass `trusted_explicit_executable`. That check
+  now resolves symlinks (`/run/current-system/sw/bin/git` and
+  `/etc/alternatives` indirection are the normal case) and walks the *whole*
+  resolved directory chain rather than the leaf and its immediate parent: a
+  binary in a private directory under a world-writable ancestor is not safe,
+  because the ancestor can be renamed away and replaced wholesale. A configured
+  path that fails yields no helper rather than falling back to the automatic
+  candidate — starting a different binary than the one that was named is worse
+  than the feature being missing — and says so once per helper per process,
+  because resolution happens from a prompt callback and a notification thread.
+
 - Model requests are cancellable rather than merely abandonable. A blocking ureq
   read cannot be interrupted in place, so running it on a worker thread only ever
   achieved half the job: INT released the foreground, but the request stayed
@@ -89,34 +139,6 @@ release installer now fails closed, and AI response headers are bounded.
   retained before it applies.
 
 ## Remaining boundaries
-
-### Replace snapshot preflight with schema-aware decoding
-
-Session load has a 4 MiB file cap, allocation-free JSON depth/value/string
-preflight, and post-decode logical validation. The final construction still uses
-ordinary Serde. Replace it with bounded map/sequence visitors that enforce
-collection counts, per-field limits, and cumulative text while allocating,
-without weakening legacy snapshot migration. jterm1's `src/session.rs` now has a
-worked example of this shape for a comparable schema.
-
-### Generalize trusted automatic helpers without reopening PATH execution
-
-Automatic bash, git, and notify-send integrations intentionally use fixed,
-permission-checked system paths. Nix and custom system layouts can therefore lose
-optional integration features. Support explicitly configured absolute helper paths
-only after verifying executability, ownership, and every containing directory; do
-not restore mutable PATH lookup for background helpers.
-
-### Deployment-free shell integration as a third fallback
-
-When no directory on the destination can execute a file, `jsh-remote.sh` falls
-back to that machine's own shell and the terminal loses OSC 133 blocks, cwd
-tracking, and exit codes along with jsh. A middle option exists: inject a
-`PROMPT_COMMAND` that emits the same marks `src/osc.rs` writes into the remote's
-existing bash, which needs no file on disk at all. It buys back the terminal-side
-features but none of jsh's completion, and it degrades on images whose only
-shell is busybox ash, so it is worth building only if unexecutable destinations
-turn out to be common in practice.
 
 ### Add a signed release manifest
 
