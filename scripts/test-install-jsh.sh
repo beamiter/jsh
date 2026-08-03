@@ -175,6 +175,33 @@ assert "unreachable manifest exits nonzero" [ ${rc} -ne 0 ]
 assert "unreachable manifest reported, not guessed" matches "${out}" '"error":"cannot reach'
 mv "${REL}/manifest.hidden" "${REL}/latest/download/manifest.json"
 
+echo "== a clamped PATH still finds the user's jsh via JSH_LOOKUP_PATH =="
+# A terminal runs --check with PATH clamped to system directories so the tools
+# the script executes cannot be hijacked. A jsh installed somewhere else —
+# ~/.cargo/bin is the common case, and it is neither on the clamped PATH nor
+# the default destination — then reports as "nothing installed", and the
+# terminal raises an install banner forever. JSH_LOOKUP_PATH carries the PATH
+# the terminal's user would have seen, for lookup only.
+CARGO_HOME_DIR="${ROOT}/cargo-home"
+CARGO_BIN="${CARGO_HOME_DIR}/.cargo/bin"
+mkdir -p "${CARGO_BIN}"
+cp "${BIN}/jsh" "${CARGO_BIN}/jsh"
+clamped_run() {
+    env -i HOME="${CARGO_HOME_DIR}" PATH="/usr/local/bin:/usr/bin:/bin" \
+        XDG_CACHE_HOME="${CARGO_HOME_DIR}/.cache" XDG_STATE_HOME="${CARGO_HOME_DIR}/.local/state" \
+        JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${TARGET}" \
+        "$@" sh "${INSTALLER}" --check --json
+}
+out="$(clamped_run 2> /dev/null)"
+indent "${out}"
+assert "the clamp alone misses the installed jsh" matches "${out}" '"installed":null'
+assert "and would offer an install of what is already current" matches "${out}" '"update_available":true'
+out="$(clamped_run JSH_LOOKUP_PATH="${CARGO_BIN}:/usr/local/bin:/usr/bin:/bin" 2> /dev/null)"
+indent "${out}"
+assert "the lookup path finds it" matches "${out}" '"installed":"0\.3\.1"'
+assert "in place, where the user's shells resolve it" matches "${out}" "\"installed_path\":\"${CARGO_BIN}/jsh\""
+assert "so nothing is offered" matches "${out}" '"update_available":false'
+
 echo "== checksum mismatch aborts =="
 make_release 0.3.2 corrupt
 out="$(run 2>&1)"

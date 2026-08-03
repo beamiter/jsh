@@ -339,8 +339,19 @@ version_gt() {
 }
 
 # Absolute path of the jsh that PATH resolves to, whatever it turns out to be.
+#
+# A terminal that runs this script clamps PATH to system directories so the
+# tools it executes (curl, mktemp, ...) cannot be hijacked, but the jsh its
+# user would run still lives on the user's own PATH — usually ~/.cargo/bin or
+# ~/.local/bin. JSH_LOOKUP_PATH carries that PATH for *lookup only*: nothing
+# resolved through it is executed except jsh itself, which the terminal
+# already executes as the session shell.
 path_jsh() {
-    resolved="$(command -v jsh 2>/dev/null)" || return 0
+    resolved="$(
+        PATH="${JSH_LOOKUP_PATH:-${PATH}}"
+        export PATH
+        command -v jsh 2>/dev/null
+    )" || return 0
     case "${resolved}" in
         /*) printf '%s\n' "${resolved}" ;;
         *) ;;
