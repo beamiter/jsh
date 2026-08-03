@@ -186,13 +186,57 @@ fn trusted_explicit_executable(path: &Path) -> bool {
     true
 }
 
-/// Trusted means "only root or this user can change it". Group- and
-/// world-writable are refused outright — that covers the sticky-bit temporary
-/// directories, where anyone can plant a name — and so is ownership by some
-/// third user, who could replace the file between this check and the exec.
+/// Trusted means "only root or this user can change it". World-writable is
+/// refused outright — that covers the sticky-bit temporary directories, where
+/// anyone can plant a name — and so is ownership by some third user, who could
+/// replace the file between this check and the exec.
+///
+/// Group-writable is refused only when the group actually contains somebody
+/// else; see [`group_write_reaches_others`].
 fn trusted_path_component(metadata: &fs::Metadata) -> bool {
-    metadata.mode() & 0o022 == 0
-        && (metadata.uid() == 0 || metadata.uid() == unsafe { nix::libc::geteuid() })
+    if metadata.mode() & 0o002 != 0 {
+        return false;
+    }
+    if metadata.mode() & 0o020 != 0 && group_write_reaches_others(metadata.gid(), metadata.uid()) {
+        return false;
+    }
+    metadata.uid() == 0 || metadata.uid() == unsafe { nix::libc::geteuid() }
+}
+
+/// Does the group bit on a path hand write access to anyone beyond its owner?
+///
+/// Debian, Ubuntu and Fedora all give each user a group of their own and ship
+/// umask 002, so *everything* a user installs under their home is mode 0775
+/// with a group only that user is in. Reading the bit alone as "someone else
+/// can write here" therefore refuses a whole `~/miniconda3`, `~/.local` or
+/// `~/.cargo` — every helper a person actually installs — while proving
+/// nothing: the group is them. That is how `conda activate` lost its shell
+/// hook, silently, on a stock Ubuntu.
+///
+/// So look at who is in the group instead of at the bit. Private means the
+/// owner's primary group with no other members, which grants exactly the
+/// access the owner bit already grants. Anything else — a shared `staff`,
+/// `wheel`, or a group the owner merely belongs to — stays untrusted.
+///
+/// Users whose *primary* group is this one do not appear in the member list,
+/// and finding them would mean enumerating passwd, which is unbounded and
+/// often impossible under LDAP or SSSD. A second account sharing a first
+/// account's private group is a hand-made configuration; a shell's helper
+/// lookup is not where it gets caught.
+fn group_write_reaches_others(gid: u32, owner: u32) -> bool {
+    let Ok(Some(group)) = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(gid)) else {
+        return true;
+    };
+    let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner)) else {
+        return true;
+    };
+    group_reaches_others(gid, user.gid.as_raw(), &user.name, &group.mem)
+}
+
+/// Split from [`group_write_reaches_others`] so the membership rule can be
+/// asserted without a test suite that owns /etc/group.
+fn group_reaches_others(gid: u32, owner_primary_gid: u32, owner: &str, members: &[String]) -> bool {
+    gid != owner_primary_gid || members.iter().any(|member| member != owner)
 }
 
 /// Read the first bytes of a regular file, with the same refusals as
@@ -948,6 +992,53 @@ mod tests {
         fs::write(&data, "").expect("data fixture");
         fs::set_permissions(&data, fs::Permissions::from_mode(0o600)).expect("data mode");
         assert!(!explicit_absolute_executable(&data));
+    }
+
+    #[test]
+    fn a_group_of_one_is_not_somebody_else() {
+        let nobody: [String; 0] = [];
+        // The stock Ubuntu shape: user-private group, umask 002, so every
+        // helper under $HOME is 0775 and the group is the owner alone.
+        assert!(!group_reaches_others(1000, 1000, "ubuntu", &nobody));
+        // A second member of that group can write through the bit.
+        assert!(group_reaches_others(
+            1000,
+            1000,
+            "ubuntu",
+            &["deploy".to_string()]
+        ));
+        // Owner listed in its own group changes nothing.
+        assert!(!group_reaches_others(
+            1000,
+            1000,
+            "ubuntu",
+            &["ubuntu".to_string()]
+        ));
+        // A shared group the owner merely belongs to is not private, even
+        // while empty: its membership is not the owner's to keep at one.
+        assert!(group_reaches_others(50, 1000, "ubuntu", &nobody));
+    }
+
+    #[test]
+    fn a_helper_under_a_user_private_group_stays_usable() {
+        // What a `pip install --user` or a conda prefix looks like on a
+        // distribution shipping umask 002.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let helper = temp.path().join("group-writable-helper");
+        fs::write(&helper, "#!/bin/sh\n").expect("helper fixture");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o775)).expect("group-writable");
+        let metadata = fs::metadata(&helper).expect("helper metadata");
+        assert_eq!(
+            trusted_path_component(&metadata),
+            !group_write_reaches_others(metadata.gid(), metadata.uid()),
+            "0775 was judged by the bit rather than by who is in the group"
+        );
+
+        // World-writable is still refused with no lookup at all.
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o777)).expect("world-writable");
+        assert!(!trusted_path_component(
+            &fs::metadata(&helper).expect("helper metadata")
+        ));
     }
 
     #[test]

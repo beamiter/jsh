@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A helper under a user-private group is trusted again. Ubuntu, Debian and
+  Fedora give each user a group of their own and ship umask 002, so every
+  helper a person installs into their home — `~/miniconda3`, `~/.local`,
+  `~/.cargo` — is mode 0775 with a group containing only them. Reading that
+  bit as "somebody else can write here" refused all of it: on a stock Ubuntu
+  the conda shell hook stopped loading and `conda activate` answered "Run
+  'conda init' before 'conda activate'" in every new shell, with nothing said
+  about why. The group bit is now judged by who is in the group instead — the
+  owner's primary group with no other members grants exactly the access the
+  owner bit already grants — while world-writable, a shared group, and a group
+  the owner merely belongs to stay refused as before.
 - `jsh-remote.sh` lends the local jsh instead of fetching a release. When the
   jsh on this machine is static and the destination runs the same
   architecture, it is the artifact: pushed as-is, verified by its banner after
