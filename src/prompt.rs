@@ -45,7 +45,9 @@ pub fn render_prompt(state: &ShellState) -> String {
     }
 }
 
-/// Full prompt: user@host ~/path (branch) took duration ❯
+/// Full prompt, two lines so the input never starts mid-line under a long path:
+///   user@host ~/path (branch) took duration
+///   ❯
 fn render_prompt_full(state: &ShellState) -> String {
     let user = crate::terminal_text::escape_inline(
         &env::var("USER").unwrap_or_else(|_| String::from("user")),
@@ -110,14 +112,18 @@ fn render_prompt_full(state: &ShellState) -> String {
         }
     }
 
-    prompt.push(' ');
+    // CRLF, not LF: the editor reprints this string during repaints in raw
+    // mode, where a bare LF does not return the carriage.
+    prompt.push_str("\r\n");
     prompt.push_str(&exit_indicator);
     prompt.push(' ');
 
     prompt
 }
 
-/// Compact prompt: user ~/path (branch) ❯
+/// Compact prompt, two lines like the full style:
+///   user ~/path (branch)
+///   ❯
 fn render_prompt_compact(state: &ShellState) -> String {
     let user = crate::terminal_text::escape_inline(
         &env::var("USER").unwrap_or_else(|_| String::from("user")),
@@ -169,14 +175,16 @@ fn render_prompt_compact(state: &ShellState) -> String {
         prompt.push_str(&format!(" {}", format!("({})", branch).magenta()));
     }
 
-    prompt.push(' ');
+    prompt.push_str("\r\n");
     prompt.push_str(&exit_indicator);
     prompt.push(' ');
 
     prompt
 }
 
-/// Minimal prompt: ~/path ❯
+/// Minimal prompt, two lines — narrow panes are where a long path hurts most:
+///   ~/path
+///   ❯
 fn render_prompt_minimal(state: &ShellState) -> String {
     let cwd = get_short_cwd(state);
     let env_hint = get_env_hint().map(|hint| crate::terminal_text::escape_inline(&hint, 1024));
@@ -203,7 +211,7 @@ fn render_prompt_minimal(state: &ShellState) -> String {
         .bold()
     ));
 
-    prompt.push(' ');
+    prompt.push_str("\r\n");
     prompt.push_str(&exit_indicator);
     prompt.push(' ');
 
@@ -361,10 +369,38 @@ pub fn format_duration(d: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_env_hint, parse_git_status_header, GitContext};
+    use super::{get_env_hint, parse_git_status_header, render_prompt, GitContext};
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn every_style_puts_the_input_marker_on_its_own_line() {
+        // Two-line prompt: info line, then ❯ alone on the next line, so input
+        // starts at column 0 however long the cwd is. The separator must be
+        // CRLF — the editor reprints the prompt during raw-mode repaints,
+        // where a bare LF does not return the carriage.
+        for style in [
+            crate::environment::PromptStyle::Full,
+            crate::environment::PromptStyle::Compact,
+            crate::environment::PromptStyle::Minimal,
+        ] {
+            let mut state = crate::environment::ShellState::new(false);
+            state.prompt_style = style;
+            let prompt = render_prompt(&state);
+            let (before, after) = prompt
+                .split_once("\r\n")
+                .unwrap_or_else(|| panic!("{style:?} prompt has no CRLF: {prompt:?}"));
+            assert!(
+                !before.contains('❯') && after.contains('❯'),
+                "{style:?} keeps the marker off the info line: {prompt:?}"
+            );
+            assert!(
+                !after.contains('\n'),
+                "{style:?} marker line is the last line: {prompt:?}"
+            );
+        }
+    }
 
     #[test]
     fn parses_main_or_master_and_tracking_remote_from_one_status() {
