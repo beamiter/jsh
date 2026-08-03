@@ -40,7 +40,7 @@ assert() {
 
 # matches <text> <extended regex>
 matches() { grep -qE -- "$2" <<< "$1"; }
-lacks_target() { ! grep -q -- "--target" "${SRCLOG}"; }
+lacks() { ! grep -qE -- "$2" <<< "$1"; }
 
 # version_is <binary> <expected --version output>
 version_is() { [ "$("$1" --version)" = "$2" ]; }
@@ -90,11 +90,13 @@ EOF
 }
 
 # A pristine environment every time: no inherited PATH, cache, or state.
+# --channel release explicitly: these tests exercise the release path, and the
+# bare default (source) has tests of its own further down.
 run() {
     env -i HOME="${FAKE_HOME}" PATH="${PATH_FOR_RUN}" \
         XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
         JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${TARGET}" \
-        sh "${INSTALLER}" "$@"
+        sh "${INSTALLER}" --channel release "$@"
 }
 
 PATH_FOR_RUN="/usr/local/bin:/usr/bin:/bin"
@@ -435,7 +437,7 @@ assert "the musl C compiler reaches the C dependency" \
     matches "$(cat "${SRCLOG}")" "cc_(x86|arm)=(${SRC_ARCH}-linux-)?musl-gcc"
 assert "the stub build was installed" [ -x "${ROOT}/src-bin/jsh" ]
 
-echo "== without a musl compiler the build says what it lost and still lands =="
+echo "== without a musl compiler the build refuses instead of going dynamic =="
 rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
 THINSTUB="${ROOT}/thinstub"
 mkdir -p "${THINSTUB}"
@@ -446,12 +448,13 @@ out="$(env -i HOME="${FAKE_HOME}" PATH="${THINSTUB}:${THIN}" \
     JSH_INSTALL_BASE_URL="file://${REL}" \
     sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin" --force 2>&1)"
 rc=$?
-indent "$(grep -E 'musl-tools|lend itself' <<< "${out}")"
-assert "exit 0" [ ${rc} -eq 0 ]
+indent "$(grep -E 'musl-tools|lend itself|glibc' <<< "${out}")"
+assert "exit nonzero" [ ${rc} -ne 0 ]
 assert "names the package to install" matches "${out}" "musl-tools"
 assert "says what a dynamic build cannot do" matches "${out}" "lend itself"
-assert "cargo builds without a target override" lacks_target
-assert "the fallback build was installed" [ -x "${ROOT}/src-bin/jsh" ]
+assert "names the glibc escape hatch" matches "${out}" "JSH_INSTALL_TARGET=${SRC_ARCH}-unknown-linux-gnu"
+assert "cargo was never consulted" [ ! -f "${SRCLOG}" ]
+assert "nothing was installed" [ ! -e "${ROOT}/src-bin/jsh" ]
 
 echo "== an explicit gnu triple is obeyed for source too =="
 rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
@@ -465,16 +468,33 @@ assert "cargo builds the gnu target" \
 assert "no musl compiler is exported for a gnu build" \
     matches "$(cat "${SRCLOG}")" "cc_x86=\$" 
 
-echo "== a bare install against a repository with no releases builds from source =="
-# The state every repository is in before its first tag, and the reason a
-# plain `install-jsh.sh` has to work without one.
+echo "== a bare install defaults to the source channel =="
+# No --channel: the default is a source build even when releases exist, so a
+# bare install always lands the static musl binary the release would have
+# shipped, and works before the first release exists.
+rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
+out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
+    XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
+    JSH_INSTALL_BASE_URL="file://${REL}" \
+    sh "${INSTALLER}" --bin-dir "${ROOT}/src-bin" 2>&1)"
+rc=$?
+indent "$(grep -E 'building' <<< "${out}")"
+assert "exit 0" [ ${rc} -eq 0 ]
+assert "cargo was consulted" [ -f "${SRCLOG}" ]
+assert "cargo builds the musl target" matches "$(cat "${SRCLOG}")" -- "--target ${MUSL_TRIPLE}"
+assert "no release was downloaded" lacks "${out}" "downloading"
+assert "the source build was installed" [ -x "${ROOT}/src-bin/jsh" ]
+
+echo "== an explicit release channel with no releases falls back to source =="
+# The state every repository is in before its first tag: asking for a release
+# that does not exist reroutes to source rather than failing the install.
 EMPTY_REL="${ROOT}/no-releases"
 mkdir -p "${EMPTY_REL}"
 rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
 out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
     XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
     JSH_INSTALL_BASE_URL="file://${EMPTY_REL}" \
-    sh "${INSTALLER}" --bin-dir "${ROOT}/src-bin" 2>&1)"
+    sh "${INSTALLER}" --channel release --bin-dir "${ROOT}/src-bin" 2>&1)"
 rc=$?
 indent "$(grep -E 'falling back|manifest' <<< "${out}")"
 assert "exit 0" [ ${rc} -eq 0 ]
@@ -490,7 +510,7 @@ rm -f "${SRCLOG}"
 out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
     XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
     JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${TARGET}" \
-    sh "${INSTALLER}" --bin-dir "${ROOT}/src-bin" --force 2>&1)"
+    sh "${INSTALLER}" --channel release --bin-dir "${ROOT}/src-bin" --force 2>&1)"
 rc=$?
 assert "exit nonzero" [ ${rc} -ne 0 ]
 assert "dies on the checksum" matches "${out}" "checksum mismatch"

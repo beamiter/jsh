@@ -35,7 +35,9 @@ MAX_METADATA_BYTES=65536
 # Seconds allowed for one `--version` probe of an untrusted binary.
 PROBE_TIMEOUT=5
 
-channel="release"
+# Defaulted after the arguments are parsed: source for an install, release for
+# --stage-dir. Empty means "nothing explicit was asked for".
+channel=""
 bin_dir=""
 prefix=""
 want_version=""
@@ -58,9 +60,10 @@ Options:
   --max-age SECONDS    With --check, reuse a cached result younger than this
   --version VERSION    Install an exact version instead of the latest
   --tag TAG            Same, spelled as a tag (v0.2.0)
-  --channel CHANNEL    release (prebuilt, default) or source (cargo build).
-                       When no release can be found at all, an install falls
-                       back to source on its own and says so
+  --channel CHANNEL    source (cargo build, default) or release (prebuilt).
+                       Staging always uses release. An explicit release that
+                       finds no published release falls back to source and
+                       says so
   --prefix PATH        Install root; binary lands in PATH/bin
   --bin-dir PATH       Install directory for the binary (overrides --prefix)
   --target TRIPLE      Fetch for this target instead of the detected one
@@ -162,6 +165,17 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Source is the default channel: it produces the same static musl binary a
+# release would ship and works before the first release exists. Staging keeps
+# the release channel — the staged artifact is for another machine, and a
+# build here would be for this host.
+if [ -z "${channel}" ]; then
+    if [ "${mode}" = "stage" ]; then
+        channel="release"
+    else
+        channel="source"
+    fi
+fi
 case "${channel}" in
     release | source) ;;
     *) die "unknown channel: ${channel} (expected release or source)" ;;
@@ -727,9 +741,12 @@ else
     # userland. The pieces that takes: the musl std (rustup adds it), and a
     # musl C compiler for the TLS dependency's C sources.
     #
-    # When a piece is missing the build falls back to the host toolchain and
-    # says exactly what was missed and what it costs, rather than failing an
-    # install that would otherwise work or silently dropping features.
+    # A missing piece fails the install rather than degrading it. A
+    # host-toolchain build would look installed but be dynamically linked, and
+    # a dynamic jsh cannot lend itself into containers or onto ssh hosts — a
+    # silent downgrade here only surfaces much later, as a remote tab with no
+    # jsh in it. Naming a gnu triple (JSH_INSTALL_TARGET or --target) is how
+    # glibc is asked for on purpose.
     source_target=""
     source_cc=""
     source_arch=""
@@ -756,19 +773,15 @@ else
                 fi
             done
             if [ -z "${source_cc}" ]; then
-                warn "static build needs a musl C compiler (Debian/Ubuntu: sudo apt install musl-tools)"
-                warn "building for the host toolchain instead; the result is dynamically"
-                warn "linked and cannot lend itself into containers or onto ssh hosts"
-                source_target=""
+                warn "a dynamically linked jsh cannot lend itself into containers or onto ssh hosts"
+                warn "to build for the host glibc on purpose: JSH_INSTALL_TARGET=${source_arch}-unknown-linux-gnu"
+                die "static build needs a musl C compiler (Debian/Ubuntu: sudo apt install musl-tools)"
             elif ! have rustup; then
-                warn "static build needs rustup to add the ${source_target} std; building for the host toolchain instead"
-                source_target=""
+                die "static build needs rustup to add the ${source_target} std (https://rustup.rs)"
             elif ! rustup target list --installed 2>/dev/null | grep -qx "${source_target}"; then
                 say "adding the ${source_target} toolchain target"
-                rustup target add "${source_target}" || {
-                    warn "cannot add ${source_target}; building for the host toolchain instead"
-                    source_target=""
-                }
+                rustup target add "${source_target}" \
+                    || die "cannot add the ${source_target} std with rustup"
             fi
             ;;
     esac

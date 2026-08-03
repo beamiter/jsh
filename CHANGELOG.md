@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `install-jsh.sh` defaults to `--channel source` and refuses to downgrade a
+  static build. A bare install now cargo-builds the static musl binary instead
+  of consulting the release tree first, and a missing musl toolchain is an
+  error naming the package to install (`musl-tools`) rather than a warning
+  followed by a dynamically linked build that cannot lend itself into
+  containers or onto ssh hosts. Staging (`--stage-dir`) keeps the release
+  channel — a staged artifact is for another machine — and an explicit
+  `--channel release` still falls back to source when no release exists.
+  `JSH_INSTALL_TARGET=<arch>-unknown-linux-gnu` remains the way to ask for a
+  glibc build on purpose.
 - A helper under a user-private group is trusted again. Ubuntu, Debian and
   Fedora give each user a group of their own and ship umask 002, so every
   helper a person installs into their home — `~/miniconda3`, `~/.local`,
