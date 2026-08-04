@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Entering a container that runs as a non-root user works again. The typed
+  `docker exec -it <name> bash` upgrade streams jsh into the container's
+  `/dev` tmpfs, and an image that says `USER ubuntu` had that write refused —
+  the rewrite then gave up silently and the person landed in plain bash with
+  no completion. The push now retries once as uid 0 when the default user is
+  refused (whoever can reach the daemon already has root in the container);
+  the session itself still runs as whoever was asked for, and the binary
+  still lives only in the tmpfs, gone when the container stops.
 - `install-jsh.sh` defaults to `--channel source` and refuses to downgrade a
   static build. A bare install now cargo-builds the static musl binary instead
   of consulting the release tree first, and a missing musl toolchain is an

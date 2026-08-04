@@ -558,20 +558,35 @@ fn place_binary_in_container(engine: Engine, container: &str, binary: &Path) -> 
         "cat > {CONTAINER_PATH}.incoming && chmod 755 {CONTAINER_PATH}.incoming \
          && mv -f {CONTAINER_PATH}.incoming {CONTAINER_PATH}"
     );
-    let mut push = std::process::Command::new(program);
-    push.args(["exec", "-i", container, "/bin/sh", "-c", &script]);
-    crate::io_guard::bounded_command_session(
-        &mut push,
-        crate::io_guard::BoundedCommand {
-            stdout_limit: 4 * 1024,
-            stderr_limit: 4 * 1024,
-            timeout: std::time::Duration::from_secs(60),
-            stdin: Some(&bytes),
-            cancel: None,
-            die_with_parent: true,
-        },
-    )
-    .is_ok_and(|output| output.status.success())
+    // The push runs as the image's default user, and /dev belongs to root: an
+    // image that says `USER ubuntu` gets its write refused. Anyone allowed to
+    // talk to the daemon already has root inside the container, so a refusal
+    // is retried once as uid 0 — the binary lands 0755 in the tmpfs, and the
+    // session itself still runs as whoever the person asked for.
+    for user in [None, Some("0")] {
+        let mut push = std::process::Command::new(program);
+        push.arg("exec");
+        if let Some(uid) = user {
+            push.args(["--user", uid]);
+        }
+        push.args(["-i", container, "/bin/sh", "-c", &script]);
+        let pushed = crate::io_guard::bounded_command_session(
+            &mut push,
+            crate::io_guard::BoundedCommand {
+                stdout_limit: 4 * 1024,
+                stderr_limit: 4 * 1024,
+                timeout: std::time::Duration::from_secs(60),
+                stdin: Some(&bytes),
+                cancel: None,
+                die_with_parent: true,
+            },
+        )
+        .is_ok_and(|output| output.status.success());
+        if pushed {
+            return true;
+        }
+    }
+    false
 }
 
 /// Does this image start a shell when nobody says otherwise? Only then can the
