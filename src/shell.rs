@@ -679,6 +679,10 @@ impl Shell {
         let mut final_status = run_exit_trap(&mut self.state);
         self.save_session();
         self.history.save();
+        // What was completed this session ranks the next one's lists.
+        if let Ok(mut accepted) = crate::accepted::get_accepted_db().lock() {
+            accepted.save();
+        }
 
         // Opportunistically clean up stale session files (older than 7 days)
         session::cleanup_stale_sessions(std::time::Duration::from_secs(7 * 24 * 3600));

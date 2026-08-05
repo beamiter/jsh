@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Completion remembers what was taken. Accepting a candidate records it
+  against the command whose argument it was, scored by the same frecency `z`
+  uses for directories, and the next list leads with what was chosen before —
+  among candidates the typed text matches equally well. It is a ranking hint
+  only: nothing is added to a list because of it and nothing is removed, the
+  command name itself is never learned (there the typed prefix decides), and
+  a habit that stops being one fades. Ghost text reads the same record, so
+  `git checkout ma` fills in the branch that gets chosen without waiting for
+  Tab. The record lives in `~/.jsh_completions`, private and bounded.
+- A multi-word alias completes as the command it stands for. With `alias
+  gs='git status'`, `gs --<TAB>` is a `git status` flag position and `dc
+  lo<TAB>` reaches `docker compose logs` — the head word is expanded as many
+  times as it names an alias, with `alias ls='ls --color=auto'` expanding
+  once as the shell itself resolves it, and a cycle terminating.
+- Value-aware builtins complete field names from the pipeline's own source:
+  `from-json orders.json | where cust<TAB>` offers `customer`, labelled with
+  the type it holds, and the same for `select`, `sort-by`, `group-by` and
+  their siblings across JSON, NDJSON, YAML, TOML and CSV. The file is parsed,
+  never executed, and only when an earlier stage names one — a pipeline fed
+  by a command's output would have to run that command to know.
+- Options whose value is a fixed set now offer it, in both spellings:
+  `curl -X <TAB>`, `git log --pretty=<TAB>`, `find -type <TAB>`, `journalctl
+  -p <TAB>`, `systemctl --state=<TAB>`, `kubectl -o <TAB>`, `docker
+  --restart <TAB>`, `ps -o <TAB>` and more, each value with a word on what it
+  means. `test`, `[` and `[[` complete their operators the same way, `chmod`
+  completes both numeric and symbolic modes with what each grants, and `man
+  3<TAB>` completes manual sections.
+- Completing at command position no longer rebuilds its candidate list on
+  every keystroke. The list of every builtin, keyword, alias, function and
+  PATH entry is built once and rebuilt only when one of those changes, and
+  ranking now scores candidates in place instead of cloning several thousand
+  of them per Tab: a repeated Tab at command position went from 671µs to
+  4.6µs.
+
 - Path completion understands the prefixes people actually type. `~alice<TAB>`
   completes user names as the home directory they stand for, `~alice/pro<TAB>`
   scans that home, and `$HOME/pro<TAB>` and `${HOME}/pro<TAB>` scan the

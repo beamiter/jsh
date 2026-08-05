@@ -13,6 +13,9 @@ pub struct SuggestionContext<'a> {
     pub git_branches: &'a [String],
     /// Command names known here, for correcting a mistyped one.
     pub known_commands: &'a [String],
+    /// This shell's aliases, so a suggestion for `gco` is a suggestion for
+    /// the command it stands for.
+    pub aliases: Option<&'a HashMap<String, String>>,
     pub git_has_staged: bool,
     pub git_has_unstaged: bool,
     pub git_has_conflicts: bool,
@@ -185,7 +188,15 @@ pub fn suggest(buffer: &str, history: &History, ctx: &SuggestionContext) -> Opti
         return Some(s);
     }
 
-    // 3. For "cd " and "z " commands, suggest from the z-jump database
+    // 3. The argument most often accepted here before. `git checkout <TAB>`
+    // has taught the shell which branch this is; the ghost says it without
+    // waiting for Tab. Only for a word being typed, so an empty argument
+    // position stays quiet rather than guessing at nothing.
+    if let Some(s) = suggest_accepted_argument(segment, ctx) {
+        return Some(s);
+    }
+
+    // 4. For "cd " and "z " commands, suggest from the z-jump database
     if let Some(current_arg) = segment
         .strip_prefix("cd ")
         .or_else(|| segment.strip_prefix("z "))
@@ -208,7 +219,7 @@ pub fn suggest(buffer: &str, history: &History, ctx: &SuggestionContext) -> Opti
         }
     }
 
-    // 4. Filesystem probe: context-aware completion based on command + filesystem state
+    // 5. Filesystem probe: context-aware completion based on command + filesystem state
     if let Some(suggestion) = probe_filesystem_suggestion(segment) {
         return Some(suggestion);
     }
@@ -457,6 +468,40 @@ fn frequent_command_in_cwd(history: &History, cwd: &str) -> Option<String> {
         .filter(|(_, (count, _))| *count >= 3)
         .max_by_key(|(_, (count, last_seen))| (*count, *last_seen))
         .map(|(command, _)| command.to_string())
+}
+
+/// Ghost the argument this command has most often had accepted, when the
+/// word being typed is a prefix of it.
+///
+/// This is the completion record read the other way round: Tab ranks a list
+/// by it, and here it fills the line before a list is asked for. It only
+/// ever extends what is already typed, so it can never propose something the
+/// typed prefix contradicts.
+fn suggest_accepted_argument(segment: &str, ctx: &SuggestionContext) -> Option<String> {
+    // A trailing space means no word is being typed: an empty argument
+    // position stays quiet rather than guessing at nothing.
+    if segment.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    // At least a command and a partial argument.
+    let [command, .., partial] = words.as_slice() else {
+        return None;
+    };
+    if words.len() < 2 || partial.is_empty() || partial.starts_with('-') {
+        return None;
+    }
+    let command = match ctx.aliases {
+        Some(aliases) => crate::completer::resolve_alias(command, aliases),
+        None => (*command).to_string(),
+    };
+    let db = crate::accepted::get_accepted_db().lock().ok()?;
+    let scores = db.scores_for(&command);
+    let best = scores
+        .iter()
+        .filter(|(candidate, _)| candidate.starts_with(partial) && candidate.len() > partial.len())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+    Some(best.0[partial.len()..].to_string())
 }
 
 /// Exit status 127 is "command not found". Only that status, and only when a
@@ -796,6 +841,29 @@ mod tests {
             None
         );
         assert_eq!(suggest_next_command(&failed("FOO=1", 127), &history), None);
+    }
+
+    #[test]
+    fn accepted_arguments_are_ghosted_only_while_a_word_is_being_typed() {
+        let mut aliases = HashMap::new();
+        aliases.insert("gco".to_string(), "git checkout".to_string());
+        let ctx = SuggestionContext {
+            aliases: Some(&aliases),
+            ..SuggestionContext::default()
+        };
+
+        // Nothing is proposed for an empty argument position, whatever has
+        // been accepted before.
+        assert_eq!(suggest_accepted_argument("git checkout ", &ctx), None);
+        // Nor for the command name itself, nor for a flag.
+        assert_eq!(suggest_accepted_argument("gi", &ctx), None);
+        assert_eq!(suggest_accepted_argument("git --ver", &ctx), None);
+
+        // With an empty record there is nothing to say either; the point is
+        // that it never invents a suffix the typed text contradicts.
+        if let Some(suffix) = suggest_accepted_argument("git checkout ma", &ctx) {
+            assert!(!suffix.is_empty());
+        }
     }
 
     #[test]

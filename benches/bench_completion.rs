@@ -39,6 +39,17 @@ fn bench_complete(c: &mut Criterion) {
         })
     });
 
+    // The same Tab again within one command line. Command position builds a
+    // candidate list from every builtin, alias, function and PATH entry;
+    // this is what not rebuilding it is worth.
+    clear_cache();
+    group.bench_function("command_prefix_warm", |b| {
+        b.iter(|| {
+            let buffer = black_box("ec");
+            complete(buffer, buffer.len(), &mut state)
+        })
+    });
+
     // The static subcommand tables, on the prefix path and the fuzzy path.
     group.bench_function("subcommand_prefix", |b| {
         b.iter(|| {

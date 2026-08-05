@@ -1094,7 +1094,7 @@ fn yaml_to_json(y: serde_yaml::Value) -> serde_json::Value {
     }
 }
 
-fn toml_to_json(t: toml::Value) -> serde_json::Value {
+pub(crate) fn toml_to_json(t: toml::Value) -> serde_json::Value {
     use toml::Value as T;
     match t {
         T::String(s) => serde_json::Value::String(s),

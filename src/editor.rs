@@ -431,6 +431,7 @@ impl Editor {
                     let completion = &menu.completions[menu.selected];
                     let text = completion.text.clone();
                     let is_dir = completion.is_dir;
+                    self.record_accepted_completion(menu.word_start, &text, state);
                     self.buffer
                         .replace_range(menu.word_start..self.cursor, &text);
                     self.cursor = menu.word_start + text.len();
@@ -676,7 +677,7 @@ impl Editor {
     fn handle_vi_normal_key(
         &mut self,
         key: KeyEvent,
-        _state: &mut ShellState,
+        state: &mut ShellState,
         history: &mut History,
     ) -> io::Result<KeyAction> {
         // Handle pending multi-char commands (dd, dw, etc.)
@@ -859,6 +860,7 @@ impl Editor {
                     let completion = &menu.completions[menu.selected];
                     let text = completion.text.clone();
                     let is_dir = completion.is_dir;
+                    self.record_accepted_completion(menu.word_start, &text, state);
                     self.buffer
                         .replace_range(menu.word_start..self.cursor, &text);
                     self.cursor = menu.word_start + text.len();
@@ -1148,6 +1150,15 @@ impl Editor {
         Ok(KeyAction::Continue)
     }
 
+    /// Remember a completion that was actually taken, so it leads the list
+    /// next time. Recorded on acceptance, never on merely being shown or
+    /// cycled past — the point is which candidate was wanted.
+    fn record_accepted_completion(&self, word_start: usize, text: &str, state: &ShellState) {
+        if let Some(cmd) = completer::command_at(&self.buffer, word_start, state) {
+            completer::record_accepted(&cmd, text);
+        }
+    }
+
     /// Move the completion menu's selection by `step`, wrapping at both ends,
     /// and put the newly selected candidate in the buffer so the line always
     /// shows what accepting it would give.
@@ -1183,6 +1194,7 @@ impl Editor {
             0 => {}
             1 => {
                 let text = &completions[0].text;
+                self.record_accepted_completion(word_start, text, state);
                 self.buffer.replace_range(word_start..self.cursor, text);
                 self.cursor = word_start + text.len();
                 if !completions[0].is_dir {
@@ -1381,6 +1393,7 @@ impl Editor {
             git_remote: state.cached_git_remote.as_deref(),
             git_branches: &state.cached_git_branches,
             known_commands: state.path_cache_if_scanned(),
+            aliases: Some(&state.aliases),
             git_has_staged: state.cached_git_has_staged,
             git_has_unstaged: state.cached_git_has_unstaged,
             git_has_conflicts: state.cached_git_has_conflicts,

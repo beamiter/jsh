@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod accepted;
 #[cfg(feature = "ai")]
 pub mod agent;
 pub mod ai;

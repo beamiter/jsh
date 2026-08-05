@@ -150,7 +150,16 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     let (word, word_start) = extract_word_at(buf);
     let is_cmd_pos = is_command_position(buf, word_start);
 
-    let cmd = resolve_transparent_alias(first_command(buf), &state.aliases);
+    // Everything after the command name reasons about the alias-expanded
+    // line: with `alias gs='git status'`, `gs -<TAB>` is a `git status` flag
+    // position, not the first argument of some command named `gs`.
+    let segment_start = active_command_segment_start(&buf[..word_start]);
+    let typed_before = &buf[segment_start..word_start];
+    let expanded_before = alias_expanded_segment(typed_before, &state.aliases);
+    let cmd = command_words(expanded_before.trim())
+        .next()
+        .unwrap_or("")
+        .to_string();
 
     // `sudo -u <TAB>` sits at what the wrapper-skipping logic counts as a
     // command position; the value the option expects is a user or group.
@@ -253,9 +262,12 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
             cmd_completions.extend(project);
         }
         cmd_completions
-    } else if let Some(subs) = subcommand_completions(&cmd, &word, buf, word_start, state) {
+    } else if let Some(fields) = pipeline_field_completions(&cmd, &word, buf, word_start, state) {
+        fields
+    } else if let Some(subs) = subcommand_completions(&cmd, &word, &expanded_before, state) {
         subs
-    } else if let Some(spec_completions) = complete_from_spec(&cmd, &word, buf, state) {
+    } else if let Some(spec_completions) = complete_from_spec(&cmd, &word, &expanded_before, state)
+    {
         spec_completions
     } else if cmd == "cd" {
         // Local directories; when none match, fall back to the frecency
@@ -291,6 +303,14 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     };
 
     let completions = requote_completions(completions, &word);
+    // What was accepted here before leads, among candidates the typed text
+    // matches equally well. Never for the command name itself: there the
+    // prefix decides and a learned order would fight it.
+    let completions = if is_cmd_pos {
+        completions
+    } else {
+        promote_accepted(completions, &cmd)
+    };
     let completions = finalize_completions(completions);
 
     // Store in cache
@@ -429,6 +449,17 @@ fn apply_completion_spec(
     completions
 }
 
+/// The command an alias stands for, following one-word aliases and taking
+/// the head word of a multi-word one.
+pub fn resolve_alias(cmd: &str, aliases: &HashMap<String, String>) -> String {
+    let expanded = alias_expanded_segment(cmd, aliases);
+    expanded
+        .split_whitespace()
+        .next()
+        .unwrap_or(cmd)
+        .to_string()
+}
+
 /// A one-word alias is a transparent command wrapper for completion (`g=git`).
 fn resolve_transparent_alias(mut cmd: String, aliases: &HashMap<String, String>) -> String {
     for _ in 0..8 {
@@ -445,6 +476,47 @@ fn resolve_transparent_alias(mut cmd: String, aliases: &HashMap<String, String>)
         cmd = target.to_string();
     }
     cmd
+}
+
+/// The active command with its leading alias expanded, as the words a
+/// completion should reason about.
+///
+/// `alias gs='git status'` makes `gs -<TAB>` a `git status` flag position,
+/// not the first argument of a command called `gs`. Only the head word is
+/// substituted, and only while it keeps naming an alias, so the expansion of
+/// a multi-word alias contributes its own subcommands and options exactly as
+/// if they had been typed.
+fn alias_expanded_segment(segment: &str, aliases: &HashMap<String, String>) -> String {
+    let mut expanded = segment.to_string();
+    for _ in 0..8 {
+        let words: Vec<&str> = expanded.split_whitespace().collect();
+        let index = effective_command_index(&words);
+        let Some(head) = words.get(index).copied() else {
+            break;
+        };
+        let Some(expansion) = aliases.get(head) else {
+            break;
+        };
+        // `alias ls='ls --color=auto'` is the idiomatic self-reference: it
+        // expands once and then stands for the real command, exactly as the
+        // shell itself resolves it.
+        let self_referential = expansion.split_whitespace().next() == Some(head);
+        let Some(offset) = word_offset(&expanded, index) else {
+            break;
+        };
+        expanded.replace_range(offset..offset + head.len(), expansion);
+        if self_referential {
+            break;
+        }
+    }
+    expanded
+}
+
+/// Byte offset of the nth whitespace-separated word.
+fn word_offset(text: &str, index: usize) -> Option<usize> {
+    text.split_whitespace()
+        .nth(index)
+        .map(|word| word.as_ptr() as usize - text.as_ptr() as usize)
 }
 
 fn first_command(buf: &str) -> String {
@@ -843,12 +915,10 @@ fn active_command_segment_start(buf: &str) -> usize {
 fn subcommand_completions(
     cmd: &str,
     prefix: &str,
-    buf: &str,
-    word_start: usize,
+    before: &str,
     state: &mut ShellState,
 ) -> Option<Vec<Completion>> {
-    let segment_start = active_command_segment_start(&buf[..word_start]);
-    let before = buf[segment_start..word_start].trim();
+    let before = before.trim();
     let words: Vec<&str> = command_words(before).collect();
     let word_count = words.len();
 
@@ -990,7 +1060,14 @@ fn subcommand_completions(
         return Some(rank_prefix_then_fuzzy(completions, prefix));
     }
 
-    if matches!(cmd, "which" | "type" | "whereis" | "man") && !prefix.starts_with('-') {
+    // `man 3 printf` names a section first. Digits would otherwise fuzzy
+    // match every command with a digit in it, which is not what was asked.
+    let man_section =
+        cmd == "man" && !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit());
+    if matches!(cmd, "which" | "type" | "whereis" | "man")
+        && !prefix.starts_with('-')
+        && !man_section
+    {
         let results = complete_command(prefix, state);
         if !results.is_empty() {
             return Some(results);
@@ -1033,6 +1110,111 @@ fn subcommand_completions(
             .collect();
         if !results.is_empty() {
             return Some(results);
+        }
+    }
+
+    // Test operators. `[ -f x ]` and `[[ -z "$v" ]]` are where the single
+    // letters are hardest to remember, and they are a closed set.
+    if matches!(cmd, "test" | "[" | "[[") && prefix.starts_with('-') {
+        let completions = TEST_OPERATORS
+            .iter()
+            .map(|(operator, desc)| {
+                Completion::new((*operator).to_string(), CompletionKind::Flag).with_desc(desc)
+            })
+            .collect();
+        let ranked = rank_prefix_then_fuzzy(completions, prefix);
+        if !ranked.is_empty() {
+            return Some(ranked);
+        }
+    }
+
+    // `man 3 printf`: a section number narrows the page, and each section
+    // holds a different kind of thing.
+    if cmd == "man" && word_count == 1 && prefix.chars().all(|ch| ch.is_ascii_digit()) {
+        let sections = [
+            ("1", "user commands"),
+            ("2", "system calls"),
+            ("3", "library functions"),
+            ("4", "device files"),
+            ("5", "file formats"),
+            ("6", "games"),
+            ("7", "conventions and miscellany"),
+            ("8", "system administration"),
+        ];
+        let completions = sections
+            .iter()
+            .map(|(section, desc)| {
+                Completion::new((*section).to_string(), CompletionKind::Other).with_desc(desc)
+            })
+            .collect();
+        let ranked = rank_prefix_then_fuzzy(completions, prefix);
+        if !ranked.is_empty() {
+            return Some(ranked);
+        }
+    }
+
+    // Symbolic and numeric modes for the permission commands.
+    if matches!(cmd, "chmod") && word_count == 1 && !prefix.starts_with('-') {
+        let modes: &[(&str, &str)] = &[
+            ("644", "rw-r--r-- — a file others may read"),
+            ("600", "rw------- — a private file"),
+            ("755", "rwxr-xr-x — a program or directory"),
+            ("700", "rwx------ — a private directory"),
+            ("664", "rw-rw-r-- — group writable"),
+            ("777", "rwxrwxrwx — everyone, everything"),
+            ("u+x", "let the owner execute it"),
+            ("a+r", "let everyone read it"),
+            ("go-w", "take write away from group and others"),
+            ("+X", "execute on directories only"),
+        ];
+        let completions = modes
+            .iter()
+            .map(|(mode, desc)| {
+                Completion::new((*mode).to_string(), CompletionKind::Other).with_desc(desc)
+            })
+            .collect();
+        let ranked = rank_prefix_then_fuzzy(completions, prefix);
+        if !ranked.is_empty() {
+            return Some(ranked);
+        }
+    }
+
+    // Options whose value is one of a fixed set. Both spellings: `-X POST`
+    // and `--pretty=oneline`.
+    if !prefix.starts_with('-') {
+        if let Some(previous) = words.last().copied().filter(|word| word.starts_with('-')) {
+            if let Some(values) = option_value_choices(cmd, previous) {
+                let completions = values
+                    .iter()
+                    .map(|(value, desc)| {
+                        Completion::new((*value).to_string(), CompletionKind::Other).with_desc(desc)
+                    })
+                    .collect();
+                let ranked = rank_prefix_then_fuzzy(completions, prefix);
+                if !ranked.is_empty() {
+                    return Some(ranked);
+                }
+            }
+        }
+    }
+    if let Some((option, value_prefix)) = prefix.split_once('=') {
+        if let Some(values) = option_value_choices(cmd, option) {
+            let completions = values
+                .iter()
+                .map(|(value, desc)| {
+                    Completion::new((*value).to_string(), CompletionKind::Other).with_desc(desc)
+                })
+                .collect();
+            let ranked: Vec<Completion> = rank_prefix_then_fuzzy(completions, value_prefix)
+                .into_iter()
+                .map(|mut completion| {
+                    completion.text = format!("{option}={}", completion.text);
+                    completion
+                })
+                .collect();
+            if !ranked.is_empty() {
+                return Some(ranked);
+            }
         }
     }
 
@@ -2040,6 +2222,351 @@ fn subcommand_completions(
     }
 
     None
+}
+
+/// Value-aware builtins whose first argument names a field of the records
+/// flowing through the pipeline.
+const FIELD_TAKING_BUILTINS: &[&str] = &[
+    "where", "select", "sort-by", "group-by", "reject", "get", "uniq-by", "count-by", "flatten",
+    "rename",
+];
+
+/// Field names for a value-aware builtin, read from the structured file the
+/// pipeline started with.
+///
+/// This is the one completion that has to look left past the pipe: `where`
+/// alone says nothing, while `from-json orders.json | where <TAB>` knows
+/// exactly which fields exist. The file is parsed, never executed, and only
+/// when an earlier stage names one — a pipeline fed by a command's output
+/// would have to run that command to know, which a keystroke must not do.
+fn pipeline_field_completions(
+    cmd: &str,
+    prefix: &str,
+    buf: &str,
+    word_start: usize,
+    state: &ShellState,
+) -> Option<Vec<Completion>> {
+    if !FIELD_TAKING_BUILTINS.contains(&cmd) || prefix.starts_with('-') {
+        return None;
+    }
+    // Only the first argument of the builtin is a field name.
+    let segment_start = active_command_segment_start(&buf[..word_start]);
+    let words = buf[segment_start..word_start].split_whitespace().count();
+    if words > 1 {
+        return None;
+    }
+
+    let fields = structured_source_fields(&buf[..segment_start], state)?;
+    let completions: Vec<Completion> = fields
+        .into_iter()
+        .map(|(name, kind)| Completion::new(name, CompletionKind::Other).with_desc(&kind))
+        .collect();
+    let ranked = rank_prefix_then_fuzzy(completions, prefix);
+    (!ranked.is_empty()).then_some(ranked)
+}
+
+/// Find the structured file an earlier pipeline stage reads, and return its
+/// record fields with the type each holds.
+fn structured_source_fields(pipeline: &str, state: &ShellState) -> Option<Vec<(String, String)>> {
+    // The last reader wins: `from-json a.json | ... | from-csv b.csv |`.
+    let mut source: Option<(&str, String)> = None;
+    for stage in pipeline.split('|') {
+        let mut words = stage.split_whitespace();
+        let Some(reader) = words.next() else { continue };
+        if !matches!(
+            reader,
+            "from-json" | "from-csv" | "from-yaml" | "from-toml" | "from-ndjson" | "open"
+        ) {
+            continue;
+        }
+        // The argument may be a redirection or a flag; take the first plain
+        // word, which is where the file name goes.
+        let Some(argument) = words.find(|word| !word.starts_with('-')) else {
+            continue;
+        };
+        source = Some((reader, unescape_shell_word(argument)));
+    }
+    let (reader, argument) = source?;
+
+    let path = expand_completion_prefix(&argument, state)?;
+    let content =
+        crate::io_guard::read_regular_text(Path::new(&path), MAX_COMPLETION_PROJECT_FILE_BYTES)
+            .ok()?;
+    let format = if reader == "open" {
+        Path::new(&path).extension()?.to_str()?
+    } else {
+        reader.trim_start_matches("from-")
+    };
+    structured_fields(&content, format)
+}
+
+/// Field names and value types from one structured document.
+fn structured_fields(content: &str, format: &str) -> Option<Vec<(String, String)>> {
+    let value: serde_json::Value = match format {
+        "json" => serde_json::from_str(content).ok()?,
+        "ndjson" | "jsonl" => {
+            let first = content.lines().find(|line| !line.trim().is_empty())?;
+            serde_json::from_str(first).ok()?
+        }
+        "yaml" | "yml" => {
+            let parsed: serde_yaml::Value = serde_yaml::from_str(content).ok()?;
+            serde_json::to_value(parsed).ok()?
+        }
+        "toml" => {
+            // The same conversion `from-toml` itself uses, so a field named
+            // here is the field that pipeline would carry.
+            let parsed: toml::Value = toml::from_str(content).ok()?;
+            crate::value_builtins::toml_to_json(parsed)
+        }
+        "csv" => {
+            // The header row names the fields; the first data row types them.
+            let mut lines = content.lines().filter(|line| !line.trim().is_empty());
+            let header = lines.next()?;
+            let sample: Vec<&str> = lines
+                .next()
+                .map(|row| row.split(',').collect())
+                .unwrap_or_default();
+            return Some(
+                header
+                    .split(',')
+                    .enumerate()
+                    .map(|(index, name)| {
+                        let name = name.trim().trim_matches('"').to_string();
+                        let kind = sample
+                            .get(index)
+                            .map(|value| csv_value_kind(value.trim()))
+                            .unwrap_or("column");
+                        (name, kind.to_string())
+                    })
+                    .filter(|(name, _)| !name.is_empty())
+                    .take(MAX_COMPLETION_ITEMS)
+                    .collect(),
+            );
+        }
+        _ => return None,
+    };
+
+    // A list of records is the common shape; a bare record works too.
+    let record = match &value {
+        serde_json::Value::Array(items) => items.iter().find(|item| item.is_object())?,
+        other => other,
+    };
+    let object = record.as_object()?;
+    Some(
+        object
+            .iter()
+            .map(|(name, value)| (name.clone(), json_value_kind(value).to_string()))
+            .take(MAX_COMPLETION_ITEMS)
+            .collect(),
+    )
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "int",
+        serde_json::Value::Number(_) => "float",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "list",
+        serde_json::Value::Object(_) => "record",
+    }
+}
+
+fn csv_value_kind(value: &str) -> &'static str {
+    let value = value.trim_matches('"');
+    if value.is_empty() {
+        "column"
+    } else if value.parse::<i64>().is_ok() {
+        "int"
+    } else if value.parse::<f64>().is_ok() {
+        "float"
+    } else if matches!(value, "true" | "false") {
+        "bool"
+    } else {
+        "string"
+    }
+}
+
+/// The operators of `test`, `[` and `[[`, which are a closed set and the
+/// place single letters are hardest to recall.
+const TEST_OPERATORS: &[(&str, &str)] = &[
+    ("-e", "the path exists"),
+    ("-f", "a regular file"),
+    ("-d", "a directory"),
+    ("-L", "a symbolic link"),
+    ("-h", "a symbolic link"),
+    ("-s", "exists and is not empty"),
+    ("-r", "readable"),
+    ("-w", "writable"),
+    ("-x", "executable"),
+    ("-p", "a named pipe"),
+    ("-S", "a socket"),
+    ("-b", "a block device"),
+    ("-c", "a character device"),
+    ("-t", "a terminal on this descriptor"),
+    ("-z", "the string is empty"),
+    ("-n", "the string is not empty"),
+    ("-eq", "numbers are equal"),
+    ("-ne", "numbers differ"),
+    ("-lt", "less than"),
+    ("-le", "less than or equal"),
+    ("-gt", "greater than"),
+    ("-ge", "greater than or equal"),
+    ("-nt", "newer than"),
+    ("-ot", "older than"),
+    ("-ef", "the same file"),
+    ("-v", "the variable is set"),
+    ("-a", "and"),
+    ("-o", "or"),
+];
+
+/// Values an option accepts, when they are a fixed set worth choosing from.
+/// Keyed by command and option name; `None` when the option takes free text,
+/// a path, or something only the command itself could enumerate.
+fn option_value_choices(
+    cmd: &str,
+    option: &str,
+) -> Option<&'static [(&'static str, &'static str)]> {
+    let choices: &[(&str, &str)] = match (cmd, option) {
+        ("curl", "-X" | "--request") => &[
+            ("GET", "read a resource"),
+            ("POST", "create or submit"),
+            ("PUT", "replace"),
+            ("PATCH", "modify"),
+            ("DELETE", "remove"),
+            ("HEAD", "headers only"),
+            ("OPTIONS", "what the resource allows"),
+        ],
+        ("git", "--pretty" | "--format") => &[
+            ("oneline", "one commit per line"),
+            ("short", "author and message"),
+            ("medium", "the default"),
+            ("full", "author and committer"),
+            ("fuller", "with dates"),
+            ("reference", "hash, subject and date"),
+            ("raw", "the commit object"),
+        ],
+        ("git", "--color" | "--decorate")
+        | ("ls" | "grep" | "diff" | "dir", "--color")
+        | ("systemctl" | "journalctl", "--legend") => &[
+            ("auto", "when the output is a terminal"),
+            ("always", "even when piped"),
+            ("never", "never"),
+        ],
+        ("git", "--strategy" | "-s") => &[
+            ("ort", "the default merge strategy"),
+            ("recursive", "the previous default"),
+            ("resolve", "three-way merge"),
+            ("ours", "keep this side"),
+            ("subtree", "merge a subtree"),
+        ],
+        ("git", "--cleanup") => &[
+            ("strip", "drop comments and blank lines"),
+            ("whitespace", "strip trailing whitespace"),
+            ("verbatim", "keep the message as written"),
+            ("scissors", "cut at the scissor line"),
+        ],
+        ("systemctl", "--state") => &[
+            ("active", "running or otherwise active"),
+            ("inactive", "not active"),
+            ("failed", "failed units"),
+            ("enabled", "enabled unit files"),
+            ("disabled", "disabled unit files"),
+            ("static", "no enable symlinks"),
+            ("masked", "cannot be started"),
+        ],
+        ("systemctl", "--type" | "-t") => &[
+            ("service", "services"),
+            ("socket", "sockets"),
+            ("timer", "timers"),
+            ("target", "targets"),
+            ("mount", "mounts"),
+            ("path", "path units"),
+            ("device", "devices"),
+        ],
+        ("journalctl", "-p" | "--priority") => &[
+            ("emerg", "system is unusable"),
+            ("alert", "act immediately"),
+            ("crit", "critical"),
+            ("err", "errors"),
+            ("warning", "warnings"),
+            ("notice", "normal but significant"),
+            ("info", "informational"),
+            ("debug", "debug"),
+        ],
+        ("journalctl", "-o" | "--output") => &[
+            ("short", "the default"),
+            ("short-iso", "ISO timestamps"),
+            ("json", "one JSON object per entry"),
+            ("json-pretty", "indented JSON"),
+            ("cat", "message text only"),
+            ("verbose", "every field"),
+        ],
+        ("docker", "--restart") => &[
+            ("no", "never restart"),
+            ("on-failure", "restart on a non-zero exit"),
+            ("always", "always restart"),
+            ("unless-stopped", "unless it was stopped by hand"),
+        ],
+        ("docker" | "docker-compose", "--format") => {
+            &[("json", "JSON output"), ("table", "a table")]
+        }
+        ("kubectl", "-o" | "--output") => &[
+            ("wide", "extra columns"),
+            ("json", "JSON"),
+            ("yaml", "YAML"),
+            ("name", "resource names only"),
+            ("jsonpath", "a JSONPath expression"),
+            ("custom-columns", "columns you name"),
+        ],
+        ("find", "-type") => &[
+            ("f", "regular file"),
+            ("d", "directory"),
+            ("l", "symbolic link"),
+            ("s", "socket"),
+            ("p", "named pipe"),
+            ("b", "block device"),
+            ("c", "character device"),
+        ],
+        ("ps", "-o" | "--format") => &[
+            ("pid", "process id"),
+            ("ppid", "parent process id"),
+            ("user", "owner"),
+            ("comm", "command name"),
+            ("args", "full command line"),
+            ("pcpu", "CPU percentage"),
+            ("pmem", "memory percentage"),
+            ("rss", "resident memory"),
+            ("etime", "elapsed time"),
+            ("stat", "process state"),
+        ],
+        ("tar", "--format") => &[
+            ("gnu", "GNU tar format"),
+            ("pax", "POSIX pax format"),
+            ("ustar", "POSIX ustar format"),
+        ],
+        ("cargo", "--message-format") => &[
+            ("human", "for reading"),
+            ("json", "for tools"),
+            ("short", "one line per diagnostic"),
+        ],
+        ("npm" | "pnpm" | "yarn", "--save") => &[
+            ("prod", "into dependencies"),
+            ("dev", "into devDependencies"),
+            ("optional", "into optionalDependencies"),
+        ],
+        ("ssh" | "scp" | "sftp", "-o") => &[
+            ("StrictHostKeyChecking=", "trust policy for host keys"),
+            ("UserKnownHostsFile=", "where host keys are stored"),
+            ("ProxyJump=", "connect through another host"),
+            ("ConnectTimeout=", "seconds before giving up"),
+            ("ServerAliveInterval=", "keepalive interval"),
+            ("ForwardAgent=", "forward the agent"),
+        ],
+        _ => return None,
+    };
+    Some(choices)
 }
 
 /// Flags for the tools people reach for constantly, where remembering which
@@ -3623,12 +4150,11 @@ fn complete_git_remotes(prefix: &str) -> Vec<Completion> {
 fn complete_from_spec(
     cmd: &str,
     prefix: &str,
-    buf: &str,
+    segment: &str,
     state: &ShellState,
 ) -> Option<Vec<Completion>> {
     use crate::completion_spec::SpecCompletionKind;
 
-    let segment = active_command_segment(buf);
     let words: Vec<&str> = command_words(segment).collect();
     let ctx = state.spec_registry.resolve_context(cmd, &words)?;
 
@@ -3753,10 +4279,11 @@ fn venv_activators_in(cwd: &Path, state: &ShellState) -> Vec<Completion> {
             continue;
         }
         let python = cwd.join(name).join("bin/python");
-        let description = python
-            .is_file()
-            .then(|| format!("activate {name}"))
-            .unwrap_or_else(|| "activate a virtual environment".to_string());
+        let description = if python.is_file() {
+            format!("activate {name}")
+        } else {
+            "activate a virtual environment".to_string()
+        };
         completions.push(
             Completion::new(format!("{name}/bin/activate"), CompletionKind::File)
                 .with_desc(&description),
@@ -3981,7 +4508,83 @@ const SHELL_KEYWORDS: &[(&str, &str)] = &[
     ("time", "time a command"),
 ];
 
+thread_local! {
+    /// Every name that can start a command, built once and filtered per
+    /// keystroke. Rebuilding it meant allocating a `Completion` for each of
+    /// a few thousand PATH entries on every Tab, which dominated the cost of
+    /// completing at command position.
+    static COMMAND_CANDIDATES: std::cell::RefCell<Option<(u64, std::rc::Rc<Vec<Completion>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What the candidate list is built from. When any of it changes the list is
+/// stale: a new alias, a `def`, a sourced file of functions, a different
+/// PATH. Counting is enough — names are only added or removed as a set, and
+/// a rename changes the count of neither more nor less than a swap would.
+fn command_candidate_generation(state: &mut ShellState) -> u64 {
+    let path_commands = state.path_cache().len() as u64;
+    path_commands
+        .wrapping_mul(31)
+        .wrapping_add(state.aliases.len() as u64)
+        .wrapping_mul(31)
+        .wrapping_add(state.functions.len() as u64)
+        .wrapping_mul(31)
+        .wrapping_add(state.user_signatures.len() as u64)
+}
+
+fn command_candidates(state: &mut ShellState) -> std::rc::Rc<Vec<Completion>> {
+    let generation = command_candidate_generation(state);
+    if let Some(cached) = COMMAND_CANDIDATES.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, candidates)| candidates.clone())
+    }) {
+        return cached;
+    }
+    let candidates = std::rc::Rc::new(build_command_candidates(state));
+    COMMAND_CANDIDATES.with(|cell| {
+        *cell.borrow_mut() = Some((generation, candidates.clone()));
+    });
+    candidates
+}
+
 fn complete_command(prefix: &str, state: &mut ShellState) -> Vec<Completion> {
+    let candidates = command_candidates(state);
+
+    // Path completion is per-prefix and cannot be cached with the rest.
+    let mut extra = Vec::new();
+    if prefix.contains('/') {
+        extra = complete_path(prefix, state);
+    }
+
+    let pattern = lowered(prefix);
+    let mut scored: Vec<(&Completion, i32)> = candidates
+        .iter()
+        .chain(extra.iter())
+        .map(|candidate| {
+            (
+                candidate,
+                fuzzy_match_score_lowered(&candidate.text, &pattern),
+            )
+        })
+        .filter(|(_, score)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.text.len().cmp(&b.0.text.len()))
+    });
+
+    let mut seen = std::collections::HashSet::new();
+    scored
+        .into_iter()
+        .filter(|(candidate, _)| seen.insert(candidate.text.as_str()))
+        .take(50)
+        .map(|(candidate, _)| candidate.clone())
+        .collect()
+}
+
+fn build_command_candidates(state: &mut ShellState) -> Vec<Completion> {
     let mut completions = Vec::new();
 
     for (keyword, description) in SHELL_KEYWORDS {
@@ -4086,19 +4689,7 @@ fn complete_command(prefix: &str, state: &mut ShellState) -> Vec<Completion> {
         });
     }
 
-    // Add path completions if prefix contains /
-    if prefix.contains('/') {
-        completions.extend(complete_path(prefix, state));
-    }
-
-    // Remove duplicates
-    completions.dedup_by(|a, b| a.text == b.text);
-
-    // Apply fuzzy filtering and sorting
-    let filtered = filter_completions(completions, prefix);
-
-    // Limit to top 50 completions to avoid overwhelming the user
-    filtered.into_iter().take(50).collect()
+    completions
 }
 
 fn path_metadata_desc(entry: &fs::DirEntry) -> Option<String> {
@@ -4467,6 +5058,62 @@ fn fuzzy_match_score_lowered(text: &str, pattern_lower: &str) -> i32 {
     }
 }
 
+/// Move the candidates this command has had accepted before to the front,
+/// highest frecency first, keeping every other candidate in its existing
+/// order behind them.
+///
+/// A stable partition, not a re-sort: the ranking a source chose still holds
+/// for everything that has no history, and nothing is added or dropped.
+fn promote_accepted(completions: Vec<Completion>, cmd: &str) -> Vec<Completion> {
+    if cmd.is_empty() || completions.len() < 2 {
+        return completions;
+    }
+    let Ok(db) = crate::accepted::get_accepted_db().lock() else {
+        return completions;
+    };
+    let scores = db.scores_for(cmd);
+    if scores.is_empty() {
+        return completions;
+    }
+    let mut accepted: Vec<(f64, Completion)> = Vec::new();
+    let mut rest = Vec::with_capacity(completions.len());
+    for completion in completions {
+        match scores.get(completion.text.as_str()) {
+            Some(score) => accepted.push((*score, completion)),
+            None => rest.push(completion),
+        }
+    }
+    accepted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut ranked: Vec<Completion> = accepted.into_iter().map(|(_, item)| item).collect();
+    ranked.extend(rest);
+    ranked
+}
+
+/// Remember that a completion was taken, so it leads next time. Called from
+/// the editor when a candidate is inserted, not when it is merely shown.
+pub fn record_accepted(cmd: &str, candidate: &str) {
+    if cmd.is_empty() {
+        return;
+    }
+    if let Ok(mut db) = crate::accepted::get_accepted_db().lock() {
+        db.record(cmd, candidate);
+    }
+}
+
+/// The command whose argument is being completed at `cursor`, if any. The
+/// editor needs it to record what was accepted.
+pub fn command_at(buffer: &str, cursor: usize, state: &ShellState) -> Option<String> {
+    let buf = &buffer[..cursor.min(buffer.len())];
+    let (_, word_start) = extract_word_at(buf);
+    if is_command_position(buf, word_start) {
+        return None;
+    }
+    let segment_start = active_command_segment_start(&buf[..word_start]);
+    let expanded = alias_expanded_segment(&buf[segment_start..word_start], &state.aliases);
+    let cmd = command_words(expanded.trim()).next()?.to_string();
+    (!cmd.is_empty()).then_some(cmd)
+}
+
 /// Prefix matches in their source order when any exist; otherwise
 /// fuzzy-ranked subsequence matches, so `git chk<TAB>` still finds checkout
 /// without prefix matches losing their curated order.
@@ -4516,6 +5163,11 @@ pub fn clear_cache() {
     });
     HISTORY_ENTRIES.with(|entries| {
         *entries.borrow_mut() = None;
+    });
+    // The generation check catches an alias or function added between
+    // commands; dropping it here also catches one merely redefined.
+    COMMAND_CANDIDATES.with(|candidates| {
+        *candidates.borrow_mut() = None;
     });
 }
 
@@ -6866,6 +7518,404 @@ mod tests {
         let (word_start, completions) = complete(buffer, cursor, &mut state);
         assert_eq!(word_start, 0);
         assert!(completions.iter().any(|item| item.text == "cargo"));
+    }
+
+    #[test]
+    fn multi_word_aliases_complete_as_the_command_they_stand_for() {
+        let mut state = ShellState::new(false);
+        state
+            .aliases
+            .insert("gs".to_string(), "git status".to_string());
+        state
+            .aliases
+            .insert("gco".to_string(), "git checkout".to_string());
+        state
+            .aliases
+            .insert("dc".to_string(), "docker compose".to_string());
+
+        // `gc --am` is a `git commit` flag position, from the git spec.
+        state
+            .aliases
+            .insert("gc".to_string(), "git commit".to_string());
+        clear_cache();
+        let buffer = "gc --am";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(
+            completions.iter().any(|item| item.text == "--amend"),
+            "expected git commit flags"
+        );
+
+        // And its arguments: `gco ` reaches ref completion.
+        clear_cache();
+        let buffer = "gco ";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(
+            completions
+                .iter()
+                .any(|item| item.kind == CompletionKind::Other),
+            "expected git checkout refs"
+        );
+
+        // `dc ` reaches the compose subcommands, two words in.
+        clear_cache();
+        let buffer = "dc lo";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "logs"));
+
+        // The expansion is only the head word: an argument already typed
+        // still counts, so `gco` reaches ref completion rather than the
+        // subcommand list.
+        assert_eq!(
+            alias_expanded_segment("gco ", &state.aliases),
+            "git checkout "
+        );
+        assert_eq!(
+            alias_expanded_segment("sudo gs ", &state.aliases),
+            "sudo git status "
+        );
+    }
+
+    #[test]
+    fn alias_expansion_terminates_on_self_reference_and_cycles() {
+        let mut aliases = HashMap::new();
+        // The idiomatic self-referential alias must expand exactly once.
+        aliases.insert("ls".to_string(), "ls --color=auto".to_string());
+        assert_eq!(alias_expanded_segment("ls ", &aliases), "ls --color=auto ");
+
+        // A cycle between two aliases must not spin.
+        aliases.insert("a".to_string(), "b x".to_string());
+        aliases.insert("b".to_string(), "a y".to_string());
+        let expanded = alias_expanded_segment("a ", &aliases);
+        assert!(expanded.contains('x') || expanded.contains('y'));
+
+        // An unknown head word is left alone.
+        assert_eq!(alias_expanded_segment("git st ", &aliases), "git st ");
+    }
+
+    #[test]
+    fn options_with_a_fixed_set_of_values_offer_them() {
+        let mut state = ShellState::new(false);
+
+        // Separate form.
+        clear_cache();
+        let buffer = "curl -X PO";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let post = completions.iter().find(|item| item.text == "POST").unwrap();
+        assert_eq!(post.description.as_deref(), Some("create or submit"));
+
+        // Inline form keeps the option on the inserted text.
+        clear_cache();
+        let buffer = "git log --pretty=one";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions
+            .iter()
+            .any(|item| item.text == "--pretty=oneline"));
+
+        clear_cache();
+        let buffer = "find . -type ";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let texts: Vec<&str> = completions.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"d"), "{texts:?}");
+        assert!(texts.contains(&"f"), "{texts:?}");
+
+        clear_cache();
+        let buffer = "journalctl -p err";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "err"));
+
+        // An option with no fixed set is untouched: `-o` for curl is a file.
+        assert!(option_value_choices("curl", "-o").is_none());
+        assert!(option_value_choices("unknown", "-X").is_none());
+    }
+
+    #[test]
+    fn option_value_tables_are_well_formed() {
+        // Every documented pair must be reachable and described.
+        for (cmd, option) in [
+            ("curl", "-X"),
+            ("git", "--pretty"),
+            ("systemctl", "--state"),
+            ("journalctl", "-o"),
+            ("kubectl", "-o"),
+            ("find", "-type"),
+            ("ps", "-o"),
+            ("docker", "--restart"),
+        ] {
+            let values = option_value_choices(cmd, option)
+                .unwrap_or_else(|| panic!("{cmd} {option} has no values"));
+            let mut seen = std::collections::HashSet::new();
+            for (value, description) in values {
+                assert!(seen.insert(*value), "{cmd} {option} repeats {value}");
+                assert!(
+                    !description.is_empty(),
+                    "{cmd} {option} {value} has no help"
+                );
+                assert!(!value.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn structured_fields_are_read_from_each_format_with_their_types() {
+        let json = r#"[{"id": 1, "name": "ada", "score": 9.5, "tags": ["x"], "ok": true}]"#;
+        let fields = structured_fields(json, "json").unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("id".to_string(), "int".to_string()),
+                ("name".to_string(), "string".to_string()),
+                ("score".to_string(), "float".to_string()),
+                ("tags".to_string(), "list".to_string()),
+                ("ok".to_string(), "bool".to_string()),
+            ]
+        );
+
+        // A bare record, not only a list of them.
+        let fields = structured_fields(r#"{"host": "a"}"#, "json").unwrap();
+        assert_eq!(fields, vec![("host".to_string(), "string".to_string())]);
+
+        // NDJSON is typed from its first line.
+        let fields = structured_fields("\n{\"a\": 1}\n{\"b\": 2}\n", "ndjson").unwrap();
+        assert_eq!(fields, vec![("a".to_string(), "int".to_string())]);
+
+        // CSV names fields in the header and types them from the first row.
+        let fields = structured_fields("name,count,ratio\nada,3,0.5\n", "csv").unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("name".to_string(), "string".to_string()),
+                ("count".to_string(), "int".to_string()),
+                ("ratio".to_string(), "float".to_string()),
+            ]
+        );
+        // A header with no data row still names the fields.
+        let fields = structured_fields("name,count\n", "csv").unwrap();
+        assert_eq!(fields[0], ("name".to_string(), "column".to_string()));
+
+        let fields = structured_fields("host: a\nport: 8080\n", "yaml").unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("host".to_string(), "string".to_string()),
+                ("port".to_string(), "int".to_string()),
+            ]
+        );
+
+        let fields = structured_fields("name = \"jsh\"\nedition = 2021\n", "toml").unwrap();
+        assert!(fields.contains(&("name".to_string(), "string".to_string())));
+
+        // Malformed input and unknown formats yield nothing at all.
+        assert!(structured_fields("{not json", "json").is_none());
+        assert!(structured_fields("anything", "xlsx").is_none());
+    }
+
+    #[test]
+    fn value_builtins_complete_field_names_from_the_pipeline_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("orders.json");
+        fs::write(
+            &path,
+            r#"[{"order_id": 7, "customer": "ada", "total": 12.5}]"#,
+        )
+        .unwrap();
+        let mut state = ShellState::new(false);
+
+        clear_cache();
+        let buffer = format!("from-json {} | where cust", path.display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        let field = completions
+            .iter()
+            .find(|item| item.text == "customer")
+            .expect("field from the source file");
+        assert_eq!(field.description.as_deref(), Some("string"));
+
+        // Every field-taking builtin sees them, and only its first argument.
+        clear_cache();
+        let buffer = format!("from-json {} | sort-by tot", path.display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "total"));
+
+        clear_cache();
+        let buffer = format!("from-json {} | where total > cust", path.display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        assert!(
+            !completions.iter().any(|item| item.text == "customer"),
+            "only the first argument names a field"
+        );
+
+        // A pipeline with no structured source falls through to the usual
+        // completions rather than inventing fields.
+        clear_cache();
+        let buffer = "ps aux | where cust";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(!completions.iter().any(|item| item.text == "customer"));
+    }
+
+    #[test]
+    fn the_command_candidate_cache_notices_new_names() {
+        let mut state = ShellState::new(false);
+        clear_cache();
+        let before = command_candidates(&mut state);
+        assert!(!before
+            .iter()
+            .any(|item| item.text == "jsh_cached_alias_probe"));
+
+        // A name defined without an intervening command still shows up: the
+        // generation check, not only `clear_cache`, has to catch it.
+        state
+            .aliases
+            .insert("jsh_cached_alias_probe".to_string(), "echo hi".to_string());
+        let after = command_candidates(&mut state);
+        assert!(
+            after
+                .iter()
+                .any(|item| item.text == "jsh_cached_alias_probe"),
+            "a new alias invalidates the candidate cache"
+        );
+
+        // Functions are counted separately, so they invalidate it too.
+        state.functions.insert(
+            "jsh_cached_fn_probe".to_string(),
+            crate::parser::ast::CompoundCommand::BraceGroup {
+                body: Vec::new(),
+                redirects: Vec::new(),
+            },
+        );
+        let after = command_candidates(&mut state);
+        assert!(after.iter().any(|item| item.text == "jsh_cached_fn_probe"));
+
+        // An unchanged shell hands back the very same list, not a rebuild.
+        let again = command_candidates(&mut state);
+        assert!(std::rc::Rc::ptr_eq(&after, &again));
+    }
+
+    #[test]
+    fn command_completion_still_ranks_and_deduplicates() {
+        let mut state = ShellState::new(false);
+        clear_cache();
+        let buffer = "ech";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert_eq!(
+            completions.first().map(|item| item.text.as_str()),
+            Some("echo"),
+            "the exact prefix match ranks first"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for completion in &completions {
+            assert!(
+                seen.insert(completion.text.clone()),
+                "{} appears twice",
+                completion.text
+            );
+        }
+        assert!(completions.len() <= 50, "the list stays bounded");
+    }
+
+    #[test]
+    fn accepted_candidates_lead_without_changing_the_list() {
+        let items = |texts: &[&str]| -> Vec<Completion> {
+            texts
+                .iter()
+                .map(|text| Completion::new((*text).to_string(), CompletionKind::Other))
+                .collect()
+        };
+
+        // With nothing recorded the order is exactly the source's order.
+        let original = items(&["alpha", "beta", "gamma"]);
+        let ranked = promote_accepted(original.clone(), "jsh-test-unused-command");
+        assert_eq!(
+            ranked.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+
+        // A single candidate is never reordered, and neither is a command
+        // name position (the caller passes an empty command for that).
+        assert_eq!(promote_accepted(items(&["only"]), "git").len(), 1);
+        assert_eq!(
+            promote_accepted(items(&["a", "b"]), "")
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn the_command_being_completed_is_identified_for_recording() {
+        let mut state = ShellState::new(false);
+        state
+            .aliases
+            .insert("gco".to_string(), "git checkout".to_string());
+
+        // Argument positions name their command, alias expanded.
+        let buffer = "git checkout ma";
+        assert_eq!(
+            command_at(buffer, buffer.len(), &state).as_deref(),
+            Some("git")
+        );
+        let buffer = "gco ma";
+        assert_eq!(
+            command_at(buffer, buffer.len(), &state).as_deref(),
+            Some("git")
+        );
+        let buffer = "ls | grep fo";
+        assert_eq!(
+            command_at(buffer, buffer.len(), &state).as_deref(),
+            Some("grep")
+        );
+        let buffer = "sudo systemctl restart ng";
+        assert_eq!(
+            command_at(buffer, buffer.len(), &state).as_deref(),
+            Some("systemctl")
+        );
+
+        // A command position has no command to attribute the choice to.
+        assert_eq!(command_at("gi", 2, &state), None);
+        assert_eq!(command_at("ls | gr", 7, &state), None);
+    }
+
+    #[test]
+    fn test_operators_modes_and_man_sections_complete() {
+        let mut state = ShellState::new(false);
+
+        clear_cache();
+        let buffer = "[[ -z";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let empty = completions.iter().find(|item| item.text == "-z").unwrap();
+        assert_eq!(empty.description.as_deref(), Some("the string is empty"));
+
+        clear_cache();
+        let buffer = "if [ -d";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "-d"));
+
+        clear_cache();
+        let buffer = "test -n";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "-ne"));
+
+        clear_cache();
+        let buffer = "chmod 7";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let mode = completions.iter().find(|item| item.text == "755").unwrap();
+        assert!(mode.description.as_deref().unwrap().contains("rwxr-xr-x"));
+
+        clear_cache();
+        let buffer = "man 3";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert_eq!(
+            completions
+                .iter()
+                .find(|item| item.text == "3")
+                .and_then(|item| item.description.as_deref()),
+            Some("library functions")
+        );
+
+        // `man ls` is still a command name, not a section.
+        clear_cache();
+        let buffer = "man ec";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "echo"));
     }
 
     #[test]
