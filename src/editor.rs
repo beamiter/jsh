@@ -527,17 +527,7 @@ impl Editor {
                 self.handle_tab(state);
             }
             (KeyCode::BackTab, _) => {
-                if let Some(ref mut menu) = self.completion_menu {
-                    if menu.selected == 0 {
-                        menu.selected = menu.completions.len() - 1;
-                    } else {
-                        menu.selected -= 1;
-                    }
-                    let text = menu.completions[menu.selected].text.clone();
-                    self.buffer
-                        .replace_range(menu.word_start..self.cursor, &text);
-                    self.cursor = menu.word_start + text.len();
-                }
+                self.step_completion_menu(-1);
             }
             (KeyCode::Right, KeyModifiers::NONE) => {
                 if self.cursor >= self.buffer.len() {
@@ -557,6 +547,15 @@ impl Editor {
             }
             (KeyCode::End, _) => {
                 self.cursor = self.current_line_end();
+            }
+            // While the completion menu is open the arrows belong to it.
+            // Walking away into history would discard a menu the person is
+            // still reading, and there is no way back to it.
+            (KeyCode::Up, _) if self.completion_menu.is_some() => {
+                self.step_completion_menu(-1);
+            }
+            (KeyCode::Down, _) if self.completion_menu.is_some() => {
+                self.step_completion_menu(1);
             }
             (KeyCode::Up, _) => {
                 // Multiline: move cursor up within buffer if not on first line
@@ -1149,6 +1148,25 @@ impl Editor {
         Ok(KeyAction::Continue)
     }
 
+    /// Move the completion menu's selection by `step`, wrapping at both ends,
+    /// and put the newly selected candidate in the buffer so the line always
+    /// shows what accepting it would give.
+    fn step_completion_menu(&mut self, step: isize) {
+        let Some(menu) = self.completion_menu.as_mut() else {
+            return;
+        };
+        let count = menu.completions.len();
+        if count == 0 {
+            return;
+        }
+        let selected = menu.selected as isize + step;
+        menu.selected = selected.rem_euclid(count as isize) as usize;
+        let text = menu.completions[menu.selected].text.clone();
+        let word_start = menu.word_start;
+        self.buffer.replace_range(word_start..self.cursor, &text);
+        self.cursor = word_start + text.len();
+    }
+
     fn handle_tab(&mut self, state: &mut ShellState) {
         if let Some(ref mut menu) = self.completion_menu {
             menu.selected = (menu.selected + 1) % menu.completions.len();
@@ -1362,6 +1380,7 @@ impl Editor {
             git_branch: state.cached_git_branch.as_deref(),
             git_remote: state.cached_git_remote.as_deref(),
             git_branches: &state.cached_git_branches,
+            known_commands: state.path_cache_if_scanned(),
             git_has_staged: state.cached_git_has_staged,
             git_has_unstaged: state.cached_git_has_unstaged,
             git_has_conflicts: state.cached_git_has_conflicts,
@@ -1752,6 +1771,18 @@ impl Editor {
                 menu.selected - max_visible / 2
             };
 
+            // Where the selection sits in the whole list. With scrolling, the
+            // visible rows alone never say how much there is to choose from.
+            if total > max_visible {
+                out.queue(SetAttribute(Attribute::Dim))?;
+                out.queue(SetForegroundColor(Color::DarkGrey))?;
+                out.queue(Print(format!("  {}/{} matches", menu.selected + 1, total)))?;
+                out.queue(ResetColor)?;
+                out.queue(SetAttribute(Attribute::Reset))?;
+                out.queue(Print("\r\n"))?;
+                rendered_lines += 1;
+            }
+
             // Show "↑ N above" indicator
             if scroll_offset > 0 {
                 out.queue(SetAttribute(Attribute::Dim))?;
@@ -1834,18 +1865,24 @@ impl Editor {
                     out.queue(ResetColor)?;
                 }
 
-                // Description (dim, after name) — skip generic kind labels
-                if !is_selected {
-                    if let Some(ref d) = item.comp.description {
-                        if d != "builtin" && d != "alias" && d != "function" {
+                // Description, after the name. The selected row keeps its
+                // description too — it is the one whose meaning is being
+                // asked for — but undimmed, so the highlight stays readable.
+                if let Some(ref d) = item.comp.description {
+                    // Generic kind labels repeat the badge; the badge said it.
+                    if d != "builtin" && d != "alias" && d != "function" {
+                        if is_selected {
+                            out.queue(SetForegroundColor(Color::Cyan))?;
+                        } else {
                             out.queue(SetAttribute(Attribute::Dim))?;
                             out.queue(SetForegroundColor(Color::White))?;
-                            let max_desc =
-                                (self.terminal_width as usize).saturating_sub(name_width + 5);
-                            let (description, _) = history_panel_text(d, max_desc);
-                            out.queue(Print(description))?;
-                            out.queue(ResetColor)?;
                         }
+                        let max_desc =
+                            (self.terminal_width as usize).saturating_sub(name_width + 5);
+                        let (description, _) = history_panel_text(d, max_desc);
+                        out.queue(Print(description))?;
+                        out.queue(ResetColor)?;
+                        out.queue(SetAttribute(Attribute::Reset))?;
                     }
                 }
 
@@ -2418,6 +2455,61 @@ fn find_next_word_boundary(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_selection_wraps_and_rewrites_the_word_in_both_directions() {
+        let mut editor = Editor::new();
+        editor.buffer = "git pu".to_string();
+        editor.cursor = editor.buffer.len();
+        let completions = ["push", "pull"]
+            .iter()
+            .map(|text| Completion {
+                text: (*text).to_string(),
+                display: (*text).to_string(),
+                description: None,
+                kind: CompletionKind::Subcommand,
+                is_dir: false,
+            })
+            .collect::<Vec<_>>();
+        editor.completion_menu = Some(CompletionMenu {
+            completions,
+            selected: 0,
+            word_start: 4,
+            original_word: "pu".to_string(),
+        });
+
+        editor.step_completion_menu(1);
+        assert_eq!(editor.buffer, "git pull");
+        assert_eq!(editor.cursor, editor.buffer.len());
+
+        // Forward from the last entry wraps to the first.
+        editor.step_completion_menu(1);
+        assert_eq!(editor.buffer, "git push");
+
+        // Backwards from the first wraps to the last, which is what makes
+        // Shift-Tab and Up usable on the very first candidate.
+        editor.step_completion_menu(-1);
+        assert_eq!(editor.buffer, "git pull");
+        assert_eq!(editor.completion_menu.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn stepping_an_absent_or_empty_menu_is_harmless() {
+        let mut editor = Editor::new();
+        editor.buffer = "ls".to_string();
+        editor.cursor = 2;
+        editor.step_completion_menu(1);
+        assert_eq!(editor.buffer, "ls");
+
+        editor.completion_menu = Some(CompletionMenu {
+            completions: Vec::new(),
+            selected: 0,
+            word_start: 0,
+            original_word: String::new(),
+        });
+        editor.step_completion_menu(-1);
+        assert_eq!(editor.buffer, "ls");
+    }
 
     #[test]
     fn comments_are_not_ai_prompts_without_an_enabled_worker() {

@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- Path completion understands the prefixes people actually type. `~alice<TAB>`
+  completes user names as the home directory they stand for, `~alice/pro<TAB>`
+  scans that home, and `$HOME/pro<TAB>` and `${HOME}/pro<TAB>` scan the
+  variable's value — while the candidate keeps the spelling that was typed, so
+  a `$HOME/` stays `$HOME/` in the command line instead of being expanded or
+  escaped into `\$HOME/`. Candidates are now built by appending to the text
+  already on the line rather than re-escaping the whole path, which is what
+  makes that possible.
+- Commands are recognised where shell syntax puts them: after `do`, `then`,
+  `else`, `elif`, `if`, `while`, `until`, `!` and `{`, so `while read line; do
+  gr<TAB>` completes a command instead of an argument, and inside backtick
+  substitution as well as `$(…)`. Shell keywords themselves complete at
+  command position, each with a word on what it opens.
+- `git` completion reaches further: `git config` offers the keys already set
+  here alongside the well-known ones, `git branch -d` offers branches only —
+  never a tag, a remote ref, or the branch that is checked out, which Git
+  would refuse — `git worktree remove` offers worktree paths labelled with
+  what is checked out in each, and `git tag -d` offers tags.
+- Flags for everyday tools now complete with an explanation of each: `ps`,
+  `df`, `du`, `curl`, `wget`, `sed`, `awk`, `xargs`, `sort`, `uniq`, `head`,
+  `tail`, `wc`, `rsync`, `journalctl`, `systemctl`, `ssh`, `scp`, `jq`, `ln`,
+  `mv`, `ping` and `diff`. The existing table for `ls`, `grep`, `find` and
+  friends was unreachable at the first argument — `ls -<TAB>` never consulted
+  it — and now is.
+- A completion spec can name a dynamic source. `{"template": {"generator":
+  "git_branches"}}` in a spec file reaches the same branch, host, container,
+  unit, service, context and project sources the built-in completions use.
+  A generator is a fixed name resolved inside the shell, never a command
+  line: a spec file is data, and data that could run a program on Tab would
+  make every downloaded spec an execution vector. Unknown names yield
+  nothing, so a spec written for another shell degrades quietly.
+- `source <TAB>` finds a project's virtual environment: the activate script
+  leads the listing, three directories deep as it is, with the ordinary
+  listing behind it. `nvm`, `pyenv`, `rbenv` and `jenv` complete the versions
+  installed here, newest first, read from the directory each keeps them in —
+  asking the tool itself would mean sourcing a shell function on Tab.
+- The completion menu answers the arrow keys while it is open, instead of
+  walking off into history with no way back, and Shift-Tab and Up wrap around
+  at the ends. The selected row keeps its description — it is the one whose
+  meaning is being asked for — and a scrolled menu says how many matches
+  there are and where the selection sits among them.
+
 - Completion probes run once per command line instead of once per keystroke.
   Every external probe and its result — Git refs and status, the Docker
   daemon, systemd, and the decoded history file — is remembered for the

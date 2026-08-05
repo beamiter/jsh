@@ -11,6 +11,8 @@ pub struct SuggestionContext<'a> {
     pub git_remote: Option<&'a str>,
     /// Local branches, most recently committed first.
     pub git_branches: &'a [String],
+    /// Command names known here, for correcting a mistyped one.
+    pub known_commands: &'a [String],
     pub git_has_staged: bool,
     pub git_has_unstaged: bool,
     pub git_has_conflicts: bool,
@@ -376,9 +378,10 @@ fn suggest_subcommand(buffer: &str) -> Option<String> {
 fn suggest_next_command(ctx: &SuggestionContext, history: &History) -> Option<String> {
     let last_cmd = ctx.last_command?;
 
-    // Only suggest after successful commands
     if ctx.last_exit_code != 0 {
-        return None;
+        // A command that failed because its name was mistyped has one
+        // obvious next command: the same line with the name corrected.
+        return correct_mistyped_command(last_cmd, ctx);
     }
 
     // Prefer live repository state over a generic static command chain.
@@ -454,6 +457,33 @@ fn frequent_command_in_cwd(history: &History, cwd: &str) -> Option<String> {
         .filter(|(_, (count, _))| *count >= 3)
         .max_by_key(|(_, (count, last_seen))| (*count, *last_seen))
         .map(|(command, _)| command.to_string())
+}
+
+/// Exit status 127 is "command not found". Only that status, and only when a
+/// close name exists, becomes a suggestion: re-running anything else is a
+/// guess about why it failed.
+const COMMAND_NOT_FOUND: i32 = 127;
+
+fn correct_mistyped_command(last_cmd: &str, ctx: &SuggestionContext) -> Option<String> {
+    if ctx.last_exit_code != COMMAND_NOT_FOUND || ctx.known_commands.is_empty() {
+        return None;
+    }
+    let trimmed = last_cmd.trim();
+    let (typed, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((typed, rest)) => (typed, rest.trim_start()),
+        None => (trimmed, ""),
+    };
+    // Only a plain name: a path, an assignment or a pipeline is not this.
+    if typed.is_empty() || typed.contains('/') || typed.contains('=') {
+        return None;
+    }
+    let candidates = ctx.known_commands.iter().map(String::as_str);
+    let correction = crate::value_builtins::closest_match(typed, candidates)?;
+    Some(if rest.is_empty() {
+        correction
+    } else {
+        format!("{correction} {rest}")
+    })
 }
 
 fn git_push_command(ctx: &SuggestionContext) -> Option<String> {
@@ -722,6 +752,50 @@ mod tests {
             suggest_git_command("git rebase mai", &ctx),
             Some("ntenance".to_string())
         );
+    }
+
+    #[test]
+    fn a_mistyped_command_name_is_offered_back_corrected() {
+        let history = History::new(0);
+        let known: Vec<String> = ["cargo", "git", "grep", "ls"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        fn failed<'a>(command: &'a str, code: i32, known: &'a [String]) -> SuggestionContext<'a> {
+            SuggestionContext {
+                last_command: Some(command),
+                last_exit_code: code,
+                known_commands: known,
+                ..SuggestionContext::default()
+            }
+        }
+        let failed = |command: &'static str, code: i32| failed(command, code, &known);
+
+        assert_eq!(
+            suggest_next_command(&failed("gti status", 127), &history),
+            Some("git status".to_string())
+        );
+        assert_eq!(
+            suggest_next_command(&failed("crgo", 127), &history),
+            Some("cargo".to_string())
+        );
+
+        // A command that ran and failed on its own terms is not a typo, and
+        // nothing close enough is not a correction either.
+        assert_eq!(
+            suggest_next_command(&failed("git status", 1), &history),
+            None
+        );
+        assert_eq!(
+            suggest_next_command(&failed("kubernetesctl get", 127), &history),
+            None
+        );
+        // Paths and assignments are not name typos.
+        assert_eq!(
+            suggest_next_command(&failed("./gti build", 127), &history),
+            None
+        );
+        assert_eq!(suggest_next_command(&failed("FOO=1", 127), &history), None);
     }
 
     #[test]

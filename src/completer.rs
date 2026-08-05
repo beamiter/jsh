@@ -168,7 +168,7 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
         format!("wrapval:{kind:?}:{word}")
     } else if is_cmd_pos {
         format!("cmd:{}", word)
-    } else if word.starts_with('$') {
+    } else if word.starts_with('$') && !word.contains('/') {
         format!("var:{word}")
     } else {
         // Argument completion depends on the full command and repository
@@ -209,9 +209,13 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
         before.ends_with('|') && !before.ends_with("||")
     };
 
-    let completions = if let Some(variable) = word.strip_prefix("${") {
+    // A `/` ends the variable name: `$HOME` is still being typed, while
+    // `$HOME/pro` is a path whose first segment happens to be a variable.
+    let variable_word = word.starts_with('$') && !word.contains('/');
+
+    let completions = if let Some(variable) = word.strip_prefix("${").filter(|_| variable_word) {
         complete_variable_braced(variable, state)
-    } else if let Some(variable) = word.strip_prefix('$') {
+    } else if let Some(variable) = word.strip_prefix('$').filter(|_| variable_word) {
         complete_variable(variable, state)
     } else if redirect_target {
         complete_path(&word, state)
@@ -511,6 +515,11 @@ fn effective_command_index(words: &[&str]) -> usize {
                 index += 1;
                 index = skip_wrapper_options(words, index, &["-n", "--adjustment"]);
             }
+            // Keywords a command follows. `while read x; do gr<TAB>` is a
+            // command position, not an argument of `do`.
+            "do" | "then" | "else" | "elif" | "if" | "while" | "until" | "!" | "{" => {
+                index += 1;
+            }
             _ => return index,
         }
     }
@@ -535,6 +544,77 @@ fn skip_wrapper_options(words: &[&str], mut index: usize, value_options: &[&str]
         }
     }
     index
+}
+
+/// Resolve the leading `~`, `~user` or `$VAR` of a path being completed to
+/// the directory that must actually be scanned. The candidate text keeps the
+/// spelling the user typed — a `$HOME/` stays `$HOME/` in the command line —
+/// so only the lookup is expanded here.
+fn expand_completion_prefix(lookup_prefix: &str, state: &ShellState) -> Option<String> {
+    if let Some(rest) = lookup_prefix.strip_prefix('~') {
+        let home = state.home_dir.to_string_lossy();
+        if rest.is_empty() {
+            return Some(format!("{home}/"));
+        }
+        if let Some(rest) = rest.strip_prefix('/') {
+            return Some(format!("{home}/{rest}"));
+        }
+        // `~user/...`: the home directory comes from the user database.
+        let (user, rest) = rest.split_once('/')?;
+        let home = passwd_home_dir(user)?;
+        return Some(format!("{}/{}", home.trim_end_matches('/'), rest));
+    }
+
+    // `$VAR/...` and `${VAR}/...`. Only a whole leading segment is resolved:
+    // `$HOME` is a directory to scan, while `pre$VAR` is a pattern this
+    // completion has no way to invert.
+    if let Some(rest) = lookup_prefix.strip_prefix('$') {
+        let (name, rest) = match rest.strip_prefix('{') {
+            Some(braced) => {
+                let (name, rest) = braced.split_once('}')?;
+                (name, rest)
+            }
+            None => {
+                let end = rest
+                    .find(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                    .unwrap_or(rest.len());
+                rest.split_at(end)
+            }
+        };
+        if !rest.starts_with('/') {
+            return None;
+        }
+        let value = state.get_var(name)?;
+        return Some(format!("{}{}", value.trim_end_matches('/'), rest));
+    }
+
+    Some(lookup_prefix.to_string())
+}
+
+/// The home directory recorded for one user, or `None` when the user is not
+/// in the database or the entry has no home field.
+fn passwd_home_dir(user: &str) -> Option<String> {
+    let content =
+        crate::io_guard::read_regular_text(Path::new("/etc/passwd"), MAX_USER_DB_BYTES).ok()?;
+    content.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == user).then(|| fields.nth(4).map(str::to_string))?
+    })
+}
+
+/// `~alice<TAB>` — user names spelled as the home directory they stand for,
+/// so accepting one continues into that directory.
+fn complete_user_homes(prefix: &str) -> Vec<Completion> {
+    rank_prefix_then_fuzzy(complete_users(""), prefix)
+        .into_iter()
+        .map(|mut completion| {
+            completion.display = format!("~{}", completion.text);
+            completion.text = format!("~{}/", completion.text);
+            completion.is_dir = true;
+            completion.kind = CompletionKind::Directory;
+            completion
+        })
+        .collect()
 }
 
 /// Extensions a command is normally pointed at. Directories always stay —
@@ -736,6 +816,11 @@ fn active_command_segment_start(buf: &str) -> usize {
                 '(' => starts.push(index + ch.len_utf8()),
                 ')' if starts.len() > 1 => {
                     starts.pop();
+                }
+                // A backtick opens a command substitution and the next one
+                // closes it, so each is the start of a fresh command.
+                '`' => {
+                    *starts.last_mut().unwrap() = index + ch.len_utf8();
                 }
                 ';' | '\n' | '|' => {
                     *starts.last_mut().unwrap() = index + ch.len_utf8();
@@ -947,6 +1032,45 @@ fn subcommand_completions(
             })
             .collect();
         if !results.is_empty() {
+            return Some(results);
+        }
+    }
+
+    // Version managers keep their interpreters in a fixed directory, so the
+    // versions installed here can be offered without running anything.
+    if matches!(cmd, "nvm" | "pyenv" | "rbenv" | "jenv") && !prefix.starts_with('-') {
+        let takes_version = word_count == 1
+            || matches!(
+                words.get(1).copied().unwrap_or(""),
+                "use"
+                    | "install"
+                    | "uninstall"
+                    | "exec"
+                    | "global"
+                    | "local"
+                    | "shell"
+                    | "which"
+                    | "prefix"
+                    | "alias"
+                    | "run"
+            );
+        if takes_version {
+            let results = rank_prefix_then_fuzzy(complete_toolchain_versions(cmd, state), prefix);
+            if !results.is_empty() {
+                return Some(results);
+            }
+        }
+    }
+
+    // `source <TAB>` next to a virtual environment: its activate script is
+    // three directories down, and it is almost always what was meant.
+    if matches!(cmd, "source" | ".") && !prefix.starts_with('-') {
+        let mut results = complete_venv_activators(state);
+        results.retain(|completion| completion.text.starts_with(prefix));
+        if !results.is_empty() {
+            let mut rest = complete_path(prefix, state);
+            rest.retain(|candidate| !results.iter().any(|item| item.text == candidate.text));
+            results.extend(filter_by_file_type(rest, cmd));
             return Some(results);
         }
     }
@@ -1232,8 +1356,96 @@ fn subcommand_completions(
         }
     }
 
+    // Option completions for common commands
+    if prefix.starts_with('-') {
+        let options: &[(&str, &str)] = match cmd {
+            "ls" => &[
+                ("-l", "long format"),
+                ("-a", "include hidden"),
+                ("-h", "human readable"),
+                ("-r", "reverse order"),
+                ("-t", "sort by time"),
+                ("-S", "sort by size"),
+                ("-R", "recursive"),
+                ("-d", "list directories"),
+            ],
+            "grep" => &[
+                ("-i", "case insensitive"),
+                ("-v", "invert match"),
+                ("-n", "show line numbers"),
+                ("-r", "recursive"),
+                ("-R", "recursive dereference"),
+                ("-l", "list filenames"),
+                ("-c", "count matches"),
+                ("-o", "only matching parts"),
+                ("-E", "extended regex"),
+                ("-F", "fixed strings"),
+            ],
+            "find" => &[
+                ("-type", "file type"),
+                ("-name", "filename pattern"),
+                ("-iname", "case insensitive name"),
+                ("-path", "path pattern"),
+                ("-regex", "regex pattern"),
+                ("-size", "file size"),
+                ("-mtime", "modification time"),
+                ("-atime", "access time"),
+                ("-user", "file owner"),
+                ("-exec", "execute command"),
+            ],
+            "tar" => &[
+                ("-c", "create archive"),
+                ("-x", "extract archive"),
+                ("-t", "list contents"),
+                ("-v", "verbose"),
+                ("-z", "gzip compression"),
+                ("-j", "bzip2 compression"),
+                ("-f", "archive file"),
+                ("-C", "change directory"),
+            ],
+            "rm" => &[
+                ("-r", "recursive"),
+                ("-f", "force"),
+                ("-i", "interactive"),
+                ("-v", "verbose"),
+            ],
+            "cp" => &[
+                ("-r", "recursive"),
+                ("-i", "interactive"),
+                ("-v", "verbose"),
+                ("-a", "preserve all"),
+                ("-p", "preserve properties"),
+            ],
+            "mkdir" => &[("-p", "create parents"), ("-m", "mode"), ("-v", "verbose")],
+            "chmod" => &[
+                ("-R", "recursive"),
+                ("-v", "verbose"),
+                ("-c", "report changes only"),
+                ("--reference", "copy another file's mode"),
+            ],
+            _ => COMMON_FLAGS
+                .iter()
+                .find(|(name, _)| *name == cmd)
+                .map(|(_, flags)| *flags)
+                .unwrap_or(&[]),
+        };
+
+        if !options.is_empty() {
+            let completions = options
+                .iter()
+                .map(|(opt, desc)| {
+                    Completion::new((*opt).to_string(), CompletionKind::Flag).with_desc(desc)
+                })
+                .collect::<Vec<_>>();
+            let ranked = rank_prefix_then_fuzzy(completions, prefix);
+            if !ranked.is_empty() {
+                return Some(ranked);
+            }
+        }
+    }
+
     // First-level subcommands with descriptions
-    if word_count == 1 {
+    if word_count == 1 && !prefix.starts_with('-') {
         let subs: &[(&str, &str)] = match cmd {
             "git" => &[
                 ("add", "Stage changes"),
@@ -1483,10 +1695,92 @@ fn subcommand_completions(
     if cmd == "git" && word_count >= 2 && !prefix.starts_with('-') {
         let subcmd = words.get(1).copied().unwrap_or("");
         match subcmd {
+            // Deleting a branch names a branch, never a tag or a remote ref,
+            // and never the branch that is checked out — Git would refuse.
+            "branch" | "switch"
+                if words
+                    .iter()
+                    .skip(2)
+                    .any(|word| matches!(*word, "-d" | "-D" | "--delete")) =>
+            {
+                let current = state.cached_git_branch.as_deref();
+                let branches: Vec<Completion> = complete_git_local_branches("")
+                    .into_iter()
+                    .filter(|completion| Some(completion.text.as_str()) != current)
+                    .collect();
+                return Some(rank_prefix_then_fuzzy(branches, prefix));
+            }
             "checkout" | "switch" | "merge" | "rebase" | "branch" | "diff" | "log" => {
                 // All refs, prefix matches first, fuzzy when nothing starts
                 // with the typed text (`git checkout rel21` → release-2.1).
                 return Some(rank_prefix_then_fuzzy(complete_git_refs(""), prefix));
+            }
+            "config" => {
+                // `--get`/`--unset` name a key that exists here; otherwise
+                // the well-known keys are what someone is reaching for.
+                let existing = words
+                    .iter()
+                    .skip(2)
+                    .any(|word| matches!(*word, "--get" | "--get-all" | "--unset" | "--unset-all"));
+                let mut results = if existing {
+                    complete_git_config_keys("")
+                } else {
+                    Vec::new()
+                };
+                if results.is_empty() {
+                    results = complete_git_config_keys("");
+                    for (key, description) in GIT_CONFIG_KEYS {
+                        if !results.iter().any(|item| item.text == *key) {
+                            results.push(
+                                Completion::new((*key).to_string(), CompletionKind::Other)
+                                    .with_desc(description),
+                            );
+                        }
+                    }
+                }
+                return Some(rank_prefix_then_fuzzy(results, prefix));
+            }
+            "worktree" if word_count == 2 => {
+                let subs = [
+                    ("add", "Create a worktree"),
+                    ("list", "List worktrees"),
+                    ("lock", "Prevent pruning"),
+                    ("move", "Move a worktree"),
+                    ("prune", "Remove stale entries"),
+                    ("remove", "Remove a worktree"),
+                    ("repair", "Repair worktree links"),
+                    ("unlock", "Allow pruning"),
+                ];
+                let completions = subs
+                    .iter()
+                    .map(|(name, desc)| {
+                        Completion::new((*name).to_string(), CompletionKind::Subcommand)
+                            .with_desc(desc)
+                    })
+                    .collect();
+                return Some(rank_prefix_then_fuzzy(completions, prefix));
+            }
+            "worktree" if word_count >= 3 => {
+                if matches!(
+                    words.get(2).copied().unwrap_or(""),
+                    "remove" | "lock" | "unlock" | "move" | "repair"
+                ) {
+                    let results = rank_prefix_then_fuzzy(complete_git_worktrees(""), prefix);
+                    if !results.is_empty() {
+                        return Some(results);
+                    }
+                }
+            }
+            "tag"
+                if words
+                    .iter()
+                    .skip(2)
+                    .any(|word| matches!(*word, "-d" | "--delete" | "-v" | "--verify")) =>
+            {
+                let results = rank_prefix_then_fuzzy(complete_git_tags(""), prefix);
+                if !results.is_empty() {
+                    return Some(results);
+                }
             }
             "add" => {
                 return Some(rank_prefix_then_fuzzy(
@@ -1745,95 +2039,257 @@ fn subcommand_completions(
         }
     }
 
-    // Option completions for common commands
-    if prefix.starts_with('-') {
-        let options: &[(&str, &str)] = match cmd {
-            "ls" => &[
-                ("-l", "long format"),
-                ("-a", "include hidden"),
-                ("-h", "human readable"),
-                ("-r", "reverse order"),
-                ("-t", "sort by time"),
-                ("-S", "sort by size"),
-                ("-R", "recursive"),
-                ("-d", "list directories"),
-            ],
-            "grep" => &[
-                ("-i", "case insensitive"),
-                ("-v", "invert match"),
-                ("-n", "show line numbers"),
-                ("-r", "recursive"),
-                ("-R", "recursive dereference"),
-                ("-l", "list filenames"),
-                ("-c", "count matches"),
-                ("-o", "only matching parts"),
-                ("-E", "extended regex"),
-                ("-F", "fixed strings"),
-            ],
-            "find" => &[
-                ("-type", "file type"),
-                ("-name", "filename pattern"),
-                ("-iname", "case insensitive name"),
-                ("-path", "path pattern"),
-                ("-regex", "regex pattern"),
-                ("-size", "file size"),
-                ("-mtime", "modification time"),
-                ("-atime", "access time"),
-                ("-user", "file owner"),
-                ("-exec", "execute command"),
-            ],
-            "tar" => &[
-                ("-c", "create archive"),
-                ("-x", "extract archive"),
-                ("-t", "list contents"),
-                ("-v", "verbose"),
-                ("-z", "gzip compression"),
-                ("-j", "bzip2 compression"),
-                ("-f", "archive file"),
-                ("-C", "change directory"),
-            ],
-            "rm" => &[
-                ("-r", "recursive"),
-                ("-f", "force"),
-                ("-i", "interactive"),
-                ("-v", "verbose"),
-            ],
-            "cp" => &[
-                ("-r", "recursive"),
-                ("-i", "interactive"),
-                ("-v", "verbose"),
-                ("-a", "preserve all"),
-                ("-p", "preserve properties"),
-            ],
-            "mkdir" => &[("-p", "parents"), ("-m", "mode"), ("-v", "verbose")],
-            "chmod" => &[
-                ("-r", "recursive"),
-                ("-v", "verbose"),
-                ("-c", "changes only"),
-                ("-R", "recursive"),
-            ],
-            _ => return None,
-        };
-
-        let completions = options
-            .iter()
-            .filter(|(opt, _)| opt.starts_with(prefix))
-            .map(|(opt, desc)| Completion {
-                text: opt.to_string(),
-                display: opt.to_string(),
-                description: Some(desc.to_string()),
-                kind: CompletionKind::Flag,
-                is_dir: false,
-            })
-            .collect::<Vec<_>>();
-
-        if !completions.is_empty() {
-            return Some(completions);
-        }
-    }
-
     None
 }
+
+/// Flags for the tools people reach for constantly, where remembering which
+/// letter means what is the actual friction. Kept to the options worth
+/// choosing from a list: exhaustive coverage belongs in a spec file, and the
+/// history fallback already recalls whatever else someone has typed before.
+#[allow(clippy::type_complexity)]
+const COMMON_FLAGS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "ps",
+        &[
+            ("aux", "every process, user-oriented"),
+            ("-e", "every process"),
+            ("-f", "full format"),
+            ("-o", "choose output columns"),
+            ("--sort", "sort by a column"),
+            ("-p", "by process id"),
+            ("-u", "by user"),
+        ],
+    ),
+    (
+        "df",
+        &[
+            ("-h", "human readable sizes"),
+            ("-i", "inodes instead of blocks"),
+            ("-T", "show filesystem type"),
+            ("-x", "exclude a filesystem type"),
+        ],
+    ),
+    (
+        "du",
+        &[
+            ("-h", "human readable sizes"),
+            ("-s", "summary per argument"),
+            ("-d", "limit depth"),
+            ("-a", "include files"),
+            ("-x", "stay on one filesystem"),
+            ("--exclude", "skip matching paths"),
+        ],
+    ),
+    (
+        "curl",
+        &[
+            ("-s", "silent"),
+            ("-S", "show errors even when silent"),
+            ("-L", "follow redirects"),
+            ("-o", "write to a file"),
+            ("-O", "write to the remote name"),
+            ("-X", "request method"),
+            ("-H", "add a header"),
+            ("-d", "request body"),
+            ("-F", "multipart form field"),
+            ("-u", "credentials"),
+            ("-i", "include response headers"),
+            ("-I", "headers only"),
+            ("-f", "fail on HTTP errors"),
+            ("--json", "JSON body, headers set"),
+            ("--retry", "retry a failed transfer"),
+        ],
+    ),
+    (
+        "wget",
+        &[
+            ("-O", "write to a file"),
+            ("-c", "continue a partial download"),
+            ("-q", "quiet"),
+            ("-r", "recursive"),
+            ("--no-check-certificate", "skip TLS verification"),
+        ],
+    ),
+    (
+        "sed",
+        &[
+            ("-i", "edit files in place"),
+            ("-E", "extended regex"),
+            ("-n", "print only what is asked"),
+            ("-e", "add a script"),
+            ("-f", "read a script file"),
+        ],
+    ),
+    (
+        "awk",
+        &[
+            ("-F", "field separator"),
+            ("-v", "assign a variable"),
+            ("-f", "read a program file"),
+        ],
+    ),
+    (
+        "xargs",
+        &[
+            ("-n", "arguments per command"),
+            ("-P", "run in parallel"),
+            ("-I", "replace a placeholder"),
+            ("-0", "null separated input"),
+            ("-r", "skip when input is empty"),
+            ("-t", "print each command"),
+        ],
+    ),
+    (
+        "sort",
+        &[
+            ("-n", "numeric"),
+            ("-r", "reverse"),
+            ("-k", "sort by field"),
+            ("-t", "field separator"),
+            ("-u", "drop duplicates"),
+            ("-h", "human readable numbers"),
+        ],
+    ),
+    (
+        "uniq",
+        &[
+            ("-c", "count occurrences"),
+            ("-d", "duplicates only"),
+            ("-u", "unique lines only"),
+            ("-i", "case insensitive"),
+        ],
+    ),
+    ("head", &[("-n", "line count"), ("-c", "byte count")]),
+    (
+        "tail",
+        &[
+            ("-n", "line count"),
+            ("-f", "follow as it grows"),
+            ("-F", "follow across renames"),
+            ("-c", "byte count"),
+        ],
+    ),
+    (
+        "wc",
+        &[
+            ("-l", "lines"),
+            ("-w", "words"),
+            ("-c", "bytes"),
+            ("-m", "characters"),
+        ],
+    ),
+    (
+        "rsync",
+        &[
+            ("-a", "archive mode"),
+            ("-v", "verbose"),
+            ("-z", "compress in transit"),
+            ("-P", "progress and resume"),
+            ("-n", "dry run"),
+            ("--delete", "remove what the source dropped"),
+            ("--exclude", "skip matching paths"),
+            ("-e", "remote shell to use"),
+        ],
+    ),
+    (
+        "journalctl",
+        &[
+            ("-u", "one unit"),
+            ("-f", "follow"),
+            ("-n", "last N lines"),
+            ("-b", "this boot"),
+            ("-p", "minimum priority"),
+            ("--since", "from a time"),
+            ("--until", "to a time"),
+            ("--user", "user session log"),
+            ("-k", "kernel messages"),
+        ],
+    ),
+    (
+        "systemctl",
+        &[
+            ("--user", "user manager"),
+            ("--now", "start or stop as well"),
+            ("--no-pager", "plain output"),
+            ("-q", "quiet"),
+            ("--failed", "only failed units"),
+        ],
+    ),
+    (
+        "ssh",
+        &[
+            ("-p", "port"),
+            ("-i", "identity file"),
+            ("-l", "login name"),
+            ("-J", "jump host"),
+            ("-A", "forward the agent"),
+            ("-N", "no remote command"),
+            ("-L", "local port forward"),
+            ("-R", "remote port forward"),
+            ("-o", "config option"),
+            ("-v", "verbose"),
+        ],
+    ),
+    (
+        "scp",
+        &[
+            ("-r", "recursive"),
+            ("-P", "port"),
+            ("-i", "identity file"),
+            ("-C", "compress"),
+            ("-p", "preserve times and modes"),
+        ],
+    ),
+    (
+        "jq",
+        &[
+            ("-r", "raw output"),
+            ("-c", "compact output"),
+            ("-n", "no input"),
+            ("-s", "slurp into an array"),
+            ("-e", "exit status from the result"),
+            ("--arg", "pass a string variable"),
+        ],
+    ),
+    (
+        "ln",
+        &[
+            ("-s", "symbolic link"),
+            ("-f", "replace the target"),
+            ("-n", "treat a link as a file"),
+            ("-r", "relative symbolic link"),
+        ],
+    ),
+    (
+        "mv",
+        &[
+            ("-i", "ask before replacing"),
+            ("-n", "never replace"),
+            ("-v", "verbose"),
+            ("-f", "replace without asking"),
+        ],
+    ),
+    (
+        "ping",
+        &[
+            ("-c", "stop after N packets"),
+            ("-i", "seconds between packets"),
+            ("-W", "reply timeout"),
+            ("-4", "IPv4"),
+            ("-6", "IPv6"),
+        ],
+    ),
+    (
+        "diff",
+        &[
+            ("-u", "unified context"),
+            ("-r", "recursive"),
+            ("-q", "report only whether they differ"),
+            ("-w", "ignore whitespace"),
+            ("--color", "colourise"),
+        ],
+    ),
+];
 
 /// ssh-family options whose next word is a value, not the destination.
 const SSH_VALUE_OPTIONS: &[&str] = &[
@@ -2785,6 +3241,155 @@ fn complete_git_refs(prefix: &str) -> Vec<Completion> {
     Vec::new()
 }
 
+/// Local branches only, most recently committed first, for the arguments
+/// that mean a branch rather than any ref.
+fn complete_git_local_branches(prefix: &str) -> Vec<Completion> {
+    let Some(output) = probe_text_once("git:local-branches", || {
+        crate::prompt::bounded_git_stdout(
+            Path::new("."),
+            &[
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(refname:short)%09%(contents:subject)",
+                "refs/heads",
+            ],
+            MAX_GIT_COMPLETION_BYTES,
+        )
+        .map(|output| String::from_utf8_lossy(&output).into_owned())
+    }) else {
+        return Vec::new();
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            let (branch, subject) = line.split_once('\t').unwrap_or((line, ""));
+            let branch = branch.trim();
+            if branch.is_empty() || !branch.starts_with(prefix) {
+                return None;
+            }
+            let completion = Completion::new(branch.to_string(), CompletionKind::Other);
+            Some(if subject.is_empty() {
+                completion.with_desc("branch")
+            } else {
+                completion.with_desc(subject)
+            })
+        })
+        .take(MAX_COMPLETION_ITEMS)
+        .collect()
+}
+
+fn complete_git_tags(prefix: &str) -> Vec<Completion> {
+    let Some(output) = probe_text_once("git:tags", || {
+        crate::prompt::bounded_git_stdout(
+            Path::new("."),
+            &[
+                "for-each-ref",
+                "--sort=-creatordate",
+                "--format=%(refname:short)",
+                "refs/tags",
+            ],
+            MAX_GIT_COMPLETION_BYTES,
+        )
+        .map(|output| String::from_utf8_lossy(&output).into_owned())
+    }) else {
+        return Vec::new();
+    };
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty() && tag.starts_with(prefix))
+        .map(|tag| Completion::new(tag.to_string(), CompletionKind::Other).with_desc("tag"))
+        .take(MAX_COMPLETION_ITEMS)
+        .collect()
+}
+
+/// Worktree paths as `git worktree list --porcelain` reports them.
+fn complete_git_worktrees(prefix: &str) -> Vec<Completion> {
+    let Some(output) = probe_text_once("git:worktrees", || {
+        crate::prompt::bounded_git_stdout(
+            Path::new("."),
+            &["worktree", "list", "--porcelain"],
+            MAX_GIT_COMPLETION_BYTES,
+        )
+        .map(|output| String::from_utf8_lossy(&output).into_owned())
+    }) else {
+        return Vec::new();
+    };
+    parse_git_worktrees(&output, prefix)
+}
+
+fn parse_git_worktrees(output: &str, prefix: &str) -> Vec<Completion> {
+    let mut completions = Vec::new();
+    let mut path: Option<&str> = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(value.trim());
+            continue;
+        }
+        let Some(current) = path else { continue };
+        // The line after the path says which branch is checked out there.
+        let description = if let Some(branch) = line.strip_prefix("branch ") {
+            branch.trim().trim_start_matches("refs/heads/").to_string()
+        } else if line.starts_with("detached") {
+            "detached HEAD".to_string()
+        } else {
+            continue;
+        };
+        path = None;
+        if !current.starts_with(prefix) {
+            continue;
+        }
+        completions.push(
+            Completion::new(escape_shell_word(current), CompletionKind::Directory)
+                .with_desc(&description),
+        );
+    }
+    completions.truncate(MAX_COMPLETION_ITEMS);
+    completions
+}
+
+/// Keys already set in any scope, with their values, so `git config --get`
+/// completes what this repository actually has.
+fn complete_git_config_keys(prefix: &str) -> Vec<Completion> {
+    let Some(output) = probe_text_once("git:config-keys", || {
+        crate::prompt::bounded_git_stdout(
+            Path::new("."),
+            &["config", "--list", "--name-only"],
+            MAX_GIT_COMPLETION_BYTES,
+        )
+        .map(|output| String::from_utf8_lossy(&output).into_owned())
+    }) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && key.starts_with(prefix))
+        .filter(|key| seen.insert(key.to_string()))
+        .map(|key| Completion::new(key.to_string(), CompletionKind::Other).with_desc("set here"))
+        .take(MAX_COMPLETION_ITEMS)
+        .collect()
+}
+
+/// Keys worth offering even when nothing has set them yet.
+const GIT_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("user.name", "Name recorded on commits"),
+    ("user.email", "Email recorded on commits"),
+    ("core.editor", "Editor for messages"),
+    ("core.excludesfile", "Global ignore file"),
+    ("init.defaultBranch", "Branch name for new repositories"),
+    ("pull.rebase", "Rebase instead of merge on pull"),
+    ("push.default", "What a bare push pushes"),
+    ("push.autoSetupRemote", "Create the upstream on first push"),
+    ("merge.conflictstyle", "Conflict marker style"),
+    ("rebase.autostash", "Stash before rebasing"),
+    ("diff.tool", "External diff tool"),
+    ("commit.gpgsign", "Sign commits"),
+    ("fetch.prune", "Drop deleted remote branches on fetch"),
+    ("alias.", "Define a Git alias"),
+];
+
 fn parse_git_refs(output: &str, prefix: &str) -> Vec<Completion> {
     let mut completions = Vec::new();
     for reference in output.lines().map(str::trim) {
@@ -3111,17 +3716,193 @@ fn complete_spec_args(
                     )
                 }),
         );
-        match arg.template {
+        match &arg.template {
             ArgTemplate::FilePath => completions.extend(complete_path(prefix, state)),
             ArgTemplate::FolderPath => completions.extend(
                 complete_path(prefix, state)
                     .into_iter()
                     .filter(|completion| completion.is_dir),
             ),
-            _ => {}
+            ArgTemplate::Generator(name) => {
+                completions.extend(complete_from_generator(name, prefix, state))
+            }
+            ArgTemplate::None => {}
         }
     }
     completions
+}
+
+/// Directory names a Python virtual environment conventionally uses.
+const VENV_DIR_NAMES: &[&str] = &[".venv", "venv", "env", ".env", "virtualenv"];
+
+/// `source <TAB>` in a project with a virtual environment: the activate
+/// script is what someone is reaching for, and it is three segments deep.
+/// Offered ahead of the ordinary listing rather than instead of it.
+fn complete_venv_activators(state: &ShellState) -> Vec<Completion> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    venv_activators_in(&cwd, state)
+}
+
+fn venv_activators_in(cwd: &Path, state: &ShellState) -> Vec<Completion> {
+    let mut completions = Vec::new();
+    for name in VENV_DIR_NAMES {
+        let activate = cwd.join(name).join("bin/activate");
+        if !activate.is_file() {
+            continue;
+        }
+        let python = cwd.join(name).join("bin/python");
+        let description = python
+            .is_file()
+            .then(|| format!("activate {name}"))
+            .unwrap_or_else(|| "activate a virtual environment".to_string());
+        completions.push(
+            Completion::new(format!("{name}/bin/activate"), CompletionKind::File)
+                .with_desc(&description),
+        );
+    }
+    // A venv named in the environment but living elsewhere still activates.
+    if let Some(active) = state.env_vars.get("VIRTUAL_ENV") {
+        let activate = Path::new(active).join("bin/activate");
+        if activate.is_file() {
+            let text = escape_shell_word(&activate.to_string_lossy());
+            if !completions.iter().any(|item| item.text == text) {
+                completions.push(
+                    Completion::new(text, CompletionKind::File).with_desc("the active environment"),
+                );
+            }
+        }
+    }
+    completions
+}
+
+/// Installed interpreter versions, from the version managers that keep them
+/// in a fixed directory. Reading the directory is the whole probe: asking
+/// `nvm`/`pyenv` itself would mean sourcing a shell function on Tab.
+fn complete_toolchain_versions(cmd: &str, state: &ShellState) -> Vec<Completion> {
+    let home = &state.home_dir;
+    let (roots, label): (Vec<PathBuf>, &str) = match cmd {
+        "nvm" | "node" | "npx" => (
+            vec![state
+                .env_vars
+                .get("NVM_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".nvm"))
+                .join("versions/node")],
+            "installed node",
+        ),
+        "pyenv" => (
+            vec![state
+                .env_vars
+                .get("PYENV_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".pyenv"))
+                .join("versions")],
+            "installed python",
+        ),
+        "rbenv" => (vec![home.join(".rbenv/versions")], "installed ruby"),
+        "jenv" => (vec![home.join(".jenv/versions")], "installed java"),
+        _ => return Vec::new(),
+    };
+
+    let mut versions = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten().take(MAX_COMPLETION_ITEMS) {
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            versions.push(Completion::new(name, CompletionKind::Other).with_desc(label));
+        }
+    }
+    // Newest first, as a version directory listing is not sorted usefully.
+    versions.sort_by(|a, b| natural_version_order(&b.text, &a.text));
+    versions
+}
+
+/// Compare version-shaped names by their numeric parts, so `v20.11.0` sorts
+/// above `v9.1.0` where a plain string comparison would not.
+fn natural_version_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let numbers = |text: &str| {
+        text.split(|ch: char| !ch.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse::<u64>().ok())
+            .take(4)
+            .collect::<Vec<_>>()
+    };
+    numbers(a).cmp(&numbers(b)).then_with(|| a.cmp(b))
+}
+
+/// The dynamic sources a completion spec may name.
+///
+/// A generator is a fixed name resolved here, never a command line: a spec
+/// file is data, and data that could run a program on Tab would make every
+/// downloaded spec an execution vector. An unknown name yields nothing, so a
+/// spec written for another shell degrades to no suggestions rather than to
+/// something surprising.
+fn complete_from_generator(name: &str, prefix: &str, state: &ShellState) -> Vec<Completion> {
+    let candidates = match name {
+        "git_refs" => complete_git_refs(""),
+        "git_branches" => complete_git_local_branches(""),
+        "git_tags" => complete_git_tags(""),
+        "git_remotes" => complete_git_remotes(""),
+        "git_worktrees" => complete_git_worktrees(""),
+        "git_config_keys" => complete_git_config_keys(""),
+        "git_modified_files" => complete_git_dirty_files("", "add"),
+        "ssh_hosts" => complete_ssh_hosts("", false, &state.home_dir),
+        "users" => complete_users(""),
+        "groups" => complete_groups(""),
+        "processes" => complete_system_pids(""),
+        "signals" => KILL_SIGNALS
+            .iter()
+            .map(|(signal, desc)| {
+                Completion::new(
+                    signal.trim_start_matches('-').to_string(),
+                    CompletionKind::Other,
+                )
+                .with_desc(desc)
+            })
+            .collect(),
+        "docker_containers" => complete_docker_containers("", true),
+        "docker_running_containers" => complete_docker_containers("", false),
+        "docker_images" => complete_docker_images(""),
+        "compose_services" => complete_compose_services(""),
+        "systemd_units" => complete_systemctl_units("", false, false),
+        "systemd_unit_files" => complete_systemctl_units("", false, true),
+        "kube_contexts" => complete_kube_names("", KubeName::Context, state),
+        "kube_namespaces" => complete_kube_names("", KubeName::Namespace, state),
+        "npm_scripts" => complete_npm_scripts(""),
+        "npm_dependencies" => complete_npm_dependencies(""),
+        "make_targets" => complete_make_targets(""),
+        "cargo_bins" => complete_cargo_argument("", CargoArgKind::Bin),
+        "cargo_features" => complete_cargo_argument("", CargoArgKind::Feature),
+        "cargo_packages" => complete_cargo_argument("", CargoArgKind::Package),
+        "environment_variables" => complete_variable_names("", state),
+        "shell_functions" => {
+            let mut names: Vec<&String> = state.functions.keys().collect();
+            names.sort();
+            names
+                .into_iter()
+                .map(|name| {
+                    Completion::new(name.clone(), CompletionKind::Function).with_desc("function")
+                })
+                .collect()
+        }
+        "bookmarks" => match crate::bookmarks::get_bookmark_db().lock() {
+            Ok(db) => db
+                .names()
+                .into_iter()
+                .map(|name| Completion::new(name, CompletionKind::Other).with_desc("bookmark"))
+                .collect(),
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    rank_prefix_then_fuzzy(candidates, prefix)
 }
 
 fn extract_word_at(buf: &str) -> (String, usize) {
@@ -3178,8 +3959,36 @@ fn is_command_position(buf: &str, word_start: usize) -> bool {
     effective_command_index(&words) >= words.len()
 }
 
+/// Words that open a shell construct. They are typed where a command is
+/// typed, so a command position must offer them; the description is what the
+/// construct does, since the word alone rarely says it.
+const SHELL_KEYWORDS: &[(&str, &str)] = &[
+    ("if", "conditional"),
+    ("then", "conditional body"),
+    ("else", "conditional alternative"),
+    ("elif", "further condition"),
+    ("fi", "end a conditional"),
+    ("for", "loop over words"),
+    ("while", "loop while a command succeeds"),
+    ("until", "loop until a command succeeds"),
+    ("do", "loop body"),
+    ("done", "end a loop"),
+    ("case", "match a value"),
+    ("esac", "end a match"),
+    ("in", "the words of a for or case"),
+    ("function", "define a function"),
+    ("select", "menu loop"),
+    ("time", "time a command"),
+];
+
 fn complete_command(prefix: &str, state: &mut ShellState) -> Vec<Completion> {
     let mut completions = Vec::new();
+
+    for (keyword, description) in SHELL_KEYWORDS {
+        completions.push(
+            Completion::new((*keyword).to_string(), CompletionKind::Builtin).with_desc(description),
+        );
+    }
 
     // Collect all builtin commands
     for cmd in crate::builtins::BUILTIN_NAMES {
@@ -3325,15 +4134,20 @@ fn format_file_size(bytes: u64) -> String {
 
 fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
     let lookup_prefix = unescape_shell_word(prefix);
-    let expanded = if let Some(home_relative) = lookup_prefix.strip_prefix('~') {
-        let home = state.home_dir.to_string_lossy();
-        if lookup_prefix == "~" {
-            format!("{}/", home)
-        } else {
-            format!("{home}{home_relative}")
+
+    // `~alice<TAB>` names a person, not a path: there is nothing to scan
+    // until the home directory it stands for is known.
+    if let Some(user_prefix) = lookup_prefix
+        .strip_prefix('~')
+        .filter(|rest| !rest.contains('/'))
+    {
+        if !user_prefix.is_empty() {
+            return complete_user_homes(user_prefix);
         }
-    } else {
-        lookup_prefix.clone()
+    }
+
+    let Some(expanded) = expand_completion_prefix(&lookup_prefix, state) else {
+        return Vec::new();
     };
 
     let (dir, file_prefix) = if expanded.ends_with('/') {
@@ -3343,6 +4157,13 @@ fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
             Some(pos) => (&expanded[..=pos], &expanded[pos + 1..]),
             None => (".", expanded.as_str()),
         }
+    };
+
+    // The part of the word the user has already typed, up to and including
+    // the last separator. Candidates are built by appending to it verbatim.
+    let typed_directory = match prefix.rfind('/') {
+        Some(pos) => &prefix[..=pos],
+        None => "",
     };
 
     let mut completions = Vec::new();
@@ -3362,46 +4183,21 @@ fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
             }
 
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            let full = if dir == "." {
-                if is_dir {
-                    format!("{}/", name)
-                } else {
-                    name.clone()
-                }
-            } else if lookup_prefix.starts_with('~') {
-                let suffix = if expanded.ends_with('/') {
-                    format!("{}{}", &lookup_prefix, name)
-                } else {
-                    match lookup_prefix.rfind('/') {
-                        Some(pos) => format!("{}/{}", &lookup_prefix[..pos], name),
-                        None => format!("~/{}", name),
-                    }
-                };
-                if is_dir {
-                    format!("{}/", suffix)
-                } else {
-                    suffix
-                }
-            } else {
-                let path = if expanded.ends_with('/') {
-                    format!("{}{}", lookup_prefix, name)
-                } else {
-                    match lookup_prefix.rfind('/') {
-                        Some(pos) => format!("{}/{}", &lookup_prefix[..pos], name),
-                        None => name.clone(),
-                    }
-                };
-                if is_dir {
-                    format!("{}/", path)
-                } else {
-                    path
-                }
-            };
+            // Keep everything the user already typed exactly as they typed
+            // it — their own quoting, a `~user`, a `$VAR` — and escape only
+            // the name being appended. Re-escaping the typed part would turn
+            // `$HOME/` into a literal `\$HOME/`.
+            let text = format!(
+                "{}{}{}",
+                typed_directory,
+                escape_shell_word(&name),
+                if is_dir { "/" } else { "" }
+            );
 
             let description = path_metadata_desc(&entry);
 
             let completion = Completion {
-                text: escape_shell_word(&full),
+                text,
                 display: if is_dir {
                     format!("{}/", name)
                 } else {
@@ -5654,6 +6450,422 @@ mod tests {
         let (_, completions) = complete(buffer, buffer.len(), &mut state);
         let texts: Vec<&str> = completions.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["staging"]);
+    }
+
+    #[test]
+    fn tilde_user_and_variable_prefixes_resolve_for_the_scan_only() {
+        let mut state = ShellState::new(false);
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("projects")).unwrap();
+        fs::write(tmp.path().join("notes.txt"), "").unwrap();
+        state
+            .env_vars
+            .insert("JSH_BASE".to_string(), tmp.path().display().to_string());
+
+        // `$VAR/` scans the value but the candidate keeps the variable.
+        clear_cache();
+        let buffer = "ls $JSH_BASE/pro";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions
+            .iter()
+            .any(|item| item.text == "$JSH_BASE/projects/"));
+
+        // The braced spelling resolves the same way.
+        clear_cache();
+        let buffer = "ls ${JSH_BASE}/not";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions
+            .iter()
+            .any(|item| item.text == "${JSH_BASE}/notes.txt"));
+
+        // A trailing slash is required: `$JSH_BAS` is still a variable name
+        // being typed, and completes as one.
+        assert_eq!(
+            expand_completion_prefix("$JSH_BASE", &state),
+            None,
+            "a bare variable is not a directory to scan"
+        );
+        assert_eq!(expand_completion_prefix("$UNSET_VARIABLE/x", &state), None);
+
+        // `~` keeps working, and `~user/` resolves through the user database.
+        state.home_dir = tmp.path().to_path_buf();
+        assert_eq!(
+            expand_completion_prefix("~/pro", &state).as_deref(),
+            Some(format!("{}/pro", tmp.path().display()).as_str())
+        );
+        let root_home = passwd_home_dir("root");
+        assert!(root_home.is_some(), "root is in the user database");
+        assert_eq!(
+            expand_completion_prefix("~root/", &state),
+            root_home.map(|home| format!("{}/", home.trim_end_matches('/')))
+        );
+        assert_eq!(expand_completion_prefix("~nosuchuser/x", &state), None);
+    }
+
+    #[test]
+    fn tilde_completes_user_names_as_home_directories() {
+        let homes = complete_user_homes("roo");
+        let root = homes
+            .iter()
+            .find(|completion| completion.text == "~root/")
+            .expect("root completes as a home directory");
+        assert_eq!(root.display, "~root");
+        assert!(root.is_dir, "accepting it continues into the directory");
+
+        let mut state = ShellState::new(false);
+        clear_cache();
+        let buffer = "ls ~roo";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "~root/"));
+    }
+
+    #[test]
+    fn worktree_listing_pairs_paths_with_what_is_checked_out() {
+        let output = "worktree /home/u/proj\n\
+            HEAD abc123\n\
+            branch refs/heads/master\n\
+            \n\
+            worktree /home/u/proj-fix\n\
+            HEAD def456\n\
+            detached\n\
+            \n\
+            worktree /home/u/other\n\
+            HEAD 000\n\
+            branch refs/heads/feature\n";
+        let results = parse_git_worktrees(output, "");
+        let texts: Vec<&str> = results.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["/home/u/proj", "/home/u/proj-fix", "/home/u/other"]
+        );
+        assert_eq!(results[0].description.as_deref(), Some("master"));
+        assert_eq!(results[1].description.as_deref(), Some("detached HEAD"));
+
+        assert_eq!(parse_git_worktrees(output, "/home/u/proj-").len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_branch_never_offers_the_one_checked_out() {
+        // Runs in this repository, so the probe has real branches. Whatever
+        // the current branch is, it must not be offered for deletion.
+        let mut state = ShellState::new(false);
+        state.cached_git_branch = crate::prompt::probe_git_context().branch;
+        let Some(current) = state.cached_git_branch.clone() else {
+            return; // Not in a repository; nothing to assert.
+        };
+
+        clear_cache();
+        let buffer = "git branch -d ";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(
+            completions.iter().all(|item| item.text != current),
+            "the checked-out branch cannot be deleted"
+        );
+        // Tags and remotes are not branches either.
+        assert!(completions
+            .iter()
+            .all(|item| !item.text.contains("origin/")));
+    }
+
+    #[test]
+    fn git_config_offers_well_known_keys_beside_the_ones_already_set() {
+        let mut state = ShellState::new(false);
+        clear_cache();
+        let buffer = "git config user.";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let texts: Vec<&str> = completions.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"user.email"), "{texts:?}");
+        assert!(texts.contains(&"user.name"), "{texts:?}");
+
+        clear_cache();
+        let buffer = "git config init.def";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let key = completions
+            .iter()
+            .find(|item| item.text == "init.defaultBranch")
+            .unwrap();
+        assert!(key.description.is_some());
+    }
+
+    #[test]
+    fn everyday_commands_explain_their_flags() {
+        let mut state = ShellState::new(false);
+
+        clear_cache();
+        let buffer = "curl -";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let follow = completions.iter().find(|item| item.text == "-L").unwrap();
+        assert_eq!(follow.description.as_deref(), Some("follow redirects"));
+
+        clear_cache();
+        let buffer = "tail -f";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert_eq!(
+            completions
+                .iter()
+                .find(|item| item.text == "-f")
+                .and_then(|item| item.description.as_deref()),
+            Some("follow as it grows")
+        );
+
+        // Long options are offered too, and every table entry is a flag.
+        clear_cache();
+        let buffer = "rsync --del";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "--delete"));
+        assert!(completions
+            .iter()
+            .all(|item| item.kind == CompletionKind::Flag));
+
+        // A command with no table still falls through to whatever else the
+        // completer knows, rather than answering nothing.
+        clear_cache();
+        let buffer = "git -";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(!completions.is_empty());
+    }
+
+    #[test]
+    fn flag_tables_are_well_formed() {
+        for (command, flags) in COMMON_FLAGS {
+            assert!(!flags.is_empty(), "{command} has no flags");
+            let mut seen = std::collections::HashSet::new();
+            for (flag, description) in *flags {
+                assert!(seen.insert(*flag), "{command} lists {flag} twice");
+                assert!(!description.is_empty(), "{command} {flag} has no help");
+                // `ps aux` is the one bare-word idiom people type as a flag.
+                assert!(
+                    flag.starts_with('-') || (*command == "ps" && *flag == "aux"),
+                    "{command} {flag} is not a flag"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spec_generators_resolve_to_builtin_sources_and_never_to_commands() {
+        let mut state = ShellState::new(false);
+        state
+            .env_vars
+            .insert("JSH_GENERATOR_VAR".to_string(), "x".to_string());
+
+        // A generator name reaches the same dynamic source the built-in
+        // branches use.
+        let results = complete_from_generator("environment_variables", "JSH_GENER", &state);
+        assert!(results.iter().any(|item| item.text == "JSH_GENERATOR_VAR"));
+
+        let signals = complete_from_generator("signals", "TE", &state);
+        assert!(signals.iter().any(|item| item.text == "TERM"));
+
+        // An unknown name yields nothing rather than anything surprising,
+        // and a name that looks like a command is just an unknown name.
+        assert!(complete_from_generator("not_a_generator", "", &state).is_empty());
+        assert!(complete_from_generator("bash -c 'echo pwned'", "", &state).is_empty());
+        assert!(complete_from_generator("$(id)", "", &state).is_empty());
+    }
+
+    #[test]
+    fn generator_names_in_shipped_specs_all_resolve() {
+        // A generator in a shipped spec that no longer exists would silently
+        // complete nothing; every name must still be one this build knows.
+        let state = ShellState::new(false);
+        let known = [
+            "git_refs",
+            "git_branches",
+            "git_tags",
+            "git_remotes",
+            "git_worktrees",
+            "git_config_keys",
+            "git_modified_files",
+            "ssh_hosts",
+            "users",
+            "groups",
+            "processes",
+            "signals",
+            "docker_containers",
+            "docker_running_containers",
+            "docker_images",
+            "compose_services",
+            "systemd_units",
+            "systemd_unit_files",
+            "kube_contexts",
+            "kube_namespaces",
+            "npm_scripts",
+            "npm_dependencies",
+            "make_targets",
+            "cargo_bins",
+            "cargo_features",
+            "cargo_packages",
+            "environment_variables",
+            "shell_functions",
+            "bookmarks",
+        ];
+        // Each documented name is routed: an unrouted one would fall to the
+        // catch-all, which is what `not_a_generator` proves returns nothing.
+        for name in known {
+            let _ = complete_from_generator(name, "\u{1}unmatchable", &state);
+        }
+
+        let registry = crate::completion_spec::SpecRegistry::new();
+        let spec = registry.get("git").expect("git spec ships with the shell");
+        let generators: Vec<String> = spec
+            .subcommands
+            .iter()
+            .flat_map(|sub| sub.args.iter())
+            .filter_map(|arg| match &arg.template {
+                crate::completion_spec::ArgTemplate::Generator(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !generators.is_empty(),
+            "the git spec uses generators for its ref arguments"
+        );
+        for generator in generators {
+            assert!(
+                known.contains(&generator.as_str()),
+                "{generator} is not a generator this build resolves"
+            );
+        }
+    }
+
+    #[test]
+    fn version_managers_offer_what_is_installed_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let versions = tmp.path().join(".nvm/versions/node");
+        for version in ["v9.1.0", "v20.11.0", "v18.19.1"] {
+            fs::create_dir_all(versions.join(version)).unwrap();
+        }
+        // A stray file among the version directories is not a version.
+        fs::write(versions.join("README"), "").unwrap();
+
+        let mut state = ShellState::new(false);
+        state.home_dir = tmp.path().to_path_buf();
+        // The machine running the tests may have its own nvm; this asserts
+        // about the one in the temporary home.
+        state.env_vars.remove("NVM_DIR");
+
+        let results = complete_toolchain_versions("nvm", &state);
+        let texts: Vec<&str> = results.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["v20.11.0", "v18.19.1", "v9.1.0"]);
+        assert_eq!(results[0].description.as_deref(), Some("installed node"));
+
+        clear_cache();
+        let buffer = "nvm use v18";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "v18.19.1"));
+
+        // NVM_DIR from this shell's environment relocates the search.
+        let other = tempfile::tempdir().unwrap();
+        fs::create_dir_all(other.path().join("versions/node/v22.0.0")).unwrap();
+        state
+            .env_vars
+            .insert("NVM_DIR".to_string(), other.path().display().to_string());
+        let results = complete_toolchain_versions("nvm", &state);
+        let texts: Vec<&str> = results.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["v22.0.0"]);
+
+        assert_eq!(
+            natural_version_order("v20.11.0", "v9.1.0"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn source_finds_the_virtual_environment_activate_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".venv/bin")).unwrap();
+        fs::write(tmp.path().join(".venv/bin/activate"), "").unwrap();
+        fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
+
+        let mut state = ShellState::new(false);
+        state.env_vars.remove("VIRTUAL_ENV");
+        let found = venv_activators_in(tmp.path(), &state);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, ".venv/bin/activate");
+        assert_eq!(found[0].description.as_deref(), Some("activate .venv"));
+
+        // A directory with no environment offers nothing of its own.
+        let bare = tempfile::tempdir().unwrap();
+        assert!(venv_activators_in(bare.path(), &state).is_empty());
+
+        // An environment named in this shell's own variables is offered by
+        // its full path, wherever it lives.
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::create_dir_all(elsewhere.path().join("bin")).unwrap();
+        fs::write(elsewhere.path().join("bin/activate"), "").unwrap();
+        state.env_vars.insert(
+            "VIRTUAL_ENV".to_string(),
+            elsewhere.path().display().to_string(),
+        );
+        let found = venv_activators_in(bare.path(), &state);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].description.as_deref(),
+            Some("the active environment")
+        );
+        assert!(found[0].text.ends_with("/bin/activate"));
+    }
+
+    #[test]
+    fn commands_are_recognised_after_keywords_and_inside_substitutions() {
+        let mut state = ShellState::new(false);
+
+        // A command follows `do`, `then` and the rest, not an argument.
+        for buffer in [
+            "while read line; do ec",
+            "if true; then ec",
+            "if true; then :; else ec",
+            "for f in *; do ec",
+            "if ec",
+            "! ec",
+        ] {
+            clear_cache();
+            let (_, completions) = complete(buffer, buffer.len(), &mut state);
+            assert!(
+                completions.iter().any(|item| item.text == "echo"),
+                "{buffer}"
+            );
+        }
+
+        // Backtick substitution starts a command, like `$(` already did.
+        clear_cache();
+        let buffer = "echo `git pu";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "push"));
+
+        clear_cache();
+        let buffer = "echo $(git pu";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "push"));
+
+        // The keyword itself is still a command name while being typed.
+        clear_cache();
+        let buffer = "whil";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "while"));
+    }
+
+    #[test]
+    fn completion_uses_the_text_before_the_cursor_not_the_whole_line() {
+        let mut state = ShellState::new(false);
+        // The cursor sits after `pu`, with an old argument still to its
+        // right: the completion is for the word being edited.
+        let buffer = "git pu --force";
+        let cursor = "git pu".len();
+        clear_cache();
+        let (word_start, completions) = complete(buffer, cursor, &mut state);
+        assert_eq!(word_start, 4);
+        assert!(completions.iter().any(|item| item.text == "push"));
+
+        // A cursor inside an earlier command of a pipeline completes that
+        // command, not the one after the pipe.
+        let buffer = "car | grep x";
+        let cursor = "car".len();
+        clear_cache();
+        let (word_start, completions) = complete(buffer, cursor, &mut state);
+        assert_eq!(word_start, 0);
+        assert!(completions.iter().any(|item| item.text == "cargo"));
     }
 
     #[test]

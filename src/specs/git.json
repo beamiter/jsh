@@ -2,145 +2,861 @@
   "name": "git",
   "description": "Distributed version control system",
   "subcommands": [
-    {"name": "add", "description": "Stage changes", "options": [
-      {"names": ["-A", "--all"], "description": "Stage all changes"},
-      {"names": ["-p", "--patch"], "description": "Interactive staging"},
-      {"names": ["-n", "--dry-run"], "description": "Dry run"},
-      {"names": ["-f", "--force"], "description": "Allow adding ignored files"},
-      {"names": ["-u", "--update"], "description": "Update tracked files only"}
-    ], "args": [{"template": "file_path", "is_variadic": true}]},
-    {"name": "commit", "description": "Record changes", "options": [
-      {"names": ["-m", "--message"], "description": "Commit message", "args": [{"name": "message"}]},
-      {"names": ["-a", "--all"], "description": "Stage modified and deleted"},
-      {"names": ["--amend"], "description": "Amend previous commit"},
-      {"names": ["-n", "--no-verify"], "description": "Skip hooks"},
-      {"names": ["--fixup"], "description": "Fixup commit", "args": [{"name": "commit"}]},
-      {"names": ["-s", "--signoff"], "description": "Add Signed-off-by"}
-    ]},
-    {"name": "push", "description": "Update remote refs", "options": [
-      {"names": ["-f", "--force"], "description": "Force push"},
-      {"names": ["--force-with-lease"], "description": "Safe force push"},
-      {"names": ["-u", "--set-upstream"], "description": "Set upstream"},
-      {"names": ["--tags"], "description": "Push all tags"},
-      {"names": ["-d", "--delete"], "description": "Delete remote branch"},
-      {"names": ["--dry-run"], "description": "Dry run"}
-    ]},
-    {"name": "pull", "description": "Fetch and merge", "options": [
-      {"names": ["--rebase"], "description": "Rebase instead of merge"},
-      {"names": ["--no-rebase"], "description": "Merge (no rebase)"},
-      {"names": ["--ff-only"], "description": "Fast-forward only"},
-      {"names": ["--autostash"], "description": "Auto stash/unstash"}
-    ]},
-    {"name": "checkout", "description": "Switch branches/restore files", "options": [
-      {"names": ["-b"], "description": "Create and switch branch", "args": [{"name": "branch"}]},
-      {"names": ["-B"], "description": "Force create and switch", "args": [{"name": "branch"}]},
-      {"names": ["--track", "-t"], "description": "Set upstream tracking"},
-      {"names": ["--"], "description": "Separate paths from revisions"}
-    ]},
-    {"name": "branch", "description": "List/create branches", "options": [
-      {"names": ["-d", "--delete"], "description": "Delete branch"},
-      {"names": ["-D"], "description": "Force delete branch"},
-      {"names": ["-m", "--move"], "description": "Rename branch"},
-      {"names": ["-a", "--all"], "description": "List all branches"},
-      {"names": ["-r", "--remotes"], "description": "List remote branches"},
-      {"names": ["-v", "--verbose"], "description": "Show commit info"}
-    ]},
-    {"name": "merge", "description": "Join branches", "options": [
-      {"names": ["--no-ff"], "description": "No fast-forward"},
-      {"names": ["--squash"], "description": "Squash merge"},
-      {"names": ["--abort"], "description": "Abort merge"},
-      {"names": ["--continue"], "description": "Continue merge"}
-    ]},
-    {"name": "rebase", "description": "Reapply commits", "options": [
-      {"names": ["-i", "--interactive"], "description": "Interactive rebase"},
-      {"names": ["--onto"], "description": "Rebase onto", "args": [{"name": "branch"}]},
-      {"names": ["--abort"], "description": "Abort rebase"},
-      {"names": ["--continue"], "description": "Continue rebase"},
-      {"names": ["--skip"], "description": "Skip current patch"}
-    ]},
-    {"name": "log", "description": "Show commit log", "options": [
-      {"names": ["--oneline"], "description": "One line per commit"},
-      {"names": ["--graph"], "description": "Draw graph"},
-      {"names": ["-n", "--max-count"], "description": "Limit commits", "args": [{"name": "number"}]},
-      {"names": ["--all"], "description": "All refs"},
-      {"names": ["--stat"], "description": "Show diffstat"},
-      {"names": ["-p", "--patch"], "description": "Show diffs"},
-      {"names": ["--author"], "description": "Filter by author", "args": [{"name": "pattern"}]},
-      {"names": ["--since", "--after"], "description": "Show since date", "args": [{"name": "date"}]}
-    ]},
-    {"name": "diff", "description": "Show changes", "options": [
-      {"names": ["--staged", "--cached"], "description": "Staged changes"},
-      {"names": ["--stat"], "description": "Show diffstat"},
-      {"names": ["--name-only"], "description": "Names only"},
-      {"names": ["-w", "--ignore-all-space"], "description": "Ignore whitespace"}
-    ]},
-    {"name": "stash", "description": "Stash changes", "subcommands": [
-      {"name": "push", "description": "Save changes to stash", "options": [
-        {"names": ["-m", "--message"], "description": "Stash message", "args": [{"name": "msg"}]},
-        {"names": ["-u", "--include-untracked"], "description": "Include untracked"},
-        {"names": ["-k", "--keep-index"], "description": "Keep staged"}
-      ]},
-      {"name": "pop", "description": "Apply and remove stash"},
-      {"name": "apply", "description": "Apply stash"},
-      {"name": "drop", "description": "Remove stash"},
-      {"name": "list", "description": "List stashes"},
-      {"name": "show", "description": "Show stash changes"},
-      {"name": "clear", "description": "Remove all stashes"}
-    ]},
-    {"name": "remote", "description": "Manage remotes", "subcommands": [
-      {"name": "add", "description": "Add remote"},
-      {"name": "remove", "description": "Remove remote"},
-      {"name": "rename", "description": "Rename remote"},
-      {"name": "show", "description": "Show remote info"},
-      {"name": "prune", "description": "Remove stale refs"},
-      {"name": "update", "description": "Fetch all remotes"}
-    ]},
-    {"name": "clone", "description": "Clone repository", "options": [
-      {"names": ["--depth"], "description": "Shallow clone", "args": [{"name": "depth"}]},
-      {"names": ["--branch", "-b"], "description": "Clone branch", "args": [{"name": "branch"}]},
-      {"names": ["--single-branch"], "description": "Single branch only"},
-      {"names": ["--recursive"], "description": "Init submodules"}
-    ]},
-    {"name": "fetch", "description": "Download objects/refs", "options": [
-      {"names": ["--all"], "description": "Fetch all remotes"},
-      {"names": ["--prune", "-p"], "description": "Prune stale refs"},
-      {"names": ["--tags"], "description": "Fetch all tags"}
-    ]},
-    {"name": "reset", "description": "Reset HEAD", "options": [
-      {"names": ["--soft"], "description": "Keep changes staged"},
-      {"names": ["--mixed"], "description": "Unstage changes"},
-      {"names": ["--hard"], "description": "Discard all changes"}
-    ]},
-    {"name": "tag", "description": "Manage tags", "options": [
-      {"names": ["-a", "--annotate"], "description": "Annotated tag"},
-      {"names": ["-d", "--delete"], "description": "Delete tag"},
-      {"names": ["-l", "--list"], "description": "List tags"},
-      {"names": ["-m", "--message"], "description": "Tag message", "args": [{"name": "message"}]}
-    ]},
-    {"name": "switch", "description": "Switch branches", "options": [
-      {"names": ["-c", "--create"], "description": "Create branch", "args": [{"name": "branch"}]},
-      {"names": ["-d", "--detach"], "description": "Detach HEAD"}
-    ]},
-    {"name": "restore", "description": "Restore working tree", "options": [
-      {"names": ["--staged", "-S"], "description": "Restore staged"},
-      {"names": ["--worktree", "-W"], "description": "Restore worktree"},
-      {"names": ["--source", "-s"], "description": "Restore from ref", "args": [{"name": "ref"}]}
-    ]},
-    {"name": "cherry-pick", "description": "Apply commit changes", "options": [
-      {"names": ["-n", "--no-commit"], "description": "Don't commit"},
-      {"names": ["--abort"], "description": "Abort cherry-pick"},
-      {"names": ["--continue"], "description": "Continue cherry-pick"}
-    ]},
-    {"name": "worktree", "description": "Manage worktrees", "subcommands": [
-      {"name": "add", "description": "Create worktree"},
-      {"name": "list", "description": "List worktrees"},
-      {"name": "remove", "description": "Remove worktree"},
-      {"name": "prune", "description": "Prune stale info"}
-    ]}
+    {
+      "name": "add",
+      "description": "Stage changes",
+      "options": [
+        {
+          "names": [
+            "-A",
+            "--all"
+          ],
+          "description": "Stage all changes"
+        },
+        {
+          "names": [
+            "-p",
+            "--patch"
+          ],
+          "description": "Interactive staging"
+        },
+        {
+          "names": [
+            "-n",
+            "--dry-run"
+          ],
+          "description": "Dry run"
+        },
+        {
+          "names": [
+            "-f",
+            "--force"
+          ],
+          "description": "Allow adding ignored files"
+        },
+        {
+          "names": [
+            "-u",
+            "--update"
+          ],
+          "description": "Update tracked files only"
+        }
+      ],
+      "args": [
+        {
+          "template": "file_path",
+          "is_variadic": true
+        }
+      ]
+    },
+    {
+      "name": "commit",
+      "description": "Record changes",
+      "options": [
+        {
+          "names": [
+            "-m",
+            "--message"
+          ],
+          "description": "Commit message",
+          "args": [
+            {
+              "name": "message"
+            }
+          ]
+        },
+        {
+          "names": [
+            "-a",
+            "--all"
+          ],
+          "description": "Stage modified and deleted"
+        },
+        {
+          "names": [
+            "--amend"
+          ],
+          "description": "Amend previous commit"
+        },
+        {
+          "names": [
+            "-n",
+            "--no-verify"
+          ],
+          "description": "Skip hooks"
+        },
+        {
+          "names": [
+            "--fixup"
+          ],
+          "description": "Fixup commit",
+          "args": [
+            {
+              "name": "commit"
+            }
+          ]
+        },
+        {
+          "names": [
+            "-s",
+            "--signoff"
+          ],
+          "description": "Add Signed-off-by"
+        }
+      ]
+    },
+    {
+      "name": "push",
+      "description": "Update remote refs",
+      "options": [
+        {
+          "names": [
+            "-f",
+            "--force"
+          ],
+          "description": "Force push"
+        },
+        {
+          "names": [
+            "--force-with-lease"
+          ],
+          "description": "Safe force push"
+        },
+        {
+          "names": [
+            "-u",
+            "--set-upstream"
+          ],
+          "description": "Set upstream"
+        },
+        {
+          "names": [
+            "--tags"
+          ],
+          "description": "Push all tags"
+        },
+        {
+          "names": [
+            "-d",
+            "--delete"
+          ],
+          "description": "Delete remote branch"
+        },
+        {
+          "names": [
+            "--dry-run"
+          ],
+          "description": "Dry run"
+        }
+      ],
+      "args": [
+        {
+          "name": "push target",
+          "template": {
+            "generator": "git_remotes"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pull",
+      "description": "Fetch and merge",
+      "options": [
+        {
+          "names": [
+            "--rebase"
+          ],
+          "description": "Rebase instead of merge"
+        },
+        {
+          "names": [
+            "--no-rebase"
+          ],
+          "description": "Merge (no rebase)"
+        },
+        {
+          "names": [
+            "--ff-only"
+          ],
+          "description": "Fast-forward only"
+        },
+        {
+          "names": [
+            "--autostash"
+          ],
+          "description": "Auto stash/unstash"
+        }
+      ],
+      "args": [
+        {
+          "name": "pull target",
+          "template": {
+            "generator": "git_remotes"
+          }
+        }
+      ]
+    },
+    {
+      "name": "checkout",
+      "description": "Switch branches/restore files",
+      "options": [
+        {
+          "names": [
+            "-b"
+          ],
+          "description": "Create and switch branch",
+          "args": [
+            {
+              "name": "branch"
+            }
+          ]
+        },
+        {
+          "names": [
+            "-B"
+          ],
+          "description": "Force create and switch",
+          "args": [
+            {
+              "name": "branch"
+            }
+          ]
+        },
+        {
+          "names": [
+            "--track",
+            "-t"
+          ],
+          "description": "Set upstream tracking"
+        },
+        {
+          "names": [
+            "--"
+          ],
+          "description": "Separate paths from revisions"
+        }
+      ],
+      "args": [
+        {
+          "name": "checkout target",
+          "template": {
+            "generator": "git_refs"
+          }
+        }
+      ]
+    },
+    {
+      "name": "branch",
+      "description": "List/create branches",
+      "options": [
+        {
+          "names": [
+            "-d",
+            "--delete"
+          ],
+          "description": "Delete branch"
+        },
+        {
+          "names": [
+            "-D"
+          ],
+          "description": "Force delete branch"
+        },
+        {
+          "names": [
+            "-m",
+            "--move"
+          ],
+          "description": "Rename branch"
+        },
+        {
+          "names": [
+            "-a",
+            "--all"
+          ],
+          "description": "List all branches"
+        },
+        {
+          "names": [
+            "-r",
+            "--remotes"
+          ],
+          "description": "List remote branches"
+        },
+        {
+          "names": [
+            "-v",
+            "--verbose"
+          ],
+          "description": "Show commit info"
+        }
+      ]
+    },
+    {
+      "name": "merge",
+      "description": "Join branches",
+      "options": [
+        {
+          "names": [
+            "--no-ff"
+          ],
+          "description": "No fast-forward"
+        },
+        {
+          "names": [
+            "--squash"
+          ],
+          "description": "Squash merge"
+        },
+        {
+          "names": [
+            "--abort"
+          ],
+          "description": "Abort merge"
+        },
+        {
+          "names": [
+            "--continue"
+          ],
+          "description": "Continue merge"
+        }
+      ],
+      "args": [
+        {
+          "name": "merge target",
+          "template": {
+            "generator": "git_branches"
+          }
+        }
+      ]
+    },
+    {
+      "name": "rebase",
+      "description": "Reapply commits",
+      "options": [
+        {
+          "names": [
+            "-i",
+            "--interactive"
+          ],
+          "description": "Interactive rebase"
+        },
+        {
+          "names": [
+            "--onto"
+          ],
+          "description": "Rebase onto",
+          "args": [
+            {
+              "name": "branch"
+            }
+          ]
+        },
+        {
+          "names": [
+            "--abort"
+          ],
+          "description": "Abort rebase"
+        },
+        {
+          "names": [
+            "--continue"
+          ],
+          "description": "Continue rebase"
+        },
+        {
+          "names": [
+            "--skip"
+          ],
+          "description": "Skip current patch"
+        }
+      ],
+      "args": [
+        {
+          "name": "rebase target",
+          "template": {
+            "generator": "git_branches"
+          }
+        }
+      ]
+    },
+    {
+      "name": "log",
+      "description": "Show commit log",
+      "options": [
+        {
+          "names": [
+            "--oneline"
+          ],
+          "description": "One line per commit"
+        },
+        {
+          "names": [
+            "--graph"
+          ],
+          "description": "Draw graph"
+        },
+        {
+          "names": [
+            "-n",
+            "--max-count"
+          ],
+          "description": "Limit commits",
+          "args": [
+            {
+              "name": "number"
+            }
+          ]
+        },
+        {
+          "names": [
+            "--all"
+          ],
+          "description": "All refs"
+        },
+        {
+          "names": [
+            "--stat"
+          ],
+          "description": "Show diffstat"
+        },
+        {
+          "names": [
+            "-p",
+            "--patch"
+          ],
+          "description": "Show diffs"
+        },
+        {
+          "names": [
+            "--author"
+          ],
+          "description": "Filter by author",
+          "args": [
+            {
+              "name": "pattern"
+            }
+          ]
+        },
+        {
+          "names": [
+            "--since",
+            "--after"
+          ],
+          "description": "Show since date",
+          "args": [
+            {
+              "name": "date"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "diff",
+      "description": "Show changes",
+      "options": [
+        {
+          "names": [
+            "--staged",
+            "--cached"
+          ],
+          "description": "Staged changes"
+        },
+        {
+          "names": [
+            "--stat"
+          ],
+          "description": "Show diffstat"
+        },
+        {
+          "names": [
+            "--name-only"
+          ],
+          "description": "Names only"
+        },
+        {
+          "names": [
+            "-w",
+            "--ignore-all-space"
+          ],
+          "description": "Ignore whitespace"
+        }
+      ]
+    },
+    {
+      "name": "stash",
+      "description": "Stash changes",
+      "subcommands": [
+        {
+          "name": "push",
+          "description": "Save changes to stash",
+          "options": [
+            {
+              "names": [
+                "-m",
+                "--message"
+              ],
+              "description": "Stash message",
+              "args": [
+                {
+                  "name": "msg"
+                }
+              ]
+            },
+            {
+              "names": [
+                "-u",
+                "--include-untracked"
+              ],
+              "description": "Include untracked"
+            },
+            {
+              "names": [
+                "-k",
+                "--keep-index"
+              ],
+              "description": "Keep staged"
+            }
+          ]
+        },
+        {
+          "name": "pop",
+          "description": "Apply and remove stash"
+        },
+        {
+          "name": "apply",
+          "description": "Apply stash"
+        },
+        {
+          "name": "drop",
+          "description": "Remove stash"
+        },
+        {
+          "name": "list",
+          "description": "List stashes"
+        },
+        {
+          "name": "show",
+          "description": "Show stash changes"
+        },
+        {
+          "name": "clear",
+          "description": "Remove all stashes"
+        }
+      ]
+    },
+    {
+      "name": "remote",
+      "description": "Manage remotes",
+      "subcommands": [
+        {
+          "name": "add",
+          "description": "Add remote"
+        },
+        {
+          "name": "remove",
+          "description": "Remove remote"
+        },
+        {
+          "name": "rename",
+          "description": "Rename remote"
+        },
+        {
+          "name": "show",
+          "description": "Show remote info"
+        },
+        {
+          "name": "prune",
+          "description": "Remove stale refs"
+        },
+        {
+          "name": "update",
+          "description": "Fetch all remotes"
+        }
+      ]
+    },
+    {
+      "name": "clone",
+      "description": "Clone repository",
+      "options": [
+        {
+          "names": [
+            "--depth"
+          ],
+          "description": "Shallow clone",
+          "args": [
+            {
+              "name": "depth"
+            }
+          ]
+        },
+        {
+          "names": [
+            "--branch",
+            "-b"
+          ],
+          "description": "Clone branch",
+          "args": [
+            {
+              "name": "branch"
+            }
+          ]
+        },
+        {
+          "names": [
+            "--single-branch"
+          ],
+          "description": "Single branch only"
+        },
+        {
+          "names": [
+            "--recursive"
+          ],
+          "description": "Init submodules"
+        }
+      ]
+    },
+    {
+      "name": "fetch",
+      "description": "Download objects/refs",
+      "options": [
+        {
+          "names": [
+            "--all"
+          ],
+          "description": "Fetch all remotes"
+        },
+        {
+          "names": [
+            "--prune",
+            "-p"
+          ],
+          "description": "Prune stale refs"
+        },
+        {
+          "names": [
+            "--tags"
+          ],
+          "description": "Fetch all tags"
+        }
+      ],
+      "args": [
+        {
+          "name": "fetch target",
+          "template": {
+            "generator": "git_remotes"
+          }
+        }
+      ]
+    },
+    {
+      "name": "reset",
+      "description": "Reset HEAD",
+      "options": [
+        {
+          "names": [
+            "--soft"
+          ],
+          "description": "Keep changes staged"
+        },
+        {
+          "names": [
+            "--mixed"
+          ],
+          "description": "Unstage changes"
+        },
+        {
+          "names": [
+            "--hard"
+          ],
+          "description": "Discard all changes"
+        }
+      ]
+    },
+    {
+      "name": "tag",
+      "description": "Manage tags",
+      "options": [
+        {
+          "names": [
+            "-a",
+            "--annotate"
+          ],
+          "description": "Annotated tag"
+        },
+        {
+          "names": [
+            "-d",
+            "--delete"
+          ],
+          "description": "Delete tag"
+        },
+        {
+          "names": [
+            "-l",
+            "--list"
+          ],
+          "description": "List tags"
+        },
+        {
+          "names": [
+            "-m",
+            "--message"
+          ],
+          "description": "Tag message",
+          "args": [
+            {
+              "name": "message"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "switch",
+      "description": "Switch branches",
+      "options": [
+        {
+          "names": [
+            "-c",
+            "--create"
+          ],
+          "description": "Create branch",
+          "args": [
+            {
+              "name": "branch"
+            }
+          ]
+        },
+        {
+          "names": [
+            "-d",
+            "--detach"
+          ],
+          "description": "Detach HEAD"
+        }
+      ],
+      "args": [
+        {
+          "name": "switch target",
+          "template": {
+            "generator": "git_branches"
+          }
+        }
+      ]
+    },
+    {
+      "name": "restore",
+      "description": "Restore working tree",
+      "options": [
+        {
+          "names": [
+            "--staged",
+            "-S"
+          ],
+          "description": "Restore staged"
+        },
+        {
+          "names": [
+            "--worktree",
+            "-W"
+          ],
+          "description": "Restore worktree"
+        },
+        {
+          "names": [
+            "--source",
+            "-s"
+          ],
+          "description": "Restore from ref",
+          "args": [
+            {
+              "name": "ref"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cherry-pick",
+      "description": "Apply commit changes",
+      "options": [
+        {
+          "names": [
+            "-n",
+            "--no-commit"
+          ],
+          "description": "Don't commit"
+        },
+        {
+          "names": [
+            "--abort"
+          ],
+          "description": "Abort cherry-pick"
+        },
+        {
+          "names": [
+            "--continue"
+          ],
+          "description": "Continue cherry-pick"
+        }
+      ],
+      "args": [
+        {
+          "name": "cherry-pick target",
+          "template": {
+            "generator": "git_refs"
+          }
+        }
+      ]
+    },
+    {
+      "name": "worktree",
+      "description": "Manage worktrees",
+      "subcommands": [
+        {
+          "name": "add",
+          "description": "Create worktree"
+        },
+        {
+          "name": "list",
+          "description": "List worktrees"
+        },
+        {
+          "name": "remove",
+          "description": "Remove worktree"
+        },
+        {
+          "name": "prune",
+          "description": "Prune stale info"
+        }
+      ]
+    }
   ],
   "options": [
-    {"names": ["-C"], "description": "Run in directory", "args": [{"template": "folder_path"}]},
-    {"names": ["--version"], "description": "Show version"},
-    {"names": ["--help"], "description": "Show help"}
+    {
+      "names": [
+        "-C"
+      ],
+      "description": "Run in directory",
+      "args": [
+        {
+          "template": "folder_path"
+        }
+      ]
+    },
+    {
+      "names": [
+        "--version"
+      ],
+      "description": "Show version"
+    },
+    {
+      "names": [
+        "--help"
+      ],
+      "description": "Show help"
+    }
   ]
 }

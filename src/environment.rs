@@ -600,6 +600,16 @@ impl ShellState {
             Self::hash_path(self.env_vars.get("PATH").map(|s| s.as_str()).unwrap_or(""));
     }
 
+    /// Commands already discovered on PATH, without starting a scan.
+    ///
+    /// [`Self::path_cache`] refreshes and may block on a first scan, which is
+    /// right when someone pressed Tab and wrong on a keystroke: ghost text is
+    /// drawn while typing and must never wait on the filesystem. An empty
+    /// slice here simply means the scan has not finished yet.
+    pub fn path_cache_if_scanned(&self) -> &[String] {
+        self.path_cache.as_deref().unwrap_or(&[])
+    }
+
     pub fn path_cache(&mut self) -> &Vec<String> {
         let current_path_hash =
             Self::hash_path(self.env_vars.get("PATH").map(|s| s.as_str()).unwrap_or(""));
