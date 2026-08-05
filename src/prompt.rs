@@ -247,6 +247,31 @@ pub fn probe_git_context() -> GitContext {
     parse_git_status_header(&String::from_utf8_lossy(&output))
 }
 
+/// Local branch names, most recently committed first, for ghost suggestions
+/// (`git checkout fea` → `feature-x`). One bounded probe, capped at 50 —
+/// a ghost shows a single best candidate, not a menu.
+pub fn probe_git_branches() -> Vec<String> {
+    let Some(output) = bounded_git_stdout(
+        Path::new("."),
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "--count=50",
+            "refs/heads",
+        ],
+        MAX_GIT_PROMPT_BYTES,
+    ) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 /// Run a read-only Git probe without letting a large worktree pin the prompt
 /// or allocate an unbounded `Command::output` buffer.
 pub(crate) fn bounded_git_stdout(cwd: &Path, args: &[&str], max_bytes: usize) -> Option<Vec<u8>> {
@@ -373,6 +398,17 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn branch_probe_lists_this_repositorys_branches() {
+        // Runs inside the jsh checkout; whatever the branch is called, the
+        // probe finds at least one and every name is a clean single token.
+        let branches = super::probe_git_branches();
+        assert!(!branches.is_empty());
+        for branch in &branches {
+            assert!(!branch.contains('\n') && !branch.trim().is_empty());
+        }
+    }
 
     #[test]
     fn every_style_puts_the_input_marker_on_its_own_line() {

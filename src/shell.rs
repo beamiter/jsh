@@ -514,6 +514,13 @@ impl Shell {
             let git = prompt::probe_git_context();
             self.state.cached_git_branch = git.branch;
             self.state.cached_git_remote = git.remote;
+            // The branch list matters only where a branch resolved; outside a
+            // repository this skips spawning a second Git that would fail.
+            self.state.cached_git_branches = if self.state.cached_git_branch.is_some() {
+                prompt::probe_git_branches()
+            } else {
+                Vec::new()
+            };
             self.state.cached_git_has_staged = git.has_staged;
             self.state.cached_git_has_unstaged = git.has_unstaged;
             self.state.cached_git_has_conflicts = git.has_conflicts;

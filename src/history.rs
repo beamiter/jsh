@@ -326,6 +326,15 @@ impl History {
         self.entries.iter().map(|e| e.command.as_str()).collect()
     }
 
+    /// Commands recorded in one working directory, oldest first.
+    pub fn commands_in_cwd(&self, cwd: &str) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|e| e.cwd.as_deref() == Some(cwd))
+            .map(|e| e.command.as_str())
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

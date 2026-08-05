@@ -309,6 +309,9 @@ pub struct ShellState {
     pub cached_git_branch: Option<String>,
     /// Tracking remote for the current branch, discovered together with the branch.
     pub cached_git_remote: Option<String>,
+    /// Local branch names, most recently committed first, refreshed with the
+    /// rest of the Git cache once per prompt.
+    pub cached_git_branches: Vec<String>,
     /// Git worktree state, refreshed once before each prompt.
     pub cached_git_has_staged: bool,
     pub cached_git_has_unstaged: bool,
@@ -423,6 +426,7 @@ impl ShellState {
             last_command: None,
             cached_git_branch: None,
             cached_git_remote: None,
+            cached_git_branches: Vec::new(),
             cached_git_has_staged: false,
             cached_git_has_unstaged: false,
             cached_git_has_conflicts: false,

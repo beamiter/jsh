@@ -1361,6 +1361,7 @@ impl Editor {
         let ctx = suggest::SuggestionContext {
             git_branch: state.cached_git_branch.as_deref(),
             git_remote: state.cached_git_remote.as_deref(),
+            git_branches: &state.cached_git_branches,
             git_has_staged: state.cached_git_has_staged,
             git_has_unstaged: state.cached_git_has_unstaged,
             git_has_conflicts: state.cached_git_has_conflicts,

@@ -17,6 +17,21 @@
   assignment completes its value as a path with the assignment kept on the
   inserted text, and `z` ranks the frecency database's directories above the
   plain subdirectory listing.
+- Ghost suggestions know every local branch, not just the current one. The
+  once-per-prompt Git probe now also caches local branch names, most
+  recently committed first, so `git checkout fea` ghosts `feature-x` while
+  checkout and switch still prefer the current branch when both match — and
+  `git merge`/`git rebase` suggest other branches only, never the one that
+  is checked out. Outside a repository no extra Git process is spawned.
+- Ghost suggestions follow the command being typed now, not the whole line:
+  after `cargo build && git p` the ghost completes `push`, pipes and
+  connectors included, with history, abbreviations, git context and the
+  filesystem probe all matching against the active segment (whole-line
+  history matches still win when they exist). `z` gets the same resolved-path
+  preview `cd` has. And arriving in a directory suggests what is usually run
+  there: after `cd`/`z`, an empty prompt ghosts the command most often typed
+  in that directory — three occurrences before it counts as a habit,
+  navigation commands never suggest more navigation.
 - Completion forgives typing that is close but not exact. Path completion
   falls back to case-insensitive prefix matches when nothing matches the
   typed case — `cd doc<TAB>` completes `Documents/`, while an exact-case

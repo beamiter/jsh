@@ -9,6 +9,8 @@ use std::collections::HashMap;
 pub struct SuggestionContext<'a> {
     pub git_branch: Option<&'a str>,
     pub git_remote: Option<&'a str>,
+    /// Local branches, most recently committed first.
+    pub git_branches: &'a [String],
     pub git_has_staged: bool,
     pub git_has_unstaged: bool,
     pub git_has_conflicts: bool,
@@ -146,16 +148,22 @@ pub fn suggest(buffer: &str, history: &History, ctx: &SuggestionContext) -> Opti
         return suggest_next_command(ctx, history);
     }
 
+    // Everything below matches against the command being typed *now*: after
+    // `cargo build && git p`, the active segment is `git p`, and a matched
+    // suffix appends at the cursor exactly as it would for a lone `git p`.
+    let segment = crate::completer::active_command_segment(buffer);
+
     // Repository context must beat history here. A command copied from another
     // repository may contain `main` while this repository is on `master` (or the
     // other way around).
-    if buffer.starts_with("git ") {
-        if let Some(s) = suggest_git_command(buffer, ctx) {
+    if segment.starts_with("git ") {
+        if let Some(s) = suggest_git_command(segment, ctx) {
             return Some(s);
         }
     }
 
-    // 1. Exact prefix match from history
+    // 1. Exact prefix match from history: the whole buffer first, then the
+    // active segment when the buffer already holds earlier commands.
     let cwd = std::env::current_dir().ok();
     let cwd = cwd
         .as_deref()
@@ -164,14 +172,22 @@ pub fn suggest(buffer: &str, history: &History, ctx: &SuggestionContext) -> Opti
     if let Some(entry) = history.search_prefix_in_cwd(buffer, cwd) {
         return Some(entry[buffer.len()..].to_string());
     }
+    if segment != buffer && !segment.is_empty() {
+        if let Some(entry) = history.search_prefix_in_cwd(segment, cwd) {
+            return Some(entry[segment.len()..].to_string());
+        }
+    }
 
     // 2. Subcommand abbreviation expansion (git l → git log, cargo b → cargo build)
-    if let Some(s) = suggest_subcommand(buffer) {
+    if let Some(s) = suggest_subcommand(segment) {
         return Some(s);
     }
 
-    // 3. For "cd " commands, suggest from z-jump database
-    if let Some(current_arg) = buffer.strip_prefix("cd ") {
+    // 3. For "cd " and "z " commands, suggest from the z-jump database
+    if let Some(current_arg) = segment
+        .strip_prefix("cd ")
+        .or_else(|| segment.strip_prefix("z "))
+    {
         let query = current_arg.trim();
         if !query.is_empty() {
             if let Ok(db) = crate::zjump::get_z_db().lock() {
@@ -191,7 +207,7 @@ pub fn suggest(buffer: &str, history: &History, ctx: &SuggestionContext) -> Opti
     }
 
     // 4. Filesystem probe: context-aware completion based on command + filesystem state
-    if let Some(suggestion) = probe_filesystem_suggestion(buffer) {
+    if let Some(suggestion) = probe_filesystem_suggestion(segment) {
         return Some(suggestion);
     }
 
@@ -271,25 +287,44 @@ fn suggest_git_command(buffer: &str, ctx: &SuggestionContext) -> Option<String> 
         }
     }
 
-    // git checkout / git switch: suggest branch name
-    for cmd in &["git checkout", "git switch"] {
-        let prefix = format!("{} ", cmd);
-        if buffer == *cmd {
-            // Don't auto-suggest branch here, user might want a file
+    // Branch arguments. checkout/switch prefer the current branch; merge and
+    // rebase never suggest it — merging a branch into itself is not a thing.
+    // Other branches come most recently committed first.
+    let branch_commands = [
+        ("git checkout ", true),
+        ("git switch ", true),
+        ("git merge ", false),
+        ("git rebase ", false),
+    ];
+    for (command, include_current) in branch_commands {
+        let Some(partial) = buffer.strip_prefix(command) else {
+            continue;
+        };
+        if partial.is_empty() || partial.starts_with('-') {
             continue;
         }
-        if buffer.starts_with(&prefix) {
-            let partial = &buffer[prefix.len()..];
-            if !partial.is_empty() && !partial.starts_with('-') {
-                // Don't override if already has a complete branch
-                if branch.starts_with(partial) && branch.len() > partial.len() {
-                    return Some(branch[partial.len()..].to_string());
-                }
+        if include_current {
+            if let Some(suffix) = ghost_suffix(branch, partial) {
+                return Some(suffix);
+            }
+        }
+        for candidate in ctx.git_branches {
+            if !include_current && candidate == branch {
+                continue;
+            }
+            if let Some(suffix) = ghost_suffix(candidate, partial) {
+                return Some(suffix);
             }
         }
     }
 
     None
+}
+
+/// The rest of `full` when `partial` is a proper prefix of it.
+fn ghost_suffix(full: &str, partial: &str) -> Option<String> {
+    (full.starts_with(partial) && full.len() > partial.len())
+        .then(|| full[partial.len()..].to_string())
 }
 
 /// Suggest full subcommand from common abbreviations (git l → git log, cargo b → cargo build).
@@ -373,6 +408,16 @@ fn suggest_next_command(ctx: &SuggestionContext, history: &History) -> Option<St
         return Some("git status".to_string());
     }
 
+    // Arriving in a directory: suggest what is usually run there.
+    if matches!(command_base(last_cmd), "cd" | "z") {
+        let cwd = std::env::current_dir().ok();
+        if let Some(cwd) = cwd.as_deref().and_then(std::path::Path::to_str) {
+            if let Some(command) = frequent_command_in_cwd(history, cwd) {
+                return Some(command);
+            }
+        }
+    }
+
     // 1. Check static chain patterns first
     for (prefix, suggestion) in COMMAND_CHAINS {
         if last_cmd.starts_with(prefix) {
@@ -388,6 +433,27 @@ fn suggest_next_command(ctx: &SuggestionContext, history: &History) -> Option<St
 
     // 2. Fall back to history-based chain learning
     suggest_from_history_chains(last_cmd, history)
+}
+
+/// The command most often typed in this directory, when that habit is strong
+/// enough to be worth ghosting (at least three occurrences). Ties go to the
+/// most recent. Navigation commands never suggest more navigation.
+fn frequent_command_in_cwd(history: &History, cwd: &str) -> Option<String> {
+    let commands = history.commands_in_cwd(cwd);
+    let mut counts: HashMap<&str, (u32, usize)> = HashMap::new();
+    for (index, command) in commands.iter().enumerate() {
+        if matches!(command_base(command), "cd" | "z" | "exit") {
+            continue;
+        }
+        let entry = counts.entry(command).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = index;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, (count, _))| *count >= 3)
+        .max_by_key(|(_, (count, last_seen))| (*count, *last_seen))
+        .map(|(command, _)| command.to_string())
 }
 
 fn git_push_command(ctx: &SuggestionContext) -> Option<String> {
@@ -552,6 +618,109 @@ mod tests {
         assert_eq!(
             suggest_next_command(&ctx, &history),
             Some("git push origin main".to_string())
+        );
+    }
+
+    #[test]
+    fn suggestions_follow_the_active_command_segment() {
+        let history = History::new(0);
+        let ctx = SuggestionContext::default();
+
+        // Abbreviation expansion works after connectors and pipes.
+        assert_eq!(
+            suggest("cargo build && git p", &history, &ctx),
+            Some("ush".to_string())
+        );
+        assert_eq!(
+            suggest("ls | git ch", &history, &ctx),
+            Some("eckout".to_string())
+        );
+
+        // Git context suggestions too: the segment is `git push`.
+        let ctx = SuggestionContext {
+            git_branch: Some("main"),
+            git_remote: Some("origin"),
+            ..SuggestionContext::default()
+        };
+        assert_eq!(
+            suggest("echo hi && git push", &history, &ctx),
+            Some(" origin main".to_string())
+        );
+    }
+
+    #[test]
+    fn history_matches_the_active_segment_when_the_buffer_holds_earlier_commands() {
+        let mut history = History::new(100);
+        history.add("git push origin release-2.1");
+        let ctx = SuggestionContext::default();
+
+        assert_eq!(
+            suggest("make && git pu", &history, &ctx),
+            Some("sh origin release-2.1".to_string())
+        );
+    }
+
+    #[test]
+    fn entering_a_directory_suggests_its_usual_command() {
+        let mut history = History::new(100);
+        history.add_with_cwd("cargo test", Some("/proj"));
+        history.add_with_cwd("ls", Some("/proj"));
+        history.add_with_cwd("cargo test", Some("/proj"));
+        history.add_with_cwd("vim src/main.rs", Some("/proj"));
+        history.add_with_cwd("cargo test", Some("/proj"));
+        history.add_with_cwd("cd /proj", Some("/elsewhere"));
+
+        assert_eq!(
+            frequent_command_in_cwd(&history, "/proj"),
+            Some("cargo test".to_string())
+        );
+        // Two occurrences are not a habit yet.
+        assert_eq!(frequent_command_in_cwd(&history, "/elsewhere"), None);
+    }
+
+    #[test]
+    fn checkout_ghosts_any_cached_branch_with_the_current_one_preferred() {
+        let branches = vec!["feature-x".to_string(), "main".to_string()];
+        let ctx = SuggestionContext {
+            git_branch: Some("main"),
+            git_branches: &branches,
+            ..SuggestionContext::default()
+        };
+
+        // Another branch entirely: completed from the cached list.
+        assert_eq!(
+            suggest_git_command("git checkout fea", &ctx),
+            Some("ture-x".to_string())
+        );
+        // The current branch still wins when both match.
+        let both = vec!["maintenance".to_string(), "main".to_string()];
+        let ctx = SuggestionContext {
+            git_branch: Some("main"),
+            git_branches: &both,
+            ..SuggestionContext::default()
+        };
+        assert_eq!(
+            suggest_git_command("git switch mai", &ctx),
+            Some("n".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_and_rebase_never_ghost_the_current_branch() {
+        let branches = vec!["main".to_string(), "maintenance".to_string()];
+        let ctx = SuggestionContext {
+            git_branch: Some("main"),
+            git_branches: &branches,
+            ..SuggestionContext::default()
+        };
+
+        assert_eq!(
+            suggest_git_command("git merge mai", &ctx),
+            Some("ntenance".to_string())
+        );
+        assert_eq!(
+            suggest_git_command("git rebase mai", &ctx),
+            Some("ntenance".to_string())
         );
     }
 
