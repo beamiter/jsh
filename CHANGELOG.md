@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+- Tab completion understands more of what the argument actually is instead of
+  falling back to filenames. The ssh family (`ssh`, `scp`, `sftp`, `rsync`,
+  `mosh`, `ssh-copy-id`) completes destinations from `~/.ssh/config` aliases
+  and `known_hosts` — a `user@` prefix is preserved, `scp`/`rsync` hosts come
+  with the `:` already typed, and hashed `known_hosts` entries are skipped
+  because they cannot be spelled back. `export`, `unset`, `readonly`,
+  `declare` and `local` complete bare variable names (`unset -f` completes
+  functions), `alias`/`unalias` complete alias names showing their expansion,
+  `which`/`type`/`whereis`/`man` complete command names, and `fg`/`bg`/
+  `wait`/`disown`/`kill` complete job specs labelled with the job's command —
+  `kill` also offers PIDs and, after `-`, signal names. `${PREF<TAB>`
+  completes braced variables closed (`${PREFIX}`), a `VAR=/pa<TAB>`
+  assignment completes its value as a path with the assignment kept on the
+  inserted text, and `z` ranks the frecency database's directories above the
+  plain subdirectory listing.
+- Completion forgives typing that is close but not exact. Path completion
+  falls back to case-insensitive prefix matches when nothing matches the
+  typed case — `cd doc<TAB>` completes `Documents/`, while an exact-case
+  match keeps winning outright. Everything else falls back to fuzzy
+  subsequence matches when nothing starts with the typed text — subcommand
+  tables (`git chk<TAB>` finds checkout), Git refs, dirty files and remotes,
+  ssh hosts, docker containers and images, systemctl units, users and
+  groups, variable, alias, and bookmark names, npm scripts and dependencies,
+  make targets, cargo arguments, and trap signals — and prefix matches keep
+  their curated order, so nothing changes while the typing is exact.
+  Completion lists from merged sources (pipe suggestions plus PATH commands,
+  refs plus files) no longer repeat an entry; the higher-priority spelling
+  wins.
+- `systemctl` completes unit names probed from systemd itself, with the same
+  bounded trusted-binary probe: `start`/`enable`/`mask` list unit files so
+  units systemd has not loaded still complete, the rest list loaded units
+  labelled with their active state and description, `--user` scopes the
+  probe, and `journalctl -u`/`--unit=` completes the same names. Template
+  units (`getty@.service`) are skipped — they cannot be operated on without
+  an instance. `chown` completes users (and the group half once the `:` is
+  typed), `chgrp` completes groups, `su`/`passwd`/`id`/`groups` complete
+  users, and `sudo -u <TAB>`/`-g <TAB>` completes the option's value while
+  still inside sudo's own option zone — human accounts sort ahead of system
+  ones. `trap 'handler' <TAB>` completes signal and shell-condition names
+  (EXIT, ERR, DEBUG, INT, …) with a word on when each fires.
+- Docker arguments complete from the local daemon, probed the same bounded
+  way Git arguments are (fixed trusted binary path, two-second timeout,
+  byte-capped output): `docker exec`/`stop`/`restart` and friends complete
+  running container names labelled with image and status, `docker
+  start`/`rm`/`logs` include stopped ones, and `docker rmi`/`run`/`tag`
+  complete image references. `docker container <sub>` and `docker image
+  <sub>` reach the same completions one level deeper, and once `docker exec
+  app` has its container the arguments beyond it belong to the command inside
+  and complete as paths again. `kill` completes the user's own processes from
+  /proc — newest first, labelled with the command name, the shell itself
+  excluded — alongside the existing job specs. `npm uninstall`, `pnpm
+  remove`, `yarn upgrade` and their spellings complete dependency names from
+  the nearest package.json, labelled with the declared version.
+- When no path matches at an argument position, Tab falls back to arguments
+  the same command has been given before: `git checkout release-2<TAB>`
+  recalls the branch spelling from history even though nothing in the working
+  tree matches. Entries typed in the current directory come first, newest
+  first, with quoted arguments kept exactly as typed; pipelines, `sudo`-style
+  wrappers, and one-word aliases in old command lines are all seen through to
+  the command they ran. `cd` gets the same treatment from the frecency
+  database instead: local directories keep priority, and only when none match
+  does `cd proj<TAB>` complete the frecent directory from anywhere.
 - Entering a container that runs as a non-root user works again. The typed
   `docker exec -it <name> bash` upgrade streams jsh into the container's
   `/dev` tmpfs, and an image that says `USER ubuntu` had that write refused —

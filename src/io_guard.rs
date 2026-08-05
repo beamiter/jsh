@@ -24,6 +24,8 @@ pub(crate) fn automatic_system_helper(name: &str) -> Option<&'static Path> {
     let candidates: &[&'static str] = match name {
         "bash" => &["/usr/bin/bash", "/bin/bash"],
         "git" => &["/usr/bin/git", "/bin/git", "/usr/local/bin/git"],
+        "docker" => &["/usr/bin/docker", "/bin/docker", "/usr/local/bin/docker"],
+        "systemctl" => &["/usr/bin/systemctl", "/bin/systemctl"],
         "notify-send" => &["/usr/bin/notify-send", "/bin/notify-send"],
         _ => return None,
     };
