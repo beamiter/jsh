@@ -1,0 +1,283 @@
+{
+  "name": "gh",
+  "description": "GitHub on the command line",
+  "subcommands": [
+    {
+      "name": "pr",
+      "description": "Manage pull requests",
+      "subcommands": [
+        {
+          "name": "create",
+          "description": "Open a pull request",
+          "options": [
+            {
+              "names": [
+                "-t",
+                "--title"
+              ],
+              "description": "Title"
+            },
+            {
+              "names": [
+                "-b",
+                "--body"
+              ],
+              "description": "Body"
+            },
+            {
+              "names": [
+                "-B",
+                "--base"
+              ],
+              "description": "Base branch",
+              "args": [
+                {
+                  "name": "branch",
+                  "template": {
+                    "generator": "git_branches"
+                  }
+                }
+              ]
+            },
+            {
+              "names": [
+                "-d",
+                "--draft"
+              ],
+              "description": "Open as a draft"
+            },
+            {
+              "names": [
+                "-w",
+                "--web"
+              ],
+              "description": "Open in a browser"
+            }
+          ]
+        },
+        {
+          "name": "list",
+          "description": "List pull requests",
+          "options": [
+            {
+              "names": [
+                "-s",
+                "--state"
+              ],
+              "description": "open, closed, merged or all"
+            },
+            {
+              "names": [
+                "-a",
+                "--assignee"
+              ],
+              "description": "By assignee"
+            },
+            {
+              "names": [
+                "-L",
+                "--limit"
+              ],
+              "description": "Maximum number"
+            }
+          ]
+        },
+        {
+          "name": "checkout",
+          "description": "Check a pull request out locally"
+        },
+        {
+          "name": "view",
+          "description": "Show a pull request"
+        },
+        {
+          "name": "merge",
+          "description": "Merge a pull request",
+          "options": [
+            {
+              "names": [
+                "-s",
+                "--squash"
+              ],
+              "description": "Squash and merge"
+            },
+            {
+              "names": [
+                "-r",
+                "--rebase"
+              ],
+              "description": "Rebase and merge"
+            },
+            {
+              "names": [
+                "-m",
+                "--merge"
+              ],
+              "description": "Create a merge commit"
+            },
+            {
+              "names": [
+                "-d",
+                "--delete-branch"
+              ],
+              "description": "Delete the branch afterwards"
+            }
+          ]
+        },
+        {
+          "name": "status",
+          "description": "Pull requests relevant to you"
+        },
+        {
+          "name": "diff",
+          "description": "Show a pull request's changes"
+        },
+        {
+          "name": "checks",
+          "description": "Show check results"
+        }
+      ]
+    },
+    {
+      "name": "issue",
+      "description": "Manage issues",
+      "subcommands": [
+        {
+          "name": "create",
+          "description": "Open an issue"
+        },
+        {
+          "name": "list",
+          "description": "List issues"
+        },
+        {
+          "name": "view",
+          "description": "Show an issue"
+        },
+        {
+          "name": "close",
+          "description": "Close an issue"
+        },
+        {
+          "name": "reopen",
+          "description": "Reopen an issue"
+        },
+        {
+          "name": "comment",
+          "description": "Comment on an issue"
+        }
+      ]
+    },
+    {
+      "name": "repo",
+      "description": "Manage repositories",
+      "subcommands": [
+        {
+          "name": "clone",
+          "description": "Clone a repository"
+        },
+        {
+          "name": "create",
+          "description": "Create a repository"
+        },
+        {
+          "name": "fork",
+          "description": "Fork a repository"
+        },
+        {
+          "name": "view",
+          "description": "Show a repository"
+        },
+        {
+          "name": "sync",
+          "description": "Sync a fork"
+        }
+      ]
+    },
+    {
+      "name": "run",
+      "description": "Manage workflow runs",
+      "subcommands": [
+        {
+          "name": "list",
+          "description": "List runs"
+        },
+        {
+          "name": "view",
+          "description": "Show a run"
+        },
+        {
+          "name": "watch",
+          "description": "Follow a run"
+        },
+        {
+          "name": "rerun",
+          "description": "Run it again"
+        },
+        {
+          "name": "cancel",
+          "description": "Cancel a run"
+        }
+      ]
+    },
+    {
+      "name": "workflow",
+      "description": "Manage workflows"
+    },
+    {
+      "name": "release",
+      "description": "Manage releases"
+    },
+    {
+      "name": "auth",
+      "description": "Authenticate",
+      "subcommands": [
+        {
+          "name": "login",
+          "description": "Log in"
+        },
+        {
+          "name": "logout",
+          "description": "Log out"
+        },
+        {
+          "name": "status",
+          "description": "Show authentication state"
+        }
+      ]
+    },
+    {
+      "name": "api",
+      "description": "Make an authenticated API request"
+    },
+    {
+      "name": "browse",
+      "description": "Open the repository in a browser"
+    },
+    {
+      "name": "gist",
+      "description": "Manage gists"
+    }
+  ],
+  "options": [
+    {
+      "names": [
+        "-R",
+        "--repo"
+      ],
+      "description": "Repository, as OWNER/REPO"
+    },
+    {
+      "names": [
+        "--help"
+      ],
+      "description": "Show help"
+    },
+    {
+      "names": [
+        "--version"
+      ],
+      "description": "Show version"
+    }
+  ]
+}

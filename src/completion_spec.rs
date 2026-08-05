@@ -17,6 +17,12 @@ pub struct CommandSpec {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Another command whose spec describes this one too. `batcat` wraps
+    /// `bat`, `nvim` wraps `vim`, a wrapper script wraps what it wraps —
+    /// each is the same interface under a different name, and saying so is
+    /// cheaper and more honest than copying the spec.
+    #[serde(default)]
+    pub wraps: Option<String>,
     #[serde(default)]
     pub subcommands: Vec<SubcommandSpec>,
     #[serde(default)]
@@ -114,6 +120,13 @@ impl SpecRegistry {
             ("cargo", include_str!("specs/cargo.json")),
             ("kubectl", include_str!("specs/kubectl.json")),
             ("npm", include_str!("specs/npm.json")),
+            ("gh", include_str!("specs/gh.json")),
+            ("systemctl", include_str!("specs/systemctl.json")),
+            ("tmux", include_str!("specs/tmux.json")),
+            ("terraform", include_str!("specs/terraform.json")),
+            ("apt", include_str!("specs/apt.json")),
+            ("podman", include_str!("specs/podman.json")),
+            ("pnpm", include_str!("specs/pnpm.json")),
         ];
 
         for (name, json) in builtin_specs {
@@ -150,12 +163,41 @@ impl SpecRegistry {
         }
     }
 
+    /// The spec that describes `command`, following `wraps` links. Bounded
+    /// and cycle-safe: a spec that wraps itself, or a pair that wrap each
+    /// other, resolves to the last one reached rather than spinning.
+    pub fn resolve_wraps(&self, command: &str) -> Option<&CommandSpec> {
+        let mut spec = self.specs.get(command)?;
+        let mut seen = vec![command];
+        for _ in 0..8 {
+            let Some(target) = spec.wraps.as_deref() else {
+                break;
+            };
+            if seen.contains(&target) {
+                break;
+            }
+            let Some(next) = self.specs.get(target) else {
+                break;
+            };
+            seen.push(target);
+            spec = next;
+        }
+        Some(spec)
+    }
+
     pub fn get(&self, command: &str) -> Option<&CommandSpec> {
         self.specs.get(command)
     }
 
     pub fn has(&self, command: &str) -> bool {
         self.specs.contains_key(command)
+    }
+
+    /// Names in the registry, for the shipped-spec checks and for listing.
+    pub fn command_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.specs.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     /// Resolve completion context: walk the spec tree based on typed words.
@@ -165,7 +207,7 @@ impl SpecRegistry {
         command: &str,
         words: &[&str],
     ) -> Option<CompletionContext<'a>> {
-        let spec = self.specs.get(command)?;
+        let spec = self.resolve_wraps(command)?;
 
         let mut current_options = &spec.options;
         let mut current_subcommands = &spec.subcommands;
@@ -257,6 +299,9 @@ fn safe_subcommands(subcommands: &[SubcommandSpec], depth: usize, nodes: &mut us
 }
 
 fn command_spec_is_safe_and_bounded(spec: &CommandSpec) -> bool {
+    if !safe_optional_text(spec.wraps.as_deref()) {
+        return false;
+    }
     let mut nodes = 1usize;
     safe_spec_text(&spec.name)
         && safe_optional_text(spec.description.as_deref())
@@ -333,10 +378,153 @@ pub enum SpecCompletionKind {
 mod tests {
     use super::*;
 
+    /// Every spec this binary carries, as the registry loads them.
+    fn shipped_specs() -> Vec<(&'static str, CommandSpec)> {
+        let sources: &[(&str, &str)] = &[
+            ("git", include_str!("specs/git.json")),
+            ("docker", include_str!("specs/docker.json")),
+            ("cargo", include_str!("specs/cargo.json")),
+            ("kubectl", include_str!("specs/kubectl.json")),
+            ("npm", include_str!("specs/npm.json")),
+            ("gh", include_str!("specs/gh.json")),
+            ("systemctl", include_str!("specs/systemctl.json")),
+            ("tmux", include_str!("specs/tmux.json")),
+            ("terraform", include_str!("specs/terraform.json")),
+            ("apt", include_str!("specs/apt.json")),
+            ("podman", include_str!("specs/podman.json")),
+            ("pnpm", include_str!("specs/pnpm.json")),
+        ];
+        sources
+            .iter()
+            .map(|(name, json)| {
+                let spec: CommandSpec = serde_json::from_str(json)
+                    .unwrap_or_else(|error| panic!("{name}.json does not parse: {error}"));
+                (*name, spec)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_shipped_spec_parses_and_passes_the_safety_check() {
+        // A spec that fails the bound check is dropped at load time and the
+        // command silently loses its completions, which is the kind of
+        // regression only a test notices.
+        for (name, spec) in shipped_specs() {
+            assert!(
+                command_spec_is_safe_and_bounded(&spec),
+                "{name}.json is rejected by the safety and bound checks"
+            );
+            assert_eq!(spec.name, name, "{name}.json names itself differently");
+            assert!(
+                !spec.subcommands.is_empty() || !spec.options.is_empty() || spec.wraps.is_some(),
+                "{name}.json describes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_specs_describe_what_they_offer() {
+        // A candidate with no description is a name with no explanation,
+        // which is most of the value of a spec over a bare word list.
+        fn check(path: &str, subs: &[SubcommandSpec]) {
+            for sub in subs {
+                let here = format!("{path} {}", sub.name);
+                assert!(
+                    sub.description.as_ref().is_some_and(|d| !d.is_empty()),
+                    "{here} has no description"
+                );
+                for option in &sub.options {
+                    assert!(!option.names.is_empty(), "{here} has a nameless option");
+                    assert!(
+                        option.description.as_ref().is_some_and(|d| !d.is_empty()),
+                        "{here} {:?} has no description",
+                        option.names
+                    );
+                    for name in &option.names {
+                        assert!(name.starts_with('-'), "{here} option {name} is not a flag");
+                    }
+                }
+                check(&here, &sub.subcommands);
+            }
+        }
+        for (name, spec) in shipped_specs() {
+            check(name, &spec.subcommands);
+            for option in &spec.options {
+                assert!(
+                    option.description.as_ref().is_some_and(|d| !d.is_empty()),
+                    "{name} {:?} has no description",
+                    option.names
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrapping_spec_completes_as_what_it_wraps() {
+        let registry = SpecRegistry::new();
+
+        // `podman` ships as nothing but a link to `docker`, and resolves to
+        // docker's own subcommands.
+        let resolved = registry
+            .resolve_wraps("podman")
+            .expect("podman ships as a wrapping spec");
+        assert_eq!(resolved.name, "docker");
+        assert!(!resolved.subcommands.is_empty());
+
+        let context = registry
+            .resolve_context("podman", &["podman"])
+            .expect("a wrapping spec resolves a context");
+        assert!(context.subcommands.iter().any(|sub| sub.name == "run"));
+
+        // An unwrapped spec resolves to itself, and an unknown command to
+        // nothing at all.
+        assert_eq!(
+            registry.resolve_wraps("git").map(|s| s.name.as_str()),
+            Some("git")
+        );
+        assert!(registry.resolve_wraps("no-such-command").is_none());
+    }
+
+    #[test]
+    fn wrapping_cycles_and_dangling_links_terminate() {
+        let mut registry = SpecRegistry {
+            specs: HashMap::new(),
+            user_dir: PathBuf::from("/nonexistent"),
+        };
+        let spec = |name: &str, wraps: Option<&str>| CommandSpec {
+            name: name.to_string(),
+            description: None,
+            wraps: wraps.map(str::to_string),
+            subcommands: Vec::new(),
+            options: Vec::new(),
+            args: Vec::new(),
+        };
+        registry.specs.insert("a".into(), spec("a", Some("b")));
+        registry.specs.insert("b".into(), spec("b", Some("a")));
+        registry
+            .specs
+            .insert("self".into(), spec("self", Some("self")));
+        registry
+            .specs
+            .insert("dangling".into(), spec("dangling", Some("absent")));
+
+        // Each terminates at the last spec it could reach.
+        assert!(registry.resolve_wraps("a").is_some());
+        assert_eq!(
+            registry.resolve_wraps("self").map(|s| s.name.as_str()),
+            Some("self")
+        );
+        assert_eq!(
+            registry.resolve_wraps("dangling").map(|s| s.name.as_str()),
+            Some("dangling")
+        );
+    }
+
     #[test]
     fn unsafe_completion_spec_text_is_rejected() {
         let mut spec = CommandSpec {
             name: "tool".into(),
+            wraps: None,
             description: Some("safe".into()),
             subcommands: Vec::new(),
             options: Vec::new(),

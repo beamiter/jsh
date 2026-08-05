@@ -1,0 +1,5 @@
+{
+  "name": "pnpm",
+  "description": "Fast, disk-efficient npm-compatible package manager",
+  "wraps": "npm"
+}

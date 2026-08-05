@@ -1,0 +1,5 @@
+{
+  "name": "podman",
+  "description": "Daemonless container engine, Docker-compatible",
+  "wraps": "docker"
+}

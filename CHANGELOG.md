@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- `compgen` and `complete -A` now reach the same implementation of each
+  action the Tab completer uses, so a script and a keystroke cannot disagree
+  about what a user, a service or a builtin is. `compgen` previously carried
+  its own smaller answers for seven of them.
+- Specifications ship for `gh`, `systemctl`, `tmux`, `terraform` and `apt`
+  alongside the existing five, and a spec can now say it `wraps` another
+  command when it is the same interface under a different name — `podman`
+  ships as nothing but a link to `docker`. A test checks every shipped spec
+  parses, passes the safety bounds, and describes each subcommand and option
+  it offers, so a spec that would be silently dropped at load time fails the
+  build instead.
+- Git aliases complete as the subcommands they are: `git co<TAB>` offers the
+  alias this repository defines, described by what it stands for. `--` ends
+  the options, so `rm -- -f<TAB>` means the file named `-f`.
+- Typing with the completion menu open narrows it rather than closing it —
+  the list opened because the word was ambiguous, and continuing to type is
+  the natural way to resolve that. Backspace widens it again, and a character
+  no candidate has closes the menu and leaves the word as typed.
+- `debug-completion '<command line>'` reports what completion would answer at
+  the end of that line and which source answered — spec, probe, history
+  fallback, cache, or one of the argument kinds. A completion list shows what
+  is on offer but never why, and why is the first question when an answer
+  looks wrong.
+- The completion engine is now a module tree rather than one file: reading
+  the command line, ranking candidates, and the static tables each have their
+  own file and their own explanation of what belongs there.
+
 - Bash completion scripts work as written. `complete -A <action>` resolves to
   this shell's own sources — users, groups, hostnames, services, jobs,
   signals, aliases, functions, builtins, keywords, variables, exports, shopt

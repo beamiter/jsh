@@ -1,0 +1,154 @@
+{
+  "name": "tmux",
+  "description": "Terminal multiplexer",
+  "subcommands": [
+    {
+      "name": "new-session",
+      "description": "Start a session",
+      "options": [
+        {
+          "names": [
+            "-s"
+          ],
+          "description": "Session name"
+        },
+        {
+          "names": [
+            "-d"
+          ],
+          "description": "Detached"
+        },
+        {
+          "names": [
+            "-c"
+          ],
+          "description": "Working directory",
+          "args": [
+            {
+              "name": "dir",
+              "template": "folder_path"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "attach-session",
+      "description": "Attach to a session",
+      "options": [
+        {
+          "names": [
+            "-t"
+          ],
+          "description": "Target session"
+        }
+      ]
+    },
+    {
+      "name": "list-sessions",
+      "description": "List sessions"
+    },
+    {
+      "name": "kill-session",
+      "description": "Kill a session",
+      "options": [
+        {
+          "names": [
+            "-t"
+          ],
+          "description": "Target session"
+        }
+      ]
+    },
+    {
+      "name": "kill-server",
+      "description": "Kill the server"
+    },
+    {
+      "name": "new-window",
+      "description": "Create a window"
+    },
+    {
+      "name": "split-window",
+      "description": "Split a pane",
+      "options": [
+        {
+          "names": [
+            "-h"
+          ],
+          "description": "Split horizontally"
+        },
+        {
+          "names": [
+            "-v"
+          ],
+          "description": "Split vertically"
+        }
+      ]
+    },
+    {
+      "name": "list-windows",
+      "description": "List windows"
+    },
+    {
+      "name": "list-panes",
+      "description": "List panes"
+    },
+    {
+      "name": "send-keys",
+      "description": "Send keys to a pane"
+    },
+    {
+      "name": "source-file",
+      "description": "Load a configuration file",
+      "args": [
+        {
+          "name": "file",
+          "template": "file_path"
+        }
+      ]
+    },
+    {
+      "name": "detach-client",
+      "description": "Detach a client"
+    }
+  ],
+  "options": [
+    {
+      "names": [
+        "-2"
+      ],
+      "description": "Force 256 colours"
+    },
+    {
+      "names": [
+        "-u"
+      ],
+      "description": "Force UTF-8"
+    },
+    {
+      "names": [
+        "-f"
+      ],
+      "description": "Configuration file",
+      "args": [
+        {
+          "name": "file",
+          "template": "file_path"
+        }
+      ]
+    },
+    {
+      "names": [
+        "-L"
+      ],
+      "description": "Socket name"
+    },
+    {
+      "names": [
+        "-S"
+      ],
+      "description": "Socket path"
+    }
+  ]
+}

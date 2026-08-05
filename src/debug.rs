@@ -271,6 +271,47 @@ pub fn builtin_debug_profile(args: &[String]) -> i32 {
     }
 }
 
+/// `debug-completion <line>` — what completion would answer for a command
+/// line, and which source answered it.
+///
+/// A completion list shows what is on offer but never why, and "why" is the
+/// first question when the answer looks wrong: whether a spec, a probe, the
+/// history fallback or a stale cache produced it. This runs the same
+/// `complete` the editor runs, at the end of the given line.
+pub fn builtin_debug_completion(
+    args: &[String],
+    state: &mut crate::environment::ShellState,
+) -> i32 {
+    if args.is_empty() {
+        eprintln!("Usage: debug-completion <command line>");
+        eprintln!("  Shows the candidates, and which source produced them.");
+        return 1;
+    }
+    let line = args.join(" ");
+    // The editor completes at the cursor; here that is the end of the line.
+    crate::completer::clear_cache();
+    let (word_start, completions) = crate::completer::complete(&line, line.len(), state);
+
+    let word = &line[word_start..];
+    println!("line:   {line}");
+    println!("word:   {word:?} (from byte {word_start})");
+    println!(
+        "source: {}",
+        crate::completer::last_source().unwrap_or("none")
+    );
+    println!("count:  {}", completions.len());
+    for completion in completions.iter().take(20) {
+        match &completion.description {
+            Some(description) => println!("  {}  — {description}", completion.text),
+            None => println!("  {}", completion.text),
+        }
+    }
+    if completions.len() > 20 {
+        println!("  … {} more", completions.len() - 20);
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

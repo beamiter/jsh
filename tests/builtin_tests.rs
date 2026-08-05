@@ -337,3 +337,56 @@ fn test_test_builtin() {
         0
     );
 }
+
+/// `compgen` and `complete -A` must resolve an action the same way the Tab
+/// completer does — one implementation, so a script and a keystroke cannot
+/// disagree about what a user or a builtin is.
+#[test]
+fn compgen_actions_share_the_completers_sources() {
+    let mut state = make_state();
+    state
+        .aliases
+        .insert("jsh_compgen_alias".to_string(), "echo hi".to_string());
+
+    let candidates = |action: &str, prefix: &str, state: &mut ShellState| {
+        jsh::completer::action_candidates(action, prefix, state)
+            .into_iter()
+            .map(|completion| completion.text)
+            .collect::<Vec<_>>()
+    };
+
+    assert!(
+        candidates("alias", "jsh_compgen", &mut state).contains(&"jsh_compgen_alias".to_string())
+    );
+    assert!(candidates("builtin", "expo", &mut state).contains(&"export".to_string()));
+    assert!(candidates("keyword", "wh", &mut state).contains(&"while".to_string()));
+    assert!(candidates("user", "roo", &mut state).contains(&"root".to_string()));
+
+    // An action this shell has no notion of yields nothing, rather than
+    // something that looks like an answer.
+    assert!(candidates("helptopic", "", &mut state).is_empty());
+}
+
+#[test]
+fn compgen_reports_matches_and_their_absence() {
+    let mut state = make_state();
+    // A word list filters by the prefix, as bash does.
+    assert_eq!(
+        run_builtin(
+            "compgen",
+            &["-W".into(), "alpha beta".into(), "al".into()],
+            &mut state
+        ),
+        0
+    );
+    // No match at all is a non-zero status, which is what scripts test.
+    assert_eq!(
+        run_builtin(
+            "compgen",
+            &["-W".into(), "alpha beta".into(), "zzz".into()],
+            &mut state
+        ),
+        1
+    );
+    assert!(is_builtin("compgen"));
+}

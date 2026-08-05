@@ -1,0 +1,108 @@
+{
+  "name": "apt",
+  "description": "Debian package management",
+  "subcommands": [
+    {
+      "name": "install",
+      "description": "Install packages",
+      "options": [
+        {
+          "names": [
+            "-y",
+            "--yes"
+          ],
+          "description": "Do not ask"
+        },
+        {
+          "names": [
+            "--no-install-recommends"
+          ],
+          "description": "Skip recommended packages"
+        },
+        {
+          "names": [
+            "--reinstall"
+          ],
+          "description": "Reinstall what is already installed"
+        }
+      ]
+    },
+    {
+      "name": "remove",
+      "description": "Remove packages"
+    },
+    {
+      "name": "purge",
+      "description": "Remove packages and their configuration"
+    },
+    {
+      "name": "update",
+      "description": "Refresh the package lists"
+    },
+    {
+      "name": "upgrade",
+      "description": "Upgrade installed packages"
+    },
+    {
+      "name": "full-upgrade",
+      "description": "Upgrade, removing what is in the way"
+    },
+    {
+      "name": "autoremove",
+      "description": "Remove packages nothing needs"
+    },
+    {
+      "name": "search",
+      "description": "Search package descriptions"
+    },
+    {
+      "name": "show",
+      "description": "Show package details"
+    },
+    {
+      "name": "list",
+      "description": "List packages",
+      "options": [
+        {
+          "names": [
+            "--installed"
+          ],
+          "description": "Only installed packages"
+        },
+        {
+          "names": [
+            "--upgradable"
+          ],
+          "description": "Only upgradable packages"
+        }
+      ]
+    },
+    {
+      "name": "policy",
+      "description": "Show version priorities"
+    }
+  ],
+  "options": [
+    {
+      "names": [
+        "-y",
+        "--yes"
+      ],
+      "description": "Do not ask"
+    },
+    {
+      "names": [
+        "-q",
+        "--quiet"
+      ],
+      "description": "Quiet"
+    },
+    {
+      "names": [
+        "-s",
+        "--simulate"
+      ],
+      "description": "Do nothing, say what would happen"
+    }
+  ]
+}

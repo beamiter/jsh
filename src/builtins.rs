@@ -90,6 +90,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "upper",
     "lower",
     // Debug commands
+    "debug-completion",
     "debug-trace",
     "debug-timing",
     "debug-profile",
@@ -265,6 +266,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "upper" => crate::stream::builtin_upper(args),
         "lower" => crate::stream::builtin_lower(args),
         // Debug commands
+        "debug-completion" => crate::debug::builtin_debug_completion(args, state),
         "debug-trace" => crate::debug::builtin_debug_trace(args),
         "debug-timing" => crate::debug::builtin_debug_timing(args),
         "debug-profile" => crate::debug::builtin_debug_profile(args),
@@ -3270,23 +3272,10 @@ fn builtin_compgen(args: &[String], state: &mut ShellState) -> i32 {
                     action = Some(args[i].as_str());
                 }
             }
-            "-c" => {
-                action = Some("command");
-            }
-            "-b" => {
-                action = Some("builtin");
-            }
-            "-a" => {
-                action = Some("alias");
-            }
-            "-d" => {
-                action = Some("directory");
-            }
-            "-f" => {
-                action = Some("file");
-            }
-            "-v" => {
-                action = Some("variable");
+            "-d" => action = Some("directory"),
+            "-f" => action = Some("file"),
+            flag @ ("-a" | "-b" | "-c" | "-e" | "-g" | "-j" | "-k" | "-s" | "-u" | "-v") => {
+                action = Some(short_flag_action(flag));
             }
             "-G" => {
                 i += 1;
@@ -3304,81 +3293,15 @@ fn builtin_compgen(args: &[String], state: &mut ShellState) -> i32 {
 
     let mut results: Vec<String> = Vec::new();
 
-    if let Some(act) = action {
-        match act {
-            "command" => {
-                let cache = state.path_cache().clone();
-                results.extend(cache.into_iter().filter(|c| c.starts_with(prefix)));
-                results.extend(
-                    BUILTIN_NAMES
-                        .iter()
-                        .filter(|b| b.starts_with(prefix))
-                        .map(|s| s.to_string()),
-                );
-            }
-            "builtin" => {
-                results.extend(
-                    BUILTIN_NAMES
-                        .iter()
-                        .filter(|b| b.starts_with(prefix))
-                        .map(|s| s.to_string()),
-                );
-            }
-            "alias" => {
-                results.extend(
-                    state
-                        .aliases
-                        .keys()
-                        .filter(|a| a.starts_with(prefix))
-                        .cloned(),
-                );
-            }
-            "function" => {
-                results.extend(
-                    state
-                        .functions
-                        .keys()
-                        .filter(|f| f.starts_with(prefix))
-                        .cloned(),
-                );
-            }
-            "directory" => {
-                if let Ok(entries) = std::fs::read_dir(".") {
-                    for entry in entries.flatten() {
-                        if let Ok(ft) = entry.file_type() {
-                            if ft.is_dir() {
-                                if let Some(name) = entry.file_name().to_str() {
-                                    if name.starts_with(prefix) {
-                                        results.push(name.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            "file" => {
-                if let Ok(entries) = std::fs::read_dir(".") {
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            if name.starts_with(prefix) {
-                                results.push(name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            "variable" => {
-                results.extend(
-                    state
-                        .env_vars
-                        .keys()
-                        .filter(|v| v.starts_with(prefix))
-                        .cloned(),
-                );
-            }
-            _ => {}
-        }
+    // One implementation of what each action names, shared with the Tab
+    // completer and with `complete -A`: `compgen -A user` and a `complete -A
+    // user` spec must not be able to disagree about what a user is.
+    if let Some(action) = action {
+        results.extend(
+            crate::completer::action_candidates(action, prefix, state)
+                .into_iter()
+                .map(|completion| completion.text),
+        );
     }
 
     if let Some(pat) = glob_pattern {

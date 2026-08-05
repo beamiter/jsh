@@ -1,0 +1,222 @@
+{
+  "name": "terraform",
+  "description": "Infrastructure as code",
+  "subcommands": [
+    {
+      "name": "init",
+      "description": "Prepare a working directory",
+      "options": [
+        {
+          "names": [
+            "-upgrade"
+          ],
+          "description": "Upgrade modules and providers"
+        },
+        {
+          "names": [
+            "-backend-config"
+          ],
+          "description": "Backend configuration"
+        }
+      ]
+    },
+    {
+      "name": "plan",
+      "description": "Show what would change",
+      "options": [
+        {
+          "names": [
+            "-out"
+          ],
+          "description": "Write the plan to a file",
+          "args": [
+            {
+              "name": "file",
+              "template": "file_path"
+            }
+          ]
+        },
+        {
+          "names": [
+            "-var"
+          ],
+          "description": "Set a variable"
+        },
+        {
+          "names": [
+            "-var-file"
+          ],
+          "description": "Read variables from a file",
+          "args": [
+            {
+              "name": "file",
+              "template": "file_path"
+            }
+          ]
+        },
+        {
+          "names": [
+            "-target"
+          ],
+          "description": "Limit to one resource"
+        }
+      ]
+    },
+    {
+      "name": "apply",
+      "description": "Make the changes",
+      "options": [
+        {
+          "names": [
+            "-auto-approve"
+          ],
+          "description": "Do not ask"
+        },
+        {
+          "names": [
+            "-var"
+          ],
+          "description": "Set a variable"
+        },
+        {
+          "names": [
+            "-target"
+          ],
+          "description": "Limit to one resource"
+        }
+      ]
+    },
+    {
+      "name": "destroy",
+      "description": "Remove the infrastructure",
+      "options": [
+        {
+          "names": [
+            "-auto-approve"
+          ],
+          "description": "Do not ask"
+        }
+      ]
+    },
+    {
+      "name": "fmt",
+      "description": "Format configuration files",
+      "options": [
+        {
+          "names": [
+            "-recursive"
+          ],
+          "description": "Include subdirectories"
+        },
+        {
+          "names": [
+            "-check"
+          ],
+          "description": "Report rather than rewrite"
+        }
+      ]
+    },
+    {
+      "name": "validate",
+      "description": "Check the configuration"
+    },
+    {
+      "name": "show",
+      "description": "Show state or a plan"
+    },
+    {
+      "name": "output",
+      "description": "Show output values"
+    },
+    {
+      "name": "state",
+      "description": "Advanced state management",
+      "subcommands": [
+        {
+          "name": "list",
+          "description": "List resources in state"
+        },
+        {
+          "name": "show",
+          "description": "Show one resource"
+        },
+        {
+          "name": "mv",
+          "description": "Move an item"
+        },
+        {
+          "name": "rm",
+          "description": "Remove an item"
+        },
+        {
+          "name": "pull",
+          "description": "Download the state"
+        }
+      ]
+    },
+    {
+      "name": "workspace",
+      "description": "Manage workspaces",
+      "subcommands": [
+        {
+          "name": "list",
+          "description": "List workspaces"
+        },
+        {
+          "name": "select",
+          "description": "Switch workspace"
+        },
+        {
+          "name": "new",
+          "description": "Create a workspace"
+        },
+        {
+          "name": "delete",
+          "description": "Delete a workspace"
+        }
+      ]
+    },
+    {
+      "name": "import",
+      "description": "Bring existing infrastructure into state"
+    },
+    {
+      "name": "refresh",
+      "description": "Update state from the real infrastructure"
+    },
+    {
+      "name": "console",
+      "description": "Evaluate expressions interactively"
+    },
+    {
+      "name": "providers",
+      "description": "Show provider requirements"
+    }
+  ],
+  "options": [
+    {
+      "names": [
+        "-chdir"
+      ],
+      "description": "Work in another directory",
+      "args": [
+        {
+          "name": "dir",
+          "template": "folder_path"
+        }
+      ]
+    },
+    {
+      "names": [
+        "-help"
+      ],
+      "description": "Show help"
+    },
+    {
+      "names": [
+        "-version"
+      ],
+      "description": "Show version"
+    }
+  ]
+}

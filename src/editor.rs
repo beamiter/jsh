@@ -284,10 +284,31 @@ impl Editor {
                         // subsequent key dismisses it while leaving the restored
                         // command buffer intact.
                         self.ai_error = None;
-                        if key.code != KeyCode::Tab
-                            && key.code != KeyCode::BackTab
-                            && key.code != KeyCode::Enter
-                        {
+                        // Typing with the menu open narrows it rather than
+                        // closing it: the list was opened *because* the word
+                        // was ambiguous, and the natural way to resolve that
+                        // is to keep typing. Arrows and Tab move within it;
+                        // anything else ends it.
+                        let narrowing = matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT);
+                        // Narrowing consumes the keystroke: the character
+                        // is already on the line, and letting the normal
+                        // insert path run would type it twice.
+                        if narrowing && self.completion_menu.is_some() {
+                            self.narrow_completion_menu(key.code);
+                            self.update_suggestion(history, state);
+                            self.repaint(state)?;
+                            continue;
+                        }
+                        if !matches!(
+                            key.code,
+                            KeyCode::Tab
+                                | KeyCode::BackTab
+                                | KeyCode::Enter
+                                | KeyCode::Up
+                                | KeyCode::Down
+                        ) {
                             if let Some(menu) = self.completion_menu.take() {
                                 if key.code == KeyCode::Esc {
                                     self.buffer.replace_range(
@@ -1157,6 +1178,54 @@ impl Editor {
             }
         }
         Ok(KeyAction::Continue)
+    }
+
+    /// Narrow the open menu by one typed character, or widen it by one
+    /// backspace, without re-running completion.
+    ///
+    /// The menu's candidates were computed for the word as it stood when it
+    /// opened; typing filters that same set. When nothing survives, the menu
+    /// closes and the keystroke lands as ordinary input — the word has moved
+    /// past anything that was on offer.
+    fn narrow_completion_menu(&mut self, key: KeyCode) {
+        let Some(menu) = self.completion_menu.as_mut() else {
+            return;
+        };
+        let mut word = menu.original_word.clone();
+        match key {
+            KeyCode::Char(ch) => word.push(ch),
+            KeyCode::Backspace => {
+                if word.pop().is_none() {
+                    self.completion_menu = None;
+                    return;
+                }
+            }
+            _ => return,
+        }
+
+        let matching: Vec<Completion> = menu
+            .completions
+            .iter()
+            .filter(|candidate| !completer::match_positions(&candidate.text, &word).is_empty())
+            .cloned()
+            .collect();
+
+        // Put the word back on the line as typed, whatever happens next.
+        let word_start = menu.word_start;
+        self.buffer.replace_range(word_start..self.cursor, &word);
+        self.cursor = word_start + word.len();
+
+        if matching.is_empty() {
+            self.completion_menu = None;
+            return;
+        }
+        menu.original_word = word;
+        menu.completions = matching;
+        menu.selected = 0;
+        // Show what accepting the first survivor would give.
+        let text = menu.completions[0].text.clone();
+        self.buffer.replace_range(word_start..self.cursor, &text);
+        self.cursor = word_start + text.len();
     }
 
     /// What separates one accepted piece of a suggestion from the next.
@@ -2523,6 +2592,72 @@ fn find_next_word_boundary(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn menu_of(texts: &[&str], word: &str) -> CompletionMenu {
+        CompletionMenu {
+            completions: texts
+                .iter()
+                .map(|text| Completion {
+                    text: (*text).to_string(),
+                    display: (*text).to_string(),
+                    description: None,
+                    kind: CompletionKind::Subcommand,
+                    is_dir: false,
+                })
+                .collect(),
+            selected: 0,
+            word_start: 4,
+            original_word: word.to_string(),
+        }
+    }
+
+    #[test]
+    fn typing_narrows_the_open_menu_instead_of_closing_it() {
+        let mut editor = Editor::new();
+        editor.buffer = "git checkout".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.completion_menu = Some(menu_of(&["checkout", "cherry-pick", "commit"], "c"));
+
+        // `h` narrows to the two candidates containing it after the `c`.
+        editor.narrow_completion_menu(KeyCode::Char('h'));
+        let menu = editor.completion_menu.as_ref().expect("menu stays open");
+        assert_eq!(menu.original_word, "ch");
+        assert_eq!(menu.completions.len(), 2);
+        assert_eq!(menu.selected, 0);
+        // The line shows what accepting the first survivor would give.
+        assert_eq!(editor.buffer, "git checkout");
+
+        // Backspace widens it again.
+        editor.narrow_completion_menu(KeyCode::Backspace);
+        let menu = editor.completion_menu.as_ref().unwrap();
+        assert_eq!(menu.original_word, "c");
+        assert_eq!(menu.completions.len(), 2, "narrowing does not restore");
+    }
+
+    #[test]
+    fn narrowing_past_every_candidate_closes_the_menu_and_keeps_the_word() {
+        let mut editor = Editor::new();
+        editor.buffer = "git che".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.completion_menu = Some(menu_of(&["checkout", "cherry-pick"], "che"));
+
+        // A character no candidate has: the word has moved past the list.
+        editor.narrow_completion_menu(KeyCode::Char('z'));
+        assert!(editor.completion_menu.is_none(), "the menu closes");
+        assert_eq!(editor.buffer, "git chez", "the typed word stays");
+        assert_eq!(editor.cursor, editor.buffer.len());
+    }
+
+    #[test]
+    fn backspacing_an_empty_word_closes_the_menu() {
+        let mut editor = Editor::new();
+        editor.buffer = "git ".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.completion_menu = Some(menu_of(&["add", "commit"], ""));
+
+        editor.narrow_completion_menu(KeyCode::Backspace);
+        assert!(editor.completion_menu.is_none());
+    }
 
     #[test]
     fn a_ghost_suggestion_can_be_taken_one_word_at_a_time() {

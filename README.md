@@ -465,8 +465,19 @@ and remote `scp` paths are deliberately absent for exactly this reason.
 `complete` and `compgen` accept the bash spellings, including `-A <action>`,
 which resolves to the sources above, and `-F <function>`, which is called with
 `COMP_WORDS`, `COMP_CWORD`, `COMP_LINE` and `$1`/`$2`/`$3` as bash sets them.
-Additional JSON specs can be placed in `~/.jsh/completions/`; an argument may
-name a `generator` to reach any of the dynamic sources above.
+Both reach one implementation of each action, so a script and a keystroke
+cannot disagree about what a user or a service is.
+
+Specifications ship for `git`, `docker`, `cargo`, `kubectl`, `npm`, `gh`,
+`systemctl`, `tmux`, `terraform` and `apt`, and more can be placed in
+`~/.jsh/completions/`. A spec's argument may name a `generator` to reach any
+of the dynamic sources above, and a spec may `wraps` another command when it
+is the same interface under a different name — `podman` ships as nothing but
+a link to `docker`.
+
+`debug-completion '<command line>'` shows what completion would answer at the
+end of that line, and which source answered: a list says what is on offer but
+never why, and why is the first question when an answer looks wrong.
 
 ## Workflows
 

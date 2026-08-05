@@ -1,0 +1,261 @@
+{
+  "name": "systemctl",
+  "description": "Control the systemd manager",
+  "subcommands": [
+    {
+      "name": "start",
+      "description": "Start a unit",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_unit_files"
+          }
+        }
+      ]
+    },
+    {
+      "name": "stop",
+      "description": "Stop a unit",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "restart",
+      "description": "Restart a unit",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "reload",
+      "description": "Reload a unit's configuration",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "status",
+      "description": "Show a unit's status",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "enable",
+      "description": "Enable a unit at boot",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_unit_files"
+          }
+        }
+      ]
+    },
+    {
+      "name": "disable",
+      "description": "Disable a unit at boot",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "mask",
+      "description": "Make a unit unstartable",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_unit_files"
+          }
+        }
+      ]
+    },
+    {
+      "name": "unmask",
+      "description": "Undo a mask",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "cat",
+      "description": "Show a unit's files",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_unit_files"
+          }
+        }
+      ]
+    },
+    {
+      "name": "edit",
+      "description": "Edit a unit's files",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_unit_files"
+          }
+        }
+      ]
+    },
+    {
+      "name": "show",
+      "description": "Show a unit's properties",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "is-active",
+      "description": "Is the unit active?",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "is-enabled",
+      "description": "Is the unit enabled?",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "is-failed",
+      "description": "Has the unit failed?",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "reset-failed",
+      "description": "Clear a failed state",
+      "args": [
+        {
+          "name": "unit",
+          "template": {
+            "generator": "systemd_units"
+          }
+        }
+      ]
+    },
+    {
+      "name": "daemon-reload",
+      "description": "Reload systemd's own configuration"
+    },
+    {
+      "name": "list-units",
+      "description": "List loaded units"
+    },
+    {
+      "name": "list-unit-files",
+      "description": "List installed unit files"
+    },
+    {
+      "name": "list-timers",
+      "description": "List timers"
+    },
+    {
+      "name": "poweroff",
+      "description": "Power the system off"
+    },
+    {
+      "name": "reboot",
+      "description": "Reboot the system"
+    }
+  ],
+  "options": [
+    {
+      "names": [
+        "--user"
+      ],
+      "description": "Act on the user manager"
+    },
+    {
+      "names": [
+        "--system"
+      ],
+      "description": "Act on the system manager"
+    },
+    {
+      "names": [
+        "--now"
+      ],
+      "description": "Start or stop as well as enabling"
+    },
+    {
+      "names": [
+        "--no-pager"
+      ],
+      "description": "Plain output"
+    },
+    {
+      "names": [
+        "--failed"
+      ],
+      "description": "Only failed units"
+    },
+    {
+      "names": [
+        "-q",
+        "--quiet"
+      ],
+      "description": "Quiet"
+    }
+  ]
+}
