@@ -3,7 +3,7 @@
 use crate::environment::ShellState;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAX_COMPLETION_ITEMS: usize = 4096;
 const MAX_COMPLETION_TEXT_BYTES: usize = 16 * 1024;
@@ -112,6 +112,37 @@ impl CompletionCache {
 thread_local! {
     static COMPLETION_CACHE: std::cell::RefCell<CompletionCache> =
         std::cell::RefCell::new(CompletionCache::new(256));
+    /// Raw output of each external probe and each project file read, for the
+    /// current command line. Keyed by source rather than by prefix: the
+    /// completion cache above keys on the typed word, so without this a
+    /// growing prefix re-forks Git or Docker on every keystroke.
+    static PROBE_CACHE: std::cell::RefCell<HashMap<String, Option<Vec<u8>>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+const MAX_PROBE_CACHE_ENTRIES: usize = 64;
+
+/// Run a probe at most once per source per command line. A probe that fails
+/// or finds nothing is remembered too — a stopped Docker daemon must cost one
+/// timeout while a word is typed, not one per keystroke.
+fn probe_once(key: &str, produce: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+    if let Some(cached) = PROBE_CACHE.with(|cache| cache.borrow().get(key).cloned()) {
+        return cached;
+    }
+    let produced = produce();
+    PROBE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() < MAX_PROBE_CACHE_ENTRIES {
+            cache.insert(key.to_string(), produced.clone());
+        }
+    });
+    produced
+}
+
+/// [`probe_once`] for the probes whose output is text.
+fn probe_text_once(key: &str, produce: impl FnOnce() -> Option<String>) -> Option<String> {
+    probe_once(key, || produce().map(String::into_bytes))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, Vec<Completion>) {
@@ -125,8 +156,15 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     // command position; the value the option expects is a user or group.
     let wrapper_value = wrapper_value_kind(&buf[..word_start]);
 
+    // A redirection target is a plain file wherever it appears. Without this
+    // the word still belongs to the command being written, so `git add > n`
+    // would offer dirty files and `cd > n` only directories.
+    let redirect_target = is_redirect_target(&buf[..word_start]);
+
     // Create cache key based on context
-    let cache_key = if let Some(kind) = wrapper_value {
+    let cache_key = if redirect_target {
+        format!("redir:{word}")
+    } else if let Some(kind) = wrapper_value {
         format!("wrapval:{kind:?}:{word}")
     } else if is_cmd_pos {
         format!("cmd:{}", word)
@@ -175,6 +213,8 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
         complete_variable_braced(variable, state)
     } else if let Some(variable) = word.strip_prefix('$') {
         complete_variable(variable, state)
+    } else if redirect_target {
+        complete_path(&word, state)
     } else if let Some(kind) = wrapper_value {
         match kind {
             WrapperValueKind::User => complete_users(&word),
@@ -238,7 +278,7 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     } else {
         // Paths; when none match, fall back to arguments this command has
         // been given before.
-        let results = complete_path(&word, state);
+        let results = filter_by_file_type(complete_path(&word, state), &cmd);
         if results.is_empty() {
             complete_history_arguments(&cmd, &word, state)
         } else {
@@ -246,6 +286,7 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
         }
     };
 
+    let completions = requote_completions(completions, &word);
     let completions = finalize_completions(completions);
 
     // Store in cache
@@ -494,6 +535,151 @@ fn skip_wrapper_options(words: &[&str], mut index: usize, value_options: &[&str]
         }
     }
     index
+}
+
+/// Extensions a command is normally pointed at. Directories always stay —
+/// they are the way to reach the file — and a command not listed here keeps
+/// every candidate.
+fn command_file_extensions(cmd: &str) -> Option<&'static [&'static str]> {
+    Some(match cmd {
+        "source" | "." | "bash" | "sh" | "zsh" | "jsh" => &["sh", "bash", "zsh", "jsh", "rc"],
+        "python" | "python3" => &["py", "pyc", "pyz"],
+        "node" | "nodejs" => &["js", "mjs", "cjs", "ts"],
+        "ruby" => &["rb"],
+        "perl" => &["pl", "pm"],
+        "unzip" | "zipinfo" => &["zip", "jar", "war", "aar", "whl", "egg", "apk"],
+        "gunzip" | "zcat" => &["gz", "tgz", "z"],
+        "bunzip2" | "bzcat" => &["bz2", "tbz", "tbz2"],
+        "unxz" | "xzcat" => &["xz", "txz"],
+        "gzip" | "bzip2" | "xz" | "zstd" => return None,
+        "rustc" => &["rs"],
+        "javac" => &["java"],
+        "java" => &["jar", "class"],
+        "go" => &["go"],
+        "docker-compose" => &["yml", "yaml"],
+        "psql" | "sqlite3" => &["sql", "db", "sqlite", "sqlite3"],
+        _ => return None,
+    })
+}
+
+/// Keep only the candidates a command can actually open, when it is a command
+/// whose argument is a specific kind of file. A prefix that already matches
+/// nothing of that kind keeps the unfiltered list rather than showing an
+/// empty menu: the guess is a convenience, never a restriction.
+fn filter_by_file_type(completions: Vec<Completion>, cmd: &str) -> Vec<Completion> {
+    let Some(extensions) = command_file_extensions(cmd) else {
+        return completions;
+    };
+    let filtered: Vec<Completion> = completions
+        .iter()
+        .filter(|completion| {
+            completion.is_dir
+                || Path::new(completion.display.as_str())
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extensions
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(extension))
+                    })
+        })
+        .cloned()
+        .collect();
+    // Only directories left means the filter found nothing of its own kind.
+    if filtered.iter().any(|completion| !completion.is_dir) {
+        filtered
+    } else {
+        completions
+    }
+}
+
+/// Is the word being completed the target of a redirection? True for the
+/// operators that name a file (`>`, `>>`, `<`, `2>`, `&>`, `<>`), false for
+/// `>&`/`<&`, whose operand is a file descriptor.
+fn is_redirect_target(before: &str) -> bool {
+    let before = before.trim_end_matches([' ', '\t']);
+    if before.ends_with('&') {
+        return false;
+    }
+    let mut quote = None;
+    let mut escaped = false;
+    let mut last_operator = false;
+    for ch in before.chars() {
+        if escaped {
+            escaped = false;
+            last_operator = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                _ => {}
+            },
+            _ => match ch {
+                '\\' => escaped = true,
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    last_operator = false;
+                }
+                '<' | '>' => last_operator = true,
+                ch if ch.is_whitespace() => {}
+                _ => last_operator = false,
+            },
+        }
+    }
+    last_operator
+}
+
+/// An unclosed quote opening the word being completed, with the text inside
+/// it. `cat "my fi` completes inside the quotes rather than replacing them
+/// with backslash escapes.
+fn open_quote_context(word: &str) -> Option<(char, &str)> {
+    let quote = word.chars().next().filter(|ch| *ch == '\'' || *ch == '"')?;
+    let inner = &word[quote.len_utf8()..];
+    // A quote the user already closed is not an open context; the word after
+    // it is ordinary text again.
+    let closed = match quote {
+        '\'' => inner.contains('\''),
+        _ => {
+            let mut escaped = false;
+            inner.chars().any(|ch| {
+                let closes = !escaped && ch == '"';
+                escaped = !escaped && ch == '\\';
+                closes
+            })
+        }
+    };
+    (!closed).then_some((quote, inner))
+}
+
+/// Re-spell path candidates in the quoting style the word already uses.
+/// A file closes the quote, so the next keystroke lands outside it; a
+/// directory leaves it open, because the path continues.
+fn requote_completions(completions: Vec<Completion>, word: &str) -> Vec<Completion> {
+    let Some((quote, _)) = open_quote_context(word) else {
+        return completions;
+    };
+    completions
+        .into_iter()
+        .map(|mut completion| {
+            let raw = unescape_shell_word(&completion.text);
+            // A quote cannot appear inside itself; leave those escaped.
+            if !raw.contains(quote) {
+                completion.text = if completion.is_dir {
+                    format!("{quote}{raw}")
+                } else {
+                    format!("{quote}{raw}{quote}")
+                };
+            }
+            completion
+        })
+        .collect()
 }
 
 /// Byte offset of the value in a `NAME=value` or `NAME+=value` word, if the
@@ -760,6 +946,172 @@ fn subcommand_completions(
                 Completion::new(sig.to_string(), CompletionKind::Flag).with_desc(desc)
             })
             .collect();
+        if !results.is_empty() {
+            return Some(results);
+        }
+    }
+
+    // jsh's own builtins know their arguments exactly; nothing here needs a
+    // probe or a spec file.
+    if cmd == "shopt" && !prefix.starts_with('-') {
+        let completions = crate::builtins::SHOPT_OPTIONS
+            .iter()
+            .map(|(name, default_on)| {
+                Completion::new((*name).to_string(), CompletionKind::Other).with_desc(
+                    if *default_on {
+                        "on by default"
+                    } else {
+                        "off by default"
+                    },
+                )
+            })
+            .collect();
+        return Some(rank_prefix_then_fuzzy(completions, prefix));
+    }
+
+    if cmd == "set" && matches!(words.last().copied(), Some("-o" | "+o")) {
+        let completions = crate::builtins::SET_OPTIONS
+            .iter()
+            .map(|(name, flag)| {
+                let completion = Completion::new((*name).to_string(), CompletionKind::Other);
+                match flag {
+                    Some(flag) => completion.with_desc(&format!("same as -{flag}")),
+                    None => completion,
+                }
+            })
+            .collect();
+        return Some(rank_prefix_then_fuzzy(completions, prefix));
+    }
+
+    if cmd == "hook" && word_count >= 2 {
+        let hook_sub = words.get(1).copied().unwrap_or("");
+        // `hook add <kind> <function>` / `hook remove <kind> <function>`.
+        if matches!(hook_sub, "add" | "remove") && word_count == 2 {
+            let kinds = [
+                ("precmd", "before each prompt"),
+                ("preexec", "before each command runs"),
+                ("chpwd", "after the directory changes"),
+            ];
+            let completions = kinds
+                .iter()
+                .map(|(name, desc)| {
+                    Completion::new((*name).to_string(), CompletionKind::Subcommand).with_desc(desc)
+                })
+                .collect();
+            return Some(rank_prefix_then_fuzzy(completions, prefix));
+        }
+        if matches!(hook_sub, "add" | "remove") && word_count == 3 {
+            // Registered hooks for `remove`, every function for `add`.
+            let kind = words.get(2).copied().unwrap_or("");
+            let registered: &[String] = match kind {
+                "precmd" => &state.hooks.precmd,
+                "preexec" => &state.hooks.preexec,
+                "chpwd" => &state.hooks.chpwd,
+                _ => &[],
+            };
+            let completions: Vec<Completion> = if hook_sub == "remove" {
+                registered
+                    .iter()
+                    .map(|name| {
+                        Completion::new(name.clone(), CompletionKind::Function)
+                            .with_desc(&format!("registered {kind} hook"))
+                    })
+                    .collect()
+            } else {
+                let mut names: Vec<&String> = state.functions.keys().collect();
+                names.sort();
+                names
+                    .into_iter()
+                    .map(|name| {
+                        Completion::new(name.clone(), CompletionKind::Function)
+                            .with_desc("function")
+                    })
+                    .collect()
+            };
+            return Some(rank_prefix_then_fuzzy(completions, prefix));
+        }
+    }
+
+    if matches!(cmd, "workflow" | "wf") && !prefix.starts_with('-') {
+        let completions: Vec<Completion> = state
+            .workflow_registry
+            .search("")
+            .into_iter()
+            .map(|workflow| {
+                Completion::new(workflow.name.clone(), CompletionKind::Other)
+                    .with_desc(&workflow.description)
+            })
+            .collect();
+        let ranked = rank_prefix_then_fuzzy(completions, prefix);
+        if !ranked.is_empty() {
+            return Some(ranked);
+        }
+    }
+
+    // kubectl names that live in the local kubeconfig. Resource names would
+    // need the API server, and a keystroke must not become a network call.
+    if matches!(cmd, "kubectl" | "kubectx" | "kubens" | "helm" | "k9s") {
+        let namespace_flag = matches!(words.last().copied(), Some("-n" | "--namespace"));
+        if namespace_flag && !prefix.starts_with('-') {
+            let results =
+                rank_prefix_then_fuzzy(complete_kube_names("", KubeName::Namespace, state), prefix);
+            if !results.is_empty() {
+                return Some(results);
+            }
+        }
+        if matches!(words.last().copied(), Some("--context")) && !prefix.starts_with('-') {
+            let results =
+                rank_prefix_then_fuzzy(complete_kube_names("", KubeName::Context, state), prefix);
+            if !results.is_empty() {
+                return Some(results);
+            }
+        }
+        for (flag, kind) in [
+            ("--namespace=", KubeName::Namespace),
+            ("--context=", KubeName::Context),
+            ("--cluster=", KubeName::Cluster),
+            ("--user=", KubeName::User),
+        ] {
+            if let Some(value) = prefix.strip_prefix(flag) {
+                let results: Vec<Completion> =
+                    rank_prefix_then_fuzzy(complete_kube_names("", kind, state), value)
+                        .into_iter()
+                        .map(|mut completion| {
+                            completion.text = format!("{flag}{}", completion.text);
+                            completion
+                        })
+                        .collect();
+                if !results.is_empty() {
+                    return Some(results);
+                }
+            }
+        }
+    }
+
+    // `kubectl config use-context <TAB>` and the sibling subcommands.
+    if cmd == "kubectl" && words.get(1) == Some(&"config") && word_count >= 3 {
+        let kind = match words.get(2).copied().unwrap_or("") {
+            "use-context" | "delete-context" | "rename-context" => Some(KubeName::Context),
+            "delete-cluster" => Some(KubeName::Cluster),
+            "delete-user" => Some(KubeName::User),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let results = rank_prefix_then_fuzzy(complete_kube_names("", kind, state), prefix);
+            if !results.is_empty() {
+                return Some(results);
+            }
+        }
+    }
+
+    // `kubectx <TAB>` switches contexts; `kubens <TAB>` switches namespaces.
+    if matches!(cmd, "kubectx" | "kubens") && word_count == 1 && !prefix.starts_with('-') {
+        let kind = if cmd == "kubectx" {
+            KubeName::Context
+        } else {
+            KubeName::Namespace
+        };
+        let results = rank_prefix_then_fuzzy(complete_kube_names("", kind, state), prefix);
         if !results.is_empty() {
             return Some(results);
         }
@@ -1266,6 +1618,56 @@ fn subcommand_completions(
         }
     }
 
+    // `docker compose <sub> <TAB>` and `docker-compose <sub> <TAB>` name
+    // services from the project's own compose file.
+    {
+        let compose_sub = if cmd == "docker" && words.get(1) == Some(&"compose") {
+            words.get(2).copied()
+        } else if cmd == "docker-compose" {
+            words.get(1).copied()
+        } else {
+            None
+        };
+        if let Some(compose_sub) = compose_sub {
+            let takes_services = matches!(
+                compose_sub,
+                "up" | "down"
+                    | "start"
+                    | "stop"
+                    | "restart"
+                    | "logs"
+                    | "exec"
+                    | "run"
+                    | "build"
+                    | "pull"
+                    | "push"
+                    | "ps"
+                    | "rm"
+                    | "kill"
+                    | "pause"
+                    | "unpause"
+                    | "top"
+                    | "images"
+                    | "port"
+                    | "create"
+                    | "config"
+            );
+            // `exec`/`run` take one service, then a command inside it.
+            let single_service = matches!(compose_sub, "exec" | "run");
+            let service_index = if cmd == "docker" { 3 } else { 2 };
+            let service_named = words
+                .iter()
+                .skip(service_index)
+                .any(|word| !word.starts_with('-'));
+            if takes_services && !prefix.starts_with('-') && !(single_service && service_named) {
+                let results = rank_prefix_then_fuzzy(complete_compose_services(""), prefix);
+                if !results.is_empty() {
+                    return Some(results);
+                }
+            }
+        }
+    }
+
     // Second-level: docker container and image names from the local daemon,
     // probed the same bounded way Git arguments are.
     if cmd == "docker" && word_count >= 2 && !prefix.starts_with('-') {
@@ -1490,13 +1892,9 @@ fn complete_ssh_hosts(prefix: &str, colon_suffix: bool, home: &Path) -> Vec<Comp
     };
 
     let mut candidates: Vec<(String, &'static str)> = Vec::new();
-    if let Ok(content) = crate::io_guard::read_regular_text(
-        &home.join(".ssh/config"),
-        MAX_COMPLETION_PROJECT_FILE_BYTES,
-    ) {
-        for host in parse_ssh_config_hosts(&content) {
-            candidates.push((host, "ssh config"));
-        }
+    let mut seen_files = Vec::new();
+    for host in ssh_config_hosts(&home.join(".ssh/config"), home, &mut seen_files, 0) {
+        candidates.push((host, "ssh config"));
     }
     if let Ok(content) = crate::io_guard::read_regular_text(
         &home.join(".ssh/known_hosts"),
@@ -1534,16 +1932,29 @@ fn complete_ssh_hosts(prefix: &str, colon_suffix: bool, home: &Path) -> Vec<Comp
 /// `Host` aliases from an ssh_config document. Patterns (`*`, `?`) and
 /// negations match rather than name, so they are not completions.
 fn parse_ssh_config_hosts(content: &str) -> Vec<String> {
+    let (hosts, _) = parse_ssh_config_directives(content);
+    hosts
+}
+
+/// `Host` aliases and the argument of every `Include`, in one pass.
+fn parse_ssh_config_directives(content: &str) -> (Vec<String>, Vec<String>) {
     let mut hosts = Vec::new();
+    let mut includes = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        let Some(rest) = line
-            .split_once(|ch: char| ch.is_whitespace() || ch == '=')
-            .filter(|(keyword, _)| keyword.eq_ignore_ascii_case("host"))
-            .map(|(_, rest)| rest)
+        let Some((keyword, rest)) = line.split_once(|ch: char| ch.is_whitespace() || ch == '=')
         else {
             continue;
         };
+        if keyword.eq_ignore_ascii_case("include") {
+            includes.extend(rest.split_whitespace().map(str::to_string));
+            continue;
+        }
+        // `Match host foo` describes when a block applies; the word after it
+        // is a condition, not an alias someone can type.
+        if !keyword.eq_ignore_ascii_case("host") {
+            continue;
+        }
         for pattern in rest.split_whitespace() {
             if pattern.contains('*') || pattern.contains('?') || pattern.starts_with('!') {
                 continue;
@@ -1551,7 +1962,87 @@ fn parse_ssh_config_hosts(content: &str) -> Vec<String> {
             hosts.push(pattern.to_string());
         }
     }
+    (hosts, includes)
+}
+
+/// How far `Include` chains are followed, and how many files in total. Both
+/// bound work done per keystroke; ssh's own limit is 16 levels.
+const MAX_SSH_INCLUDE_DEPTH: usize = 8;
+const MAX_SSH_CONFIG_FILES: usize = 64;
+
+/// Host aliases from one ssh_config and everything it includes. Relative
+/// include paths resolve against `~/.ssh`, as ssh resolves them for a user
+/// config, and a file already read is not read again, so an include cycle
+/// terminates.
+fn ssh_config_hosts(
+    path: &Path,
+    home: &Path,
+    seen: &mut Vec<PathBuf>,
+    depth: usize,
+) -> Vec<String> {
+    if depth > MAX_SSH_INCLUDE_DEPTH || seen.len() >= MAX_SSH_CONFIG_FILES {
+        return Vec::new();
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if seen.contains(&canonical) {
+        return Vec::new();
+    }
+    seen.push(canonical);
+
+    let Ok(content) = crate::io_guard::read_regular_text(path, MAX_COMPLETION_PROJECT_FILE_BYTES)
+    else {
+        return Vec::new();
+    };
+    let (mut hosts, includes) = parse_ssh_config_directives(&content);
+    for include in includes {
+        for included in expand_ssh_include(&include, home) {
+            hosts.extend(ssh_config_hosts(&included, home, seen, depth + 1));
+        }
+    }
     hosts
+}
+
+/// Resolve one `Include` argument to the files it names, expanding a trailing
+/// glob against the directory it sits in. `~` and a bare relative path both
+/// resolve the way ssh resolves them in a user config.
+fn expand_ssh_include(pattern: &str, home: &Path) -> Vec<PathBuf> {
+    let resolved = if let Some(rest) = pattern.strip_prefix("~/") {
+        home.join(rest)
+    } else if pattern.starts_with('/') {
+        PathBuf::from(pattern)
+    } else {
+        home.join(".ssh").join(pattern)
+    };
+
+    let Some(name) = resolved.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    if !name.contains('*') && !name.contains('?') && !name.contains('[') {
+        return vec![resolved];
+    }
+    let Some(parent) = resolved.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut matched: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|candidate| crate::glob_match::glob_match(name, candidate))
+        })
+        .map(|entry| entry.path())
+        .take(MAX_SSH_CONFIG_FILES)
+        .collect();
+    matched.sort();
+    matched
 }
 
 /// Plain host names from a known_hosts document. Hashed entries cannot be
@@ -1677,20 +2168,22 @@ const MAX_SYSTEM_PID_RESULTS: usize = 30;
 
 /// Run a trusted helper with bounded output and time, for completion probes.
 fn bounded_helper_stdout(helper: &str, args: &[&str], max_bytes: usize) -> Option<String> {
-    let path = crate::io_guard::trusted_helper(helper)?;
-    let mut command = std::process::Command::new(path);
-    command.args(args);
-    let output = crate::io_guard::bounded_command_output(
-        &mut command,
-        max_bytes,
-        64 * 1024,
-        HELPER_PROBE_TIMEOUT,
-    )
-    .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    probe_text_once(&format!("{helper}:{}", args.join(" ")), || {
+        let path = crate::io_guard::trusted_helper(helper)?;
+        let mut command = std::process::Command::new(path);
+        command.args(args);
+        let output = crate::io_guard::bounded_command_output(
+            &mut command,
+            max_bytes,
+            64 * 1024,
+            HELPER_PROBE_TIMEOUT,
+        )
+        .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    })
 }
 
 fn bounded_docker_stdout(args: &[&str]) -> Option<String> {
@@ -2021,6 +2514,186 @@ fn parse_group_entries(content: &str, prefix: &str) -> Vec<Completion> {
     human
 }
 
+/// Contexts, clusters, users and namespaces from the local kubeconfig.
+///
+/// Deliberately file-only: a resource name would have to come from the API
+/// server, and a Tab keystroke must never become a network round trip to a
+/// cluster that may be unreachable, slow, or somewhere else entirely. What
+/// the file holds is exactly what `kubectl config` edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KubeName {
+    Context,
+    Cluster,
+    User,
+    Namespace,
+}
+
+/// `KUBECONFIG` is a path list, like PATH, and wins over the default. It is
+/// read from this shell's own environment rather than the process's: an
+/// `export` typed at this prompt is what the next command will see.
+fn kubeconfig_paths(state: &ShellState) -> Vec<PathBuf> {
+    if let Some(value) = state.env_vars.get("KUBECONFIG") {
+        let paths: Vec<PathBuf> = value
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .take(MAX_SSH_CONFIG_FILES)
+            .collect();
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+    vec![state.home_dir.join(".kube/config")]
+}
+
+fn complete_kube_names(prefix: &str, kind: KubeName, state: &ShellState) -> Vec<Completion> {
+    let mut completions = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in kubeconfig_paths(state) {
+        let Ok(content) =
+            crate::io_guard::read_regular_text(&path, MAX_COMPLETION_PROJECT_FILE_BYTES)
+        else {
+            continue;
+        };
+        for completion in parse_kubeconfig_names(&content, kind, prefix) {
+            if seen.insert(completion.text.clone()) {
+                completions.push(completion);
+            }
+        }
+    }
+    completions
+}
+
+fn parse_kubeconfig_names(content: &str, kind: KubeName, prefix: &str) -> Vec<Completion> {
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+        return Vec::new();
+    };
+    let current = document
+        .get("current-context")
+        .and_then(|value| value.as_str());
+
+    // Namespaces are not a top-level list: each context names the one it
+    // defaults to, and those are the namespaces this machine knows about.
+    if kind == KubeName::Namespace {
+        let Some(contexts) = document
+            .get("contexts")
+            .and_then(|value| value.as_sequence())
+        else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        return contexts
+            .iter()
+            .filter_map(|entry| {
+                let namespace = entry.get("context")?.get("namespace")?.as_str()?;
+                if !namespace.starts_with(prefix) || !seen.insert(namespace.to_string()) {
+                    return None;
+                }
+                let context = entry.get("name").and_then(|value| value.as_str());
+                Some(
+                    Completion::new(namespace.to_string(), CompletionKind::Other).with_desc(
+                        &match context {
+                            Some(context) => format!("default for {context}"),
+                            None => "kubeconfig namespace".to_string(),
+                        },
+                    ),
+                )
+            })
+            .take(MAX_COMPLETION_ITEMS)
+            .collect();
+    }
+
+    let (section, label) = match kind {
+        KubeName::Context => ("contexts", "context"),
+        KubeName::Cluster => ("clusters", "cluster"),
+        KubeName::User => ("users", "user"),
+        KubeName::Namespace => unreachable!(),
+    };
+    let Some(entries) = document.get(section).and_then(|value| value.as_sequence()) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?;
+            if !name.starts_with(prefix) {
+                return None;
+            }
+            let description = if Some(name) == current {
+                "current context".to_string()
+            } else {
+                label.to_string()
+            };
+            Some(Completion::new(name.to_string(), CompletionKind::Other).with_desc(&description))
+        })
+        .take(MAX_COMPLETION_ITEMS)
+        .collect()
+}
+
+/// The compose file names Docker itself looks for, in its own order.
+const COMPOSE_FILE_NAMES: &[&str] = &[
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+];
+
+/// Service names from the nearest compose file. This reads the project's own
+/// file rather than asking the daemon: the services a person is about to
+/// `up` are the ones written down, not only the ones already running.
+fn complete_compose_services(prefix: &str) -> Vec<Completion> {
+    let Some(path) = COMPOSE_FILE_NAMES
+        .iter()
+        .find_map(|name| find_upwards(name))
+    else {
+        return Vec::new();
+    };
+    compose_services_from_path(&path, prefix)
+}
+
+fn compose_services_from_path(path: &Path, prefix: &str) -> Vec<Completion> {
+    let Ok(content) = crate::io_guard::read_regular_text(path, MAX_COMPLETION_PROJECT_FILE_BYTES)
+    else {
+        return Vec::new();
+    };
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(services) = document
+        .get("services")
+        .and_then(|value| value.as_mapping())
+    else {
+        return Vec::new();
+    };
+    services
+        .iter()
+        .filter_map(|(name, definition)| {
+            let name = name.as_str()?;
+            if !name.starts_with(prefix) {
+                return None;
+            }
+            // The image or the build context says what the service is.
+            let description = definition
+                .get("image")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    let build = definition.get("build")?;
+                    build
+                        .as_str()
+                        .map(|context| format!("build {context}"))
+                        .or_else(|| {
+                            let context = build.get("context")?.as_str()?;
+                            Some(format!("build {context}"))
+                        })
+                })
+                .unwrap_or_else(|| "compose service".to_string());
+            Some(Completion::new(name.to_string(), CompletionKind::Other).with_desc(&description))
+        })
+        .take(MAX_COMPLETION_ITEMS)
+        .collect()
+}
+
 /// Dependencies from the nearest package.json, for uninstall/update-style
 /// package-manager subcommands.
 fn complete_npm_dependencies(prefix: &str) -> Vec<Completion> {
@@ -2093,18 +2766,21 @@ fn promote_git_context(
 }
 
 fn complete_git_refs(prefix: &str) -> Vec<Completion> {
-    if let Some(output) = crate::prompt::bounded_git_stdout(
-        Path::new("."),
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/heads",
-            "refs/remotes",
-            "refs/tags",
-        ],
-        MAX_GIT_COMPLETION_BYTES,
-    ) {
-        return parse_git_refs(&String::from_utf8_lossy(&output), prefix);
+    if let Some(output) = probe_text_once("git:refs", || {
+        crate::prompt::bounded_git_stdout(
+            Path::new("."),
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ],
+            MAX_GIT_COMPLETION_BYTES,
+        )
+        .map(|output| String::from_utf8_lossy(&output).into_owned())
+    }) {
+        return parse_git_refs(&output, prefix);
     }
     Vec::new()
 }
@@ -2196,11 +2872,13 @@ fn split_remote_branch(branch: &str) -> Option<(&str, &str)> {
 
 fn complete_git_dirty_files(prefix: &str, context: &str) -> Vec<Completion> {
     let mut completions = Vec::new();
-    if let Some(output) = crate::prompt::bounded_git_stdout(
-        Path::new("."),
-        &["status", "--porcelain=v1", "-z"],
-        MAX_GIT_COMPLETION_BYTES,
-    ) {
+    if let Some(output) = probe_once("git:status-z", || {
+        crate::prompt::bounded_git_stdout(
+            Path::new("."),
+            &["status", "--porcelain=v1", "-z"],
+            MAX_GIT_COMPLETION_BYTES,
+        )
+    }) {
         let decoded_prefix = unescape_shell_word(prefix);
         for (status, file) in parse_git_status_entries(&output) {
             if completions.len() >= MAX_COMPLETION_ITEMS {
@@ -2314,10 +2992,10 @@ fn complete_git_recent_commits(prefix: &str) -> Vec<Completion> {
 
 fn complete_git_remotes(prefix: &str) -> Vec<Completion> {
     let mut completions = Vec::new();
-    if let Some(output) =
+    if let Some(stdout) = probe_text_once("git:remotes", || {
         crate::prompt::bounded_git_stdout(Path::new("."), &["remote"], MAX_GIT_COMPLETION_BYTES)
-    {
-        let stdout = String::from_utf8_lossy(&output);
+            .map(|output| String::from_utf8_lossy(&output).into_owned())
+    }) {
         for remote in stdout.lines() {
             if completions.len() >= MAX_COMPLETION_ITEMS {
                 break;
@@ -2927,50 +3605,65 @@ pub fn common_prefix(completions: &[Completion]) -> String {
 /// Fuzzy match score: higher is better
 /// 精确前缀匹配最高分，然后是首字母匹配，最后是子字符串匹配
 pub fn fuzzy_match_score(text: &str, pattern: &str) -> i32 {
-    if pattern.is_empty() {
+    fuzzy_match_score_lowered(text, &lowered(pattern))
+}
+
+/// Lowercase only when something is actually uppercase. Candidate lists are
+/// mostly lowercase command, file and branch names, and this runs once per
+/// candidate per keystroke — the allocation is the cost, not the comparison.
+fn lowered(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.bytes().any(|byte| byte.is_ascii_uppercase()) || !text.is_ascii() {
+        std::borrow::Cow::Owned(text.to_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// [`fuzzy_match_score`] with the pattern already lowercased, so a ranking
+/// pass over many candidates lowercases it once rather than once per item.
+fn fuzzy_match_score_lowered(text: &str, pattern_lower: &str) -> i32 {
+    if pattern_lower.is_empty() {
         return 1000; // Empty pattern matches everything with high score
     }
 
-    let text_lower = text.to_lowercase();
-    let pattern_lower = pattern.to_lowercase();
+    let text_lower = lowered(text);
 
     // Exact prefix match: highest score
-    if text_lower.starts_with(&pattern_lower) {
+    if text_lower.starts_with(pattern_lower) {
         return 1000 - (text_lower.len() as i32 - pattern_lower.len() as i32).abs();
     }
 
     // Check if all characters of pattern exist in text in order
     let mut pattern_chars = pattern_lower.chars().peekable();
-    let mut text_chars = text_lower.chars();
     let mut last_match_pos = 0;
     let mut match_count = 0;
     let mut gap_penalty = 0;
+    let mut previous_matched = false;
 
-    for (pos, text_char) in text_chars.by_ref().enumerate() {
-        if let Some(&pattern_char) = pattern_chars.peek() {
-            if text_char == pattern_char {
-                pattern_chars.next();
-                match_count += 1;
-
-                // Penalty for gaps between matches
-                gap_penalty += pos.saturating_sub(last_match_pos).saturating_sub(1) as i32;
-                last_match_pos = pos;
-
-                // Bonus for consecutive matches
-                if pos > 0
-                    && text_lower
-                        .chars()
-                        .nth(pos - 1)
-                        .map(|c| c == pattern_lower.chars().next().unwrap())
-                        .unwrap_or(false)
-                {
-                    gap_penalty = gap_penalty.saturating_sub(5);
-                }
-            }
+    for (pos, text_char) in text_lower.chars().enumerate() {
+        let Some(&pattern_char) = pattern_chars.peek() else {
+            break;
+        };
+        if text_char != pattern_char {
+            previous_matched = false;
+            continue;
         }
+        pattern_chars.next();
+        match_count += 1;
+
+        // Penalty for gaps between matches
+        gap_penalty += pos.saturating_sub(last_match_pos).saturating_sub(1) as i32;
+        last_match_pos = pos;
+
+        // Bonus for a run: this position matched and so did the one before,
+        // which is what makes `chk` prefer checkout over cherry-pick.
+        if previous_matched {
+            gap_penalty = gap_penalty.saturating_sub(5);
+        }
+        previous_matched = true;
     }
 
-    if match_count == pattern_lower.len() {
+    if match_count == pattern_lower.chars().count() {
         // All characters matched, score based on gaps and position
         500 + (match_count as i32 * 10) - gap_penalty
     } else {
@@ -2994,10 +3687,11 @@ fn rank_prefix_then_fuzzy(completions: Vec<Completion>, pattern: &str) -> Vec<Co
 
 /// Filter completions using fuzzy matching
 pub fn filter_completions(completions: Vec<Completion>, pattern: &str) -> Vec<Completion> {
+    let pattern_lower = lowered(pattern);
     let mut scored: Vec<(Completion, i32)> = completions
         .into_iter()
         .map(|c| {
-            let score = fuzzy_match_score(&c.text, pattern);
+            let score = fuzzy_match_score_lowered(&c.text, &pattern_lower);
             (c, score)
         })
         .filter(|(_, score)| *score > 0)
@@ -3021,6 +3715,12 @@ pub fn clear_cache() {
     COMPLETION_CACHE.with(|cache| {
         cache.borrow_mut().clear();
     });
+    PROBE_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+    HISTORY_ENTRIES.with(|entries| {
+        *entries.borrow_mut() = None;
+    });
 }
 
 const MAX_HISTORY_ARG_RESULTS: usize = 10;
@@ -3032,11 +3732,30 @@ fn complete_history_arguments(cmd: &str, prefix: &str, state: &ShellState) -> Ve
     if cmd.is_empty() {
         return Vec::new();
     }
-    let entries = crate::history::History::load_default_entries(10_000);
+    let entries = history_entries_once();
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
     history_argument_completions(&entries, cmd, &state.aliases, prefix, cwd.as_deref())
+}
+
+thread_local! {
+    /// The decoded history for this command line. Reaching the history is
+    /// the fallback when no path matches, which is exactly the keystroke
+    /// where re-reading and re-parsing the whole file would be felt.
+    static HISTORY_ENTRIES: std::cell::RefCell<Option<std::rc::Rc<Vec<crate::history::HistoryEntry>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn history_entries_once() -> std::rc::Rc<Vec<crate::history::HistoryEntry>> {
+    HISTORY_ENTRIES.with(|cell| {
+        if let Some(entries) = cell.borrow().as_ref() {
+            return entries.clone();
+        }
+        let entries = std::rc::Rc::new(crate::history::History::load_default_entries(10_000));
+        *cell.borrow_mut() = Some(entries.clone());
+        entries
+    })
 }
 
 /// Pure core of [`complete_history_arguments`]: arguments used with `cmd`
@@ -4561,6 +5280,380 @@ mod tests {
         assert!(completions
             .iter()
             .all(|item| item.text.starts_with("JSH_C")));
+    }
+
+    #[test]
+    fn probes_run_once_per_command_line_including_their_failures() {
+        clear_cache();
+        let mut runs = 0;
+        for _ in 0..3 {
+            let value = probe_text_once("test:source", || {
+                runs += 1;
+                Some("one\ntwo".to_string())
+            });
+            assert_eq!(value.as_deref(), Some("one\ntwo"));
+        }
+        assert_eq!(runs, 1, "a growing prefix must not re-fork the probe");
+
+        // A probe that finds nothing is remembered too: a stopped daemon
+        // costs one timeout per command line, not one per keystroke.
+        let mut misses = 0;
+        for _ in 0..3 {
+            let value = probe_text_once("test:absent", || {
+                misses += 1;
+                None
+            });
+            assert!(value.is_none());
+        }
+        assert_eq!(misses, 1);
+
+        // The next command line probes afresh.
+        clear_cache();
+        let value = probe_text_once("test:source", || Some("three".to_string()));
+        assert_eq!(value.as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn probe_cache_preserves_bytes_that_are_not_utf8() {
+        clear_cache();
+        let raw = vec![0x66, 0x6f, 0xff, 0x00, 0x6f];
+        let cached = probe_once("test:bytes", || Some(raw.clone()));
+        assert_eq!(cached.as_deref(), Some(raw.as_slice()));
+        // Git's -z status output is parsed as bytes; a lossy round trip
+        // through String would rewrite a path this shell must keep exact.
+        let again = probe_once("test:bytes", || panic!("must not re-probe"));
+        assert_eq!(again.as_deref(), Some(raw.as_slice()));
+    }
+
+    #[test]
+    fn redirection_targets_are_plain_files_whatever_the_command_is() {
+        assert!(is_redirect_target("echo hi >"));
+        assert!(is_redirect_target("echo hi >> "));
+        assert!(is_redirect_target("wc -l <"));
+        assert!(is_redirect_target("cmd 2> "));
+        // A descriptor duplication takes a number, not a file.
+        assert!(!is_redirect_target("cmd 2>&"));
+        // Ordinary argument positions, and operators inside quotes.
+        assert!(!is_redirect_target("git add "));
+        assert!(!is_redirect_target("echo '>' "));
+        assert!(!is_redirect_target("echo \\> "));
+        assert!(!is_redirect_target("echo hi > out.txt "));
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("logs")).unwrap();
+        fs::write(tmp.path().join("notes.txt"), "").unwrap();
+        let mut state = ShellState::new(false);
+
+        // `cd` normally offers directories only, and `git add` dirty files;
+        // after a redirection both must offer the plain file too.
+        for command in ["cd", "git add", "echo hi"] {
+            clear_cache();
+            let buffer = format!("{command} > {}/", tmp.path().display());
+            let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+            let texts: Vec<&str> = completions.iter().map(|c| c.text.as_str()).collect();
+            assert!(
+                texts.iter().any(|t| t.ends_with("notes.txt")),
+                "{command}: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completing_inside_quotes_keeps_the_quoting_style() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("my file.txt"), "").unwrap();
+        fs::create_dir(tmp.path().join("my dir")).unwrap();
+
+        assert_eq!(open_quote_context("\"my fi"), Some(('"', "my fi")));
+        assert_eq!(open_quote_context("'my fi"), Some(('\'', "my fi")));
+        // Already-closed quotes are ordinary words again.
+        assert_eq!(open_quote_context("\"done\""), None);
+        assert_eq!(open_quote_context("plain"), None);
+
+        let mut state = ShellState::new(false);
+        clear_cache();
+        let buffer = format!("cat \"{}/my fi", tmp.path().display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        let file = completions
+            .iter()
+            .find(|c| c.text.ends_with("my file.txt\""))
+            .expect("file candidate keeps its quotes closed");
+        assert!(file.text.starts_with('"'));
+        assert!(
+            !file.text.contains('\\'),
+            "no backslash escaping inside quotes"
+        );
+
+        clear_cache();
+        let buffer = format!("cat \"{}/my d", tmp.path().display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        let dir = completions
+            .iter()
+            .find(|c| c.text.ends_with("my dir/"))
+            .expect("directory candidate");
+        // The path continues, so the quote stays open for the next segment.
+        assert_eq!(dir.text.matches('"').count(), 1);
+    }
+
+    #[test]
+    fn jsh_builtins_complete_their_own_arguments() {
+        let mut state = ShellState::new(false);
+
+        clear_cache();
+        let buffer = "shopt -s globs";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "globstar"));
+
+        clear_cache();
+        let buffer = "set -o pipe";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let option = completions
+            .iter()
+            .find(|item| item.text == "pipefail")
+            .unwrap();
+        assert!(option.description.is_none() || !option.description.as_ref().unwrap().is_empty());
+
+        clear_cache();
+        let buffer = "set -o err";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let errexit = completions
+            .iter()
+            .find(|item| item.text == "errexit")
+            .unwrap();
+        assert_eq!(errexit.description.as_deref(), Some("same as -e"));
+
+        clear_cache();
+        let buffer = "hook add ch";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "chpwd"));
+    }
+
+    #[test]
+    fn hook_remove_offers_only_registered_hooks() {
+        let mut state = ShellState::new(false);
+        state.hooks.precmd.push("update_title".to_string());
+        state.functions.insert(
+            "unrelated_function".to_string(),
+            crate::parser::ast::CompoundCommand::BraceGroup {
+                body: Vec::new(),
+                redirects: Vec::new(),
+            },
+        );
+
+        clear_cache();
+        let buffer = "hook remove precmd ";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let texts: Vec<&str> = completions.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["update_title"]);
+
+        // `hook add` names any function, since none is registered yet.
+        clear_cache();
+        let buffer = "hook add precmd ";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions
+            .iter()
+            .any(|item| item.text == "unrelated_function"));
+    }
+
+    #[test]
+    fn commands_that_open_one_kind_of_file_offer_that_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("setup.sh"), "").unwrap();
+        fs::write(tmp.path().join("notes.txt"), "").unwrap();
+        fs::write(tmp.path().join("app.py"), "").unwrap();
+        fs::create_dir(tmp.path().join("scripts")).unwrap();
+        let mut state = ShellState::new(false);
+
+        clear_cache();
+        let buffer = format!("source {}/", tmp.path().display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        let names: Vec<&str> = completions.iter().map(|c| c.display.as_str()).collect();
+        assert!(names.contains(&"setup.sh"));
+        assert!(names.contains(&"scripts/"), "directories lead to the file");
+        assert!(!names.contains(&"notes.txt"));
+        assert!(!names.contains(&"app.py"));
+
+        clear_cache();
+        let buffer = format!("python {}/", tmp.path().display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        let names: Vec<&str> = completions.iter().map(|c| c.display.as_str()).collect();
+        assert!(names.contains(&"app.py"));
+        assert!(!names.contains(&"setup.sh"));
+
+        // A directory holding nothing of that kind keeps the whole listing
+        // rather than showing an empty menu.
+        let plain = tempfile::tempdir().unwrap();
+        fs::write(plain.path().join("notes.txt"), "").unwrap();
+        clear_cache();
+        let buffer = format!("source {}/", plain.path().display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|c| c.display == "notes.txt"));
+
+        // An unlisted command is untouched, and so are compressors, whose
+        // argument is whatever file is being compressed.
+        clear_cache();
+        let buffer = format!("gzip {}/", tmp.path().display());
+        let (_, completions) = complete(&buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|c| c.display == "notes.txt"));
+    }
+
+    #[test]
+    fn ssh_config_includes_are_followed_and_cycles_terminate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = tmp.path().join(".ssh");
+        fs::create_dir_all(ssh.join("config.d")).unwrap();
+        fs::write(
+            ssh.join("config"),
+            "Include config.d/*.conf\nInclude ~/.ssh/extra\nHost direct\n",
+        )
+        .unwrap();
+        fs::write(ssh.join("config.d/work.conf"), "Host workbox\n").unwrap();
+        fs::write(ssh.join("config.d/home.conf"), "Host homelab\n").unwrap();
+        // Not matched by the glob, so never read.
+        fs::write(ssh.join("config.d/notes.txt"), "Host ignored\n").unwrap();
+        // An include cycle must terminate rather than recurse forever.
+        fs::write(ssh.join("extra"), "Host extrabox\nInclude config\n").unwrap();
+
+        let hosts = complete_ssh_hosts("", false, tmp.path());
+        let texts: Vec<&str> = hosts.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"direct"));
+        assert!(texts.contains(&"workbox"));
+        assert!(texts.contains(&"homelab"));
+        assert!(texts.contains(&"extrabox"));
+        assert!(!texts.contains(&"ignored"));
+    }
+
+    #[test]
+    fn ssh_config_match_blocks_are_not_host_aliases() {
+        let (hosts, includes) = parse_ssh_config_directives(
+            "Match host bastion\n  ProxyJump none\nHost real\nInclude other/*\n",
+        );
+        assert_eq!(hosts, vec!["real"]);
+        assert_eq!(includes, vec!["other/*"]);
+    }
+
+    #[test]
+    fn compose_services_come_from_the_project_file_not_the_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("compose.yaml");
+        fs::write(
+            &path,
+            "services:\n\
+             \x20 web:\n\
+             \x20   image: nginx:1.27\n\
+             \x20 worker:\n\
+             \x20   build:\n\
+             \x20     context: ./worker\n\
+             \x20 plain:\n\
+             \x20   command: sleep 1\n\
+             volumes:\n\
+             \x20 data:\n",
+        )
+        .unwrap();
+
+        let services = compose_services_from_path(&path, "");
+        let texts: Vec<&str> = services.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["web", "worker", "plain"]);
+        assert_eq!(services[0].description.as_deref(), Some("nginx:1.27"));
+        assert_eq!(services[1].description.as_deref(), Some("build ./worker"));
+        assert_eq!(services[2].description.as_deref(), Some("compose service"));
+
+        assert_eq!(compose_services_from_path(&path, "wo").len(), 1);
+        // A file without services, and a file that is not YAML at all.
+        let empty = tmp.path().join("empty.yaml");
+        fs::write(&empty, "version: '3'\n").unwrap();
+        assert!(compose_services_from_path(&empty, "").is_empty());
+    }
+
+    #[test]
+    fn kubeconfig_names_come_from_the_file_and_mark_the_current_context() {
+        let config = "apiVersion: v1\n\
+            current-context: prod\n\
+            clusters:\n\
+            - name: prod-cluster\n\
+            - name: dev-cluster\n\
+            users:\n\
+            - name: admin\n\
+            contexts:\n\
+            - name: prod\n\
+            \x20 context:\n\
+            \x20   cluster: prod-cluster\n\
+            \x20   namespace: payments\n\
+            - name: dev\n\
+            \x20 context:\n\
+            \x20   cluster: dev-cluster\n\
+            \x20   namespace: default\n";
+
+        let contexts = parse_kubeconfig_names(config, KubeName::Context, "");
+        let texts: Vec<&str> = contexts.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["prod", "dev"]);
+        assert_eq!(contexts[0].description.as_deref(), Some("current context"));
+        assert_eq!(contexts[1].description.as_deref(), Some("context"));
+
+        let namespaces = parse_kubeconfig_names(config, KubeName::Namespace, "");
+        let texts: Vec<&str> = namespaces.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["payments", "default"]);
+        assert_eq!(
+            namespaces[0].description.as_deref(),
+            Some("default for prod")
+        );
+
+        assert_eq!(
+            parse_kubeconfig_names(config, KubeName::Cluster, "dev")
+                .first()
+                .map(|c| c.text.as_str()),
+            Some("dev-cluster")
+        );
+        assert_eq!(parse_kubeconfig_names(config, KubeName::User, "").len(), 1);
+        assert!(parse_kubeconfig_names("not: [valid", KubeName::Context, "").is_empty());
+    }
+
+    #[test]
+    fn kubectl_completes_contexts_and_namespaces_from_the_home_kubeconfig() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".kube")).unwrap();
+        fs::write(
+            tmp.path().join(".kube/config"),
+            "current-context: prod\n\
+             contexts:\n\
+             - name: prod\n\
+             \x20 context:\n\
+             \x20   namespace: payments\n",
+        )
+        .unwrap();
+
+        let mut state = ShellState::new(false);
+        state.home_dir = tmp.path().to_path_buf();
+
+        clear_cache();
+        let buffer = "kubectl -n pay";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "payments"));
+
+        clear_cache();
+        let buffer = "kubectl config use-context pr";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "prod"));
+
+        // The inline flag form keeps its prefix on the inserted text.
+        clear_cache();
+        let buffer = "kubectl get pods --context=pr";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "--context=prod"));
+
+        // KUBECONFIG in this shell's own environment wins over ~/.kube.
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = other.path().join("other.yaml");
+        fs::write(&elsewhere, "contexts:\n- name: staging\n").unwrap();
+        state
+            .env_vars
+            .insert("KUBECONFIG".to_string(), elsewhere.display().to_string());
+
+        clear_cache();
+        let buffer = "kubectx sta";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let texts: Vec<&str> = completions.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["staging"]);
     }
 
     #[test]

@@ -1849,7 +1849,7 @@ fn cmp_int(a: &str, b: &str, f: fn(i64, i64) -> bool) -> i32 {
 /// keyword, monitor, noclobber, noexec, nolog, notify, onecmd, physical, posix,
 /// privileged, verbose. Rejecting them instead would be worse: bash accepts
 /// them, so `set -a` in a real script must not become a hard error.
-const SET_OPTIONS: &[(&str, Option<char>)] = &[
+pub(crate) const SET_OPTIONS: &[(&str, Option<char>)] = &[
     ("allexport", Some('a')),
     ("braceexpand", Some('B')),
     ("emacs", None),
@@ -3476,7 +3476,7 @@ fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
 /// starts a shell instead of an error, and `shopt histappend` still answers
 /// with what was set. Rejecting them would be worse than remembering them: the
 /// stock Debian `.bashrc` alone sets two, and bash-completion sets two more.
-const SHOPT_OPTIONS: &[(&str, bool)] = &[
+pub(crate) const SHOPT_OPTIONS: &[(&str, bool)] = &[
     ("autocd", false),
     ("assoc_expand_once", false),
     ("cdable_vars", false),

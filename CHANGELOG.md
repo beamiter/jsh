@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- Completion probes run once per command line instead of once per keystroke.
+  Every external probe and its result — Git refs and status, the Docker
+  daemon, systemd, and the decoded history file — is remembered for the
+  command being typed and dropped when it runs, so a growing prefix stops
+  re-forking Git. Failures are remembered too: a stopped Docker daemon costs
+  one timeout while a word is typed rather than one per keystroke. A repeated
+  Tab through the history fallback went from 584µs to 0.7µs, and fuzzy
+  ranking itself is about 40% cheaper — it no longer lowercases the pattern
+  once per candidate, allocates nothing for candidates that are already
+  lowercase, and its run bonus is no longer an accidental O(n²) scan that
+  compared against the wrong character. `benches/bench_completion.rs` covers
+  the paths a keystroke actually takes.
+- Redirection targets complete as plain files wherever they appear: `git add
+  > n<TAB>` and `cd > n<TAB>` offer the file being written rather than dirty
+  files or directories. `>&` is left alone, since its operand is a file
+  descriptor. Completing inside an unclosed quote keeps the quoting style
+  instead of replacing it with backslashes — a file closes the quote, a
+  directory leaves it open because the path continues.
+- Commands that open one kind of file offer that kind: `source` and the
+  shells offer scripts, `python` offers `.py`, `unzip` offers archives,
+  `java` offers jars. Directories always remain, since they are the way to
+  reach the file, and a directory holding nothing of that kind keeps its
+  whole listing rather than showing an empty menu — the guess is a
+  convenience, never a restriction.
+- jsh's own builtins complete their arguments: `shopt` and `set -o` name
+  their options with what each does and whether it is on by default, `hook
+  add` names the hook kinds and then any function, `hook remove` names only
+  the hooks actually registered for that kind, and `workflow` names the
+  workflows in the registry with their descriptions.
+- ssh completion follows `Include`. Aliases now come from the whole config
+  chain — `Include config.d/*.conf`, `~` paths, and bare relative paths
+  resolved against `~/.ssh` the way ssh resolves them — with a file read at
+  most once, so an include cycle terminates, and a depth and file-count
+  bound so a keystroke stays cheap. A `Match host …` condition is no longer
+  mistaken for a host alias.
+- `docker compose` and `docker-compose` complete service names from the
+  project's own compose file, labelled with the image or build context, so
+  the services about to be started complete before any of them is running.
+  `kubectl` completes contexts, clusters, users and namespaces from the
+  local kubeconfig — `-n`, `--context`, the inline `--flag=` forms, and
+  `kubectl config use-context`, plus `kubectx`/`kubens` — with the current
+  context marked as such. `KUBECONFIG` is read from this shell's own
+  environment, so an `export` typed at this prompt takes effect at the next
+  Tab. Deliberately file-only: a resource name would mean a network round
+  trip to a cluster that may be unreachable, and a keystroke must never be
+  that.
+
 - Tab completion understands more of what the argument actually is instead of
   falling back to filenames. The ssh family (`ssh`, `scp`, `sftp`, `rsync`,
   `mosh`, `ssh-copy-id`) completes destinations from `~/.ssh/config` aliases
