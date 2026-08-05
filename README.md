@@ -424,12 +424,54 @@ the command and exit status. Review journal contents before enabling cloud
 context sharing because terminal output can contain source code, paths, tokens,
 or other secrets.
 
-## Completion and workflows
+## Completion
 
-Built-in completion specifications cover Git, Cargo, npm, Docker, and kubectl.
-Additional JSON specs can be placed in `~/.jsh/completions/`. Local workflow
-definitions live in `~/.jsh/workflows/`; press `Ctrl-G` in the editor to search
-the workflow registry and fill its parameters.
+Tab completes by what the word actually names, not by filename alone.
+
+- **Commands and syntax**: builtins, functions, aliases, `PATH` entries and
+  shell keywords; the word after `do`, `then`, `else`, `|`, `&&`, `` ` `` and
+  `$(` is a command position; redirection targets are files, and `2>&` takes a
+  descriptor.
+- **Repository state**: branches, tags, remotes, stashes, recent commits,
+  modified files (`git add`), worktrees, and `git config` keys. `git branch -d`
+  offers only branches Git would let you delete.
+- **The machine's own state**: users and groups, jobs and signals, processes
+  for `kill`, systemd units, Docker containers and images, ssh hosts from
+  `~/.ssh/config` (following `Include`) and `known_hosts`, kubeconfig contexts
+  and namespaces, `nvm`/`pyenv`/`rbenv` versions, and a project's virtual
+  environment.
+- **Project files**: npm scripts and dependencies, `make` targets, Cargo
+  binaries, examples, features and packages, and Compose services.
+- **Typed pipelines**: `from-json data.json | where <TAB>` offers the fields
+  that file actually has, with the type each holds, across JSON, NDJSON, YAML,
+  TOML and CSV. A `def` function's parameters complete by their declared type.
+- **Flags and their values**: descriptions for everyday tools, and fixed value
+  sets where they exist — `curl -X`, `git log --pretty=`, `find -type`,
+  `journalctl -p`, `systemctl --state=`, `kubectl -o`, `test` operators,
+  `chmod` modes, `man` sections.
+
+Typing that is close but not exact still finds its target: paths fall back to
+case-insensitive matching, and everything else to fuzzy subsequence matching,
+only when nothing matches exactly — so precise typing keeps its precise order.
+The menu underlines the characters that matched. Accepting a candidate is
+remembered per command, so the next list leads with what you chose before.
+
+Everything is local. Completion never runs a command to find out what to
+offer, and never makes a network request: Docker, Git and systemd are probed
+with fixed, trusted binaries under a timeout and an output cap, once per
+command line; everything else is read from files. Kubernetes resource names
+and remote `scp` paths are deliberately absent for exactly this reason.
+
+`complete` and `compgen` accept the bash spellings, including `-A <action>`,
+which resolves to the sources above, and `-F <function>`, which is called with
+`COMP_WORDS`, `COMP_CWORD`, `COMP_LINE` and `$1`/`$2`/`$3` as bash sets them.
+Additional JSON specs can be placed in `~/.jsh/completions/`; an argument may
+name a `generator` to reach any of the dynamic sources above.
+
+## Workflows
+
+Local workflow definitions live in `~/.jsh/workflows/`; press `Ctrl-G` in the
+editor to search the workflow registry and fill its parameters.
 
 ## Development
 

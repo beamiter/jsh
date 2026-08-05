@@ -530,6 +530,15 @@ impl Editor {
             (KeyCode::BackTab, _) => {
                 self.step_completion_menu(-1);
             }
+            // Take one word of the ghost rather than all of it. A suggestion
+            // is often right at the start and wrong at the end — the command
+            // and its subcommand, then a path from another directory — and
+            // this is how you keep the part that fits.
+            (KeyCode::Right, KeyModifiers::CONTROL) | (KeyCode::Char('f'), KeyModifiers::ALT)
+                if self.cursor >= self.buffer.len() && self.suggestion.is_some() =>
+            {
+                self.accept_suggestion_word();
+            }
             (KeyCode::Right, KeyModifiers::NONE) => {
                 if self.cursor >= self.buffer.len() {
                     if let Some(suggestion) = self.suggestion.take() {
@@ -1148,6 +1157,37 @@ impl Editor {
             }
         }
         Ok(KeyAction::Continue)
+    }
+
+    /// What separates one accepted piece of a suggestion from the next.
+    /// Path separators count, so accepting a long path arrives one directory
+    /// at a time rather than all at once.
+    fn is_suggestion_gap(ch: char) -> bool {
+        ch.is_whitespace() || ch == '/' || ch == '=' || ch == ':'
+    }
+
+    /// Append the first word of the ghost suggestion, keeping the rest as a
+    /// ghost. A word here is a run of separators plus the text that follows,
+    /// so accepting from `" origin main"` gives `" origin"` and leaves
+    /// `" main"` — one press, one meaningful piece.
+    fn accept_suggestion_word(&mut self) {
+        let Some(suggestion) = self.suggestion.take() else {
+            return;
+        };
+        let taken: String = {
+            let mut chars = suggestion
+                .char_indices()
+                .skip_while(|(_, ch)| Self::is_suggestion_gap(*ch));
+            let end = chars
+                .find(|(_, ch)| Self::is_suggestion_gap(*ch))
+                .map(|(index, _)| index)
+                .unwrap_or(suggestion.len());
+            suggestion[..end].to_string()
+        };
+        self.buffer.push_str(&taken);
+        self.cursor = self.buffer.len();
+        let rest = &suggestion[taken.len()..];
+        self.suggestion = (!rest.is_empty()).then(|| rest.to_string());
     }
 
     /// Remember a completion that was actually taken, so it leads the list
@@ -1861,11 +1901,26 @@ impl Editor {
                     out.queue(SetForegroundColor(Color::Blue))?;
                 }
 
-                // Display name
+                // Display name, with the characters the typed text matched
+                // underlined — a fuzzy match is otherwise unexplained, and
+                // `chk` landing on `checkout` looks arbitrary without it.
                 let name_width = 20usize.min(self.terminal_width as usize / 3);
                 let (display_name, display_name_width) =
                     history_panel_text(&item.comp.display, name_width);
-                out.queue(Print(display_name))?;
+                let matched = completer::match_positions(&display_name, &menu.original_word);
+                if matched.is_empty() {
+                    out.queue(Print(display_name))?;
+                } else {
+                    for (offset, ch) in display_name.char_indices() {
+                        if matched.contains(&offset) {
+                            out.queue(SetAttribute(Attribute::Underlined))?;
+                            out.queue(Print(ch))?;
+                            out.queue(SetAttribute(Attribute::NoUnderline))?;
+                        } else {
+                            out.queue(Print(ch))?;
+                        }
+                    }
+                }
                 out.queue(Print(
                     " ".repeat(name_width.saturating_sub(display_name_width)),
                 ))?;
@@ -2468,6 +2523,42 @@ fn find_next_word_boundary(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ghost_suggestion_can_be_taken_one_word_at_a_time() {
+        let mut editor = Editor::new();
+        editor.buffer = "git push".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.suggestion = Some(" origin main".to_string());
+
+        editor.accept_suggestion_word();
+        assert_eq!(editor.buffer, "git push origin");
+        assert_eq!(editor.cursor, editor.buffer.len());
+        assert_eq!(editor.suggestion.as_deref(), Some(" main"));
+
+        editor.accept_suggestion_word();
+        assert_eq!(editor.buffer, "git push origin main");
+        assert_eq!(editor.suggestion, None, "nothing is left to take");
+
+        // Taking from nothing is harmless.
+        editor.accept_suggestion_word();
+        assert_eq!(editor.buffer, "git push origin main");
+    }
+
+    #[test]
+    fn taking_a_ghost_path_arrives_one_directory_at_a_time() {
+        let mut editor = Editor::new();
+        editor.buffer = "cd /home".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.suggestion = Some("/user/projects/jsh".to_string());
+
+        editor.accept_suggestion_word();
+        assert_eq!(editor.buffer, "cd /home/user");
+        assert_eq!(editor.suggestion.as_deref(), Some("/projects/jsh"));
+
+        editor.accept_suggestion_word();
+        assert_eq!(editor.buffer, "cd /home/user/projects");
+    }
 
     #[test]
     fn menu_selection_wraps_and_rewrites_the_word_in_both_directions() {

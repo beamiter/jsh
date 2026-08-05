@@ -202,7 +202,11 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     // Check user-defined completion specs first
     if !is_cmd_pos {
         if let Some(spec) = state.completion_specs.get(&cmd).cloned() {
-            let completions = finalize_completions(apply_completion_spec(&spec, &word, state));
+            // The whole active command line, which is what a `-F` function
+            // is entitled to see.
+            let line = &buf[active_command_segment_start(buf)..];
+            let completions =
+                finalize_completions(apply_completion_spec(&spec, &word, line, state));
             if !completions.is_empty() {
                 COMPLETION_CACHE.with(|cache| {
                     cache.borrow_mut().insert(cache_key, completions.clone());
@@ -222,10 +226,18 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     // `$HOME/pro` is a path whose first segment happens to be a variable.
     let variable_word = word.starts_with('$') && !word.contains('/');
 
-    let completions = if let Some(variable) = word.strip_prefix("${").filter(|_| variable_word) {
+    let completions = if let Some(designator) = word.strip_prefix('!').filter(|rest| {
+        // `!` only expands history at the start of a word, and `!=` inside a
+        // test is not a history reference.
+        !rest.starts_with('=') && !rest.contains('/')
+    }) {
+        complete_history_expansion(designator)
+    } else if let Some(variable) = word.strip_prefix("${").filter(|_| variable_word) {
         complete_variable_braced(variable, state)
     } else if let Some(variable) = word.strip_prefix('$').filter(|_| variable_word) {
         complete_variable(variable, state)
+    } else if let Some(descriptors) = redirect_descriptor_completions(&buf[..word_start], &word) {
+        descriptors
     } else if redirect_target {
         complete_path(&word, state)
     } else if let Some(kind) = wrapper_value {
@@ -270,12 +282,37 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     {
         spec_completions
     } else if cmd == "cd" {
+        // The two destinations that are not paths at all.
+        let mut results: Vec<Completion> = Vec::new();
+        if word.is_empty() || word == "-" {
+            if let Some(previous) = state.dir_stack.last() {
+                results.push(
+                    Completion::new("-".to_string(), CompletionKind::Directory)
+                        .with_desc(&format!("back to {}", previous.display())),
+                );
+            }
+        }
+        if word.starts_with("..") && !word.contains('/') {
+            // `..`, `../..`, and so on: each level named by where it lands.
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let mut ancestors = cwd.ancestors().skip(1);
+            let mut path = String::from("..");
+            for _ in 0..4 {
+                let Some(target) = ancestors.next() else {
+                    break;
+                };
+                if path.starts_with(&word[..]) {
+                    results.push(
+                        Completion::new(format!("{path}/"), CompletionKind::Directory)
+                            .with_desc(&target.display().to_string()),
+                    );
+                }
+                path.push_str("/..");
+            }
+        }
         // Local directories; when none match, fall back to the frecency
         // database so `cd proj<TAB>` works from anywhere.
-        let results: Vec<Completion> = complete_path(&word, state)
-            .into_iter()
-            .filter(|c| c.is_dir)
-            .collect();
+        results.extend(complete_path(&word, state).into_iter().filter(|c| c.is_dir));
         if results.is_empty() {
             z_frecency_completions(&word)
         } else {
@@ -353,9 +390,17 @@ fn finalize_completions(completions: Vec<Completion>) -> Vec<Completion> {
 fn apply_completion_spec(
     spec: &crate::environment::CompletionSpec,
     prefix: &str,
+    line: &str,
     state: &mut ShellState,
 ) -> Vec<Completion> {
     let mut completions = Vec::new();
+
+    // -A action / the short flags that name one. Each reaches a source this
+    // shell already has, which is what makes a bash-completion `complete -A
+    // user su` behave here as it does there.
+    for action in &spec.actions {
+        completions.extend(complete_spec_action(action, prefix, state));
+    }
 
     // -W word list
     if let Some(ref words) = spec.word_list {
@@ -377,17 +422,40 @@ fn apply_completion_spec(
         if let Some(func_body) = state.functions.get(func_name).cloned() {
             // Set completion variables - push a local scope for these variables
             state.push_local_scope();
-            let line = prefix; // simplified
-            let words: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+            // Bash gives the function the whole command line, and the index
+            // of the word being completed within it. Passing only the typed
+            // prefix made every `-F` function see a one-word command line,
+            // so anything that looked at `${COMP_WORDS[1]}` — which is most
+            // of bash-completion — decided it was completing a command name.
+            let mut words: Vec<String> = line
+                .split_whitespace()
+                .map(|word| word.to_string())
+                .collect();
+            if line.ends_with(char::is_whitespace) || words.is_empty() {
+                // The word being completed is the empty one after the space.
+                words.push(String::new());
+            }
+            let cword = words.len().saturating_sub(1);
             state.arrays.insert("COMP_WORDS".to_string(), words.clone());
             if let Some(scope) = state.local_vars_stack.last_mut() {
-                scope.insert(
-                    "COMP_CWORD".to_string(),
-                    (words.len().saturating_sub(1)).to_string(),
-                );
+                scope.insert("COMP_CWORD".to_string(), cword.to_string());
                 scope.insert("COMP_LINE".to_string(), line.to_string());
                 scope.insert("COMP_POINT".to_string(), line.len().to_string());
+                // What bash passes as $1/$2/$3 to a `-F` function.
+                scope.insert("COMP_KEY".to_string(), "9".to_string());
+                scope.insert("COMP_TYPE".to_string(), "9".to_string());
             }
+            state
+                .positional_stack
+                .push(std::mem::take(&mut state.positional_params));
+            state.positional_params = vec![
+                words.first().cloned().unwrap_or_default(),
+                prefix.to_string(),
+                words
+                    .get(cword.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or_default(),
+            ];
             state.arrays.insert("COMPREPLY".to_string(), Vec::new());
 
             // Execute the function
@@ -410,6 +478,7 @@ fn apply_completion_spec(
 
             // Clean up - pop the local scope
             state.pop_local_scope();
+            state.positional_params = state.positional_stack.pop().unwrap_or_default();
             state.arrays.remove("COMP_WORDS");
             state.arrays.remove("COMPREPLY");
         }
@@ -743,6 +812,85 @@ fn filter_by_file_type(completions: Vec<Completion>, cmd: &str) -> Vec<Completio
     } else {
         completions
     }
+}
+
+/// History expansion: `!!`, `!$`, and `!prefix` for the last command that
+/// started that way. The candidate is the designator, not what it expands
+/// to — expanding it is the shell's job at submit time — but the description
+/// shows the command it would reach, which is the part worth checking.
+fn complete_history_expansion(designator: &str) -> Vec<Completion> {
+    let entries = history_entries_once();
+    let last = entries.last().map(|entry| entry.command.as_str());
+
+    let mut completions = Vec::new();
+    if designator.is_empty() || designator.starts_with('!') {
+        if let Some(last) = last {
+            completions
+                .push(Completion::new("!!".to_string(), CompletionKind::Other).with_desc(last));
+        }
+    }
+    if designator.is_empty() || designator.starts_with('$') {
+        if let Some(word) = last.and_then(|command| command.split_whitespace().last()) {
+            completions.push(
+                Completion::new("!$".to_string(), CompletionKind::Other)
+                    .with_desc(&format!("last argument — {word}")),
+            );
+        }
+    }
+    if designator.is_empty() || designator.starts_with('^') {
+        if let Some(word) = last.and_then(|command| command.split_whitespace().nth(1)) {
+            completions.push(
+                Completion::new("!^".to_string(), CompletionKind::Other)
+                    .with_desc(&format!("first argument — {word}")),
+            );
+        }
+    }
+
+    // `!git` reaches the most recent command starting with `git`.
+    if !designator.is_empty() && designator.chars().next().is_some_and(char::is_alphanumeric) {
+        let mut seen = std::collections::HashSet::new();
+        for entry in entries.iter().rev() {
+            if !entry.command.starts_with(designator) {
+                continue;
+            }
+            let head = entry.command.split_whitespace().next().unwrap_or("");
+            if head.is_empty() || !seen.insert(head.to_string()) {
+                continue;
+            }
+            completions.push(
+                Completion::new(format!("!{head}"), CompletionKind::Other)
+                    .with_desc(&entry.command),
+            );
+            if completions.len() >= MAX_HISTORY_ARG_RESULTS {
+                break;
+            }
+        }
+    }
+    completions
+}
+
+/// `2>&<TAB>` and `>&<TAB>` want a file descriptor, not a file. The set is
+/// tiny and fixed: the three standard descriptors, plus `-` to close.
+fn redirect_descriptor_completions(before: &str, word: &str) -> Option<Vec<Completion>> {
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    if !trimmed.ends_with(">&") && !trimmed.ends_with("<&") {
+        return None;
+    }
+    let descriptors = [
+        ("1", "standard output"),
+        ("2", "standard error"),
+        ("0", "standard input"),
+        ("-", "close the descriptor"),
+    ];
+    Some(
+        descriptors
+            .iter()
+            .filter(|(descriptor, _)| descriptor.starts_with(word))
+            .map(|(descriptor, desc)| {
+                Completion::new((*descriptor).to_string(), CompletionKind::Other).with_desc(desc)
+            })
+            .collect(),
+    )
 }
 
 /// Is the word being completed the target of a redirection? True for the
@@ -1110,6 +1258,31 @@ fn subcommand_completions(
             .collect();
         if !results.is_empty() {
             return Some(results);
+        }
+    }
+
+    // A `def` function declares what each parameter is. A `path` parameter
+    // completes as a path, a `bool` as true/false — the declaration is the
+    // only description of these arguments that exists.
+    if let Some(signature) = state.user_signatures.get(cmd).cloned() {
+        if !prefix.starts_with('-') {
+            // Which parameter this word fills: positionals before it, minus
+            // the command itself.
+            let position = words
+                .iter()
+                .skip(1)
+                .filter(|word| !word.starts_with('-'))
+                .count();
+            let param = signature
+                .params
+                .get(position)
+                .or_else(|| signature.params.last().filter(|param| param.rest));
+            if let Some(param) = param {
+                let results = complete_by_type(&param.kind, &param.name, prefix, state);
+                if !results.is_empty() {
+                    return Some(results);
+                }
+            }
         }
     }
 
@@ -4364,6 +4537,155 @@ fn natural_version_order(a: &str, b: &str) -> std::cmp::Ordering {
     numbers(a).cmp(&numbers(b)).then_with(|| a.cmp(b))
 }
 
+/// Candidates for one declared parameter type. A type that could be
+/// anything (`string`, `int`, `any`) yields nothing rather than a guess, so
+/// the caller falls through to the ordinary completions.
+fn complete_by_type(
+    kind: &crate::signature::Type,
+    param_name: &str,
+    prefix: &str,
+    state: &ShellState,
+) -> Vec<Completion> {
+    use crate::signature::Type;
+    let candidates = match kind {
+        Type::Path => {
+            return complete_path(prefix, state)
+                .into_iter()
+                .map(|mut completion| {
+                    if completion.description.is_none() {
+                        completion.description = Some(param_name.to_string());
+                    }
+                    completion
+                })
+                .collect();
+        }
+        Type::Bool => vec![
+            Completion::new("true".to_string(), CompletionKind::Other).with_desc(param_name),
+            Completion::new("false".to_string(), CompletionKind::Other).with_desc(param_name),
+        ],
+        Type::Null => {
+            vec![Completion::new("null".to_string(), CompletionKind::Other).with_desc(param_name)]
+        }
+        // A union offers each member's candidates, so `path|null` still
+        // completes paths.
+        Type::Union(members) => {
+            let mut merged = Vec::new();
+            for member in *members {
+                merged.extend(complete_by_type(member, param_name, prefix, state));
+            }
+            return merged;
+        }
+        _ => return Vec::new(),
+    };
+    rank_prefix_then_fuzzy(candidates, prefix)
+}
+
+/// One `complete -A <action>`, resolved to the source this shell already
+/// has for it. Actions bash defines that would mean running something, or
+/// that jsh has no notion of, yield nothing rather than something wrong.
+fn complete_spec_action(action: &str, prefix: &str, state: &mut ShellState) -> Vec<Completion> {
+    let candidates = match action {
+        "file" | "filename" => complete_path(prefix, state),
+        "directory" => complete_path(prefix, state)
+            .into_iter()
+            .filter(|completion| completion.is_dir)
+            .collect(),
+        "command" => return complete_command(prefix, state),
+        "builtin" => crate::builtins::BUILTIN_NAMES
+            .iter()
+            .map(|name| {
+                Completion::new((*name).to_string(), CompletionKind::Builtin).with_desc("builtin")
+            })
+            .collect(),
+        "keyword" => SHELL_KEYWORDS
+            .iter()
+            .map(|(keyword, desc)| {
+                Completion::new((*keyword).to_string(), CompletionKind::Builtin).with_desc(desc)
+            })
+            .collect(),
+        "alias" => {
+            let mut names: Vec<(&String, &String)> = state.aliases.iter().collect();
+            names.sort_by_key(|(name, _)| name.as_str());
+            names
+                .into_iter()
+                .map(|(name, expansion)| {
+                    Completion::new(name.clone(), CompletionKind::Alias)
+                        .with_desc(&format!("alias for {expansion}"))
+                })
+                .collect()
+        }
+        "function" => {
+            let mut names: Vec<&String> = state.functions.keys().collect();
+            names.sort();
+            names
+                .into_iter()
+                .map(|name| {
+                    Completion::new(name.clone(), CompletionKind::Function).with_desc("function")
+                })
+                .collect()
+        }
+        "variable" | "arrayvar" => complete_variable_names("", state),
+        "export" => {
+            let mut names: Vec<&String> = state.env_vars.keys().collect();
+            names.sort();
+            names
+                .into_iter()
+                .map(|name| {
+                    Completion::new(name.clone(), CompletionKind::Variable)
+                        .with_desc("environment variable")
+                })
+                .collect()
+        }
+        "user" => complete_users(""),
+        "group" => complete_groups(""),
+        "hostname" => complete_ssh_hosts("", false, &state.home_dir),
+        "service" => complete_systemctl_units("", false, false),
+        "signal" => KILL_SIGNALS
+            .iter()
+            .map(|(signal, desc)| {
+                Completion::new(
+                    format!("SIG{}", signal.trim_start_matches('-')),
+                    CompletionKind::Other,
+                )
+                .with_desc(desc)
+            })
+            .filter(|completion| !completion.text.contains(|ch: char| ch.is_ascii_digit()))
+            .collect(),
+        "job" | "running" | "stopped" => state
+            .jobs
+            .jobs
+            .iter()
+            .filter(|job| match action {
+                "running" => matches!(job.status, crate::job::JobStatus::Running),
+                "stopped" => matches!(job.status, crate::job::JobStatus::Stopped),
+                _ => true,
+            })
+            .map(|job| {
+                Completion::new(format!("%{}", job.id), CompletionKind::Other)
+                    .with_desc(&job.command)
+            })
+            .collect(),
+        "shopt" => crate::builtins::SHOPT_OPTIONS
+            .iter()
+            .map(|(name, default_on)| {
+                Completion::new((*name).to_string(), CompletionKind::Other).with_desc(
+                    if *default_on {
+                        "on by default"
+                    } else {
+                        "off by default"
+                    },
+                )
+            })
+            .collect(),
+        "setopt" => crate::builtins::SET_OPTIONS
+            .iter()
+            .map(|(name, _)| Completion::new((*name).to_string(), CompletionKind::Other))
+            .collect(),
+        _ => Vec::new(),
+    };
+    rank_prefix_then_fuzzy(candidates, prefix)
+}
+
 /// The dynamic sources a completion spec may name.
 ///
 /// A generator is a fixed name resolved here, never a command line: a spec
@@ -4868,7 +5190,64 @@ fn escape_shell_word(word: &str) -> String {
     result
 }
 
+thread_local! {
+    /// Variable names, built once per shape of the environment. `echo $J`
+    /// rebuilt one `Completion` per environment variable, local, array and
+    /// associative array on every keystroke.
+    static VARIABLE_CANDIDATES: std::cell::RefCell<Option<(u64, std::rc::Rc<Vec<Completion>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn variable_candidate_generation(state: &ShellState) -> u64 {
+    let locals: usize = state.local_vars_stack.iter().map(HashMap::len).sum();
+    (state.env_vars.len() as u64)
+        .wrapping_mul(31)
+        .wrapping_add(locals as u64)
+        .wrapping_mul(31)
+        .wrapping_add(state.arrays.len() as u64)
+        .wrapping_mul(31)
+        .wrapping_add(state.assoc_arrays.len() as u64)
+}
+
 fn complete_variable(prefix: &str, state: &ShellState) -> Vec<Completion> {
+    let generation = variable_candidate_generation(state);
+    let candidates = VARIABLE_CANDIDATES.with(|cell| {
+        if let Some(cached) = cell
+            .borrow()
+            .as_ref()
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, candidates)| candidates.clone())
+        {
+            return cached;
+        }
+        let built = std::rc::Rc::new(build_variable_candidates(state));
+        *cell.borrow_mut() = Some((generation, built.clone()));
+        built
+    });
+
+    let pattern = lowered(prefix);
+    let mut scored: Vec<(&Completion, i32)> = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate,
+                fuzzy_match_score_lowered(&candidate.text, &pattern),
+            )
+        })
+        .filter(|(_, score)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.text.len().cmp(&b.0.text.len()))
+    });
+    scored
+        .into_iter()
+        .take(50)
+        .map(|(candidate, _)| candidate.clone())
+        .collect()
+}
+
+fn build_variable_candidates(state: &ShellState) -> Vec<Completion> {
     let mut completions = Vec::new();
 
     // Add special shell variables first
@@ -4885,7 +5264,7 @@ fn complete_variable(prefix: &str, state: &ShellState) -> Vec<Completion> {
     ];
 
     for (var_name, description) in special_vars {
-        if var_name.starts_with(prefix) || prefix.is_empty() {
+        {
             completions.push(Completion {
                 text: format!("${}", var_name),
                 display: var_name.to_string(),
@@ -4901,7 +5280,7 @@ fn complete_variable(prefix: &str, state: &ShellState) -> Vec<Completion> {
     let mut env_vars: Vec<_> = state.env_vars.keys().collect();
     env_vars.sort();
     for name in env_vars {
-        if name.starts_with(prefix) || prefix.is_empty() {
+        {
             completions.push(Completion {
                 text: format!("${}", name),
                 display: name.clone(),
@@ -4917,7 +5296,7 @@ fn complete_variable(prefix: &str, state: &ShellState) -> Vec<Completion> {
         let mut local_names: Vec<_> = scope.keys().collect();
         local_names.sort();
         for name in local_names {
-            if name.starts_with(prefix) || prefix.is_empty() {
+            {
                 completions.push(Completion {
                     text: format!("${}", name),
                     display: name.clone(),
@@ -4933,7 +5312,7 @@ fn complete_variable(prefix: &str, state: &ShellState) -> Vec<Completion> {
     let mut array_names: Vec<_> = state.arrays.keys().collect();
     array_names.sort();
     for name in array_names {
-        if name.starts_with(prefix) || prefix.is_empty() {
+        {
             let len = state.array_length(name);
             completions.push(Completion {
                 text: format!("${{{}[@]}}", name),
@@ -4949,7 +5328,7 @@ fn complete_variable(prefix: &str, state: &ShellState) -> Vec<Completion> {
     let mut assoc_names: Vec<_> = state.assoc_arrays.keys().collect();
     assoc_names.sort();
     for name in assoc_names {
-        if name.starts_with(prefix) || prefix.is_empty() {
+        {
             let len = state.array_length(name);
             completions.push(Completion {
                 text: format!("${{{}[@]}}", name),
@@ -4963,10 +5342,7 @@ fn complete_variable(prefix: &str, state: &ShellState) -> Vec<Completion> {
 
     // Remove duplicates
     completions.dedup_by(|a, b| a.text == b.text);
-
-    // Apply fuzzy filtering
-    let filtered = filter_completions(completions, prefix);
-    filtered.into_iter().take(50).collect()
+    completions
 }
 
 pub fn common_prefix(completions: &[Completion]) -> String {
@@ -5114,6 +5490,37 @@ pub fn command_at(buffer: &str, cursor: usize, state: &ShellState) -> Option<Str
     (!cmd.is_empty()).then_some(cmd)
 }
 
+/// Which characters of `text` the typed `pattern` matched, as byte offsets.
+///
+/// The same subsequence walk the score uses, so what a menu underlines is
+/// exactly what made a candidate rank where it did. An empty pattern matches
+/// nothing to highlight, and text the pattern does not match at all yields
+/// no offsets rather than a partial run.
+pub fn match_positions(text: &str, pattern: &str) -> Vec<usize> {
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+    // Offsets must index the original text, and lowercasing can change a
+    // character's length, so the walk stays on the original and folds case
+    // one character at a time.
+    let fold = |ch: char| ch.to_lowercase().next().unwrap_or(ch);
+    let mut pattern_chars = pattern.chars().map(fold).peekable();
+    let mut positions = Vec::new();
+    for (offset, ch) in text.char_indices() {
+        let Some(&wanted) = pattern_chars.peek() else {
+            break;
+        };
+        if fold(ch) == wanted {
+            pattern_chars.next();
+            positions.push(offset);
+        }
+    }
+    if pattern_chars.peek().is_some() {
+        return Vec::new();
+    }
+    positions
+}
+
 /// Prefix matches in their source order when any exist; otherwise
 /// fuzzy-ranked subsequence matches, so `git chk<TAB>` still finds checkout
 /// without prefix matches losing their curated order.
@@ -5167,6 +5574,12 @@ pub fn clear_cache() {
     // The generation check catches an alias or function added between
     // commands; dropping it here also catches one merely redefined.
     COMMAND_CANDIDATES.with(|candidates| {
+        *candidates.borrow_mut() = None;
+    });
+    // A variable's *value* can change without its name appearing or leaving,
+    // and array lengths are shown in the list, so this drops between
+    // commands rather than only when the generation count moves.
+    VARIABLE_CANDIDATES.with(|candidates| {
         *candidates.borrow_mut() = None;
     });
 }
@@ -7916,6 +8329,460 @@ mod tests {
         let buffer = "man ec";
         let (_, completions) = complete(buffer, buffer.len(), &mut state);
         assert!(completions.iter().any(|item| item.text == "echo"));
+    }
+
+    #[test]
+    fn complete_actions_reach_this_shells_own_sources() {
+        let mut state = ShellState::new(false);
+        state
+            .aliases
+            .insert("jsh_action_alias".to_string(), "echo".to_string());
+
+        let alias = complete_spec_action("alias", "jsh_action", &mut state);
+        assert!(alias.iter().any(|item| item.text == "jsh_action_alias"));
+
+        let builtins = complete_spec_action("builtin", "expo", &mut state);
+        assert!(builtins.iter().any(|item| item.text == "export"));
+
+        let keywords = complete_spec_action("keyword", "wh", &mut state);
+        assert!(keywords.iter().any(|item| item.text == "while"));
+
+        let users = complete_spec_action("user", "roo", &mut state);
+        assert!(users.iter().any(|item| item.text == "root"));
+
+        let signals = complete_spec_action("signal", "SIGT", &mut state);
+        assert!(signals.iter().any(|item| item.text == "SIGTERM"));
+
+        // An action naming something this shell will not do yields nothing
+        // rather than something wrong.
+        assert!(complete_spec_action("helptopic", "", &mut state).is_empty());
+        assert!(complete_spec_action("binding", "", &mut state).is_empty());
+    }
+
+    #[test]
+    fn a_registered_action_spec_answers_the_completion() {
+        let mut state = ShellState::new(false);
+        state.completion_specs.insert(
+            "jshtestcmd".to_string(),
+            crate::environment::CompletionSpec {
+                command: "jshtestcmd".to_string(),
+                word_list: None,
+                function: None,
+                directory: false,
+                file: false,
+                actions: vec!["user".to_string()],
+                glob_pattern: None,
+                filter_pattern: None,
+                prefix: None,
+                suffix: None,
+            },
+        );
+
+        clear_cache();
+        let buffer = "jshtestcmd roo";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "root"));
+    }
+
+    #[test]
+    fn completion_functions_see_the_whole_command_line() {
+        // `-F` functions read COMP_WORDS to decide what is being completed;
+        // giving them only the typed prefix made every one of them think it
+        // was completing a command name.
+        let mut state = ShellState::new(false);
+        let body = crate::parser::parse(
+            "COMPREPLY=( \"words:${#COMP_WORDS[@]}\" \"cword:$COMP_CWORD\" \"prev:$3\" )",
+        )
+        .expect("test completion function parses");
+        state.functions.insert(
+            "_jsh_probe".to_string(),
+            crate::parser::ast::CompoundCommand::BraceGroup {
+                body,
+                redirects: Vec::new(),
+            },
+        );
+        state.completion_specs.insert(
+            "deploy".to_string(),
+            crate::environment::CompletionSpec {
+                command: "deploy".to_string(),
+                word_list: None,
+                function: Some("_jsh_probe".to_string()),
+                directory: false,
+                file: false,
+                actions: Vec::new(),
+                glob_pattern: None,
+                filter_pattern: None,
+                prefix: None,
+                suffix: None,
+            },
+        );
+
+        clear_cache();
+        let buffer = "deploy staging ";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let texts: Vec<&str> = completions.iter().map(|c| c.text.as_str()).collect();
+        // "deploy", "staging" and the empty word being completed.
+        assert!(texts.contains(&"words:3"), "{texts:?}");
+        assert!(texts.contains(&"cword:2"), "{texts:?}");
+        // $3 is the word before the one being completed.
+        assert!(texts.contains(&"prev:staging"), "{texts:?}");
+    }
+
+    #[test]
+    fn typed_function_parameters_complete_by_their_declared_type() {
+        use crate::signature::{RuntimeParam, RuntimeSignature, Type};
+        let mut state = ShellState::new(false);
+        state.user_signatures.insert(
+            "deploy".to_string(),
+            RuntimeSignature {
+                name: "deploy".to_string(),
+                params: vec![
+                    RuntimeParam {
+                        name: "manifest".to_string(),
+                        kind: Type::Path,
+                        optional: false,
+                        rest: false,
+                    },
+                    RuntimeParam {
+                        name: "dry_run".to_string(),
+                        kind: Type::Bool,
+                        optional: true,
+                        rest: false,
+                    },
+                    RuntimeParam {
+                        name: "note".to_string(),
+                        kind: Type::String,
+                        optional: true,
+                        rest: false,
+                    },
+                ],
+                desc: "deploy a manifest".to_string(),
+            },
+        );
+
+        // The first parameter is a path.
+        clear_cache();
+        let buffer = "deploy src/comp";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions
+            .iter()
+            .any(|item| item.text.starts_with("src/completer")));
+
+        // The second is a bool, and says which parameter it is filling.
+        clear_cache();
+        let buffer = "deploy manifest.yaml tr";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let value = completions.iter().find(|item| item.text == "true").unwrap();
+        assert_eq!(value.description.as_deref(), Some("dry_run"));
+
+        // A string parameter could be anything, so the ordinary completions
+        // take over rather than a list being invented.
+        clear_cache();
+        let buffer = "deploy manifest.yaml true src/comp";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions
+            .iter()
+            .all(|item| item.text != "true" && item.text != "false"));
+    }
+
+    #[test]
+    fn declared_types_map_to_candidates_or_to_nothing() {
+        use crate::signature::Type;
+        let state = ShellState::new(false);
+
+        let bools = complete_by_type(&Type::Bool, "flag", "", &state);
+        assert_eq!(bools.len(), 2);
+
+        // A union offers each member: a nullable path still completes paths.
+        const NULLABLE_PATH: &[Type] = &[Type::Path, Type::Null];
+        let union = complete_by_type(&Type::Union(NULLABLE_PATH), "target", "", &state);
+        assert!(union.iter().any(|item| item.text == "null"));
+        assert!(union
+            .iter()
+            .any(|item| item.is_dir || !item.text.is_empty()));
+
+        // Types with no closed set of values invent nothing.
+        for kind in [Type::String, Type::Int, Type::Any, Type::Record] {
+            assert!(
+                complete_by_type(&kind, "value", "", &state).is_empty(),
+                "{kind:?} must not invent candidates"
+            );
+        }
+    }
+
+    #[test]
+    fn cd_offers_the_destinations_that_are_not_paths() {
+        let mut state = ShellState::new(false);
+        state
+            .dir_stack
+            .push(std::path::PathBuf::from("/home/user/elsewhere"));
+
+        clear_cache();
+        let buffer = "cd -";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let back = completions.iter().find(|item| item.text == "-").unwrap();
+        assert!(back
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("/home/user/elsewhere"));
+
+        // `..` completes upward, each level saying where it lands.
+        clear_cache();
+        let buffer = "cd ..";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions.iter().any(|item| item.text == "../"));
+        assert!(completions.iter().any(|item| item.text == "../../"));
+        let up = completions.iter().find(|item| item.text == "../").unwrap();
+        assert!(up.description.is_some(), "says which directory that is");
+
+        // With no previous directory there is nothing to go back to.
+        let mut fresh = ShellState::new(false);
+        clear_cache();
+        let (_, completions) = complete("cd -", 4, &mut fresh);
+        assert!(completions.iter().all(|item| item.text != "-"));
+    }
+
+    #[test]
+    fn match_positions_explain_why_a_candidate_matched() {
+        // A prefix match underlines its prefix.
+        assert_eq!(match_positions("checkout", "che"), vec![0, 1, 2]);
+        // A subsequence underlines exactly the characters that matched:
+        // c-h-e-c-k, so the k of `chk` is the fifth character.
+        assert_eq!(match_positions("checkout", "chk"), vec![0, 1, 4]);
+        // Case folds, and the offsets still index the original text.
+        assert_eq!(match_positions("Documents", "doc"), vec![0, 1, 2]);
+
+        // No match at all yields nothing rather than a partial run.
+        assert!(match_positions("checkout", "xyz").is_empty());
+        assert!(match_positions("checkout", "cx").is_empty());
+        assert!(match_positions("anything", "").is_empty());
+
+        // Offsets remain valid byte boundaries for multi-byte text.
+        let text = "日本語file";
+        for offset in match_positions(text, "語f") {
+            assert!(text.is_char_boundary(offset));
+        }
+        assert_eq!(match_positions(text, "語f").len(), 2);
+    }
+
+    /// A deterministic stand-in for randomness: tests must not depend on a
+    /// seed that changes between runs, and a failure must be reproducible.
+    fn pseudo_random_sequence(seed: u64, count: usize) -> Vec<u64> {
+        let mut state = seed | 1;
+        (0..count)
+            .map(|_| {
+                // xorshift64: small, deterministic, good enough to shuffle.
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completion_survives_arbitrary_buffers_at_every_cursor() {
+        // Every slice in the completer is a byte offset into the buffer, and
+        // several are computed rather than found. This walks a corpus of
+        // awkward lines at every character boundary — the operation the
+        // editor performs on each keystroke — and asserts only that nothing
+        // panics and that the returned offset is usable.
+        let pieces = [
+            "git checkout ",
+            "日本語 ",
+            "echo \"unclosed ",
+            "cat 'quoted arg' ",
+            "ls | grep -e ",
+            "$HOME/",
+            "${VAR}/x ",
+            "~root/",
+            "a=1 b=2 sudo -u ",
+            "cmd > out.txt 2>&1 ",
+            "for f in *; do ",
+            "$(git rev-parse ",
+            "`whoami` ",
+            "\\ escaped ",
+            "emoji🎉 ",
+            "--flag=value ",
+            "trailing\\",
+            "\"",
+            "'",
+            "|",
+        ];
+        let mut state = ShellState::new(false);
+
+        for seed in pseudo_random_sequence(0x5eed_1234, 25) {
+            // Build a line from three pieces chosen by the sequence.
+            let buffer: String = (0..3)
+                .map(|index| pieces[((seed >> (index * 8)) as usize) % pieces.len()])
+                .collect();
+
+            for cursor in 0..=buffer.len() {
+                if !buffer.is_char_boundary(cursor) {
+                    continue;
+                }
+                clear_cache();
+                let (word_start, completions) = complete(&buffer, cursor, &mut state);
+
+                assert!(
+                    word_start <= cursor,
+                    "word start {word_start} past cursor {cursor} in {buffer:?}"
+                );
+                assert!(
+                    buffer.is_char_boundary(word_start),
+                    "word start {word_start} splits a character in {buffer:?}"
+                );
+                // The editor replaces buffer[word_start..cursor] with the
+                // candidate text, so that range must be a valid slice.
+                let _ = &buffer[word_start..cursor];
+                for completion in &completions {
+                    assert!(
+                        crate::terminal_text::is_safe_inline(&completion.text),
+                        "unsafe candidate {:?} from {buffer:?}",
+                        completion.text
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn suggestion_and_helper_functions_survive_the_same_corpus() {
+        // The parsing helpers are reached with the same arbitrary text, and
+        // several index by byte offset.
+        let inputs = [
+            "",
+            " ",
+            "\\",
+            "\"",
+            "'",
+            "$",
+            "${",
+            "~",
+            "日本語",
+            "a=",
+            "=b",
+            "|||",
+            ">>",
+            "2>&",
+            "$()",
+            "``",
+            "cd ..",
+            "-",
+            "--",
+            "  spaced  out  ",
+        ];
+        let mut aliases = HashMap::new();
+        aliases.insert("x".to_string(), "y z".to_string());
+        aliases.insert("y".to_string(), "x".to_string());
+
+        for input in inputs {
+            let _ = extract_word_at(input);
+            let _ = active_command_segment(input);
+            let _ = active_command_segment_start(input);
+            let _ = first_command(input);
+            let _ = is_redirect_target(input);
+            let _ = open_quote_context(input);
+            let _ = assignment_value_start(input);
+            let _ = alias_expanded_segment(input, &aliases);
+            let _ = unescape_shell_word(input);
+            let _ = escape_shell_word(input);
+            let _ = split_command_segments(input);
+            let _ = quote_aware_words(input);
+            let _ = wrapper_value_kind(input);
+            for pattern in ["", "a", "日", "\\"] {
+                let _ = fuzzy_match_score(input, pattern);
+                for offset in match_positions(input, pattern) {
+                    assert!(input.is_char_boundary(offset));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn redirecting_a_descriptor_offers_descriptors_not_files() {
+        let mut state = ShellState::new(false);
+
+        clear_cache();
+        let buffer = "make 2>&";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        let texts: Vec<&str> = completions.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["1", "2", "0", "-"]);
+        assert_eq!(
+            completions[0].description.as_deref(),
+            Some("standard output")
+        );
+
+        clear_cache();
+        let buffer = "make 2>&1";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert_eq!(
+            completions
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"]
+        );
+
+        // A plain redirection still means a file.
+        clear_cache();
+        let buffer = "make > src/comp";
+        let (_, completions) = complete(buffer, buffer.len(), &mut state);
+        assert!(completions
+            .iter()
+            .any(|item| item.text.starts_with("src/completer")));
+    }
+
+    #[test]
+    fn history_expansion_designators_show_what_they_reach() {
+        let entries = vec![
+            crate::history::HistoryEntry {
+                command: "git commit -m fix".to_string(),
+                timestamp: 0,
+                cwd: None,
+            },
+            crate::history::HistoryEntry {
+                command: "cargo test --lib completer".to_string(),
+                timestamp: 0,
+                cwd: None,
+            },
+        ];
+        // Prime the per-command-line history cache with a known list.
+        clear_cache();
+        HISTORY_ENTRIES.with(|cell| {
+            *cell.borrow_mut() = Some(std::rc::Rc::new(entries));
+        });
+
+        let all = complete_history_expansion("");
+        let texts: Vec<&str> = all.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"!!"));
+        assert!(texts.contains(&"!$"));
+        assert_eq!(
+            all.iter()
+                .find(|c| c.text == "!!")
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("cargo test --lib completer")
+        );
+        assert!(all
+            .iter()
+            .find(|c| c.text == "!$")
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("completer"));
+
+        // A prefix reaches the most recent command that started with it.
+        let git = complete_history_expansion("git");
+        assert_eq!(git.len(), 1);
+        assert_eq!(git[0].text, "!git");
+        assert_eq!(git[0].description.as_deref(), Some("git commit -m fix"));
+
+        assert!(complete_history_expansion("nothingmatches").is_empty());
+        clear_cache();
     }
 
     #[test]

@@ -233,6 +233,10 @@ pub struct CompletionSpec {
     pub function: Option<String>,
     pub directory: bool,
     pub file: bool,
+    /// `-A <action>` and the short flags that stand for one (`-c`, `-u`,
+    /// `-v`, …). Several may apply to one command, as bash allows.
+    #[serde(default)]
+    pub actions: Vec<String>,
     pub glob_pattern: Option<String>,
     pub filter_pattern: Option<String>,
     pub prefix: Option<String>,

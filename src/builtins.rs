@@ -3078,6 +3078,23 @@ fn builtin_hook(args: &[String], state: &mut ShellState) -> i32 {
 // complete / compgen (Phase 7)
 // ============================================================
 
+/// The action each short `complete` flag stands for, as bash defines them.
+fn short_flag_action(flag: &str) -> &'static str {
+    match flag {
+        "-a" => "alias",
+        "-b" => "builtin",
+        "-c" => "command",
+        "-e" => "export",
+        "-g" => "group",
+        "-j" => "job",
+        "-k" => "keyword",
+        "-s" => "service",
+        "-u" => "user",
+        "-v" => "variable",
+        _ => "",
+    }
+}
+
 fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
     if args.is_empty() {
         // List all completion specs
@@ -3109,6 +3126,7 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
     let mut filter_pattern: Option<String> = None;
     let mut prefix: Option<String> = None;
     let mut suffix: Option<String> = None;
+    let mut actions: Vec<String> = Vec::new();
     let mut remove = false;
     let mut fallback_spec = false;
     let mut command_names: Vec<String> = Vec::new();
@@ -3116,17 +3134,30 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
 
     while i < args.len() {
         match args[i].as_str() {
-            // Flags jsh does not act on yet. They still have to be recognised:
-            // `complete -o default -F __nvm nvm` registered a spec for the word
-            // `default`, and `complete -A stopped -P '"%' -S '"' bg` one for
-            // `stopped`. Both shapes are all over bash-completion.
-            "-o" | "-A" | "-C" => i += 1,
+            // `-o` names a behaviour flag jsh does not act on, and `-C`
+            // names a command to run for completions, which this shell will
+            // not do on a keystroke. Both still consume their argument:
+            // `complete -o default -F __nvm nvm` must not register a spec
+            // for the word `default`.
+            "-o" | "-C" => i += 1,
+            // `-A <action>` names one of the sources this shell already has.
+            "-A" => {
+                i += 1;
+                if let Some(action) = args.get(i) {
+                    actions.push(action.clone());
+                }
+            }
             // `-D`, `-E` and `-I` name no command: they install the fallback
             // completion, the empty-line completion and the first-word one.
             // jsh has nowhere to put them yet, but they are valid calls and
             // must not be reported as a missing command name.
             "-D" | "-E" | "-I" => fallback_spec = true,
-            "-p" | "-a" | "-b" | "-c" | "-e" | "-g" | "-j" | "-k" | "-s" | "-u" | "-v" => {}
+            // The short spellings of the same actions, as bash defines them.
+            "-a" | "-b" | "-c" | "-e" | "-g" | "-j" | "-k" | "-s" | "-u" | "-v" => {
+                actions.push(short_flag_action(&args[i]).to_string());
+            }
+            // `-p` prints specs rather than naming an action.
+            "-p" => {}
             // Everything after `--` is a command name, empty string included.
             "--" => {
                 command_names.extend(args[i + 1..].iter().cloned());
@@ -3204,6 +3235,7 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
                 function: function.clone(),
                 directory,
                 file,
+                actions: actions.clone(),
                 glob_pattern: glob_pattern.clone(),
                 filter_pattern: filter_pattern.clone(),
                 prefix: prefix.clone(),

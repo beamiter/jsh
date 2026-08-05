@@ -75,6 +75,14 @@ fn bench_complete(c: &mut Criterion) {
         })
     });
 
+    clear_cache();
+    group.bench_function("variable_prefix_warm", |b| {
+        b.iter(|| {
+            let buffer = black_box("echo $JSH_BENCH");
+            complete(buffer, buffer.len(), &mut state)
+        })
+    });
+
     // Path completion over this repository's own source directory.
     group.bench_function("path_prefix", |b| {
         b.iter(|| {

@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Bash completion scripts work as written. `complete -A <action>` resolves to
+  this shell's own sources — users, groups, hostnames, services, jobs,
+  signals, aliases, functions, builtins, keywords, variables, exports, shopt
+  and set options — as do the short spellings (`-c`, `-u`, `-v`, …), and
+  actions jsh has no notion of yield nothing rather than something wrong. A
+  `-F` function now receives the whole command line: `COMP_WORDS`,
+  `COMP_CWORD`, `COMP_LINE` and `$1`/`$2`/`$3` as bash sets them. It
+  previously saw only the typed prefix, so every function that looked at
+  `${COMP_WORDS[1]}` — which is most of bash-completion — concluded it was
+  completing a command name.
+- A `def` function's parameters complete by their declared type: a `path`
+  parameter completes paths, a `bool` offers true and false, a union offers
+  each member, and a type that could be anything falls through to the ordinary
+  completions rather than inventing a list. Each candidate names the parameter
+  it is filling.
+- Ghost suggestions can be taken one word at a time with `Ctrl-Right` or
+  `Alt-F`, keeping the rest as a ghost — a suggestion is often right at the
+  start and wrong at the end. Paths arrive one directory per press. `cd -`
+  completes with where it would go back to, and `cd ..` completes upward with
+  the directory each level lands in.
+- The completion menu underlines the characters the typed text matched, so a
+  fuzzy match explains itself: `chk` landing on `checkout` is no longer
+  arbitrary.
+- Completing a variable no longer rebuilds every name on each keystroke; the
+  list is built once per shape of the environment and ranked in place. A
+  repeated `$JSH<TAB>` went from 159µs to 8µs.
+- `2>&<TAB>` completes file descriptors rather than files, and `!<TAB>`
+  completes history expansions — `!!`, `!$`, `!^` and `!prefix` — each showing
+  the command it would reach.
+- A randomised test drives completion over deliberately awkward command lines
+  — unclosed quotes, escapes, substitutions, multi-byte text, redirections —
+  at every cursor position, asserting that nothing panics and that the offset
+  it returns is always a usable character boundary.
+
 - Completion remembers what was taken. Accepting a candidate records it
   against the command whose argument it was, scored by the same frecency `z`
   uses for directories, and the next list leads with what was chosen before —
