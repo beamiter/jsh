@@ -42,7 +42,10 @@ Re-running it is how you update. Useful options:
 
 ```sh
 ./scripts/install-jsh.sh --check          # compare installed against latest
-./scripts/install-jsh.sh --channel source # build from git instead
+./scripts/install-jsh.sh --channel source # build from source; run from a checkout
+                                          # it builds that tree, uncommitted work included
+./scripts/install-jsh.sh --git            # build the published repository instead
+./scripts/install-jsh.sh --source-dir DIR # build a checkout somewhere else
 ./scripts/install-jsh.sh --stage-dir DIR --target TRIPLE   # verify only, install nothing
 ./scripts/install-jsh.sh --help           # bin directory, pinned version, dry run
 ```

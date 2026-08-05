@@ -16,6 +16,10 @@
 #   * `--stage-dir` stops after "downloaded and verified", so jsh-remote.sh can
 #     ship a binary to a machine that has no network without growing a second
 #     copy of the download-and-verify logic.
+#   * A source build prefers the checkout this script is run from, uncommitted
+#     work included. Building the last pushed commit instead would quietly
+#     install something other than the tree the user is standing in. Piped from
+#     curl there is no checkout to find, and the repository build takes over.
 
 set -eu
 
@@ -49,6 +53,10 @@ max_age=0
 tmp_dir=""
 stage_dir=""
 check_requested=0
+# Empty means "not resolved yet"; a source build fills it in with the checkout
+# to build, and leaves it empty when the repository is the right source.
+source_dir=""
+from_git=0
 
 usage() {
     cat <<'USAGE'
@@ -64,6 +72,10 @@ Options:
                        Staging always uses release. An explicit release that
                        finds no published release falls back to source and
                        says so
+  --source-dir PATH    Build this checkout, uncommitted work included. Defaults
+                       to the checkout this script lives in, when there is one
+  --git                Build the published repository even when the script is
+                       run from a checkout
   --prefix PATH        Install root; binary lands in PATH/bin
   --bin-dir PATH       Install directory for the binary (overrides --prefix)
   --target TRIPLE      Fetch for this target instead of the detected one
@@ -99,6 +111,47 @@ die() {
     exit 1
 }
 have() { command -v "$1" > /dev/null 2>&1; }
+
+# A directory is a jsh checkout when cargo would build *this* package from it.
+# The package name is the test that matters: a directory can carry a Cargo.toml
+# and still be some other crate that happens to sit next to a scripts/ dir.
+is_jsh_checkout() {
+    [ -n "${1:-}" ] || return 1
+    [ -f "$1/Cargo.toml" ] || return 1
+    [ -f "$1/src/main.rs" ] || return 1
+    grep -q '^[[:space:]]*name[[:space:]]*=[[:space:]]*"jsh"[[:space:]]*$' "$1/Cargo.toml" 2> /dev/null
+}
+
+abs_dir() {
+    (CDPATH='' cd -- "$1" 2> /dev/null && pwd) || return 1
+}
+
+# The checkout this script was started from, when it was started from one.
+# `curl … | sh` leaves $0 as "sh" with no path to resolve, so this prints
+# nothing and the caller builds the repository instead.
+script_checkout() {
+    _dir=""
+    case "${0}" in
+        */*) _dir="$(abs_dir "$(dirname -- "${0}")/..")" || return 0 ;;
+        *) return 0 ;;
+    esac
+    is_jsh_checkout "${_dir}" || return 0
+    printf '%s\n' "${_dir}"
+}
+
+# The version in a checkout's Cargo.toml: the first `version = "…"` after the
+# [package] header, so a dependency's pin cannot be read as the package's own.
+checkout_version() {
+    awk '
+        /^[[:space:]]*\[/ { in_pkg = ($0 ~ /^[[:space:]]*\[package\]/) }
+        in_pkg && /^[[:space:]]*version[[:space:]]*=/ {
+            if (match($0, /"[^"]*"/)) {
+                print substr($0, RSTART + 1, RLENGTH - 2)
+                exit
+            }
+        }
+    ' "$1/Cargo.toml" 2> /dev/null
+}
 
 cleanup() {
     [ -n "${tmp_dir}" ] && [ -d "${tmp_dir}" ] && rm -rf "${tmp_dir}"
@@ -148,6 +201,12 @@ while [ $# -gt 0 ]; do
             export JSH_INSTALL_TARGET
             shift
             ;;
+        --source-dir)
+            need_arg "$1" $#
+            source_dir="$2"
+            shift
+            ;;
+        --git) from_git=1 ;;
         --stage-dir)
             need_arg "$1" $#
             stage_dir="$2"
@@ -180,6 +239,28 @@ case "${channel}" in
     release | source) ;;
     *) die "unknown channel: ${channel} (expected release or source)" ;;
 esac
+if [ -n "${source_dir}" ]; then
+    # Order-independent, like every other refusal here: the two flags name
+    # opposite sources, and resolving them by write order would install
+    # whichever one the user did not mean.
+    [ "${from_git}" -eq 0 ] || die "--source-dir and --git are mutually exclusive"
+    [ "${channel}" = "source" ] || die "--source-dir needs --channel source"
+    resolved_source="$(abs_dir "${source_dir}")" || die "no such directory: ${source_dir}"
+    is_jsh_checkout "${resolved_source}" \
+        || die "${resolved_source} is not a jsh checkout (no Cargo.toml for package jsh)"
+    source_dir="${resolved_source}"
+    if [ -n "${want_version}" ]; then
+        # The tree is the thing being installed, so it has to actually be the
+        # version that was asked for. Building it anyway would install
+        # something whose banner contradicts the request.
+        tree_version="$(checkout_version "${source_dir}")"
+        [ "${tree_version}" = "${want_version}" ] \
+            || die "--version ${want_version} but ${source_dir} is jsh ${tree_version:-unknown}"
+    fi
+fi
+if [ "${from_git}" -eq 1 ] && [ "${channel}" = "release" ]; then
+    die "--git needs --channel source"
+fi
 case "${max_age}" in
     '' | *[!0-9]*) die "--max-age expects whole seconds" ;;
 esac
@@ -628,6 +709,18 @@ if [ "${channel}" = "release" ] && [ -z "${version}" ]; then
     fi
 fi
 
+# Which tree a source build reads. Resolved before the dry-run report, so that
+# report can name it. `./scripts/install-jsh.sh` is run from a working tree far
+# more often than not, and `cargo install --git` would build the last *pushed*
+# commit: the local fix being tested — the whole reason for running the script
+# from a checkout — would be silently left out. An explicit --version is the
+# one case that still means the repository: it names a published build, which a
+# working tree is not, whatever its Cargo.toml says.
+if [ "${channel}" = "source" ] && [ -z "${source_dir}" ] && [ "${from_git}" -eq 0 ] \
+    && [ -z "${want_version}" ]; then
+    source_dir="$(script_checkout)"
+fi
+
 if [ -n "${installed_version}" ] && [ "${installed_version}" = "${version}" ] && [ "${force}" -eq 0 ]; then
     say "jsh ${installed_version} is already installed at ${dest}"
     say "use --force to reinstall"
@@ -653,6 +746,7 @@ if [ "${dry_run}" -eq 1 ]; then
         say "would stage jsh ${version} (${target}) in ${stage_dir}"
     else
         say "would install jsh ${version:-from source} to ${dest} (channel: ${channel}, target: ${target:-n/a})"
+        [ -z "${source_dir}" ] || say "would build the checkout at ${source_dir}"
     fi
     exit 0
 fi
@@ -786,14 +880,30 @@ else
             ;;
     esac
 
+    # Name the tree, and say out loud when it carries work that is not
+    # committed: "installed from source" is ambiguous about which source, and
+    # this is the one line that removes the ambiguity.
+    source_origin="https://github.com/${REPO}"
+    if [ -n "${source_dir}" ]; then
+        source_origin="${source_dir}"
+        if have git && git -C "${source_dir}" rev-parse --git-dir > /dev/null 2>&1; then
+            if [ -n "$(git -C "${source_dir}" status --porcelain 2> /dev/null)" ]; then
+                source_origin="${source_dir} (uncommitted changes included)"
+            fi
+        fi
+    fi
     if [ -n "${source_target}" ]; then
-        say "building jsh from source for ${source_target}; this takes a few minutes"
+        say "building jsh from ${source_origin} for ${source_target}; this takes a few minutes"
     else
-        say "building jsh from source; this takes a few minutes"
+        say "building jsh from ${source_origin}; this takes a few minutes"
     fi
     cargo_root="${tmp_dir}/cargo-root"
     set -- --locked --root "${cargo_root}"
-    [ -z "${version}" ] || set -- "$@" --tag "v${version}"
+    if [ -n "${source_dir}" ]; then
+        set -- "$@" --path "${source_dir}"
+    else
+        [ -z "${version}" ] || set -- "$@" --tag "v${version}"
+    fi
     if [ -n "${source_target}" ]; then
         set -- "$@" --target "${source_target}"
         # The variable name cc-rs actually reads for a cross target; the same
@@ -802,7 +912,19 @@ else
         CC_aarch64_unknown_linux_musl="${source_cc}"
         export CC_x86_64_unknown_linux_musl CC_aarch64_unknown_linux_musl
     fi
-    cargo install --git "https://github.com/${REPO}" "$@" jsh || die "cargo install failed"
+    if [ -n "${source_dir}" ]; then
+        if ! cargo install "$@"; then
+            # The failure this wording exists for: a Cargo.toml edited without
+            # its lock file, which --locked refuses. Nothing here writes to the
+            # user's tree to fix that.
+            if [ -f "${source_dir}/Cargo.lock" ]; then
+                warn "if --locked rejected the lock file, run 'cargo update --workspace' in ${source_dir} first"
+            fi
+            die "cargo install failed for ${source_dir}"
+        fi
+    else
+        cargo install --git "https://github.com/${REPO}" "$@" jsh || die "cargo install failed"
+    fi
     [ -f "${cargo_root}/bin/jsh" ] || die "cargo did not produce a binary"
     if [ -n "${source_target}" ] && have ldd; then
         # Confirmation, not enforcement: the triple already decides linkage,

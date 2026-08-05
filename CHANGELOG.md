@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A source install builds the checkout it is run from, uncommitted work
+  included. `./scripts/install-jsh.sh` used to hand the build to
+  `cargo install --git` regardless, so the local fix being tested — the reason
+  to run the installer from a working tree at all — was left out of the binary
+  that got installed, and the version banner gave no hint of it. Piped from
+  curl there is no checkout to find and the repository build is unchanged.
+  `--source-dir DIR` names a tree explicitly, `--git` asks for the published
+  repository from inside a checkout, and `--version` still means a published
+  build: it keeps the repository unless the named tree really is that version.
+  The build line now says which tree it read and whether that tree was dirty.
+
 - `compgen` and `complete -A` now reach the same implementation of each
   action the Tab completer uses, so a script and a keystroke cannot disagree
   about what a user, a service or a builtin is. `compgen` previously carried
