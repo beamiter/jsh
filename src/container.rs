@@ -579,6 +579,7 @@ fn place_binary_in_container(engine: Engine, container: &str, binary: &Path) -> 
                 stdin: Some(&bytes),
                 cancel: None,
                 die_with_parent: true,
+                new_session: false,
             },
         )
         .is_ok_and(|output| output.status.success());

@@ -892,6 +892,25 @@ fn command_describe(names: &[String], verbose: bool, state: &ShellState) -> i32 
     ret
 }
 
+/// Drop the two lines an interactive bash prints when it is started without a
+/// controlling terminal.
+///
+/// The helper has to be interactive — that is the only way the startup file it
+/// is sourcing will run past its own `case $- in *i*)` guard — but its stdin is
+/// a pipe, so bash announces that it cannot claim the terminal. Reporting that
+/// as a warning from the sourced file would put two lines of noise under every
+/// `source` of anything jsh's own parser could not read.
+fn strip_job_control_notices(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| {
+            !line.contains("cannot set terminal process group")
+                && !line.contains("no job control in this shell")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Use bash to source a script file when jsh's parser can't handle it,
 /// then reload environment variables and simple functions back into jsh.
 fn source_via_bash(path: &str, source_args: &[String], state: &mut ShellState) -> i32 {
@@ -899,6 +918,11 @@ fn source_via_bash(path: &str, source_args: &[String], state: &mut ShellState) -
     const MAX_SOURCE_HELPER_STDERR_BYTES: usize = 1024 * 1024;
     // Create a bash script that sources the file and outputs environment variables
     let bash_script = r#"
+# A startup file decides whether anyone is listening by looking at PS1 and at
+# `$-`; both have to say the same thing or the file stops at its own first
+# guard. See the matching helper in config.rs.
+export PS1='$ '
+
 set -a
 source -- "$1" "${@:2}"
 set +a
@@ -920,12 +944,16 @@ declare -F | awk '{print $3}'
     };
     let mut command = std::process::Command::new(bash);
     command
+        .arg("--norc")
+        .arg("--noprofile")
+        .arg("-i")
         .arg("-c")
         .arg(bash_script)
         .arg("jsh-source")
         .arg(path)
-        .args(source_args);
-    match crate::io_guard::bounded_command_output(
+        .args(source_args)
+        .env("HISTFILE", "/dev/null");
+    match crate::io_guard::bounded_command_output_detached(
         &mut command,
         MAX_SOURCE_HELPER_OUTPUT_BYTES,
         MAX_SOURCE_HELPER_STDERR_BYTES,
@@ -936,6 +964,7 @@ declare -F | awk '{print $3}'
             let stderr = String::from_utf8_lossy(&output.stderr);
 
             // If bash had errors, print them but continue
+            let stderr = strip_job_control_notices(&stderr);
             if !stderr.is_empty() && !stderr.contains("warning") {
                 eprintln!(
                     "jsh: bash source warnings: {}",

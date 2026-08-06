@@ -83,6 +83,60 @@ pub(crate) fn explicit_absolute_executable(path: &Path) -> bool {
     trusted_explicit_executable(path)
 }
 
+/// Why [`executable_named_by_startup`] would not run a path.
+pub(crate) enum StartupExecutable {
+    Ok,
+    /// Not absolute, missing, not a file, or not executable.
+    Unusable,
+    /// Some third account owns it or a directory above it.
+    ForeignOwner,
+}
+
+/// Validate an executable that the user's own startup file named, such as
+/// `$CONDA_EXE`.
+///
+/// This is deliberately weaker than [`trusted_explicit_executable`], and the
+/// reason is that the stronger rule was protecting nothing here. jsh reaches
+/// `$CONDA_EXE` only by first *sourcing the startup file that set it* — a file
+/// which, in the container images where this keeps coming up, is itself mode
+/// 0777 in a mode 0777 home, and which has already run that very binary
+/// (`conda activate base` is a line in it). A shell that executes the config
+/// and then refuses the one path the config named has not closed the hole; it
+/// has only lost the shell hook, silently, which is how `conda activate` came
+/// to answer "run 'conda init' first" in a shell whose `conda init` block has
+/// been in place for years.
+///
+/// So the writability bits are not consulted. Ownership still is: a path owned
+/// by some *third* account is a different machine-level claim from a loose mode
+/// on the user's own tree, and nothing in the startup file justifies running
+/// it. That case is reported rather than ignored — see the caller.
+pub(crate) fn executable_named_by_startup(path: &Path) -> StartupExecutable {
+    if !path.is_absolute() {
+        return StartupExecutable::Unusable;
+    }
+    let Ok(resolved) = path.canonicalize() else {
+        return StartupExecutable::Unusable;
+    };
+    let Ok(metadata) = resolved.metadata() else {
+        return StartupExecutable::Unusable;
+    };
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return StartupExecutable::Unusable;
+    }
+    let euid = unsafe { nix::libc::geteuid() };
+    let mut component = Some(resolved.as_path());
+    while let Some(current) = component {
+        let Ok(metadata) = current.metadata() else {
+            return StartupExecutable::Unusable;
+        };
+        if metadata.uid() != 0 && metadata.uid() != euid {
+            return StartupExecutable::ForeignOwner;
+        }
+        component = current.parent();
+    }
+    StartupExecutable::Ok
+}
+
 /// Environment variable that names an explicit absolute path for a helper.
 /// `notify-send` becomes `JSH_HELPER_NOTIFY_SEND`.
 fn helper_path_variable(name: &str) -> String {
@@ -477,6 +531,39 @@ pub(crate) fn bounded_command_output(
             stdin: None,
             cancel: None,
             die_with_parent: false,
+            new_session: false,
+        },
+    )
+}
+
+/// [`bounded_command_output`] for a helper that must not be able to touch the
+/// terminal jsh is drawing on.
+///
+/// An interactive bash is the one helper that goes looking. Job control is part
+/// of what `-i` means, so before it runs a line it opens `/dev/tty`, reads the
+/// foreground process group and tries to make itself that group. From a child
+/// in a background process group `tcsetpgrp` raises `SIGTTOU`, whose default
+/// action is to *stop* the process — so the helper never exits, jsh drains an
+/// idle pipe until the deadline, and the startup file it was sourcing is
+/// reported as a timeout. Detaching the helper into its own session leaves it
+/// with no controlling terminal to find: bash says it has no job control, on
+/// stderr, and gets on with the file.
+pub(crate) fn bounded_command_output_detached(
+    command: &mut Command,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Duration,
+) -> io::Result<Output> {
+    bounded_command_session(
+        command,
+        BoundedCommand {
+            stdout_limit,
+            stderr_limit,
+            timeout,
+            stdin: None,
+            cancel: None,
+            die_with_parent: false,
+            new_session: true,
         },
     )
 }
@@ -510,6 +597,13 @@ pub(crate) struct BoundedCommand<'a> {
     /// timeout as the backstop, but the window shrinks from minutes to
     /// microseconds.
     pub die_with_parent: bool,
+    /// Put the child in a session of its own rather than merely a process group
+    /// of its own, so that it has no controlling terminal.
+    ///
+    /// `setsid` makes the child a group leader too, so the timeout and cancel
+    /// paths below still reach a whole helper tree through `kill(-pid)`. See
+    /// [`bounded_command_output_detached`] for why anything wants this.
+    pub new_session: bool,
 }
 
 /// [`bounded_command_output`] with a stdin payload and a cancellation predicate.
@@ -524,6 +618,7 @@ pub(crate) fn bounded_command_session(
         stdin: stdin_payload,
         cancel,
         die_with_parent,
+        new_session,
     } = options;
     command
         .stdout(Stdio::piped())
@@ -532,10 +627,27 @@ pub(crate) fn bounded_command_session(
             Stdio::piped()
         } else {
             Stdio::null()
-        })
+        });
+    if new_session {
+        // SAFETY: runs between fork and exec in the child. setsid is a single
+        // async-signal-safe syscall and touches no allocator or lock.
+        //
+        // It replaces `process_group(0)` rather than joining it: setsid fails
+        // with EPERM on a process that is already a group leader, which is
+        // exactly what `process_group(0)` would have made this one.
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
         // A helper that forks must not escape timeout cleanup merely by
         // leaving a descendant holding one of the capture pipes open.
-        .process_group(0);
+        command.process_group(0);
+    }
     if die_with_parent {
         // SAFETY: runs between fork and exec in the child. prctl is a single
         // async-signal-safe syscall and touches no allocator or lock, which is
@@ -832,6 +944,7 @@ mod tests {
                 stdin: None,
                 cancel: Some(&predicate),
                 die_with_parent: false,
+                new_session: false,
             },
         )
         .expect_err("cancelled helper must not succeed");
@@ -856,10 +969,49 @@ mod tests {
                 stdin: None,
                 cancel: Some(&never),
                 die_with_parent: false,
+                new_session: false,
             },
         )
         .expect("helper");
         assert_eq!(output.stdout, b"done");
+    }
+
+    /// Field 6 of `/proc/PID/stat` is the session id. `comm` is field 2 and can
+    /// contain spaces, but not for the two commands used here.
+    #[cfg(target_os = "linux")]
+    fn session_of_helper(detached: bool) -> u32 {
+        let mut command = Command::new("sh");
+        command.args(["-c", "cut -d' ' -f6 /proc/self/stat"]);
+        let output = if detached {
+            bounded_command_output_detached(&mut command, 64, 64, Duration::from_secs(10))
+        } else {
+            bounded_command_output(&mut command, 64, 64, Duration::from_secs(10))
+        }
+        .expect("helper");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("session id")
+    }
+
+    /// The property that keeps an interactive helper bash from stopping itself
+    /// on `SIGTTOU`: with no session of its own it shares jsh's controlling
+    /// terminal, opens `/dev/tty`, and tries to take the foreground.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_detached_helper_leaves_the_terminal_alone() {
+        let ours = unsafe { nix::libc::getsid(0) } as u32;
+        assert_eq!(
+            session_of_helper(false),
+            ours,
+            "an ordinary helper should stay in this session"
+        );
+        assert_ne!(
+            session_of_helper(true),
+            ours,
+            "a detached helper still shares jsh's session, so it still shares \
+             jsh's controlling terminal"
+        );
     }
 
     #[test]
@@ -877,6 +1029,7 @@ mod tests {
                 stdin: Some(&payload),
                 cancel: None,
                 die_with_parent: false,
+                new_session: false,
             },
         )
         .expect("helper");
@@ -901,6 +1054,7 @@ mod tests {
                 stdin: Some(&payload),
                 cancel: None,
                 die_with_parent: false,
+                new_session: false,
             },
         )
         .expect("helper");

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- `~/.bashrc` is imported as the interactive file it is. Every distribution
+  opens it with `case $- in *i*) ;; *) return;; esac`, and the helper bash jsh
+  hands it to was not interactive, so the file returned at its fourth line and
+  the import came back empty — no PATH entries, no aliases, no `conda init`
+  block. Nothing reported it; the first sign was `conda activate` answering
+  "run 'conda init' before 'conda activate'" in a shell whose `conda init` had
+  been run years ago. The helper is now `bash --norc -i`, which is also what
+  the `source` builtin uses when it falls back to bash.
+- A helper that is interactive wants a terminal, and jsh has one. Asking for
+  the foreground process group from a background one is answered with
+  `SIGTTOU`, which stops the helper rather than failing it, so the startup
+  import died on its deadline instead. Helpers that source a startup file now
+  run in a session of their own, where there is no terminal to ask for. Their
+  own "no job control in this shell" notice no longer reaches the user, while
+  real errors from the file still do.
+- The conda shell hook is loaded from a `$CONDA_EXE` under the user's own
+  directories even when the permissions there are loose, which in the
+  container images this keeps being reported from means mode 0777. jsh has
+  already sourced the equally loose `.bashrc` that named the binary, and bash
+  has already run it, so refusing it lost the hook without closing anything.
+  A `$CONDA_EXE` owned by a third account is still refused — and said so.
+  Every way of failing to load the hook now names the path and the reason,
+  where each one used to be a bare `return`.
+
 - A source install builds the checkout it is run from, uncommitted work
   included. `./scripts/install-jsh.sh` used to hand the build to
   `cargo install --git` regardless, so the local fix being tested — the reason

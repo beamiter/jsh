@@ -640,6 +640,7 @@ fn model_request(request: HttpRequest, provider: Provider) -> Result<String, Str
             // A shell that is killed outright must not leave a request running
             // against the provider with nobody to read the answer.
             die_with_parent: true,
+            new_session: false,
         },
     );
 

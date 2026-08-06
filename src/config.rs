@@ -136,11 +136,31 @@ shopt 2>/dev/null || true
     };
     let mut command = std::process::Command::new(bash);
     command
+        // `PS1` is only half of how a startup file asks whether anyone is
+        // listening. The other half is `$-`, and the guard every distribution
+        // ships — `case $- in *i*) ;; *) return;; esac` — is the *first* thing
+        // in ~/.bashrc, so a helper bash without `i` in `$-` returns before
+        // line ten and jsh imports an empty environment from a file full of
+        // settings. That is how `conda activate` ends up reporting "run
+        // 'conda init' first" under a jsh whose ~/.bashrc has been conda-init'd
+        // for years: the block is there, it is simply never reached, so
+        // `CONDA_EXE` never arrives and the hook that defines the `conda`
+        // function has nothing to key off.
+        //
+        // `-i` sets that flag. `--norc` keeps it from meaning two sources of
+        // the same file: bash would read ~/.bashrc on its own, and then again
+        // below. `--noprofile` is for the login case, and `HISTFILE` keeps a
+        // helper that exits like an interactive shell from appending to the
+        // user's history.
+        .arg("--norc")
+        .arg("--noprofile")
+        .arg("-i")
         .arg("-c")
         .arg(bash_script)
         .arg("jsh-config")
-        .arg(path);
-    match crate::io_guard::bounded_command_output(
+        .arg(path)
+        .env("HISTFILE", "/dev/null");
+    match crate::io_guard::bounded_command_output_detached(
         &mut command,
         MAX_CONFIG_HELPER_STDOUT_BYTES,
         MAX_CONFIG_HELPER_STDERR_BYTES,
@@ -161,8 +181,29 @@ fn load_conda_hook(state: &mut ShellState) {
     else {
         return;
     };
-    if !crate::io_guard::explicit_absolute_executable(&conda_cmd) {
-        return;
+    // Every path out of this function used to be a bare `return`. A missing
+    // hook does not announce itself — it surfaces much later as conda telling
+    // the user to run `conda init`, in a shell where `conda init` has already
+    // been run and cannot help. So each way of failing says so, once, naming
+    // the path it failed on.
+    match crate::io_guard::executable_named_by_startup(&conda_cmd) {
+        crate::io_guard::StartupExecutable::Ok => {}
+        crate::io_guard::StartupExecutable::Unusable => {
+            eprintln!(
+                "jsh: conda: $CONDA_EXE is not an executable file: {}",
+                conda_cmd.display()
+            );
+            return;
+        }
+        crate::io_guard::StartupExecutable::ForeignOwner => {
+            eprintln!(
+                "jsh: conda: refusing to run {} for its shell hook: it, or a \
+                 directory above it, belongs to another user; `conda activate` \
+                 will not be available",
+                conda_cmd.display()
+            );
+            return;
+        }
     }
 
     let mut command = std::process::Command::new(&conda_cmd);
@@ -174,16 +215,40 @@ fn load_conda_hook(state: &mut ShellState) {
         CONFIG_HELPER_TIMEOUT,
     ) {
         Ok(output) if output.status.success() => output,
-        _ => return,
+        Ok(output) => {
+            eprintln!(
+                "jsh: conda: `{} shell.posix hook` failed: {}",
+                conda_cmd.display(),
+                crate::terminal_text::escape_inline(
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                    4 * 1024
+                )
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!(
+                "jsh: conda: could not run {} for its shell hook: {error}",
+                conda_cmd.display()
+            );
+            return;
+        }
     };
 
     let hook = String::from_utf8_lossy(&output.stdout);
     if hook.trim().is_empty() {
+        eprintln!(
+            "jsh: conda: {} produced an empty shell hook",
+            conda_cmd.display()
+        );
         return;
     }
 
-    if let Ok(commands) = parser::parse(&hook) {
-        executor::execute_program(&commands, state);
+    match parser::parse(&hook) {
+        Ok(commands) => {
+            executor::execute_program(&commands, state);
+        }
+        Err(error) => eprintln!("jsh: conda: could not read the shell hook: {error}"),
     }
 }
 
@@ -641,6 +706,203 @@ extglob         on"#;
 
         assert_eq!(state.get_var("JSH_SPECIAL_RC_PATH"), Some("loaded"));
         state.unset_var("JSH_SPECIAL_RC_PATH");
+    }
+
+    /// The guard that opens ~/.bashrc on Debian, Ubuntu, Fedora and every
+    /// image built from them. Everything a user configures lives below it.
+    const INTERACTIVE_GUARD: &str = "case $- in\n    *i*) ;;\n      *) return;;\nesac\n";
+
+    #[test]
+    fn bash_bridge_runs_past_the_stock_interactive_guard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("guarded.bashrc");
+        std::fs::write(
+            &path,
+            format!("{INTERACTIVE_GUARD}export JSH_PAST_THE_GUARD=loaded\n"),
+        )
+        .expect("write rc file");
+
+        let mut state = ShellState::new(false);
+        source_via_bash(&path, &mut state);
+
+        assert_eq!(
+            state.get_var("JSH_PAST_THE_GUARD"),
+            Some("loaded"),
+            "the helper bash reported a non-interactive $-, so the rc returned \
+             at its first line and jsh imported nothing"
+        );
+        state.unset_var("JSH_PAST_THE_GUARD");
+    }
+
+    /// A stand-in for `/opt/conda/bin/conda` that answers the two subcommands
+    /// the shell hook is built out of, and nothing else.
+    ///
+    /// The `activate` reply is conda's own protocol: the `conda` shell function
+    /// asks the binary what to do, and evaluates the answer in the *shell's own*
+    /// process. That is the whole reason the hook has to exist — a `conda`
+    /// resolved from PATH runs in a child and cannot change this shell's
+    /// environment, which is what "run 'conda init' before 'conda activate'" is
+    /// telling the user. Anything but `shell.posix` gets that same refusal, so
+    /// a test that loses the hook fails the way the bug did.
+    fn fake_conda(dir: &Path) -> PathBuf {
+        let root = dir.join("miniconda");
+        fs::create_dir_all(root.join("bin")).expect("conda bin dir");
+        let exe = root.join("bin").join("conda");
+        fs::write(
+            &exe,
+            r#"#!/bin/sh
+case "$1 $2" in
+"shell.posix hook")
+    cat <<'HOOK'
+export CONDA_EXE='__SELF__'
+export CONDA_SHLVL=0
+__conda_activate() {
+    \local ask_conda
+    ask_conda="$("$CONDA_EXE" shell.posix "$@")" || \return
+    \eval "$ask_conda"
+}
+conda() {
+    \local cmd="${1-__missing__}"
+    case "$cmd" in
+        activate|deactivate)
+            __conda_activate "$@"
+            ;;
+        *)
+            "$CONDA_EXE" "$@"
+            ;;
+    esac
+}
+HOOK
+    ;;
+"shell.posix activate")
+    echo "export CONDA_PREFIX='__ROOT__/envs/$3'"
+    echo "export CONDA_DEFAULT_ENV='$3'"
+    echo "export CONDA_SHLVL=1"
+    ;;
+*)
+    echo "CondaError: Run 'conda init' before 'conda activate'" >&2
+    exit 1
+    ;;
+esac
+"#
+            .replace("__SELF__", &exe.display().to_string())
+            .replace("__ROOT__", &root.display().to_string()),
+        )
+        .expect("write fake conda");
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod fake conda");
+        exe
+    }
+
+    /// The bug this whole path exists for, start to finish: a stock guarded
+    /// `~/.bashrc` carrying a `conda init` block, imported at startup, followed
+    /// by the user typing `conda activate`.
+    ///
+    /// Every stage is load-bearing. The guard is what a non-interactive helper
+    /// bash returns at, taking `CONDA_EXE` with it; `CONDA_EXE` is what the
+    /// hook loader keys off; and the hook is what makes `conda` a function that
+    /// can change *this* process rather than a binary that cannot.
+    #[test]
+    fn conda_activate_survives_a_guarded_bashrc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conda = fake_conda(dir.path());
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).expect("home dir");
+        fs::write(
+            home.join(".bashrc"),
+            format!(
+                "{INTERACTIVE_GUARD}\n\
+                 # >>> conda initialize >>>\n\
+                 export CONDA_EXE='{}'\n\
+                 # <<< conda initialize <<<\n",
+                conda.display()
+            ),
+        )
+        .expect("write bashrc");
+
+        let mut state = ShellState::new(false);
+        state.home_dir = home;
+        state.shell_opts.config_source = ConfigSource::Bashrc;
+
+        load_config(&mut state);
+        assert_eq!(
+            state.get_var("CONDA_EXE"),
+            Some(conda.display().to_string().as_str()),
+            "the conda init block never ran, so nothing downstream can work"
+        );
+
+        refresh_shell_integrations(&mut state);
+        assert!(
+            state.functions.contains_key("conda"),
+            "the shell hook did not define conda as a function, so `conda \
+             activate` would run the binary in a child and report that \
+             `conda init` has not been run"
+        );
+
+        let activate = parser::parse("conda activate demo").expect("parse activate");
+        executor::execute_program(&activate, &mut state);
+
+        assert_eq!(state.get_var("CONDA_DEFAULT_ENV"), Some("demo"));
+        assert_eq!(
+            state.get_var("CONDA_PREFIX"),
+            Some(
+                dir.path()
+                    .join("miniconda")
+                    .join("envs")
+                    .join("demo")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+        );
+        for name in [
+            "CONDA_EXE",
+            "CONDA_PREFIX",
+            "CONDA_DEFAULT_ENV",
+            "CONDA_SHLVL",
+        ] {
+            state.unset_var(name);
+        }
+    }
+
+    /// Loose permissions on the user's own tree are not a reason to drop the
+    /// hook. They are the normal state of the container images this keeps being
+    /// reported from, where `$HOME` and the conda prefix are both mode 0777 —
+    /// and where jsh has already sourced the equally loose `.bashrc` that named
+    /// the binary, and bash has already run it.
+    #[test]
+    fn a_world_writable_conda_prefix_still_yields_a_hook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conda = fake_conda(dir.path());
+        fs::set_permissions(&conda, fs::Permissions::from_mode(0o777)).expect("chmod conda");
+        fs::set_permissions(
+            conda.parent().expect("bin dir"),
+            fs::Permissions::from_mode(0o777),
+        )
+        .expect("chmod bin");
+
+        let mut state = ShellState::new(false);
+        state.export_var("CONDA_EXE", &conda.display().to_string());
+        refresh_shell_integrations(&mut state);
+
+        assert!(
+            state.functions.contains_key("conda"),
+            "a mode 0777 conda under the user's own directory was refused"
+        );
+        for name in ["CONDA_EXE", "CONDA_SHLVL"] {
+            state.unset_var(name);
+        }
+    }
+
+    #[test]
+    fn a_conda_owned_by_another_user_is_refused() {
+        // Only root can hand a file to a third account, so on an ordinary test
+        // run the reachable half of this rule is the ownership walk itself.
+        let refused = matches!(
+            crate::io_guard::executable_named_by_startup(Path::new("/proc/1/root/bin/sh")),
+            crate::io_guard::StartupExecutable::Unusable
+                | crate::io_guard::StartupExecutable::ForeignOwner
+        );
+        assert!(refused || unsafe { nix::libc::geteuid() } == 0);
     }
 
     #[test]
