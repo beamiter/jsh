@@ -411,7 +411,6 @@ fn ensure_journal_parent(path: &Path, harden_existing: bool) -> io::Result<File>
     if !existed || harden_existing {
         directory.set_permissions(fs::Permissions::from_mode(0o700))?;
     }
-    ensure_non_writable_directory(&directory, parent)?;
     Ok(directory)
 }
 
@@ -454,6 +453,10 @@ fn ensure_regular_file(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The directory has to be the user's; it does not have to be private. See the
+/// same function in `history.rs` for why the mode bits are not consulted — the
+/// journal's own descriptor carries the same `O_NOFOLLOW`, one-link,
+/// owned-by-this-user, 0600 guarantees.
 fn ensure_owned_directory(file: &File, path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -469,18 +472,6 @@ fn ensure_owned_directory(file: &File, path: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{path:?} is not owned by the current user"),
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_non_writable_directory(file: &File, path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    if file.metadata()?.mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{path:?} is writable by another user or group"),
         ));
     }
     Ok(())
@@ -996,17 +987,39 @@ mod tests {
         );
     }
 
+    /// A shared parent directory says where the user keeps their state, not
+    /// who owns the journal in it. The journal is still this user's and still
+    /// 0600, established on its own descriptor.
     #[test]
-    fn group_writable_custom_parent_is_rejected() {
+    fn group_writable_custom_parent_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("shared");
         fs::create_dir(&parent).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o770)).unwrap();
         let journal = ExecutionJournal::with_path(parent.join("custom.jsonl"));
 
+        journal
+            .record_start("jsh-custom", None, 1, "true", "/tmp", 1)
+            .expect("a shared parent is not a private file");
+
+        assert_eq!(
+            fs::metadata(journal.path()).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    /// The directory rule that remains: a parent belonging to another account
+    /// is refused. `/tmp` is root-owned and 1777 wherever it exists.
+    #[test]
+    fn a_custom_parent_owned_by_another_user_is_rejected() {
+        if unsafe { nix::libc::geteuid() } == 0 {
+            return; // root owns /tmp, so there is no third party to test against
+        }
+        let journal = ExecutionJournal::with_path(PathBuf::from("/tmp/.jsh-journal-probe.jsonl"));
+
         let error = journal
             .record_start("jsh-custom", None, 1, "true", "/tmp", 1)
-            .expect_err("unsafe namespace accepted");
+            .expect_err("another user's directory accepted");
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(!journal.path().exists());

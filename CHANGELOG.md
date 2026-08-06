@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- History, z-jump and the execution journal are kept in a directory the user
+  owns, whatever its mode bits say. Refusing a group- or world-writable parent
+  was a second, weaker statement of something the file's own descriptor already
+  proves — `O_NOFOLLOW`, one hard link, owned by this user, forced to 0600, and
+  created `O_EXCL` under a name only this process knows. What it did prove was
+  that a container image shipping `$HOME` at 0777 gave every shell inside it no
+  history at all, and a line saying so at every start. A directory belonging to
+  another account is still refused, and so is a data file that another account
+  owns.
+
 - The jsh a container is entered with is identified by its bytes, not by its
   version. `docker exec` puts a copy in the container's tmpfs and skipped that
   when one was already there, deciding "already there" by asking it for

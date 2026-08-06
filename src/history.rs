@@ -737,7 +737,6 @@ fn lock_history_file_with_timeout(path: &Path, timeout: Duration) -> io::Result<
     if !existed {
         directory.set_permissions(fs::Permissions::from_mode(0o700))?;
     }
-    ensure_non_writable_directory(&directory, parent)?;
     // Updated peers lock the directory before opening the sidecar, so one of
     // them cannot rename it and obtain a different lock inode mid-operation.
     let directory = flock_exclusive_with_timeout(directory, timeout)?;
@@ -825,6 +824,18 @@ fn ensure_regular_file(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The directory has to be the user's. It does not have to be private.
+///
+/// Privacy is a property of the file, and it is established on the file's own
+/// descriptor a few lines down: `O_NOFOLLOW`, one hard link, owned by this
+/// user, forced to 0600. A history file planted by somebody else fails the
+/// ownership check and is never appended to, whatever the directory allows —
+/// so the directory's mode is a second, weaker statement of something already
+/// proven, and reading it as a refusal only loses the feature.
+///
+/// It loses it exactly where people notice: a container image that ships
+/// `$HOME` at 0777 gave every shell inside it no history at all, and a line
+/// saying so at every start.
 fn ensure_owned_directory(file: &File, path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -840,18 +851,6 @@ fn ensure_owned_directory(file: &File, path: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{path:?} is not owned by the current user"),
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_non_writable_directory(file: &File, path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    if file.metadata()?.mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{path:?} is writable by another user or group"),
         ));
     }
     Ok(())
@@ -912,6 +911,45 @@ mod tests {
                 .expect("private history fixture parent");
         }
         History::new_with_path(max_size, path.to_path_buf())
+    }
+
+    /// A container image that ships `$HOME` at 0777 used to mean no history at
+    /// all inside it, announced once per session. The file jsh writes there is
+    /// still its own and still 0600 — which is what "private" meant all along,
+    /// and is checked on the descriptor rather than inferred from the directory.
+    #[test]
+    fn history_persists_under_a_world_writable_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o777)).expect("0777 home");
+        let path = home.path().join(".jsh_history");
+
+        let mut history = History::new_with_path(16, path.clone());
+        history.add("echo persisted");
+        drop(history);
+
+        let reloaded = History::new_with_path(16, path.clone());
+        assert_eq!(
+            reloaded.last(),
+            Some("echo persisted"),
+            "the command never reached the file"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o7777,
+            0o600,
+            "the history file itself must still be private"
+        );
+    }
+
+    /// The check that does the work: a file somebody else owns is never
+    /// appended to, whatever the directory around it allows.
+    #[test]
+    fn a_history_file_owned_by_another_user_is_refused() {
+        if unsafe { nix::libc::geteuid() } == 0 {
+            return; // root owns /etc/hostname, so there is no third party here
+        }
+        let error = open_regular_file(Path::new("/etc/hostname"), true, false, false)
+            .expect_err("another user's file must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -1155,8 +1193,11 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// A shared parent directory is where the user put their home, not a
+    /// verdict on the file. The file that lands in it is this user's and is
+    /// 0600, which is the property that was ever being defended.
     #[test]
-    fn history_rejects_a_group_writable_parent_namespace() {
+    fn history_accepts_a_group_writable_parent_namespace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let parent = dir.path().join("shared");
         fs::create_dir(&parent).expect("shared parent");
@@ -1169,7 +1210,30 @@ mod tests {
             cwd: None,
         };
 
-        let error = append_entry(&path, &entry, 10).expect_err("unsafe namespace accepted");
+        append_entry(&path, &entry, 10).expect("a shared parent is not a private file");
+
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    /// The directory rule that remains: somebody else's directory is somebody
+    /// else's, whatever it lets this user do inside it. `/tmp` is root-owned
+    /// and 1777 on every system that has one.
+    #[test]
+    fn history_rejects_a_parent_directory_owned_by_another_user() {
+        if unsafe { nix::libc::geteuid() } == 0 {
+            return; // root owns /tmp, so there is no third party to test against
+        }
+        let path = Path::new("/tmp/.jsh-history-namespace-probe");
+        let entry = HistoryEntry {
+            command: "echo private".into(),
+            timestamp: 1,
+            cwd: None,
+        };
+
+        let error = append_entry(path, &entry, 10).expect_err("another user's directory accepted");
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(!path.exists());

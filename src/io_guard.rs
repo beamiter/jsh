@@ -451,19 +451,28 @@ pub(crate) fn write_private_file_atomic(
         .read(true)
         .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
         .open(parent)?;
+    // Ownership, and not the mode bits. What has to be true of the result is
+    // that jsh wrote a private file that jsh owns, and that is established
+    // directly, on the descriptor: the temporary sibling below is created
+    // `O_EXCL` at 0600, so a name planted by somebody else makes the create
+    // fail rather than be adopted, and `rename` replaces a symlink rather than
+    // following it. A loose mode on the directory lets another account unlink
+    // the file; it does not let them read it, and it never makes jsh write
+    // through something it did not create.
+    //
+    // Reading the bit as a refusal cost the whole feature in the place people
+    // actually hit it: container images ship `$HOME` at 0777, so a shell in one
+    // had no history and no z-jump, and said so at every start. A directory
+    // owned by a *different* account is still refused — see `/tmp`.
     let directory_metadata = directory.metadata()?;
-    if !directory_metadata.is_dir()
-        || directory_metadata.uid() != unsafe { nix::libc::geteuid() }
-        || directory_metadata.mode() & 0o022 != 0
-    {
+    if !directory_metadata.is_dir() || directory_metadata.uid() != unsafe { nix::libc::geteuid() } {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "persistence directory is not a current-user-owned private namespace \
-                 (owner {}, effective user {}, mode {:04o})",
+                "persistence directory is not owned by the current user \
+                 (owner {}, effective user {})",
                 directory_metadata.uid(),
                 unsafe { nix::libc::geteuid() },
-                directory_metadata.mode() & 0o7777
             ),
         ));
     }
@@ -992,6 +1001,43 @@ mod tests {
             .trim()
             .parse()
             .expect("session id")
+    }
+
+    /// A `$HOME` that anyone can write is the normal state of a container
+    /// image, and it is not a reason to drop the user's data on the floor. The
+    /// file is still created `O_EXCL` at 0600 under a name only this process
+    /// knows, and still arrives by `rename`, so it is still private and still
+    /// jsh's — none of which the directory's mode had any part in.
+    #[test]
+    fn a_world_writable_home_still_persists() {
+        let home = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o777)).expect("0777 home");
+
+        let path = home.path().join(".jsh_z");
+        write_private_file_atomic(&path, b"/p|1.5|10\n", 4096).expect("persist under a 0777 home");
+
+        assert_eq!(fs::read(&path).expect("read back"), b"/p|1.5|10\n");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").mode() & 0o7777,
+            0o600,
+            "the file itself must still be private"
+        );
+    }
+
+    /// The half of the rule that stays: somebody else's directory is somebody
+    /// else's. `/tmp` is the one every system has — root-owned and 1777.
+    #[test]
+    fn a_directory_owned_by_another_user_is_still_refused() {
+        if unsafe { nix::libc::geteuid() } == 0 {
+            return; // root owns /tmp, so there is no third party to test against
+        }
+        let error = write_private_file_atomic(Path::new("/tmp/.jsh-guard-probe"), b"x", 16)
+            .expect_err("a root-owned directory must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("not owned by the current user"),
+            "{error}"
+        );
     }
 
     /// The property that keeps an interactive helper bash from stopping itself
