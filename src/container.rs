@@ -530,34 +530,77 @@ fn is_static_elf(path: &Path) -> bool {
     true
 }
 
+/// Name the exact bytes of a binary, so that "is the copy in there this one?"
+/// is a question about content.
+///
+/// The version string cannot answer it. `CARGO_PKG_VERSION` changes on a
+/// release, not on a build, so every jsh built between two releases calls
+/// itself `jsh 0.2.0` — and a container that a fix was built for went on
+/// running the copy from before the fix, for as long as it stayed up, because
+/// the copy agreed about its version. The bug being fixed was in the shell's
+/// startup import, so the symptom was that the fix simply had not worked.
+///
+/// FNV-1a, which is not cryptographic and does not need to be: this decides
+/// whether to re-send a file, and the alternative it replaced was a string
+/// that never changed at all.
+fn fingerprint(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}.{}", bytes.len())
+}
+
+/// Receive the binary on stdin and leave the tmpfs holding it, plus a marker
+/// naming the bytes that arrived.
+///
+/// The order is the whole point. The marker goes last, so it never claims
+/// bytes that are not in place; and it is cleared first, so a push that dies
+/// midway leaves no marker vouching for a binary that is now half of two.
+/// Either way the next session finds no match and sends the file again.
+fn push_script(identity: &str) -> String {
+    format!(
+        "rm -f {CONTAINER_PATH}.id; \
+         cat > {CONTAINER_PATH}.incoming && chmod 755 {CONTAINER_PATH}.incoming \
+         && mv -f {CONTAINER_PATH}.incoming {CONTAINER_PATH} \
+         && printf %s '{identity}' > {CONTAINER_PATH}.id"
+    )
+}
+
 /// Put the binary in the running container's tmpfs, unless the one already
 /// there is this same jsh. Streamed over the exec's stdin rather than
 /// `docker cp`, which would write into the container's filesystem.
 fn place_binary_in_container(engine: Engine, container: &str, binary: &Path) -> bool {
     let program = engine_program(engine);
-    let banner = format!("jsh {}", env!("CARGO_PKG_VERSION"));
+    let Ok(bytes) = crate::io_guard::read_regular_file(binary, 64 * 1024 * 1024) else {
+        return false;
+    };
+    let identity = fingerprint(&bytes);
+
+    // The marker is read rather than the binary run: it says which bytes are
+    // in there, which `--version` did not. A copy placed by an older jsh has no
+    // marker at all, and is replaced — once.
     let mut probe = std::process::Command::new(program);
-    probe.args(["exec", container, CONTAINER_PATH, "--version"]);
+    probe.args([
+        "exec",
+        container,
+        "/bin/sh",
+        "-c",
+        &format!("cat {CONTAINER_PATH}.id"),
+    ]);
     if let Ok(output) = crate::io_guard::bounded_command_output(
         &mut probe,
         4 * 1024,
         4 * 1024,
         std::time::Duration::from_secs(10),
     ) {
-        if String::from_utf8_lossy(&output.stdout).starts_with(&banner) {
+        if String::from_utf8_lossy(&output.stdout).trim() == identity {
             return true;
         }
     }
 
-    let Ok(bytes) = crate::io_guard::read_regular_file(binary, 64 * 1024 * 1024) else {
-        return false;
-    };
-    // Written to a temporary name and renamed, so a session that starts while
-    // this one is copying never executes half a binary.
-    let script = format!(
-        "cat > {CONTAINER_PATH}.incoming && chmod 755 {CONTAINER_PATH}.incoming \
-         && mv -f {CONTAINER_PATH}.incoming {CONTAINER_PATH}"
-    );
+    let script = push_script(&identity);
     // The push runs as the image's default user, and /dev belongs to root: an
     // image that says `USER ubuntu` gets its write refused. Anyone allowed to
     // talk to the daemon already has root inside the container, so a refusal
@@ -753,5 +796,44 @@ mod tests {
         assert!(!is_static_elf(&own) || cfg!(target_feature = "crt-static"));
         assert!(!is_static_elf(Path::new("/etc/hostname")));
         assert!(!is_static_elf(Path::new("/definitely/missing")));
+    }
+
+    /// Two builds of the same version are the normal case — a fix, rebuilt,
+    /// reinstalled — and telling them apart is the entire job of the marker.
+    /// The check this replaced compared `jsh --version` against
+    /// `CARGO_PKG_VERSION`, which is equal for both, so a container that was
+    /// already up kept running the copy from before the fix and the fix looked
+    /// like it had not worked.
+    #[test]
+    fn two_builds_of_one_version_do_not_share_an_identity() {
+        let before = fingerprint(b"jsh 0.2.0 \x01 built before the fix");
+        let after = fingerprint(b"jsh 0.2.0 \x02 built after the fix.");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the fixture should differ in content, not in length"
+        );
+        assert_ne!(before, after);
+
+        assert_eq!(before, fingerprint(b"jsh 0.2.0 \x01 built before the fix"));
+        // A truncated push must not pass for the whole file either.
+        assert_ne!(before, fingerprint(b"jsh 0.2.0 \x01 built before the fi"));
+    }
+
+    #[test]
+    fn the_marker_is_cleared_first_and_written_last() {
+        let script = push_script("cafef00dcafef00d.7");
+        let cleared = script.find("rm -f").expect("marker cleared");
+        let arrives = script.find("cat >").expect("binary received");
+        let renamed = script.find("mv -f").expect("binary put in place");
+        let claimed = script.find("printf").expect("marker written");
+        assert!(
+            cleared < arrives && arrives < renamed && renamed < claimed,
+            "a marker may never name bytes that are not in place: {script}"
+        );
+        // The clear runs whatever the last session left behind; every later
+        // step is conditional on the one before it.
+        assert!(script.contains("rm -f /dev/.jsh.id; "));
+        assert_eq!(script.matches("&&").count(), 3);
     }
 }

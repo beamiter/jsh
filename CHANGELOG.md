@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The jsh a container is entered with is identified by its bytes, not by its
+  version. `docker exec` puts a copy in the container's tmpfs and skipped that
+  when one was already there, deciding "already there" by asking it for
+  `--version` — which is `CARGO_PKG_VERSION`, and so is equal for every build
+  between two releases. A container that stayed up went on running the copy
+  from before a rebuild, and a fix built for that container looked as though it
+  had not worked. A marker written beside the binary now names the exact bytes
+  in the tmpfs; a copy placed by an older jsh has no marker and is replaced
+  once.
+
 - `~/.bashrc` is imported as the interactive file it is. Every distribution
   opens it with `case $- in *i*) ;; *) return;; esac`, and the helper bash jsh
   hands it to was not interactive, so the file returned at its fourth line and
