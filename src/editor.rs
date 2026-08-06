@@ -6,7 +6,7 @@ use crate::environment::ShellState;
 use crate::highlighter;
 use crate::history::History;
 use crate::prompt;
-use crate::signal::{SIGHUP_RECEIVED, SIGINT_RECEIVED};
+use crate::signal::{SIGHUP_RECEIVED, SIGINT_RECEIVED, SIGWINCH_RECEIVED};
 use crate::suggest;
 use crate::workflows;
 
@@ -186,10 +186,19 @@ impl Editor {
             crate::osc::prompt_start();
         }
 
+        // The width may have changed since the last prompt — or since the
+        // editor was constructed: a terminal that spawns the shell first and
+        // sizes its view afterwards (the jterm block terminals do) leaves the
+        // construction-time size stale.
+        self.refresh_terminal_size();
+
         self.cached_prompt = prompt::render_prompt(state);
-        let prompt_lines = self.cached_prompt.matches('\n').count() as u16;
-        self.last_rendered_lines = prompt_lines;
-        self.last_cursor_row = prompt_lines;
+        // Visual rows, not hard newlines: an info line wider than the
+        // terminal soft-wraps, and the first repaint must know how far up
+        // the prompt really starts.
+        let prompt_rows = rows_consumed(&self.cached_prompt, self.terminal_width);
+        self.last_rendered_lines = prompt_rows;
+        self.last_cursor_row = prompt_rows;
         print!("{}", self.cached_prompt);
         io::stdout().flush()?;
 
@@ -256,6 +265,14 @@ impl Editor {
                 self.cursor = 0;
                 print!("^C\r\n");
                 return Ok(Some(String::new()));
+            }
+            // A stale width mis-counts soft wraps, and every repaint then
+            // leaves stale prompt rows behind. SIGWINCH delivery is not to
+            // be trusted for this — the shell and crossterm each install a
+            // handler and whichever registers last wins — so the size is
+            // re-read at every wakeup rather than only when a flag fires.
+            if self.refresh_terminal_size() {
+                self.repaint(state)?;
             }
 
             // Check if terminal is dead more frequently to avoid CPU spin on deleted ptys
@@ -1515,6 +1532,24 @@ impl Editor {
             .filter(|suggestion| crate::terminal_text::is_safe_inline(suggestion));
     }
 
+    /// Re-read the PTY's window size, reporting whether it changed.
+    ///
+    /// Also clears the SIGWINCH flag, though the size is polled rather than
+    /// gated on it: the row bookkeeping in `repaint` is only correct for the
+    /// width the terminal really has, and a missed signal must not freeze the
+    /// editor on the size it happened to see at startup.
+    fn refresh_terminal_size(&mut self) -> bool {
+        SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst);
+        match crossterm::terminal::size() {
+            Ok((w, h)) if (w, h) != (self.terminal_width, self.terminal_height) => {
+                self.terminal_width = w;
+                self.terminal_height = h;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn repaint(&mut self, state: &mut ShellState) -> io::Result<()> {
         self.repaint_with_options(state, true)
     }
@@ -1555,19 +1590,23 @@ impl Editor {
             }
         }
 
-        // Fast path: only cursor moved, skip full redraw
+        // Fast path: only cursor moved, skip full redraw. A wrapped input
+        // line changes the caret's row, so this only fires while the whole
+        // line still fits on the prompt's own row.
         if cursor_only && !self.buffer.contains('\n') {
             let prompt_last = self
                 .cached_prompt
                 .rsplit('\n')
                 .next()
                 .unwrap_or(&self.cached_prompt);
-            let prompt_width = display_width(prompt_last) as u16;
-            let buf_before = &self.buffer[..self.cursor];
-            let col = prompt_width + display_width(buf_before) as u16;
-            out.queue(MoveToColumn(col))?;
-            out.flush()?;
-            return Ok(());
+            let prompt_width = display_width(prompt_last);
+            if prompt_width + display_width(&self.buffer) < self.terminal_width as usize {
+                let buf_before = &self.buffer[..self.cursor];
+                let col = (prompt_width + display_width(buf_before)) as u16;
+                out.queue(MoveToColumn(col))?;
+                out.flush()?;
+                return Ok(());
+            }
         }
 
         out.queue(MoveToColumn(0))?;
@@ -1696,9 +1735,22 @@ impl Editor {
             cursor_col = (10 + query_width) as u16;
             cursor_row = 0;
         } else {
-            // Render prompt (cached — only recomputed at read_line entry)
-            let prompt_lines = self.cached_prompt.matches('\n').count() as u16;
-            rendered_lines += prompt_lines;
+            // Render prompt (cached — only recomputed at read_line entry).
+            // All row accounting is in visual rows: an over-wide line
+            // soft-wraps, and counting hard newlines alone makes the next
+            // repaint's cursor-up stop short of the top, leaving one more
+            // stale copy of the prompt behind per keystroke. The prompt's
+            // last line shares its row with the buffer's first line, so its
+            // own wrap extras belong to `input_geometry` below, not here.
+            let prompt_last_line = self
+                .cached_prompt
+                .rsplit('\n')
+                .next()
+                .unwrap_or(&self.cached_prompt);
+            let prompt_width = display_width(prompt_last_line);
+            let rows_above_input = rows_consumed(&self.cached_prompt, self.terminal_width)
+                .saturating_sub(wrap_extra_rows(prompt_width, self.terminal_width));
+            rendered_lines += rows_above_input;
             out.queue(Print(&self.cached_prompt))?;
 
             // Render highlighted buffer with continuation prompts
@@ -1723,7 +1775,8 @@ impl Editor {
                         out.queue(SetAttribute(Attribute::Reset))?;
                         out.queue(Print("\r\n"))?;
                         out.queue(Print(&cont_prompt))?;
-                        rendered_lines += 1;
+                        // Rows are accounted by `input_geometry` below, which
+                        // also sees the soft wraps this count would miss.
                         // Re-apply colors for next segment
                         if let Some(color) = span.fg {
                             out.queue(SetForegroundColor(color))?;
@@ -1766,30 +1819,31 @@ impl Editor {
                 }
             }
 
-            // Compute cursor screen position accounting for continuation prompts
-            let prompt_last_line = self
-                .cached_prompt
-                .rsplit('\n')
-                .next()
-                .unwrap_or(&self.cached_prompt);
-            let prompt_width = display_width(prompt_last_line) as u16;
-            let cont_width = display_width(&cont_prompt) as u16;
-            let buf_before = &self.buffer[..self.cursor];
-            let buf_cursor_lines = buf_before.matches('\n').count() as u16;
-            let buf_cursor_last = buf_before.rsplit('\n').next().unwrap_or(buf_before);
-            cursor_row = prompt_lines + buf_cursor_lines;
-            cursor_col = if buf_cursor_lines > 0 {
-                cont_width + display_width(buf_cursor_last) as u16
-            } else {
-                prompt_width + display_width(buf_cursor_last) as u16
+            // Caret position and input-row count, soft-wrap aware. The ghost
+            // widens the last line (rows the clear must cover) but sits past
+            // the caret, so it never moves the caret itself.
+            let ghost_width = match &self.suggestion {
+                Some(suggestion) if self.cursor == self.buffer.len() => display_width(suggestion),
+                _ => 0,
             };
+            let geometry = input_geometry(
+                prompt_width,
+                display_width(&cont_prompt),
+                &self.buffer,
+                self.cursor,
+                ghost_width,
+                self.terminal_width,
+            );
+            rendered_lines += geometry.extra_rows;
+            cursor_row = rows_above_input + geometry.cursor_row;
+            cursor_col = geometry.cursor_col;
 
             if let Some(ref error) = self.ai_error {
                 out.queue(Print("\r\n"))?;
                 out.queue(SetForegroundColor(Color::Red))?;
                 out.queue(Print(error))?;
                 out.queue(ResetColor)?;
-                rendered_lines += 1;
+                rendered_lines += 1 + wrap_extra_rows(display_width(error), self.terminal_width);
             // Phase 16d — signature hint line below the input. Only when nothing
             // else owns this slot: no completion menu, widget mode, or AI error.
             } else if show_signature_hint
@@ -1802,7 +1856,8 @@ impl Editor {
                 {
                     out.queue(Print("\r\n"))?;
                     out.queue(Print(&hint))?;
-                    rendered_lines += 1;
+                    rendered_lines +=
+                        1 + wrap_extra_rows(display_width(&hint), self.terminal_width);
                 }
             }
         }
@@ -2561,6 +2616,109 @@ fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
+/// Extra terminal rows a line of `width` display columns occupies beyond its
+/// first, on a terminal `term_width` columns wide.
+///
+/// A line exactly as wide as the terminal stays on one row: the wrap is
+/// pending until the next glyph arrives, which is also why the caller can add
+/// these up per logical line without worrying about the `\r\n` that follows.
+fn wrap_extra_rows(width: usize, term_width: u16) -> u16 {
+    let columns = term_width.max(1) as usize;
+    if width == 0 {
+        0
+    } else {
+        ((width - 1) / columns) as u16
+    }
+}
+
+/// Rows the cursor ends up below its starting row after printing `text` from
+/// column 0: one per hard newline, plus the soft wraps of every over-wide
+/// line. ANSI escapes are already excluded by `display_width`.
+///
+/// This is what the repaint bookkeeping must count. Counting hard newlines
+/// alone under-shoots whenever a line exceeds the terminal width — the next
+/// repaint's cursor-up then stops short of the top and every keystroke leaves
+/// one more stale copy of the prompt on screen.
+fn rows_consumed(text: &str, term_width: u16) -> u16 {
+    let mut rows: u16 = 0;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            rows = rows.saturating_add(1);
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        rows = rows.saturating_add(wrap_extra_rows(display_width(line), term_width));
+    }
+    rows
+}
+
+/// The input area's visual geometry, soft-wrap aware, relative to the row the
+/// input starts on (the prompt's last line).
+struct InputGeometry {
+    /// Rows the printed input covers beyond its first: hard newlines plus the
+    /// soft wraps of each composed line (prompt/continuation prefix + text,
+    /// ghost included on the last line).
+    extra_rows: u16,
+    /// The caret's visual row, counted from the input's first row.
+    cursor_row: u16,
+    /// The caret's visual column after wrapping.
+    cursor_col: u16,
+}
+
+fn input_geometry(
+    prompt_last_width: usize,
+    cont_width: usize,
+    buffer: &str,
+    cursor: usize,
+    ghost_width: usize,
+    term_width: u16,
+) -> InputGeometry {
+    let columns = term_width.max(1) as usize;
+    let lines: Vec<&str> = buffer.split('\n').collect();
+    let last = lines.len() - 1;
+
+    let composed_width = |index: usize| {
+        let prefix = if index == 0 {
+            prompt_last_width
+        } else {
+            cont_width
+        };
+        let ghost = if index == last { ghost_width } else { 0 };
+        prefix + display_width(lines[index]) + ghost
+    };
+
+    let mut extra_rows: u16 = 0;
+    for index in 0..lines.len() {
+        if index > 0 {
+            extra_rows = extra_rows.saturating_add(1);
+        }
+        extra_rows = extra_rows.saturating_add(wrap_extra_rows(composed_width(index), term_width));
+    }
+
+    let before = &buffer[..cursor];
+    let caret_line = before.matches('\n').count();
+    let caret_last = before.rsplit('\n').next().unwrap_or(before);
+    let prefix = if caret_line == 0 {
+        prompt_last_width
+    } else {
+        cont_width
+    };
+    let caret_col = prefix + display_width(caret_last);
+
+    let mut cursor_row: u16 = 0;
+    for index in 0..caret_line {
+        cursor_row = cursor_row
+            .saturating_add(1)
+            .saturating_add(wrap_extra_rows(composed_width(index), term_width));
+    }
+    cursor_row = cursor_row.saturating_add((caret_col / columns) as u16);
+
+    InputGeometry {
+        extra_rows,
+        cursor_row,
+        cursor_col: (caret_col % columns) as u16,
+    }
+}
+
 fn display_width_raw(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
@@ -2875,5 +3033,71 @@ mod tests {
 
         let (fragments, _) = history_panel_fragments("a\u{202e}", &[1], 40);
         assert_eq!(fragments[1], ("\\u{202e}".to_string(), true));
+    }
+
+    // --- soft-wrap row accounting ------------------------------------------
+    //
+    // The repaint moves the cursor up by these counts; counting hard newlines
+    // alone made every keystroke leave one stale copy of a wrapped prompt
+    // line behind (seen live at 28 columns, where the two-line prompt's info
+    // line wraps).
+
+    #[test]
+    fn wrapped_lines_count_their_extra_rows() {
+        assert_eq!(wrap_extra_rows(0, 28), 0);
+        assert_eq!(wrap_extra_rows(27, 28), 0);
+        assert_eq!(
+            wrap_extra_rows(28, 28),
+            0,
+            "an exactly-full line keeps its wrap pending"
+        );
+        assert_eq!(wrap_extra_rows(29, 28), 1);
+        assert_eq!(wrap_extra_rows(57, 28), 2);
+        assert_eq!(
+            wrap_extra_rows(5, 0),
+            4,
+            "a zero-width terminal is treated as one column, not a division by zero"
+        );
+    }
+
+    #[test]
+    fn rows_consumed_counts_newlines_and_wraps_not_ansi() {
+        assert_eq!(rows_consumed("short", 28), 0);
+        assert_eq!(rows_consumed("a\r\nb", 28), 1);
+        // A 40-column info line on a 28-column terminal takes a second row.
+        let wrapped = format!("{}\r\n> ", "x".repeat(40));
+        assert_eq!(rows_consumed(&wrapped, 28), 2);
+        // Colour codes are painted zero-wide.
+        let coloured = format!("\x1b[38;5;11m{}\x1b[0m", "x".repeat(20));
+        assert_eq!(rows_consumed(&coloured, 28), 0);
+    }
+
+    #[test]
+    fn input_geometry_follows_the_caret_across_wraps() {
+        // "❯ " (2 cols) plus 30 typed columns on 28: the line wraps once and
+        // the caret ends on the second row.
+        let buffer = "y".repeat(30);
+        let geometry = input_geometry(2, 2, &buffer, buffer.len(), 0, 28);
+        assert_eq!(geometry.extra_rows, 1);
+        assert_eq!(geometry.cursor_row, 1);
+        assert_eq!(geometry.cursor_col, 4);
+
+        // Caret back on the first visual row of the same wrapped line.
+        let geometry = input_geometry(2, 2, &buffer, 10, 0, 28);
+        assert_eq!(geometry.cursor_row, 0);
+        assert_eq!(geometry.cursor_col, 12);
+
+        // The ghost widens the painted area but never moves the caret.
+        let geometry = input_geometry(2, 2, "echo he", 7, 40, 28);
+        assert_eq!(geometry.extra_rows, 1);
+        assert_eq!(geometry.cursor_row, 0);
+        assert_eq!(geometry.cursor_col, 9);
+
+        // Multiline input: a wrapped first line pushes the caret's row down.
+        let buffer = format!("{}\nb", "a".repeat(30));
+        let geometry = input_geometry(2, 2, &buffer, buffer.len(), 0, 28);
+        assert_eq!(geometry.extra_rows, 2, "one wrap plus one hard newline");
+        assert_eq!(geometry.cursor_row, 2);
+        assert_eq!(geometry.cursor_col, 3);
     }
 }
