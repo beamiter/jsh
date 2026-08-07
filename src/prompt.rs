@@ -251,8 +251,12 @@ pub fn probe_git_context() -> GitContext {
 /// (`git checkout fea` → `feature-x`). One bounded probe, capped at 50 —
 /// a ghost shows a single best candidate, not a menu.
 pub fn probe_git_branches() -> Vec<String> {
+    probe_git_branches_in(Path::new("."))
+}
+
+fn probe_git_branches_in(cwd: &Path) -> Vec<String> {
     let Some(output) = bounded_git_stdout(
-        Path::new("."),
+        cwd,
         &[
             "for-each-ref",
             "--sort=-committerdate",
@@ -395,16 +399,36 @@ pub fn format_duration(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{get_env_hint, parse_git_status_header, render_prompt, GitContext};
+    use std::process::Command;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn branch_probe_lists_this_repositorys_branches() {
-        // Runs inside the jsh checkout; whatever the branch is called, the
-        // probe finds at least one and every name is a clean single token.
-        let branches = super::probe_git_branches();
-        assert!(!branches.is_empty());
+        // GitHub Actions checks out an exact commit and may expose no local
+        // branch at all. Exercise the probe against a repository whose refs
+        // are part of the fixture instead of depending on the outer checkout.
+        let repo = tempfile::tempdir().expect("temporary git repository");
+        let git = crate::io_guard::trusted_helper("git").expect("trusted git helper");
+        let run_git = |args: &[&str]| {
+            let status = Command::new(&git)
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_AUTHOR_NAME", "jsh test")
+                .env("GIT_AUTHOR_EMAIL", "jsh-test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "jsh test")
+                .env("GIT_COMMITTER_EMAIL", "jsh-test@example.invalid")
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "--quiet"]);
+        run_git(&["commit", "--quiet", "--allow-empty", "-m", "initial"]);
+        run_git(&["branch", "feature-x"]);
+
+        let branches = super::probe_git_branches_in(repo.path());
+        assert!(branches.iter().any(|branch| branch == "feature-x"));
         for branch in &branches {
             assert!(!branch.contains('\n') && !branch.trim().is_empty());
         }
