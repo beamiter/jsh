@@ -540,53 +540,13 @@ fn bound_bytes(text: &str, max_bytes: usize) -> String {
 
 /// Scrub high-confidence secret shapes from anything leaving the machine.
 ///
-/// `jagent::redact_secrets` is the family-wide scrubber and runs first. Two
-/// shapes it does not cover in 0.5 matter specifically for a *shell*, whose
-/// history and captured output are exactly where these live: a connection URL
-/// with an inline password (`postgres://user:pw@host/db`, which lands in
-/// history verbatim) and an opaque `Authorization: Bearer` token that is not a
-/// JWT. Both belong in jagent's `redact` module; jsh composes them on top so no
-/// outbound payload has to wait for that to land upstream.
+/// `jagent::redact_secrets` is the family-wide scrubber. It includes the shell
+/// shapes that commonly appear in history and captured output: connection URLs
+/// with inline passwords and opaque `Authorization: Bearer` credentials, as
+/// well as provider keys, service tokens, JWTs, and private-key blocks.
 #[cfg(feature = "ai")]
 pub(crate) fn redact_sensitive_text(text: &str) -> String {
-    let mut current = jagent::redact_secrets(text);
-    for (replacement, pattern) in supplemental_secret_patterns() {
-        if pattern.is_match(&current) {
-            current = pattern.replace_all(&current, *replacement).into_owned();
-        }
-    }
-    current
-}
-
-#[cfg(feature = "ai")]
-fn supplemental_secret_patterns() -> &'static [(&'static str, regex::Regex)] {
-    use std::sync::OnceLock;
-    static CELL: OnceLock<Vec<(&'static str, regex::Regex)>> = OnceLock::new();
-    CELL.get_or_init(|| {
-        let patterns: &[(&'static str, &str)] = &[
-            // URL userinfo password: any scheme, any credential shape. The `@`
-            // and the `://` are what keep this from matching bare host:port.
-            (
-                "${prefix}:[REDACTED:url-password]@",
-                r"(?i)(?P<prefix>\b[a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@",
-            ),
-            // Opaque bearer tokens. JWT-shaped ones are already gone by now;
-            // this covers the session tokens that are not.
-            (
-                "${scheme} [REDACTED:bearer-token]",
-                r"(?i)(?P<scheme>\bbearer)[ \t]+[A-Za-z0-9._~+/=-]{16,}",
-            ),
-        ];
-        patterns
-            .iter()
-            .map(|(replacement, pattern)| {
-                (
-                    *replacement,
-                    regex::Regex::new(pattern).expect("supplemental redact pattern compiles"),
-                )
-            })
-            .collect()
-    })
+    jagent::redact_secrets(text)
 }
 
 /// The ONLY path from jsh data to an outbound AI request.
