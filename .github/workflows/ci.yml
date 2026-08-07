@@ -99,6 +99,8 @@ jobs:
         run: cargo test --no-default-features --locked
 
   installer:
+    # Keep this display name stable for existing required-check rules. The job
+    # now validates both shipped scripts and their end-to-end harnesses.
     name: Installer script
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -106,11 +108,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Shellcheck the installer
-        run: shellcheck -s sh scripts/install-jsh.sh
+      - name: Shellcheck shipped scripts
+        # jsh-remote deliberately embeds single-quoted programs for the
+        # destination shell, which ShellCheck reports at informational level.
+        # Warnings and errors remain release-blocking.
+        run: shellcheck --severity=warning -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 
       - name: Install and update against a fake release
         run: ./scripts/test-install-jsh.sh
+
+      - name: Deploy into fake remote transports
+        run: ./scripts/test-jsh-remote.sh
 
   release-build:
     name: Release build

@@ -161,6 +161,7 @@ cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo doc --locked --all-features --no-deps
+shellcheck --severity=warning -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 ./scripts/test-install-jsh.sh
 ./scripts/test-jsh-remote.sh
 ```
