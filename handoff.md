@@ -13,7 +13,9 @@ release installer now fails closed, and AI response headers are bounded.
   constructs its serialize-only `Message` values and keeps its own session
   envelope behind the existing allocation-aware decoder; no direct jagent
   transcript deserialization or compatibility wire path remains. The model
-  transport's 1 MiB body cap continues to run before its JSON value is built.
+  transport's 1 MiB body cap continues to run before its JSON value is built;
+  the exact pin also carries jagent's independent raw-byte and decoded-frame
+  ceilings for any future streaming integration.
 
 - `SessionSnapshot` no longer derives `Deserialize`. `decode_snapshot` is the
   only wire path into one, and it drives `DeserializeSeed`/`Visitor`
