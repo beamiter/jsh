@@ -159,10 +159,11 @@ That needs a release-side signing decision, so it is deliberately not
 approximated here.
 
 After changing either canonical script, synchronize and test every vendored jterm
-copy. `jterm_core/scripts/install-jsh.sh` and `jterm4/scripts/install-jsh.sh`
+copy. `jterm_core/scripts/install-jsh.sh` and `forge/scripts/install-jsh.sh`
 carry `install-jsh.sh`; `jterm_core/scripts/jsh-remote.sh` carries the launcher.
-All three are in sync with this revision, and each differs from its canonical
-copy only by a three-line vendoring header.
+All three vendor bodies match script revision
+`fd605616b56bd73265a3a6141c814938aa2859f9`; each differs from its canonical
+copy only by a four-line provenance header.
 
 ## Release checks
 
