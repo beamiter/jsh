@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-01
+Updated: 2026-08-08
 
 This baseline hardens Agent state and cancellation, AI URL/credential handling,
 session persistence, execution I/O, parser/completion limits, terminal text, and
@@ -8,6 +8,12 @@ automatic helper resolution. It exact-pins the hardened jagent baseline. The
 release installer now fails closed, and AI response headers are bounded.
 
 ## Completed since the previous handoff
+
+- The optional Agent integration now exact-pins jagent 0.6. jsh only
+  constructs its serialize-only `Message` values and keeps its own session
+  envelope behind the existing allocation-aware decoder; no direct jagent
+  transcript deserialization or compatibility wire path remains. The model
+  transport's 1 MiB body cap continues to run before its JSON value is built.
 
 - `SessionSnapshot` no longer derives `Deserialize`. `decode_snapshot` is the
   only wire path into one, and it drives `DeserializeSeed`/`Visitor`

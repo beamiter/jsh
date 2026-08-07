@@ -382,8 +382,8 @@ them before execution, especially when they contain destructive operations.
 ### Agent mode
 
 The `agent` builtin runs a review-first agent loop on the shared
-[jagent](https://github.com/beamiter/jagent) core (the same state machine as
-jterm4's Shell Agent):
+[jagent](https://github.com/beamiter/jagent) core (the same state machine used
+by the anvil, ember, forge, and frost Shell Agent integrations):
 
 ```sh
 agent find the largest files under target and free some space
