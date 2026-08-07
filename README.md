@@ -378,6 +378,11 @@ OS, and current-directory path. Cloud requests do not additionally include
 recent history or Git status unless
 `JSH_AI_SHARE_CONTEXT=1` is set. Generated commands are suggestions: inspect
 them before execution, especially when they contain destructive operations.
+Every outbound history window uses jagent's reported request builder. If older
+turns are omitted, jsh tells the model that its context is incomplete; that
+notice and the trusted system instructions share a strict 64 KiB byte ceiling.
+jsh fails the request rather than truncating the system prompt or silently
+discarding the notice.
 
 ### Agent mode
 

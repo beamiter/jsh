@@ -25,8 +25,9 @@ use std::thread;
 use jagent::prompt::{agent_user_prompt_tagged, BlockContext, EnvironmentMeta};
 #[cfg(feature = "ai")]
 use jagent::provider::{
-    bound_history_with, build_chat_request, parse_chat_response_full, ChatConfig, ChatResponse,
-    HttpRequest, Message, Provider, ProviderError, Role, MAX_MODEL_TEXT_BYTES,
+    bound_history_with, build_chat_request_with_report, parse_chat_response_full, BuiltRequest,
+    ChatConfig, ChatResponse, HttpRequest, Message, Provider, ProviderError, Role,
+    MAX_MODEL_TEXT_BYTES, MAX_REQUEST_SYSTEM_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,12 +552,13 @@ pub(crate) fn redact_sensitive_text(text: &str) -> String {
 
 /// The ONLY path from jsh data to an outbound AI request.
 ///
-/// Redaction is structural here rather than a call bolted onto each site: the
-/// system text and every history turn pass through `redact_sensitive_text` inside
-/// `jagent::bound_history_with`, which applies the hook *before* the byte
-/// budget elides a turn so the budget measures what is actually sent. A future
-/// code path cannot forget to redact because there is no other way to reach the
-/// wire — the test
+/// Redaction is structural here rather than a call bolted onto each site:
+/// every history turn passes through `redact_sensitive_text` inside
+/// `jagent::bound_history_with`, and system text passes through the same
+/// scrubber before the request is built. The system prompt and any omission
+/// notice share jagent's strict byte ceiling; neither is silently shortened or
+/// dropped. A future code path cannot forget to redact because there is no
+/// other way to reach the wire — the test
 /// `the_request_funnel_is_the_only_caller_of_the_jagent_request_builder` fails
 /// if a second call site appears.
 #[cfg(feature = "ai")]
@@ -566,26 +568,85 @@ pub fn build_redacted_chat_request(
     history: &[Message],
 ) -> Result<HttpRequest, ProviderError> {
     validate_transport_config(chat)?;
-    let mut system = system.map(redact_sensitive_text);
     let (bounded, omitted) = bound_history_with(history, redact_sensitive_text);
-    if omitted > 0 {
-        // Tell the model the window is incomplete so it does not answer as if
-        // it had seen turns jsh's budget dropped.
-        let note = format!(
-            "{omitted} older conversation turn(s) were omitted by jsh's request safety \
-             budget. Do not assume access to them."
-        );
-        match system.as_mut() {
-            Some(system) => {
-                system.push_str("\n\n");
-                system.push_str(&note);
-            }
-            None => system = Some(note),
-        }
-    }
-    let request = build_chat_request(chat, system.as_deref(), &bounded)?;
+    let system = prepare_system_with_omission_notice(system, omitted)?;
+    let built = build_chat_request_with_report(chat, system.as_deref(), &bounded)?;
+    let request = require_no_builder_omission(built)?;
     validate_outbound_request(&request)?;
     Ok(request)
+}
+
+#[cfg(feature = "ai")]
+fn omission_notice(omitted: usize) -> String {
+    format!(
+        "{omitted} older conversation turn(s) were omitted by jsh's request safety \
+         budget. Do not assume access to them."
+    )
+}
+
+/// Redact and assemble system text without ever shortening trusted
+/// instructions or dropping the model-facing history-loss notice.
+#[cfg(feature = "ai")]
+fn prepare_system_with_omission_notice(
+    system: Option<&str>,
+    omitted: usize,
+) -> Result<Option<String>, ProviderError> {
+    if system.is_some_and(|system| system.len() > MAX_REQUEST_SYSTEM_BYTES) {
+        return Err(ProviderError::InvalidConfiguration(format!(
+            "system prompt exceeds the {MAX_REQUEST_SYSTEM_BYTES}-byte request limit"
+        )));
+    }
+
+    // The raw byte check deliberately precedes this potentially expanding
+    // clone/redaction pass.
+    let mut system = system.map(redact_sensitive_text);
+    if system
+        .as_ref()
+        .is_some_and(|system| system.len() > MAX_REQUEST_SYSTEM_BYTES)
+    {
+        return Err(ProviderError::InvalidConfiguration(format!(
+            "system prompt exceeds the {MAX_REQUEST_SYSTEM_BYTES}-byte request limit after redaction"
+        )));
+    }
+
+    if omitted == 0 {
+        return Ok(system);
+    }
+
+    let note = omission_notice(omitted);
+    let separator_bytes = if system.is_some() { "\n\n".len() } else { 0 };
+    let final_bytes = system
+        .as_ref()
+        .map_or(0, String::len)
+        .checked_add(separator_bytes)
+        .and_then(|bytes| bytes.checked_add(note.len()));
+    if final_bytes.is_none_or(|bytes| bytes > MAX_REQUEST_SYSTEM_BYTES) {
+        return Err(ProviderError::InvalidConfiguration(format!(
+            "system prompt plus the history-omission notice exceeds the \
+             {MAX_REQUEST_SYSTEM_BYTES}-byte request limit; shorten the system prompt"
+        )));
+    }
+
+    match system.as_mut() {
+        Some(system) => {
+            system.push_str("\n\n");
+            system.push_str(&note);
+        }
+        None => system = Some(note),
+    }
+    Ok(system)
+}
+
+#[cfg(feature = "ai")]
+fn require_no_builder_omission(built: BuiltRequest) -> Result<HttpRequest, ProviderError> {
+    if built.omitted_history_turns != 0 {
+        return Err(ProviderError::InvalidConfiguration(
+            "jagent omitted history after jsh pre-bounded the request; refusing to send an \
+             incomplete history-omission notice"
+                .to_string(),
+        ));
+    }
+    Ok(built.request)
 }
 
 /// Backport the credential/header validation from the current jagent source at
@@ -1114,6 +1175,7 @@ mod tests {
 #[cfg(all(test, feature = "ai"))]
 mod ai_tests {
     use super::*;
+    use jagent::provider::MAX_REQUEST_HISTORY_TURNS;
 
     fn context() -> AiContext {
         AiContext {
@@ -1134,6 +1196,22 @@ mod ai_tests {
             share_context: true,
         }
         .chat_config(AI_MAX_TOKENS, Some(0.1))
+    }
+
+    fn history_with_one_omission() -> Vec<Message> {
+        (0..=MAX_REQUEST_HISTORY_TURNS)
+            .map(|index| Message {
+                role: Role::User,
+                text: format!("turn {index}"),
+            })
+            .collect()
+    }
+
+    fn request_system(request: &HttpRequest) -> String {
+        let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        // These tests use the OpenAI-compatible fixture, where system text is
+        // the first message.
+        body["messages"][0]["content"].as_str().unwrap().to_string()
     }
 
     #[test]
@@ -1355,6 +1433,89 @@ mod ai_tests {
     }
 
     #[test]
+    fn system_and_omission_notice_share_one_strict_byte_budget() {
+        let exact = "x".repeat(MAX_REQUEST_SYSTEM_BYTES);
+        let request = build_redacted_chat_request(&chat(), Some(&exact), &[]).unwrap();
+        assert_eq!(request_system(&request).len(), MAX_REQUEST_SYSTEM_BYTES);
+
+        let history = history_with_one_omission();
+        let error = build_redacted_chat_request(&chat(), Some(&exact), &history)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("history-omission notice"), "{error}");
+
+        let note = omission_notice(1);
+        let system_budget = MAX_REQUEST_SYSTEM_BYTES - "\n\n".len() - note.len();
+        let fitting = "x".repeat(system_budget);
+        let request = build_redacted_chat_request(&chat(), Some(&fitting), &history).unwrap();
+        let system = request_system(&request);
+        assert_eq!(system.len(), MAX_REQUEST_SYSTEM_BYTES);
+        assert!(system.ends_with(&note));
+
+        let one_too_many = format!("{fitting}x");
+        let error = build_redacted_chat_request(&chat(), Some(&one_too_many), &history)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("history-omission notice"), "{error}");
+
+        let request = build_redacted_chat_request(&chat(), None, &history).unwrap();
+        assert_eq!(request_system(&request), note);
+    }
+
+    #[test]
+    fn system_budget_is_byte_oriented_utf8_safe_and_checked_before_redaction() {
+        let raw_oversized = "x".repeat(MAX_REQUEST_SYSTEM_BYTES + 1);
+        let error = build_redacted_chat_request(&chat(), Some(&raw_oversized), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("system prompt exceeds"), "{error}");
+        assert!(!error.contains("after redaction"), "{error}");
+
+        let history = history_with_one_omission();
+        let note = omission_notice(1);
+        let system_budget = MAX_REQUEST_SYSTEM_BYTES - "\n\n".len() - note.len();
+        let mut utf8 = "界".repeat(system_budget / "界".len());
+        utf8.push_str(&"x".repeat(system_budget - utf8.len()));
+        assert_eq!(utf8.len(), system_budget);
+        assert!(build_redacted_chat_request(&chat(), Some(&utf8), &history).is_ok());
+        utf8.push('界');
+        assert!(build_redacted_chat_request(&chat(), Some(&utf8), &history).is_err());
+
+        let expanding = "AKIAIOSFODNN7EXAMPLE "
+            .repeat(MAX_REQUEST_SYSTEM_BYTES / "AKIAIOSFODNN7EXAMPLE ".len());
+        assert!(expanding.len() <= MAX_REQUEST_SYSTEM_BYTES);
+        assert!(redact_sensitive_text(&expanding).len() > MAX_REQUEST_SYSTEM_BYTES);
+        let error = build_redacted_chat_request(&chat(), Some(&expanding), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("after redaction"), "{error}");
+    }
+
+    #[test]
+    fn a_secondary_builder_omission_fails_closed() {
+        let request = HttpRequest {
+            url: "https://example.test/v1/chat/completions".to_string(),
+            headers: Vec::new(),
+            body: "{}".to_string(),
+        };
+        assert_eq!(
+            require_no_builder_omission(BuiltRequest {
+                request: request.clone(),
+                omitted_history_turns: 0,
+            })
+            .unwrap(),
+            request
+        );
+        let error = require_no_builder_omission(BuiltRequest {
+            request,
+            omitted_history_turns: 1,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("after jsh pre-bounded"), "{error}");
+    }
+
+    #[test]
     fn redaction_leaves_ordinary_shell_output_alone() {
         // A scrubber that eats git SHAs and host:port pairs would make the
         // whole feature useless, so pin the non-matches too.
@@ -1414,22 +1575,35 @@ mod ai_tests {
     }
 
     /// Redaction must stay structural. `build_redacted_chat_request` is the
-    /// only place in jsh allowed to call jagent's request builder; if a second
-    /// call site appears, unredacted context could reach the wire, so fail here
-    /// instead. (The needle is assembled at runtime so this test's own source
-    /// does not count as a match.)
+    /// only place in jsh allowed to call jagent's reported request builder;
+    /// legacy builder calls are forbidden because they discard the omission
+    /// report. If another call site appears, unredacted context or silent
+    /// history loss could reach the wire, so fail here instead. (The needles
+    /// are assembled at runtime so this test's own source does not count as a
+    /// match.)
     #[test]
-    fn the_request_funnel_is_the_only_caller_of_the_jagent_request_builder() {
-        let needle = format!("build_chat{}request(", '_');
+    fn the_request_funnel_is_the_only_caller_of_a_jagent_request_builder() {
+        let reported = format!("build_chat{}request_with_report(", '_');
+        let legacy = format!("build_chat{}request(", '_');
         assert_eq!(
-            include_str!("ai.rs").matches(needle.as_str()).count(),
+            include_str!("ai.rs").matches(reported.as_str()).count(),
             1,
-            "ai.rs must call jagent's request builder exactly once, inside the funnel"
+            "ai.rs must call jagent's reported request builder exactly once, inside the funnel"
         );
         assert_eq!(
-            include_str!("agent.rs").matches(needle.as_str()).count(),
+            include_str!("agent.rs").matches(reported.as_str()).count(),
             0,
             "agent.rs must go through crate::ai::build_redacted_chat_request"
+        );
+        assert_eq!(
+            include_str!("ai.rs").matches(legacy.as_str()).count(),
+            0,
+            "ai.rs must not use the legacy builder that discards omission reports"
+        );
+        assert_eq!(
+            include_str!("agent.rs").matches(legacy.as_str()).count(),
+            0,
+            "agent.rs must not use the legacy builder that discards omission reports"
         );
     }
 

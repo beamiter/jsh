@@ -17,6 +17,14 @@ release installer now fails closed, and AI response headers are bounded.
   the exact pin also carries jagent's independent raw-byte and decoded-frame
   ceilings for any future streaming integration.
 
+- The single outbound AI funnel uses jagent's reported request builder and
+  fails closed if jagent would omit anything after jsh has already bounded the
+  history. The reported omission count drives a model-facing incomplete-context
+  notice. Raw and redacted system text, the optional separator, and that notice
+  share jagent's 64 KiB byte limit with checked arithmetic; trusted system
+  instructions are never shortened and an omission notice is never dropped to
+  make a request fit.
+
 - `SessionSnapshot` no longer derives `Deserialize`. `decode_snapshot` is the
   only wire path into one, and it drives `DeserializeSeed`/`Visitor`
   implementations that charge as they build: every map and sequence stops at the
