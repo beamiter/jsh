@@ -3346,7 +3346,7 @@ fn git_file_description(status: [u8; 2], context: &str) -> Option<&'static str> 
     let [index, worktree] = status;
     match context {
         "add" => {
-            if status == [b'?', b'?'] {
+            if status == *b"??" {
                 return Some("untracked");
             }
             match worktree {
@@ -5207,9 +5207,9 @@ mod tests {
         let output = b" M file one.txt\0R  new name.txt\0old name.txt\0?? next file.txt\0";
         let entries = parse_git_status_entries(output);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], ([b' ', b'M'], "file one.txt".to_string()));
-        assert_eq!(entries[1], ([b'R', b' '], "new name.txt".to_string()));
-        assert_eq!(entries[2], ([b'?', b'?'], "next file.txt".to_string()));
+        assert_eq!(entries[0], (*b" M", "file one.txt".to_string()));
+        assert_eq!(entries[1], (*b"R ", "new name.txt".to_string()));
+        assert_eq!(entries[2], (*b"??", "next file.txt".to_string()));
     }
 
     #[test]
@@ -5231,14 +5231,14 @@ mod tests {
 
     #[test]
     fn git_file_completion_respects_index_and_worktree_columns() {
-        assert_eq!(git_file_description([b'M', b' '], "add"), None);
-        assert_eq!(git_file_description([b' ', b'M'], "add"), Some("modified"));
-        assert_eq!(git_file_description([b'M', b' '], "restore"), None);
+        assert_eq!(git_file_description(*b"M ", "add"), None);
+        assert_eq!(git_file_description(*b" M", "add"), Some("modified"));
+        assert_eq!(git_file_description(*b"M ", "restore"), None);
         assert_eq!(
-            git_file_description([b'M', b' '], "restore_staged"),
+            git_file_description(*b"M ", "restore_staged"),
             Some("staged")
         );
-        assert_eq!(git_file_description([b'?', b'?'], "restore"), None);
+        assert_eq!(git_file_description(*b"??", "restore"), None);
     }
 
     #[test]

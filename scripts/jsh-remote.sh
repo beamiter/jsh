@@ -285,9 +285,9 @@ if [ "${transport}" = "ssh" ]; then
     # Share one authenticated connection across the probe, the push, the
     # session, and the teardown. Without this, deploying costs four handshakes;
     # with it, three of them are a few milliseconds on an existing socket.
-    # jterm1 builds the same ControlPath, so a tab opened there and a session
+    # anvil builds the same ControlPath, so a tab opened there and a session
     # started here reuse each other's master.
-    ctl_base="${XDG_RUNTIME_DIR:-${CACHE_HOME}/jterm1}"
+    ctl_base="${XDG_RUNTIME_DIR:-${CACHE_HOME}/anvil}"
     case "${ctl_base}" in
         # The options are assembled into a whitespace-split string, so a control
         # path containing a space would silently become two arguments. Dropping

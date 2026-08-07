@@ -156,6 +156,13 @@ impl History {
         h
     }
 
+    /// Build a sibling-module test fixture without reading or appending to the
+    /// user's real `~/.jsh_history`.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(max_size: usize, file_path: PathBuf) -> Self {
+        Self::new_with_path(max_size, file_path)
+    }
+
     fn load(&mut self) {
         // Updated jsh processes coordinate through a stable sidecar lock.
         // Atomic rewrites already protect readers from torn files; the lock

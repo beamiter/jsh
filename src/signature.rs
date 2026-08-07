@@ -1173,7 +1173,8 @@ pub fn hint_for(
                     .collect(),
                 rs.desc.clone(),
             )
-        } else if let Some(s) = SIGNATURES.get(cmd_name.as_str()) {
+        } else {
+            let s = SIGNATURES.get(cmd_name.as_str())?;
             (
                 s.params
                     .iter()
@@ -1181,8 +1182,6 @@ pub fn hint_for(
                     .collect(),
                 s.desc.to_string(),
             )
-        } else {
-            return None;
         };
 
     if params.is_empty() && desc.is_empty() {

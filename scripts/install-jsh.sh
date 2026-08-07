@@ -4,7 +4,7 @@
 #   curl -fsSL https://github.com/beamiter/jsh/releases/latest/download/install-jsh.sh | sh
 #
 # The script is the single source of truth for "how jsh gets onto a machine":
-# jterm1..4 shell out to it instead of each carrying their own installer.
+# All four terminals shell out to it instead of each carrying their own installer.
 #
 # Design notes that are easy to get wrong and expensive to rediscover:
 #   * Every binary this script touches is identified by its `--version` banner,
@@ -369,7 +369,7 @@ detect_target() {
 # --- identifying a jsh binary -----------------------------------------------
 
 # Prints the version of a jsh binary, or nothing when the file is not jsh.
-# This is the same identity check jterm3 performs before adopting a shell.
+# This is the same identity check frost performs before adopting a shell.
 #
 # The probe writes to a file rather than a pipe, and runs under a deadline: a
 # binary we have not identified yet may fork a descendant that inherits the

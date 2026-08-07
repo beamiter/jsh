@@ -804,14 +804,14 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
             let mut names = Vec::new();
 
             // Collect all variable names starting with prefix
-            for (k, _) in state.env_vars.iter() {
+            for k in state.env_vars.keys() {
                 if k.starts_with(prefix) {
                     names.push(k.clone());
                 }
             }
             // Also collect from all local scopes
             for scope in &state.local_vars_stack {
-                for (k, _) in scope.iter() {
+                for k in scope.keys() {
                     if k.starts_with(prefix) && !names.contains(k) {
                         names.push(k.clone());
                     }

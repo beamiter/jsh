@@ -593,6 +593,12 @@ fn command_base(cmd: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn isolated_history(max_size: usize) -> (tempfile::TempDir, History) {
+        let directory = tempfile::tempdir().expect("create isolated history directory");
+        let history = History::new_for_test(max_size, directory.path().join("history.jsonl"));
+        (directory, history)
+    }
+
     #[test]
     fn test_suggest_subcommand_git_exact_match() {
         // Exact abbreviation match: "git l" → "og" (completing to "log")
@@ -683,7 +689,7 @@ mod tests {
 
     #[test]
     fn next_command_after_commit_is_not_split_into_multiple_suggestions() {
-        let history = History::new(0);
+        let (_history_dir, history) = isolated_history(0);
         let ctx = SuggestionContext {
             git_branch: Some("main"),
             last_command: Some("git commit -m 'done'"),
@@ -698,7 +704,7 @@ mod tests {
 
     #[test]
     fn suggestions_follow_the_active_command_segment() {
-        let history = History::new(0);
+        let (_history_dir, history) = isolated_history(0);
         let ctx = SuggestionContext::default();
 
         // Abbreviation expansion works after connectors and pipes.
@@ -725,7 +731,7 @@ mod tests {
 
     #[test]
     fn history_matches_the_active_segment_when_the_buffer_holds_earlier_commands() {
-        let mut history = History::new(100);
+        let (_history_dir, mut history) = isolated_history(100);
         history.add("git push origin release-2.1");
         let ctx = SuggestionContext::default();
 
@@ -737,7 +743,7 @@ mod tests {
 
     #[test]
     fn entering_a_directory_suggests_its_usual_command() {
-        let mut history = History::new(100);
+        let (_history_dir, mut history) = isolated_history(100);
         history.add_with_cwd("cargo test", Some("/proj"));
         history.add_with_cwd("ls", Some("/proj"));
         history.add_with_cwd("cargo test", Some("/proj"));
@@ -801,7 +807,7 @@ mod tests {
 
     #[test]
     fn a_mistyped_command_name_is_offered_back_corrected() {
-        let history = History::new(0);
+        let (_history_dir, history) = isolated_history(0);
         let known: Vec<String> = ["cargo", "git", "grep", "ls"]
             .iter()
             .map(|name| name.to_string())
@@ -868,7 +874,7 @@ mod tests {
 
     #[test]
     fn git_status_and_add_follow_live_worktree_state() {
-        let history = History::new(0);
+        let (_history_dir, history) = isolated_history(0);
         let unstaged = SuggestionContext {
             git_has_unstaged: true,
             last_command: Some("git status"),
