@@ -41,6 +41,7 @@ assert() {
 # matches <text> <extended regex>
 matches() { grep -qE -- "$2" <<< "$1"; }
 lacks() { ! grep -qE -- "$2" <<< "$1"; }
+has_prefix() { [[ "$1" == "$2"* ]]; }
 
 # version_is <binary> <expected --version output>
 version_is() { [ "$("$1" --version)" = "$2" ]; }
@@ -135,6 +136,82 @@ indent "${out}"
 assert "update message" matches "${out}" 'updated jsh 0\.3\.0 -> 0\.3\.1'
 assert "new version is live" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
 assert "previous binary kept for rollback" [ -f "${FAKE_HOME}/.local/state/jsh/rollback/jsh-0.3.0" ]
+
+echo "== a failed installed-binary self-check rolls back atomically =="
+# Fault-inject after the incoming file has been renamed into place. The first
+# destination rename is corrupted so the self-check fails; the second is the
+# rollback rename. Logging their source names proves both swaps stay inside the
+# destination directory rather than copying over the live inode.
+make_release 0.3.2
+MV_STUB="${ROOT}/mv-stub"
+MV_COUNT="${ROOT}/mv-count"
+MV_LOG="${ROOT}/mv-log"
+MV_FAIL_ROLLBACK="${ROOT}/mv-fail-rollback"
+REAL_MV="$(command -v mv)"
+mkdir -p "${MV_STUB}"
+cat > "${MV_STUB}/mv" <<EOF
+#!/bin/sh
+previous=""
+last=""
+for arg in "\$@"; do
+    previous="\${last}"
+    last="\${arg}"
+done
+count=0
+if [ "\${last}" = "${BIN}/jsh" ]; then
+    count="\$(cat "${MV_COUNT}" 2> /dev/null || printf '0')"
+    count=\$((count + 1))
+    printf '%s\n' "\${count}" > "${MV_COUNT}"
+    printf '%s\n' "\${previous}" >> "${MV_LOG}"
+    if [ "\${count}" -eq 2 ] && [ -f "${MV_FAIL_ROLLBACK}" ]; then
+        exit 1
+    fi
+fi
+"${REAL_MV}" "\$@" || exit \$?
+if [ "\${last}" = "${BIN}/jsh" ] && [ "\${count}" -eq 1 ]; then
+    printf '%s\n' '#!/bin/sh' 'echo "not jsh"' > "\${last}"
+    chmod 0755 "\${last}"
+fi
+EOF
+chmod +x "${MV_STUB}/mv"
+
+rm -f "${MV_COUNT}" "${MV_LOG}" "${MV_FAIL_ROLLBACK}"
+PATH_FOR_RUN="${MV_STUB}:${BIN}:/usr/local/bin:/usr/bin:/bin"
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "failed self-check exits nonzero" [ ${rc} -ne 0 ]
+assert "reports the restored version" matches "${out}" 'failed its self-check; restored 0\.3\.1'
+assert "previous version is live again" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+assert "install uses a same-directory incoming rename" \
+    has_prefix "$(sed -n '1p' "${MV_LOG}")" "${BIN}/.jsh.incoming."
+assert "rollback uses a same-directory restoring rename" \
+    has_prefix "$(sed -n '2p' "${MV_LOG}")" "${BIN}/.jsh.rollback."
+assert "successful rollback leaves no restoring temporary" \
+    [ -z "$(find "${BIN}" -maxdepth 1 -name '.jsh.rollback.*' -print -quit)" ]
+
+echo "== a failed rollback keeps a truthful recovery copy =="
+rm -f "${MV_COUNT}" "${MV_LOG}"
+: > "${MV_FAIL_ROLLBACK}"
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+rollback="${FAKE_HOME}/.local/state/jsh/rollback/jsh-0.3.1"
+assert "failed rollback exits nonzero" [ ${rc} -ne 0 ]
+assert "does not claim the rollback succeeded" \
+    matches "${out}" "rollback failed; previous binary kept at ${rollback}"
+assert "the recovery copy is still the previous version" \
+    version_is "${rollback}" "jsh 0.3.1 (fake)"
+assert "failed rollback leaves no restoring temporary" \
+    [ -z "$(find "${BIN}" -maxdepth 1 -name '.jsh.rollback.*' -print -quit)" ]
+# Repair the test fixture from the retained copy; the installer deliberately
+# leaves the failed new binary in place when the atomic rollback rename fails.
+cp "${rollback}" "${BIN}/jsh"
+chmod 0755 "${BIN}/jsh"
+rm -f "${MV_FAIL_ROLLBACK}" "${MV_COUNT}" "${MV_LOG}"
+PATH_FOR_RUN="${BIN}:/usr/local/bin:/usr/bin:/bin"
+assert "fixture recovery restores the previous binary" \
+    version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
 
 echo "== update_available means newer, not merely different =="
 # The published release is now OLDER than what is installed: a yanked tag, or a

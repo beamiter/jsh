@@ -497,7 +497,7 @@ cargo clippy --all-targets --all-features --locked
 cargo test --all-features --locked
 cargo test --no-default-features --locked
 cargo build --release --all-features --locked
-shellcheck --severity=warning -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
+shellcheck -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 ./scripts/test-install-jsh.sh
 ./scripts/test-jsh-remote.sh
 ```

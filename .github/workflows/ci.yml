@@ -109,10 +109,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Shellcheck shipped scripts
-        # jsh-remote deliberately embeds single-quoted programs for the
-        # destination shell, which ShellCheck reports at informational level.
-        # Warnings and errors remain release-blocking.
-        run: shellcheck --severity=warning -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
+        # Intentional remote-shell quoting is documented at its source, so the
+        # default ShellCheck severity can remain a release gate.
+        run: shellcheck -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 
       - name: Install and update against a fake release
         run: ./scripts/test-install-jsh.sh

@@ -133,7 +133,9 @@ release installer now fails closed, and AI response headers are bounded.
   inherits the probe's stdout cannot hang the installer.
   `scripts/test-install-jsh.sh` covers the absent and malformed checksum, the
   symlink, extra-member and traversal archives, the rejected grammars, and the
-  cache's permissions and symlink safety.
+  cache's permissions and symlink safety. It also injects a failed installed-
+  binary self-check to verify both atomic rollback and the truthful fallback
+  when the rollback rename itself fails.
 - `post_json` enforces explicit response-header count and cumulative-byte limits
   before reading a body. The body cap already existed; headers are parsed and
   retained before it applies.
@@ -161,7 +163,7 @@ cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo doc --locked --all-features --no-deps
-shellcheck --severity=warning -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
+shellcheck -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 ./scripts/test-install-jsh.sh
 ./scripts/test-jsh-remote.sh
 ```
