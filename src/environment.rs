@@ -35,7 +35,7 @@ const MAX_REAL_HOME_BYTES: usize = 4096;
 ///
 /// A value that is not an absolute path to an existing directory is ignored
 /// rather than rejected: an unusable override must not stop a shell starting.
-fn resolve_home_dir() -> PathBuf {
+pub(crate) fn resolve_home_dir() -> PathBuf {
     real_home_override(env::var_os("JSH_REAL_HOME").as_deref())
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")))
 }

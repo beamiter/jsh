@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- `jsh doctor` now performs a read-only health check across the runtime,
+  startup file, persistent-state namespaces, trusted helpers, and opt-in AI
+  configuration. `--json` emits a stable support-tool envelope, and the report
+  never starts a helper, contacts a provider, or includes credential values.
+- Directory frecency now records interactive navigation only. A `cd` inside a
+  script no longer mutates `~/.jsh_z`, and a read-only HOME can no longer add an
+  unrelated z-jump warning to otherwise successful non-interactive output.
+- The next diagnostics/CLI pass adds ten concrete refinements: doctor strict
+  status for CI; a versioned JSON schema with an explicit health bit; explicit
+  rcfile diagnosis; `JSH_REAL_HOME` awareness; startup readability, size and
+  symlink checks; private persistence-file integrity checks; accurate separate
+  session and execution-journal namespaces including journal overrides;
+  interactive `TERM` validation; `--command=`, `--rcfile=` and `--session=`
+  forms; and rejection of duplicate single-value options plus broken-pipe-safe
+  help/version output.
+
 - History, z-jump and the execution journal are kept in a directory the user
   owns, whatever its mode bits say. Refusing a group- or world-writable parent
   was a second, weaker statement of something the file's own descriptor already

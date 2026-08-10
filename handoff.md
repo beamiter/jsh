@@ -1,13 +1,33 @@
 # Engineering handoff
 
-Updated: 2026-08-08
+Updated: 2026-08-10
 
-This baseline hardens Agent state and cancellation, AI URL/credential handling,
-session persistence, execution I/O, parser/completion limits, terminal text, and
-automatic helper resolution. It exact-pins the hardened jagent baseline. The
-release installer now fails closed, and AI response headers are bounded.
+This baseline adds read-only environment diagnostics and tighter CLI behavior
+on top of the Agent, AI, persistence, execution I/O, parser/completion, terminal
+text, helper-resolution, and installer hardening described below.
 
 ## Completed since the previous handoff
+
+- `jsh doctor` inspects runtime/terminal state, the effective startup home and
+  startup file, persistence namespaces and existing private files, trusted
+  helpers, the configured execution journal, and opt-in AI configuration. It
+  never sources a file, starts a helper, contacts a provider, or prints a
+  credential. JSON reports have `schema_version: 1` and a `healthy` bit;
+  `--strict` turns warnings into status 1 for CI, and `--rcfile` diagnoses the
+  exact file an interactive launch would use.
+- Startup and persistence diagnostics distinguish `JSH_REAL_HOME` from the
+  state-writing `$HOME`, and distinguish `$HOME/.jsh/sessions` from the XDG
+  execution journal. Existing persistence entries are checked with
+  `symlink_metadata` for file type, owner, hard links, and unsafe write bits
+  without following them. Custom/disabled journal configuration is reflected
+  in the paths that are checked.
+- Long single-value options accept `--command=`, `--rcfile=`, and `--session=`.
+  Repeated `--rcfile`/`--session` values are rejected instead of silently
+  replacing one another, and immediate help/version output treats a closed
+  downstream pipe as a normal consumer exit.
+- Directory frecency records interactive navigation only. A script's `cd` no
+  longer mutates `~/.jsh_z` or emits a persistence warning from an otherwise
+  unrelated non-interactive command.
 
 - The optional Agent integration now exact-pins jagent 0.6. jsh only
   constructs its serialize-only `Message` values and keeps its own session

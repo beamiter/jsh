@@ -121,11 +121,24 @@ help where
 help --record where
 ```
 
+Check whether the surrounding environment can provide startup compatibility,
+persistent state, trusted helpers, and optional AI without starting a shell or
+making a network request:
+
+```sh
+jsh doctor
+jsh doctor --json
+jsh doctor --strict                 # exit 1 when any warning is present
+jsh doctor --rcfile ./team.jshrc    # inspect an explicit startup file
+```
+
 ## Command line
 
 ```text
 jsh [OPTIONS] [SCRIPT [ARG ...]]
 jsh [OPTIONS] -c COMMAND [NAME [ARG ...]]
+jsh context <list|show|last-failed> [OPTIONS]
+jsh doctor [--json] [--strict] [--rcfile FILE]
 ```
 
 Important options:
@@ -140,6 +153,13 @@ Important options:
 - `--rcfile FILE` selects an explicit interactive startup file.
 - `--session ID` restores and persists a named interactive terminal session.
 - `--help` and `--version` report the binary's interface and version.
+- `doctor [--json] [--strict] [--rcfile FILE]` performs a read-only environment
+  check. JSON reports carry `schema_version` and `healthy`; strict mode exits 1
+  on warnings. Reports describe credential presence, never values.
+
+Long options that take one value also accept `=` syntax, including
+`--command=...`, `--rcfile=...`, and `--session=...`. Repeating `--rcfile` or
+`--session` is an error rather than silently replacing the earlier value.
 
 Startup and session options are accepted for command-line consistency but take
 effect only when jsh starts its interactive editor; they do not alter `-c`,

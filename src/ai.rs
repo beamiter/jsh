@@ -683,6 +683,14 @@ fn validate_transport_config(chat: &ChatConfig) -> Result<(), ProviderError> {
     Ok(())
 }
 
+/// Validate configured model, endpoint, and credential boundaries without
+/// building or sending a request. Used by the read-only doctor report so it
+/// cannot drift from the actual transport policy.
+#[cfg(feature = "ai")]
+pub(crate) fn validate_config(config: &AiConfig) -> Result<(), ProviderError> {
+    validate_transport_config(&config.chat_config(1, None))
+}
+
 #[cfg(feature = "ai")]
 fn validate_ai_base_url(provider: Provider, base_url: &str) -> Result<(), ProviderError> {
     let invalid = || {

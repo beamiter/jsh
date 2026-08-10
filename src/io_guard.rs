@@ -181,6 +181,21 @@ pub(crate) fn trusted_helper(name: &str) -> Option<std::path::PathBuf> {
     automatic_system_helper(name).map(Path::to_path_buf)
 }
 
+/// Resolve a helper without emitting the normal once-per-process warning.
+///
+/// Diagnostics use this path because a valid `--json` request must produce one
+/// self-contained document. The caller reports an invalid override as a
+/// structured check instead of letting resolution write a side-channel line.
+pub(crate) fn trusted_helper_quiet(name: &str) -> Option<std::path::PathBuf> {
+    if let Some(configured) = std::env::var_os(helper_path_variable(name)) {
+        if !configured.is_empty() {
+            let path = std::path::PathBuf::from(configured);
+            return trusted_explicit_executable(&path).then_some(path);
+        }
+    }
+    automatic_system_helper(name).map(Path::to_path_buf)
+}
+
 /// One line per helper per process. These resolve from a prompt callback and a
 /// notification thread, so an unconditional warning would repeat on every
 /// prompt draw.

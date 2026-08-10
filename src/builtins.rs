@@ -469,9 +469,13 @@ fn update_directory_vars(
         state.export_var("OLDPWD", &old_str);
     }
 
-    // z-jump: record directory visit
-    if let Ok(mut z_db) = crate::zjump::get_z_db().lock() {
-        z_db.add(&new_dir.to_string_lossy());
+    // Frecency describes where a person navigates, not where a script happens
+    // to `cd`. Keeping this interactive-only also prevents non-interactive
+    // commands from mutating dotfiles or emitting persistence warnings.
+    if state.interactive {
+        if let Ok(mut z_db) = crate::zjump::get_z_db().lock() {
+            z_db.add(&new_dir.to_string_lossy());
+        }
     }
 
     // chpwd hooks

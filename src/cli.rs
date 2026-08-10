@@ -4,7 +4,7 @@
 //! and the supported surface is small enough to keep explicit and testable.
 
 use std::ffi::OsString;
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,8 @@ pub enum ParseResult {
     Run(Invocation),
     /// Query the execution journal without starting or interpreting a shell.
     Context(Vec<String>),
+    /// Inspect the local jsh environment without starting a shell.
+    Doctor(Vec<String>),
     Help,
     Version,
 }
@@ -74,6 +76,7 @@ pub const HELP: &str = concat!(
     "  jsh [OPTIONS] [SCRIPT [ARG ...]]\n",
     "  jsh [OPTIONS] -c COMMAND [NAME [ARG ...]]\n",
     "  jsh context <list|show|last-failed> [OPTIONS]\n\n",
+    "  jsh doctor [--json] [--strict] [--rcfile FILE]\n\n",
     "Input:\n",
     "  -c, --command COMMAND  Execute COMMAND; NAME becomes $0\n",
     "  -s, --stdin            Read commands from standard input\n",
@@ -85,6 +88,7 @@ pub const HELP: &str = concat!(
     "      --session ID       Restore and persist terminal session ID\n\n",
     "Other:\n",
     "  context ...            Query structured command execution context\n",
+    "  doctor ...             Diagnose startup, persistence, helpers, and AI\n",
     "  -h, --help             Print this help\n",
     "  -V, --version          Print version information\n",
     "      --                 Stop parsing options\n\n",
@@ -116,20 +120,26 @@ pub fn entrypoint() -> i32 {
     }
 
     match parse_env() {
-        Ok(ParseResult::Help) => {
-            print!("{HELP}");
-            0
-        }
-        Ok(ParseResult::Version) => {
-            println!("{}", version());
-            0
-        }
+        Ok(ParseResult::Help) => write_immediate(HELP.as_bytes()),
+        Ok(ParseResult::Version) => write_immediate(format!("{}\n", version()).as_bytes()),
         Ok(ParseResult::Context(args)) => crate::execution_context::run_args(&args),
+        Ok(ParseResult::Doctor(args)) => crate::doctor::run_args(&args),
         Ok(ParseResult::Run(invocation)) => run(invocation),
         Err(error) => {
             eprintln!("jsh: {error}");
             eprintln!("Try 'jsh --help' for more information.");
             2
+        }
+    }
+}
+
+fn write_immediate(bytes: &[u8]) -> i32 {
+    match std::io::stdout().lock().write_all(bytes) {
+        Ok(()) => 0,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => 0,
+        Err(error) => {
+            eprintln!("jsh: cannot write output: {error}");
+            74
         }
     }
 }
@@ -254,6 +264,9 @@ where
     if args.get(1).and_then(|arg| arg.to_str()) == Some("context") {
         return Ok(ParseResult::Context(utf8_args(&args[2..])?));
     }
+    if args.get(1).and_then(|arg| arg.to_str()) == Some("doctor") {
+        return Ok(ParseResult::Doctor(utf8_args(&args[2..])?));
+    }
 
     let mut noexec = false;
     let mut interactive = false;
@@ -292,14 +305,27 @@ where
                     continue;
                 }
                 Some("--rcfile") => {
+                    if rcfile.is_some() {
+                        return Err(CliError::new(
+                            "option '--rcfile' may only be specified once",
+                        ));
+                    }
                     let value = args
                         .get(index + 1)
                         .ok_or_else(|| CliError::new("option '--rcfile' requires a file"))?;
+                    if value.is_empty() {
+                        return Err(CliError::new("option '--rcfile' requires a file"));
+                    }
                     rcfile = Some(PathBuf::from(value));
                     index += 2;
                     continue;
                 }
                 Some("--session") => {
+                    if session_id.is_some() {
+                        return Err(CliError::new(
+                            "option '--session' may only be specified once",
+                        ));
+                    }
                     let value =
                         required_utf8(&args, index + 1, "option '--session' requires an ID")?;
                     if !valid_session_id(&value) {
@@ -310,6 +336,56 @@ where
                     session_id = Some(value);
                     index += 2;
                     continue;
+                }
+                Some(option) if option.starts_with("--rcfile=") => {
+                    if rcfile.is_some() {
+                        return Err(CliError::new(
+                            "option '--rcfile' may only be specified once",
+                        ));
+                    }
+                    let value = option.trim_start_matches("--rcfile=");
+                    if value.is_empty() {
+                        return Err(CliError::new("option '--rcfile' requires a file"));
+                    }
+                    rcfile = Some(PathBuf::from(value));
+                    index += 1;
+                    continue;
+                }
+                Some(option) if option.starts_with("--session=") => {
+                    if session_id.is_some() {
+                        return Err(CliError::new(
+                            "option '--session' may only be specified once",
+                        ));
+                    }
+                    let value = option.trim_start_matches("--session=");
+                    if !valid_session_id(value) {
+                        return Err(CliError::new(
+                            "session ID must be 1-128 ASCII letters, digits, '-' or '_'",
+                        ));
+                    }
+                    session_id = Some(value.to_string());
+                    index += 1;
+                    continue;
+                }
+                Some(option) if option.starts_with("--command=") => {
+                    let command = option.trim_start_matches("--command=").to_string();
+                    let trailing = utf8_args(&args[index + 1..])?;
+                    let (arg0, positional) = match trailing.split_first() {
+                        Some((arg0, rest)) => (arg0.clone(), rest.to_vec()),
+                        None => (program_name.clone(), Vec::new()),
+                    };
+                    return finish(
+                        Input::Command {
+                            command,
+                            arg0,
+                            args: positional,
+                        },
+                        noexec,
+                        interactive,
+                        no_config,
+                        rcfile,
+                        session_id,
+                    );
                 }
                 Some("-c" | "--command") => {
                     let command = required_utf8(
@@ -549,6 +625,32 @@ mod tests {
         assert!(parse_from(["jsh", "--norc", "--rcfile", "x"]).is_err());
         assert!(parse_from(["jsh", "--session", "../bad"]).is_err());
         assert!(parse_from(["jsh", "-i", "-n"]).is_err());
+        assert!(parse_from(["jsh", "--rcfile="]).is_err());
+        assert!(parse_from(["jsh", "--session="]).is_err());
+        assert!(parse_from(["jsh", "--rcfile", "one", "--rcfile=two"]).is_err());
+        assert!(parse_from(["jsh", "--session", "one", "--session=two"]).is_err());
+    }
+
+    #[test]
+    fn long_options_accept_equals_values() {
+        let invocation = run(&[
+            "jsh",
+            "--rcfile=custom.jsh",
+            "--session=tab-7",
+            "--command=echo $0:$1",
+            "worker",
+            "value",
+        ]);
+        assert_eq!(invocation.rcfile, Some(PathBuf::from("custom.jsh")));
+        assert_eq!(invocation.session_id.as_deref(), Some("tab-7"));
+        assert_eq!(
+            invocation.input,
+            Input::Command {
+                command: "echo $0:$1".into(),
+                arg0: "worker".into(),
+                args: vec!["value".into()],
+            }
+        );
     }
 
     #[test]
@@ -567,6 +669,10 @@ mod tests {
                 "--json".into(),
             ])
         );
+        assert_eq!(
+            parse_from(["jsh", "doctor", "--json"]).unwrap(),
+            ParseResult::Doctor(vec!["--json".into()])
+        );
     }
 
     #[test]
@@ -580,6 +686,22 @@ mod tests {
             invocation.input,
             Input::Script {
                 path: PathBuf::from("context"),
+                args: vec!["arg".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_is_an_action_but_double_dash_still_allows_a_script_named_doctor() {
+        assert!(matches!(
+            parse_from(["jsh", "doctor", "--json"]).unwrap(),
+            ParseResult::Doctor(_)
+        ));
+        let invocation = run(&["jsh", "--", "doctor", "arg"]);
+        assert_eq!(
+            invocation.input,
+            Input::Script {
+                path: PathBuf::from("doctor"),
                 args: vec!["arg".into()],
             }
         );
