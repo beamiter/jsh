@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Interactive SSH entry now accepts recognised session options after the
+  destination, matching OpenSSH spellings such as `ssh host -p 2222`, so these
+  sessions still receive remote jsh completion and suggestions.
 - `jsh doctor` now performs a read-only health check across the runtime,
   startup file, persistent-state namespaces, trusted helpers, and opt-in AI
   configuration. `--json` emits a stable support-tool envelope, and the report

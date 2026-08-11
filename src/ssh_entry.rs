@@ -98,10 +98,20 @@ fn enabled(state: &ShellState) -> bool {
 /// or nothing when this is not a plain interactive session.
 fn plan(args: &[String]) -> Option<(String, Vec<String>)> {
     let mut flags = Vec::new();
+    let mut destination = None;
     let mut index = 0;
     while let Some(token) = args.get(index) {
         if !token.starts_with('-') {
-            break;
+            // OpenSSH's option parser accepts recognised options on either
+            // side of the destination (`ssh host -p 2222` as well as
+            // `ssh -p 2222 host`). A second operand is the beginning of a
+            // remote command, which must keep bypassing the login upgrade.
+            if destination.is_some() {
+                return None;
+            }
+            destination = Some(token.clone());
+            index += 1;
+            continue;
         }
         let width = flag_width(token)?;
         if width == 2 {
@@ -116,11 +126,7 @@ fn plan(args: &[String]) -> Option<(String, Vec<String>)> {
         flags.extend(args[index..index + width].iter().cloned());
         index += width;
     }
-    let destination = args.get(index)?;
-    if args.len() > index + 1 {
-        // A remote command: `ssh host ls` runs ls, and must keep doing so.
-        return None;
-    }
+    let destination = destination?;
     // `ssh://user@host:port/` URIs and hostnames that look like options are
     // both possible and both rare; the launcher's grammar takes `[user@]host`.
     if destination.starts_with('-')
@@ -129,7 +135,7 @@ fn plan(args: &[String]) -> Option<(String, Vec<String>)> {
     {
         return None;
     }
-    Some((destination.clone(), flags))
+    Some((destination, flags))
 }
 
 /// How many argv slots a token occupies, or `None` when it is not a flag this
@@ -241,6 +247,13 @@ mod tests {
         // Attached values and clustered booleans are still one flag each.
         let (_, flags) = planned("-p2222 -4C host").expect("plan");
         assert_eq!(flags, ["-p2222", "-4C"]);
+
+        // OpenSSH permits options after the destination too. This spelling is
+        // particularly common when a port is added to an existing command.
+        let (destination, flags) =
+            planned("root@10.68.18.156 -p 22 -C").expect("post-destination flags");
+        assert_eq!(destination, "root@10.68.18.156");
+        assert_eq!(flags, ["-p", "22", "-C"]);
     }
 
     #[test]
@@ -249,6 +262,7 @@ mod tests {
             // A remote command must keep running that command.
             "host ls -la",
             "host true",
+            "host -p 2222 true",
             // Forwarding and no-session shapes are infrastructure.
             "-L 8080:localhost:80 host",
             "-N host",
