@@ -69,11 +69,7 @@ pub fn suggest_command(cmd: &str, state: &mut ShellState) -> Option<String> {
     for candidate in cache.iter() {
         consider(&mut best, candidate);
     }
-    for name in builtins::BUILTIN_NAMES {
-        consider(&mut best, name);
-    }
-    // Phase 15d: include value-aware signed builtins (where/each/try/...).
-    for name in crate::signature::SIGNATURES.keys() {
+    for name in crate::command_catalog::builtin_names() {
         consider(&mut best, name);
     }
     // Phase 15d: include user-defined `def` functions, aliases, and shell functions.

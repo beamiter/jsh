@@ -510,7 +510,7 @@ fn suggest_accepted_argument(segment: &str, ctx: &SuggestionContext) -> Option<S
 const COMMAND_NOT_FOUND: i32 = 127;
 
 fn correct_mistyped_command(last_cmd: &str, ctx: &SuggestionContext) -> Option<String> {
-    if ctx.last_exit_code != COMMAND_NOT_FOUND || ctx.known_commands.is_empty() {
+    if ctx.last_exit_code != COMMAND_NOT_FOUND {
         return None;
     }
     let trimmed = last_cmd.trim();
@@ -522,7 +522,11 @@ fn correct_mistyped_command(last_cmd: &str, ctx: &SuggestionContext) -> Option<S
     if typed.is_empty() || typed.contains('/') || typed.contains('=') {
         return None;
     }
-    let candidates = ctx.known_commands.iter().map(String::as_str);
+    let candidates = ctx
+        .known_commands
+        .iter()
+        .map(String::as_str)
+        .chain(crate::command_catalog::builtin_names().iter().copied());
     let correction = crate::value_builtins::closest_match(typed, candidates)?;
     Some(if rest.is_empty() {
         correction
@@ -829,6 +833,17 @@ mod tests {
         assert_eq!(
             suggest_next_command(&failed("crgo", 127), &history),
             Some("cargo".to_string())
+        );
+        assert_eq!(
+            suggest_next_command(
+                &SuggestionContext {
+                    last_command: Some("wher"),
+                    last_exit_code: 127,
+                    ..SuggestionContext::default()
+                },
+                &history,
+            ),
+            Some("where".to_string())
         );
 
         // A command that ran and failed on its own terms is not a typo, and

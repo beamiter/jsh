@@ -10,11 +10,22 @@ pub struct StyledSpan {
     pub underline: bool,
 }
 
+fn catalog_command_is_valid(name: &str, in_pipeline: bool) -> bool {
+    crate::command_catalog::get(name).is_some_and(|command| {
+        command.is_builtin()
+            || (in_pipeline
+                && command.value_route == crate::command_catalog::ValueRoute::ContextOnly)
+    })
+}
+
 /// Highlight the input buffer, returning styled spans.
 pub fn highlight(buffer: &str, state: &mut ShellState) -> Vec<StyledSpan> {
     let tokens = lexer::tokenize_lenient(buffer);
     let mut spans = Vec::new();
     let mut is_command_pos = true;
+    let in_pipeline = tokens
+        .iter()
+        .any(|token| matches!(token.token, Token::Pipe | Token::PipeAnd));
     let mut last_end = 0;
 
     for spanned in &tokens {
@@ -40,16 +51,9 @@ pub fn highlight(buffer: &str, state: &mut ShellState) -> Vec<StyledSpan> {
         let span = match &spanned.token {
             Token::Word(w) if is_command_pos => {
                 let raw = strip_quotes(w);
-                // Phase 14d: signed value-aware builtins (try/where/each/etc.)
-                // are valid commands even though they aren't in the bash-style
-                // BUILTIN_NAMES list, and aren't on PATH. Highlight them
-                // identically to other builtins so the prompt no longer
-                // marks `try`, `each`, `error` etc. red.
-                let is_signed = crate::signature::SIGNATURES.contains_key(raw.as_str());
                 let is_user_fn = state.user_signatures.contains_key(&raw)
                     || state.user_typed_fns.contains_key(&raw);
-                if is_builtin_cmd(&raw)
-                    || is_signed
+                if catalog_command_is_valid(&raw, in_pipeline)
                     || is_user_fn
                     || state.command_in_path(&raw)
                     || state.aliases.contains_key(&raw)
@@ -206,10 +210,6 @@ pub fn highlight(buffer: &str, state: &mut ShellState) -> Vec<StyledSpan> {
     spans
 }
 
-fn is_builtin_cmd(name: &str) -> bool {
-    crate::builtins::is_builtin(name)
-}
-
 fn strip_quotes(s: &str) -> String {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
@@ -244,4 +244,18 @@ fn strip_quotes(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_only_catalog_commands_need_a_multi_stage_pipeline() {
+        assert!(!catalog_command_is_valid("ls", false));
+        assert!(!catalog_command_is_valid("ps", false));
+        assert!(catalog_command_is_valid("ls", true));
+        assert!(catalog_command_is_valid("ps", true));
+        assert!(catalog_command_is_valid("where", false));
+    }
 }

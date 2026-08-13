@@ -8,6 +8,7 @@ pub mod bookmarks;
 pub mod builtins;
 pub mod cli;
 pub mod closure_expr;
+pub mod command_catalog;
 pub mod completer;
 pub mod completion_spec;
 pub mod config;

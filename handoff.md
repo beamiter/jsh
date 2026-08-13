@@ -1,12 +1,53 @@
 # Engineering handoff
 
-Updated: 2026-08-10
+Updated: 2026-08-13
 
-This baseline adds read-only environment diagnostics and tighter CLI behavior
-on top of the Agent, AI, persistence, execution I/O, parser/completion, terminal
-text, helper-resolution, and installer hardening described below.
+This baseline unifies command discovery, separates executable AI suggestions
+from read-only explanations, completes workflow parameter filling, and fixes
+Agent capture and closure UTF-8 regressions on top of the diagnostics, AI,
+persistence, execution I/O, parser/completion, terminal text, helper-resolution,
+and installer hardening described below.
 
 ## Completed since the previous handoff
+
+- `command_catalog` is the discovery contract above the classic and value
+  execution tables. Help, command completion, `compgen`, highlighting, typo
+  repair, and builtin classification now consume its sorted, unique view.
+  Contract tests prove it is exactly the union of both routing tables, every
+  public command has help metadata, aliases resolve canonically, and `ls`/`ps`
+  remain value-aware only in pipeline context. `def` and `reverse` now carry
+  signatures instead of disappearing from signature-driven surfaces.
+- Editor AI requests explicitly name Generate, Fix, or Explain and carry a
+  monotonically increasing request ID. Explanations have a separate system
+  prompt, response validator, size/line bounds, and read-only render state with
+  no route into the command buffer or ghost suggestion. A response changes the
+  editor only when both its ID and response type match the active request;
+  leaving a prompt or editing during a request invalidates that authority and
+  late replies are drained.
+- Ctrl-G workflow selection now enters a real parameter session. Defaults and
+  suggestions are visible and editable, completion inserts the final command
+  for review only, cancellation restores the original editor line, and long
+  lists scroll around the selected item. Template rendering is single-pass and
+  bounded so substituted values cannot recursively create placeholders or
+  expand a valid definition without limit. Only declared parameters are
+  substituted; Docker/Go/Helm moustache expressions remain literal.
+  `workflow`/`wf` exposes the same registry non-interactively. The public Rust
+  rendering/session helpers now return `Result`, an intentional 0.x API change
+  that prevents callers from silently accepting invalid or oversized output.
+- Agent capture pipes are `O_CLOEXEC`. The one-shot child receives only the
+  duplicated stdout/stderr destinations, never the capture reader, so a
+  detached continuous writer gets `SIGPIPE` after capture closes instead of
+  leaving itself and a waiting jsh orphaned. The regression test records the
+  writer PID and proves it exits. Linux/Android use atomic `pipe2`; other Unix
+  targets use a checked `fcntl(FD_CLOEXEC)` fallback, and CI now checks the
+  macOS source-install path.
+- Closure expression strings advance on UTF-8 character boundaries. Unicode
+  literals now round-trip through both `each` and `par-each` instead of being
+  rebuilt as one Latin-1 character per source byte.
+- CI matches the documented release gate more closely: warning-free Clippy is
+  enforced for both feature sets, tests use no-fail-fast without accidentally
+  running Criterion benchmarks or excluding doctests, and API documentation is
+  built in its own job.
 
 - `jsh doctor` inspects runtime/terminal state, the effective startup home and
   startup file, persistence namespaces and existing private files, trusted
@@ -197,8 +238,10 @@ copy only by a four-line provenance header.
 
 ```text
 cargo fmt --all -- --check
-cargo test --locked --all-targets --all-features --no-fail-fast
+cargo test --locked --all-features --no-fail-fast
+cargo test --locked --no-default-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --no-default-features -- -D warnings
 cargo doc --locked --all-features --no-deps
 shellcheck -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 ./scripts/test-install-jsh.sh

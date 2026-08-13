@@ -16,6 +16,10 @@ pub fn reset_exit_request() {
     EXIT_REQUESTED.store(false, Ordering::SeqCst);
 }
 
+/// Low-level names accepted by the classic/fork-path builtin router.
+///
+/// User-facing discovery must go through [`crate::command_catalog`], which
+/// also includes value-only commands and stable help metadata.
 pub const BUILTIN_NAMES: &[&str] = &[
     "agent",
     "cd",
@@ -72,6 +76,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "sort-by",
     "select",
     "bookmark",
+    "workflow",
+    "wf",
     "from-csv",
     "group-by",
     "unique",
@@ -114,7 +120,7 @@ fn builtin_agent(_args: &[String], _state: &mut ShellState) -> i32 {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    BUILTIN_NAMES.contains(&name) || crate::value_builtins::is_value_aware(name)
+    crate::command_catalog::is_builtin(name)
 }
 
 pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
@@ -254,6 +260,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         // catch-all arm so single-stage AND mixed-pipeline use the same code.
         // Listed in BUILTIN_NAMES + VALUE_BUILTINS; falls through to `_`.
         "bookmark" => builtin_bookmark(args, state),
+        "workflow" | "wf" => builtin_workflow(args, state),
         // Stream processing commands
         "sum" => crate::stream::builtin_sum(args),
         "avg" => crate::stream::builtin_avg(args),
@@ -3866,6 +3873,156 @@ fn builtin_bookmark(args: &[String], state: &mut ShellState) -> i32 {
     }
 }
 
+fn builtin_workflow(args: &[String], state: &ShellState) -> i32 {
+    const USAGE: &str = "Usage: workflow <list|show|render> [name] [parameter=value ...]";
+
+    let (subcommand, rest) = match args.split_first() {
+        None => ("list", &[][..]),
+        Some((subcommand, rest)) => (subcommand.as_str(), rest),
+    };
+    match subcommand {
+        "-h" | "--help" | "help" => {
+            println!("{USAGE}");
+            println!("  list [--json]                 List available workflows");
+            println!("  show NAME [--json]            Inspect one workflow template");
+            println!("  render NAME parameter=value…  Render without executing");
+            0
+        }
+        "list" => {
+            if rest == ["--json"] {
+                match serde_json::to_string_pretty(&state.workflow_registry.all()) {
+                    Ok(json) => println!("{json}"),
+                    Err(error) => {
+                        eprintln!("jsh: workflow: cannot render registry: {error}");
+                        return 1;
+                    }
+                }
+            } else if rest.is_empty() {
+                for workflow in state.workflow_registry.all() {
+                    println!("{:<28} {}", workflow.name, workflow.description);
+                }
+            } else {
+                eprintln!("jsh: workflow: list accepts only --json");
+                return 2;
+            }
+            0
+        }
+        "show" => {
+            let Some(name) = rest.first() else {
+                eprintln!("jsh: workflow: show requires a name");
+                return 2;
+            };
+            let json = rest.get(1).is_some_and(|argument| argument == "--json");
+            if rest.len() > if json { 2 } else { 1 } {
+                eprintln!("jsh: workflow: unexpected argument to show");
+                return 2;
+            }
+            let Some(workflow) = state.workflow_registry.get(name) else {
+                eprintln!("jsh: workflow: unknown workflow '{name}'");
+                return 1;
+            };
+            if json {
+                match serde_json::to_string_pretty(workflow) {
+                    Ok(json) => println!("{json}"),
+                    Err(error) => {
+                        eprintln!("jsh: workflow: cannot render '{name}': {error}");
+                        return 1;
+                    }
+                }
+            } else {
+                println!("{} — {}", workflow.name, workflow.description);
+                println!("  {}", workflow.command);
+                if !workflow.parameters.is_empty() {
+                    println!("Parameters:");
+                    for parameter in &workflow.parameters {
+                        let requirement = parameter
+                            .default
+                            .as_deref()
+                            .map(|value| format!("default: {value}"))
+                            .unwrap_or_else(|| "required".to_string());
+                        let description = parameter.description.as_deref().unwrap_or("");
+                        println!("  {:16} {:20} {}", parameter.name, requirement, description);
+                    }
+                }
+            }
+            0
+        }
+        "render" => {
+            let Some(name) = rest.first() else {
+                eprintln!("jsh: workflow: render requires a name");
+                return 2;
+            };
+            let Some(workflow) = state.workflow_registry.get(name) else {
+                eprintln!("jsh: workflow: unknown workflow '{name}'");
+                return 1;
+            };
+            let mut values: Vec<(String, String)> = workflow
+                .parameters
+                .iter()
+                .filter_map(|parameter| {
+                    parameter
+                        .default
+                        .as_ref()
+                        .map(|value| (parameter.name.clone(), value.clone()))
+                })
+                .collect();
+            let mut assigned = std::collections::HashSet::new();
+            for assignment in &rest[1..] {
+                let Some((key, value)) = assignment.split_once('=') else {
+                    eprintln!("jsh: workflow: expected parameter=value, got '{assignment}'");
+                    return 2;
+                };
+                if !workflow
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name == key)
+                {
+                    eprintln!("jsh: workflow: '{name}' has no parameter '{key}'");
+                    return 2;
+                }
+                if !assigned.insert(key) {
+                    eprintln!("jsh: workflow: duplicate value for parameter '{key}'");
+                    return 2;
+                }
+                if let Some(existing) = values.iter_mut().find(|(parameter, _)| parameter == key) {
+                    existing.1 = value.to_string();
+                } else {
+                    values.push((key.to_string(), value.to_string()));
+                }
+            }
+            for parameter in &workflow.parameters {
+                if !values.iter().any(|(name, _)| name == &parameter.name) {
+                    eprintln!(
+                        "jsh: workflow: missing value for '{}' (pass {}=value)",
+                        parameter.name, parameter.name
+                    );
+                    return 2;
+                }
+            }
+            match crate::workflows::fill_template(&workflow.command, &values) {
+                Ok(command) => {
+                    println!("{command}");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("jsh: workflow: cannot render '{name}': {error}");
+                    1
+                }
+            }
+        }
+        // A workflow name by itself is a convenient read-only shorthand for
+        // `show`; Ctrl-G remains the parameter-filling interface.
+        name if rest.is_empty() && state.workflow_registry.get(name).is_some() => {
+            builtin_workflow(&["show".to_string(), name.to_string()], state)
+        }
+        _ => {
+            eprintln!("jsh: workflow: unknown subcommand or workflow '{subcommand}'");
+            eprintln!("{USAGE}");
+            2
+        }
+    }
+}
+
 // ============================================================
 // Enhanced structured data pipeline builtins (Feature 13)
 // ============================================================
@@ -3922,177 +4079,12 @@ fn builtin_math(args: &[String]) -> i32 {
     }
 }
 
-const HELP_ENTRIES: &[(&str, &str)] = &[
-    (
-        "cd",
-        "cd [-] [dir] — Change working directory. cd - returns to previous.",
-    ),
-    (
-        "exit",
-        "exit [N] — Exit the shell with status N (default: last command's status).",
-    ),
-    (
-        "export",
-        "export [-n] name[=value] — Set environment variables. -n unexports.",
-    ),
-    ("unset", "unset name... — Remove variables or functions."),
-    (
-        "echo",
-        "echo [-neE] [args...] — Print arguments. -n no newline, -e escapes.",
-    ),
-    (
-        "printf",
-        "printf format [args...] — Formatted output (C-style).",
-    ),
-    ("pwd", "pwd — Print current working directory."),
-    (
-        "alias",
-        "alias [name[=value]...] — Define or display aliases.",
-    ),
-    (
-        "unalias",
-        "unalias [-a] name... — Remove aliases. -a removes all.",
-    ),
-    (
-        "type",
-        "type name... — Show how each name would be interpreted as a command.",
-    ),
-    (
-        "source",
-        "source file [args] — Execute commands from file in current shell.",
-    ),
-    (
-        "eval",
-        "eval [args...] — Concatenate args and execute as a command.",
-    ),
-    (
-        "read",
-        "read [-p prompt] [-t timeout] [-r] var... — Read line from stdin.",
-    ),
-    (
-        "test",
-        "test expr / [ expr ] — Evaluate conditional expression.",
-    ),
-    (
-        "set",
-        "set [-/+euxo option] — Set/unset shell options. set -e enables errexit.",
-    ),
-    (
-        "local",
-        "local name[=value]... — Declare local variables in a function.",
-    ),
-    (
-        "shift",
-        "shift [N] — Shift positional parameters left by N (default 1).",
-    ),
-    ("jobs", "jobs — List active jobs."),
-    ("fg", "fg [%N] — Bring job N to foreground."),
-    ("bg", "bg [%N] — Resume job N in background."),
-    (
-        "wait",
-        "wait [pid|%jobspec...] — Wait for processes to complete.",
-    ),
-    (
-        "trap",
-        "trap [action] signal... — Set signal handlers. trap '' SIG ignores.",
-    ),
-    (
-        "return",
-        "return [N] — Return from a function with exit status N.",
-    ),
-    ("break", "break [N] — Exit from N enclosing loops."),
-    (
-        "continue",
-        "continue [N] — Resume next iteration of Nth enclosing loop.",
-    ),
-    (
-        "declare",
-        "declare [-aAirx] name[=value] — Declare variables with attributes.",
-    ),
-    ("history", "history — Display command history."),
-    (
-        "context",
-        "context <list|show|last-failed> [options] — Query execution context.",
-    ),
-    (
-        "pushd",
-        "pushd [dir] — Push directory onto stack and cd to it.",
-    ),
-    ("popd", "popd — Pop directory from stack and cd to it."),
-    ("dirs", "dirs — Display directory stack."),
-    (
-        "complete",
-        "complete [-W words] [-F func] cmd — Register completions.",
-    ),
-    (
-        "compgen",
-        "compgen [-abcdfv] [-A action] [-W words] [-G glob] [prefix]",
-    ),
-    (
-        "disown",
-        "disown [-a] [%N] — Remove job from table (won't receive SIGHUP).",
-    ),
-    (
-        "shopt",
-        "shopt [-su] opt... — Set/unset shell options (globstar, extglob, etc).",
-    ),
-    (
-        "exec",
-        "exec cmd [args] — Replace shell with command (no fork).",
-    ),
-    (
-        "hash",
-        "hash [-r] — Refresh command lookup cache (currently a no-op).",
-    ),
-    (
-        "z",
-        "z [query] — Jump to frecency-ranked directory matching query.",
-    ),
-    (
-        "bookmark",
-        "bookmark <add|go|ls|rm> [name] — Manage directory bookmarks.",
-    ),
-    (
-        "hook",
-        "hook <add|remove|list> <precmd|preexec|chpwd> [cmd]",
-    ),
-    (
-        "from-json",
-        "from-json — Parse JSON from stdin into structured pipeline.",
-    ),
-    ("to-json", "to-json — Output structured data as JSON."),
-    (
-        "to-table",
-        "to-table — Output structured data as aligned table.",
-    ),
-    ("where", "where field op value — Filter structured records."),
-    (
-        "sort-by",
-        "sort-by field — Sort structured records by field.",
-    ),
-    (
-        "select",
-        "select field... — Project fields from structured records.",
-    ),
-];
-
 fn builtin_help(args: &[String], state: &ShellState) -> i32 {
-    // Phase 14b: prefer signature-driven help when available.
     if args.is_empty() {
         println!("jsh — a Bash-inspired shell with structured data pipelines\n");
-        println!("Core builtins:");
-        for (name, desc) in HELP_ENTRIES {
-            println!("  {:12} {}", name, desc.split(" — ").nth(1).unwrap_or(desc));
-        }
-        // Also list signed value-aware commands (Phase 14b).
-        let mut signed: Vec<&'static str> = crate::signature::SIGNATURES.keys().copied().collect();
-        signed.sort_unstable();
-        if !signed.is_empty() {
-            println!("\nValue-aware commands (with signatures):");
-            // Print 6 per line for compactness.
-            for chunk in signed.chunks(6) {
-                println!("  {}", chunk.join("  "));
-            }
+        println!("Commands:");
+        for command in crate::command_catalog::entries() {
+            println!("  {:18} {}", command.name, command.summary());
         }
         if !state.user_signatures.is_empty() {
             let mut user: Vec<&str> = state.user_signatures.keys().map(|s| s.as_str()).collect();
@@ -4102,7 +4094,7 @@ fn builtin_help(args: &[String], state: &ShellState) -> i32 {
                 println!("  {}", chunk.join("  "));
             }
         }
-        println!("\nType 'help <command>' for detailed help on a specific builtin.");
+        println!("\nType 'help <command>' for details on a specific command.");
         return 0;
     }
 
@@ -4129,37 +4121,49 @@ fn builtin_help(args: &[String], state: &ShellState) -> i32 {
     // Phase 15c: user-defined signatures take precedence so re-defs are visible.
     if let Some(rsig) = state.user_signatures.get(cmd) {
         if as_record {
-            println!(
-                "{{\"name\":\"{}\",\"user_defined\":true,\"params\":{}}}",
-                rsig.name,
-                rsig.params.len()
-            );
+            match serde_json::to_string_pretty(&rsig.to_record().to_json()) {
+                Ok(rendered) => println!("{}", rendered),
+                Err(error) => {
+                    eprintln!("jsh: help: failed to render help: {}", error);
+                    return 1;
+                }
+            }
         } else {
             print!("{}", rsig.render_help());
         }
         return 0;
     }
 
-    if let Some(sig) = crate::signature::SIGNATURES.get(cmd) {
+    if let Some(command) = crate::command_catalog::get(cmd) {
         if as_record {
-            // Print the to_record() form as JSON for downstream consumption.
-            let json = sig.to_record().to_json();
+            let json = command.help_record().to_json();
             match serde_json::to_string_pretty(&json) {
-                Ok(s) => println!("{}", s),
-                Err(_) => println!("{:?}", sig),
+                Ok(rendered) => println!("{}", rendered),
+                Err(error) => {
+                    eprintln!("jsh: help: failed to render help: {}", error);
+                    return 1;
+                }
+            }
+        } else if let Some(signature) = command.signature() {
+            print!("{}", signature.render_help());
+            if command.name != command.canonical_name {
+                println!("Alias: {} -> {}", command.name, command.canonical_name);
             }
         } else {
-            print!("{}", sig.render_help());
+            let alias = if command.name != command.canonical_name {
+                format!(" (alias of {})", command.canonical_name)
+            } else {
+                String::new()
+            };
+            println!("{}{}\n  {}", command.name, alias, command.summary());
+            if let Some(usage) = command.usage() {
+                println!("\nUsage: {usage}");
+            }
+            if let Some(detail) = command.detail() {
+                println!("\n{detail}");
+            }
         }
         return 0;
-    }
-
-    // Fall back to legacy short-form HELP_ENTRIES.
-    for (name, desc) in HELP_ENTRIES {
-        if *name == cmd {
-            println!("{}", desc);
-            return 0;
-        }
     }
     eprintln!("jsh: help: no help for '{}'", cmd);
     1

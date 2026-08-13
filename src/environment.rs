@@ -676,6 +676,14 @@ impl ShellState {
         self.path_cache().binary_search(&name.to_string()).is_ok()
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_path_for_test(&mut self, path: &str) {
+        // Unit tests need to model a shell PATH without changing the process
+        // environment shared by Rust's parallel test threads.
+        self.env_vars.insert("PATH".to_string(), path.to_string());
+        self.invalidate_path_cache();
+    }
+
     pub fn push_positional_params(&mut self, args: Vec<String>) {
         self.positional_stack
             .push(std::mem::replace(&mut self.positional_params, args));

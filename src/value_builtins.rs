@@ -4518,11 +4518,11 @@ fn vb_help(
     let name = match cmd {
         Some(n) => n,
         None => {
-            // No command given — list every signed command (one per line),
-            // including any user-defined functions registered via `def`.
-            let mut names: Vec<String> = crate::signature::SIGNATURES
-                .keys()
-                .map(|s| s.to_string())
+            // No command given — list every catalog command, including those
+            // whose help is summary-only, plus user-defined functions.
+            let mut names: Vec<String> = crate::command_catalog::all_names()
+                .iter()
+                .map(|name| (*name).to_string())
                 .chain(state.user_signatures.keys().cloned())
                 .collect();
             names.sort();
@@ -4534,38 +4534,51 @@ fn vb_help(
     // User signatures shadow static ones — `def` lets users redefine semantics.
     if let Some(rsig) = state.user_signatures.get(name) {
         if as_record {
-            let mut rec = indexmap::IndexMap::new();
-            rec.insert("name".to_string(), Value::String(rsig.name.clone()));
-            rec.insert("desc".to_string(), Value::String(rsig.desc.clone()));
-            rec.insert("user_defined".to_string(), Value::Bool(true));
-            let params: Vec<Value> = rsig
-                .params
-                .iter()
-                .map(|p| {
-                    let mut r = indexmap::IndexMap::new();
-                    r.insert("name".to_string(), Value::String(p.name.clone()));
-                    r.insert("type".to_string(), Value::String(p.kind.render()));
-                    r.insert("optional".to_string(), Value::Bool(p.optional));
-                    r.insert("rest".to_string(), Value::Bool(p.rest));
-                    Value::Record(r)
-                })
-                .collect();
-            rec.insert("params".to_string(), Value::List(params));
-            return Ok(PipelineData::Values(vec![Value::Record(rec)]));
+            return Ok(PipelineData::Values(vec![rsig.to_record()]));
         }
         return Ok(PipelineData::Bytes(rsig.render_help().into_bytes()));
     }
-    let sig = match crate::signature::SIGNATURES.get(name) {
-        Some(s) => s,
-        None => {
-            state.set_error(format!("no signature for `{}`", name), 1);
-            return Err(1);
+    if let Some(command) = crate::command_catalog::get(name) {
+        if as_record {
+            Ok(PipelineData::Values(vec![command.help_record()]))
+        } else if let Some(signature) = command.signature() {
+            let mut help = signature.render_help();
+            if command.name != command.canonical_name {
+                help.push_str(&format!(
+                    "Alias: {} -> {}\n",
+                    command.name, command.canonical_name
+                ));
+            }
+            Ok(PipelineData::Bytes(help.into_bytes()))
+        } else {
+            let alias = if command.name == command.canonical_name {
+                String::new()
+            } else {
+                format!(" (alias of {})", command.canonical_name)
+            };
+            let usage = command
+                .usage()
+                .map(|usage| format!("\nUsage: {usage}\n"))
+                .unwrap_or_else(|| "\n".to_string());
+            let detail = command
+                .detail()
+                .map(|detail| format!("\n{detail}\n"))
+                .unwrap_or_default();
+            Ok(PipelineData::Bytes(
+                format!(
+                    "{}{}\n  {}\n{}{}",
+                    command.name,
+                    alias,
+                    command.summary(),
+                    usage,
+                    detail
+                )
+                .into_bytes(),
+            ))
         }
-    };
-    if as_record {
-        Ok(PipelineData::Values(vec![sig.to_record()]))
     } else {
-        Ok(PipelineData::Bytes(sig.render_help().into_bytes()))
+        state.set_error(format!("no signature for `{}`", name), 1);
+        Err(1)
     }
 }
 

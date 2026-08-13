@@ -190,6 +190,10 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     let buf = &buffer[..cursor];
     let (word, word_start) = extract_word_at(buf);
     let is_cmd_pos = is_command_position(buf, word_start);
+    // Completion may run with the caret in an earlier stage; inspect the
+    // entire editable buffer so `l<TAB> | where ...` still sees that `ls` is
+    // a valid context-only route.
+    let in_pipeline = buffer_contains_pipeline(buffer);
 
     // Everything after the command name reasons about the alias-expanded
     // line: with `alias gs='git status'`, `gs -<TAB>` is a `git status` flag
@@ -217,7 +221,7 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     } else if let Some(kind) = wrapper_value {
         format!("wrapval:{kind:?}:{word}")
     } else if is_cmd_pos {
-        format!("cmd:{}", word)
+        format!("cmd:{}:{word}", if in_pipeline { "pipe" } else { "bare" })
     } else if word.starts_with('$') && !word.contains('/') {
         format!("var:{word}")
     } else {
@@ -309,16 +313,16 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
         // Smart pipe completion: recommend based on preceding command
         let mut pipe_completions = complete_pipe_targets(buf, &word);
         if pipe_completions.is_empty() {
-            complete_command(&word, state)
+            complete_command(&word, state, true)
         } else {
             // Also include regular command completions after pipe suggestions
-            let mut regular = complete_command(&word, state);
+            let mut regular = complete_command(&word, state, true);
             pipe_completions.append(&mut regular);
             pipe_completions
         }
     } else if is_cmd_pos {
         record_source("command name");
-        let mut cmd_completions = complete_command(&word, state);
+        let mut cmd_completions = complete_command(&word, state, in_pipeline);
         // Append project-aware completions for short prefixes
         if word.len() <= 3 {
             let project = complete_project_commands(&word);
@@ -944,7 +948,7 @@ fn subcommand_completions(
         && !prefix.starts_with('-')
         && !man_section
     {
-        let results = complete_command(prefix, state);
+        let results = complete_command(prefix, state, false);
         if !results.is_empty() {
             return Some(results);
         }
@@ -1240,15 +1244,60 @@ fn subcommand_completions(
     }
 
     if matches!(cmd, "workflow" | "wf") && !prefix.starts_with('-') {
-        let completions: Vec<Completion> = state
-            .workflow_registry
-            .search("")
-            .into_iter()
-            .map(|workflow| {
-                Completion::new(workflow.name.clone(), CompletionKind::Other)
-                    .with_desc(&workflow.description)
-            })
-            .collect();
+        let workflow_names = || {
+            state
+                .workflow_registry
+                .all()
+                .into_iter()
+                .map(|workflow| {
+                    Completion::new(workflow.name.clone(), CompletionKind::Other)
+                        .with_desc(&workflow.description)
+                })
+                .collect::<Vec<_>>()
+        };
+        let completions: Vec<Completion> = if word_count == 1 {
+            let mut commands = vec![
+                Completion::new("list".to_string(), CompletionKind::Subcommand)
+                    .with_desc("list available workflows"),
+                Completion::new("show".to_string(), CompletionKind::Subcommand)
+                    .with_desc("inspect a workflow template"),
+                Completion::new("render".to_string(), CompletionKind::Subcommand)
+                    .with_desc("render a workflow without executing it"),
+            ];
+            commands.extend(workflow_names());
+            commands
+        } else if word_count == 2 && matches!(words.get(1), Some(&"show" | &"render")) {
+            workflow_names()
+        } else if word_count >= 3 && words.get(1) == Some(&"render") {
+            words
+                .get(2)
+                .and_then(|name| state.workflow_registry.get(name))
+                .map(|workflow| {
+                    workflow
+                        .parameters
+                        .iter()
+                        .map(|parameter| {
+                            Completion::new(
+                                format!(
+                                    "{}={}",
+                                    parameter.name,
+                                    parameter.default.as_deref().unwrap_or("")
+                                ),
+                                CompletionKind::Other,
+                            )
+                            .with_desc(
+                                parameter
+                                    .description
+                                    .as_deref()
+                                    .unwrap_or("workflow parameter"),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let ranked = rank_prefix_then_fuzzy(completions, prefix);
         if !ranked.is_empty() {
             return Some(ranked);
@@ -1718,25 +1767,23 @@ fn subcommand_completions(
                 ("vet", "Report issues"),
                 ("work", "Workspace mode"),
             ],
-            // Phase 14d: signature-driven first-arg completion for
-            // `help <cmd>` — list every signed value-aware builtin.
+            // `help <cmd>` reaches every command in the unified catalog,
+            // including summary-only and pipeline-context value commands.
             "help" => {
-                let mut names: Vec<&'static str> =
-                    crate::signature::SIGNATURES.keys().copied().collect();
-                names.sort_unstable();
-                let completions: Vec<Completion> = names
-                    .into_iter()
-                    .map(|n| {
-                        let sig = crate::signature::SIGNATURES.get(n).unwrap();
-                        Completion {
-                            text: n.to_string(),
-                            display: n.to_string(),
-                            description: Some(sig.desc.to_string()),
-                            kind: CompletionKind::Subcommand,
-                            is_dir: false,
-                        }
+                let mut completions: Vec<Completion> = crate::command_catalog::entries()
+                    .iter()
+                    .map(|command| Completion {
+                        text: command.name.to_string(),
+                        display: command.name.to_string(),
+                        description: Some(command.summary().to_string()),
+                        kind: CompletionKind::Subcommand,
+                        is_dir: false,
                     })
                     .collect();
+                completions.extend(state.user_signatures.values().map(|signature| {
+                    Completion::new(signature.name.clone(), CompletionKind::Function)
+                        .with_desc(&signature.desc)
+                }));
                 return Some(rank_prefix_then_fuzzy(completions, prefix));
             }
             // `error <subcmd>` — currently just `make`.
@@ -3799,11 +3846,12 @@ pub fn action_candidates(action: &str, prefix: &str, state: &mut ShellState) -> 
             .into_iter()
             .filter(|completion| completion.is_dir)
             .collect(),
-        "command" => return complete_command(prefix, state),
-        "builtin" => crate::builtins::BUILTIN_NAMES
+        "command" => return complete_command(prefix, state, false),
+        "builtin" => crate::command_catalog::builtin_names()
             .iter()
             .map(|name| {
-                Completion::new((*name).to_string(), CompletionKind::Builtin).with_desc("builtin")
+                Completion::new((*name).to_string(), CompletionKind::Builtin)
+                    .with_desc(crate::command_catalog::summary(name).unwrap_or("builtin"))
             })
             .collect(),
         "keyword" => SHELL_KEYWORDS
@@ -4004,7 +4052,11 @@ fn command_candidates(state: &mut ShellState) -> std::rc::Rc<Vec<Completion>> {
     candidates
 }
 
-fn complete_command(prefix: &str, state: &mut ShellState) -> Vec<Completion> {
+fn complete_command(
+    prefix: &str,
+    state: &mut ShellState,
+    include_context_only: bool,
+) -> Vec<Completion> {
     let candidates = command_candidates(state);
 
     // Path completion is per-prefix and cannot be cached with the rest.
@@ -4017,6 +4069,12 @@ fn complete_command(prefix: &str, state: &mut ShellState) -> Vec<Completion> {
     let mut scored: Vec<(&Completion, i32)> = candidates
         .iter()
         .chain(extra.iter())
+        .filter(|candidate| {
+            include_context_only
+                || crate::command_catalog::get(&candidate.text)
+                    .is_none_or(|command| command.is_builtin())
+                || state.command_in_path(&candidate.text)
+        })
         .map(|candidate| {
             (
                 candidate,
@@ -4039,6 +4097,17 @@ fn complete_command(prefix: &str, state: &mut ShellState) -> Vec<Completion> {
         .collect()
 }
 
+fn buffer_contains_pipeline(buffer: &str) -> bool {
+    crate::parser::lexer::tokenize_lenient(buffer)
+        .iter()
+        .any(|token| {
+            matches!(
+                token.token,
+                crate::parser::lexer::Token::Pipe | crate::parser::lexer::Token::PipeAnd
+            )
+        })
+}
+
 fn build_command_candidates(state: &mut ShellState) -> Vec<Completion> {
     let mut completions = Vec::new();
 
@@ -4048,26 +4117,21 @@ fn build_command_candidates(state: &mut ShellState) -> Vec<Completion> {
         );
     }
 
-    // Collect all builtin commands
-    for cmd in crate::builtins::BUILTIN_NAMES {
+    // One sorted, unique source for classic and value-aware commands.
+    for command in crate::command_catalog::entries() {
+        let description = match command.signature() {
+            Some(signature) => format!(
+                "{} → {} — {}",
+                signature.input.render(),
+                signature.output.render(),
+                command.summary()
+            ),
+            None => command.summary().to_string(),
+        };
         completions.push(Completion {
-            text: cmd.to_string(),
-            display: cmd.to_string(),
-            description: Some("builtin".to_string()),
-            kind: CompletionKind::Builtin,
-            is_dir: false,
-        });
-    }
-
-    // Phase 14d: surface signed value-aware builtins (try/each/where/...).
-    // Description carries the input → output signature so users can pick the
-    // right command by type from the completion list.
-    for (name, sig) in crate::signature::SIGNATURES.iter() {
-        let desc = format!("{} → {}", sig.input.render(), sig.output.render());
-        completions.push(Completion {
-            text: (*name).to_string(),
-            display: (*name).to_string(),
-            description: Some(desc),
+            text: command.name.to_string(),
+            display: command.name.to_string(),
+            description: Some(description),
             kind: CompletionKind::Builtin,
             is_dir: false,
         });
@@ -7029,6 +7093,36 @@ mod tests {
             );
         }
         assert!(completions.len() <= 50, "the list stays bounded");
+    }
+
+    #[test]
+    fn context_only_commands_are_offered_only_for_multi_stage_pipelines() {
+        let mut state = ShellState::new(false);
+        state.replace_path_for_test("");
+
+        clear_cache();
+        let (_, bare) = complete("l", 1, &mut state);
+        assert!(
+            !bare.iter().any(|item| item.text == "ls"),
+            "bare completion must not promise the pipeline-only ls route"
+        );
+
+        let line = "l | where name == x";
+        let (_, pipeline) = complete(line, 1, &mut state);
+        assert!(
+            pipeline.iter().any(|item| item.text == "ls"),
+            "the first stage of a value pipeline may use structured ls"
+        );
+
+        let line = "echo x | l";
+        let (_, pipeline) = complete(line, line.len(), &mut state);
+        assert!(pipeline.iter().any(|item| item.text == "ls"));
+
+        let (_, bare_again) = complete("l", 1, &mut state);
+        assert!(
+            !bare_again.iter().any(|item| item.text == "ls"),
+            "pipeline candidates must not leak through the completion cache"
+        );
     }
 
     #[test]

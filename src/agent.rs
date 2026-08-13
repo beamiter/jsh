@@ -75,6 +75,28 @@ const MODEL_CHILD_OK: u8 = b'+';
 const MODEL_CHILD_ERR: u8 = b'-';
 const MAX_MODEL_CHILD_STDERR_BYTES: usize = 8 * 1024;
 
+/// Create the Agent capture pipe with close-on-exec set on both original
+/// descriptors. Linux and Android can do this atomically. Other Unix targets
+/// (notably macOS, which has no `pipe2` in nix) set the descriptor flag before
+/// either end is exposed to `Command`; owned descriptors close automatically
+/// if either `fcntl` call fails.
+fn capture_pipe_cloexec() -> nix::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+        let (reader, writer) = nix::unistd::pipe()?;
+        fcntl(&reader, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(&writer, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        Ok((reader, writer))
+    }
+}
+
 pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
     let Some(ai_config) = AiConfig::from_env() else {
         eprintln!(
@@ -1162,7 +1184,7 @@ fn run_captured_to(
     agent_cwd: &mut PathBuf,
     terminal_output: &mut dyn Write,
 ) -> (i32, String) {
-    use nix::unistd::{close, pipe, read};
+    use nix::unistd::{close, read};
     use std::os::unix::io::{BorrowedFd, IntoRawFd};
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
@@ -1193,7 +1215,14 @@ fn run_captured_to(
         Ok(transport) => transport,
         Err(error) => return (1, format!("[jsh: Agent state snapshot failed: {error}]")),
     };
-    let (r, w) = match pipe() {
+    // Neither end may leak through the exec that starts the one-shot jsh.
+    // `stdout_file` is duplicated onto fd 1 by `Command`; dup2 clears
+    // FD_CLOEXEC on that destination, while the original writer and, most
+    // importantly, the reader disappear at exec. Without this, a background
+    // command inherits both ends of its own capture pipe. Closing `r` here
+    // then cannot deliver SIGPIPE to a continuously writing descendant, which
+    // leaves the descendant and its waiting jsh parent orphaned indefinitely.
+    let (r, w) = match capture_pipe_cloexec() {
         Ok(fds) => (fds.0.into_raw_fd(), fds.1),
         Err(error) => return (1, format!("[jsh: pipe failed: {error}]")),
     };
@@ -1507,8 +1536,8 @@ fn terminal_safe_message(prefix: &str, value: &str, max_bytes: usize) -> String 
 mod tests {
     use super::{
         agent_child_command, agent_http_client, agent_reply_within_budget, bounded_git_stdout,
-        configured_max_turns, current_danger, git_meta, git_worktree_dirty, run_captured,
-        run_captured_to, run_internal_agent_child, run_internal_model_request,
+        capture_pipe_cloexec, configured_max_turns, current_danger, git_meta, git_worktree_dirty,
+        run_captured, run_captured_to, run_internal_agent_child, run_internal_model_request,
         terminal_safe_inline_text, terminal_safe_message, terminal_safe_text, AgentChildTransport,
         AGENT_CHILD_COMMAND_ENV, MAX_AGENT_ACTION_JSON_BYTES, MAX_AGENT_COMMAND_DISPLAY_BYTES,
         MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_SESSION_TURNS,
@@ -1662,13 +1691,16 @@ mod tests {
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let mut terminal_output = std::io::sink();
         let started = Instant::now();
-
-        let (status, observation) = run_captured_to(
-            "yes agent-background-output & sleep 0.1",
-            &mut state,
-            &mut cwd,
-            &mut terminal_output,
+        let temp = tempfile::tempdir().expect("pid directory");
+        let pid_file = temp.path().join("background.pid");
+        let quoted_pid_file = pid_file.display().to_string().replace('\'', "'\\''");
+        let command = format!(
+            "/bin/sh -c 'printf %s \"$$\" > \"$1\"; exec yes agent-background-output' \
+             agent-writer '{quoted_pid_file}' & sleep 0.1"
         );
+
+        let (status, observation) =
+            run_captured_to(&command, &mut state, &mut cwd, &mut terminal_output);
 
         assert_eq!(status, 0);
         assert!(
@@ -1677,6 +1709,48 @@ mod tests {
             started.elapsed()
         );
         assert!(observation.contains("further output not captured"));
+
+        // The capture reader is the only thing keeping the writer alive. Once
+        // run_captured_to closes it, the writer must receive SIGPIPE and the
+        // background shell waiting for it must disappear as well. The old
+        // plain `pipe()` leaked the read end through exec, so this exact test
+        // returned quickly while leaving both processes behind forever.
+        let background_pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("background pid report")
+            .parse()
+            .expect("numeric background pid");
+        assert!(background_pid > 1, "refuse to probe an unsafe pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut alive = true;
+        while Instant::now() < deadline {
+            alive = unsafe { nix::libc::kill(background_pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if alive {
+            // Keep a failed regression test from recreating the leak it is
+            // meant to detect. The PID came from this test's own child.
+            unsafe {
+                nix::libc::kill(background_pid, nix::libc::SIGKILL);
+            }
+        }
+        assert!(!alive, "background Agent writer survived capture teardown");
+    }
+
+    #[test]
+    fn capture_pipe_marks_both_original_descriptors_close_on_exec() {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+        let (reader, writer) = capture_pipe_cloexec().expect("capture pipe");
+        for descriptor in [&reader, &writer] {
+            let flags = fcntl(descriptor, FcntlArg::F_GETFD).expect("descriptor flags");
+            assert!(
+                FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC),
+                "capture descriptor must not survive exec"
+            );
+        }
     }
 
     #[test]

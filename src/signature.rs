@@ -271,6 +271,7 @@ const PARAMS_SPLIT_BY: &[Param] = &[p("by", Type::Union(CLOSURE_OR_STR))];
 const PARAMS_SCHEME: &[Param] = &[p("scheme", Type::String)];
 const PARAMS_ITEMS: &[Param] = &[p_rest("items", Type::Any)];
 const PARAMS_CHAR: &[Param] = &[p("name", Type::String)];
+const PARAMS_DEF: &[Param] = &[p("name", Type::String), p_rest("definition", Type::Any)];
 
 // ---------------------------------------------------------------------------
 // Signature registry
@@ -404,6 +405,13 @@ const SIGS: &[Signature] = &[
         output: Type::Any,
         params: PARAMS_FIRST,
         desc: "Last N items (default 1).",
+    },
+    Signature {
+        name: "reverse",
+        input: Type::List,
+        output: Type::List,
+        params: &[],
+        desc: "Reverse the order of pipeline values.",
     },
     Signature {
         name: "take",
@@ -542,6 +550,13 @@ const SIGS: &[Signature] = &[
         params: PARAMS_ERROR,
         desc: "error make <msg> — raise a structured error.",
     },
+    Signature {
+        name: "def",
+        input: Type::Null,
+        output: Type::Null,
+        params: PARAMS_DEF,
+        desc: "Define a typed shell function from parameters and a closure.",
+    },
     // reflection
     Signature {
         name: "describe",
@@ -583,7 +598,7 @@ const SIGS: &[Signature] = &[
         input: Type::Any,
         output: Type::Any,
         params: PARAMS_HELP,
-        desc: "Show the signature for a command, or list signed commands.",
+        desc: "Show help for a command, or list known commands; -r/--record emits structured help.",
     },
     // Phase 15a — full coverage of remaining value builtins
     Signature {
@@ -897,6 +912,29 @@ pub struct RuntimeSignature {
 }
 
 impl RuntimeSignature {
+    /// Render user-defined help with the same machine-readable schema used by
+    /// both standalone and structured-pipeline help routes.
+    pub fn to_record(&self) -> Value {
+        let mut record = IndexMap::new();
+        record.insert("name".to_string(), Value::String(self.name.clone()));
+        record.insert("desc".to_string(), Value::String(self.desc.clone()));
+        record.insert("user_defined".to_string(), Value::Bool(true));
+        let params = self
+            .params
+            .iter()
+            .map(|param| {
+                let mut value = IndexMap::new();
+                value.insert("name".to_string(), Value::String(param.name.clone()));
+                value.insert("type".to_string(), Value::String(param.kind.render()));
+                value.insert("optional".to_string(), Value::Bool(param.optional));
+                value.insert("rest".to_string(), Value::Bool(param.rest));
+                Value::Record(value)
+            })
+            .collect();
+        record.insert("params".to_string(), Value::List(params));
+        Value::Record(record)
+    }
+
     /// Mirror Signature::validate_args for runtime sigs. Same flag/positional
     /// heuristic as static signatures.
     pub fn validate_args(&self, args: &[String]) -> Result<(), String> {

@@ -1,6 +1,6 @@
 /// Line editor: raw mode, cursor movement, inline editing, integration with
 /// highlighting, suggestions, and completion. Supports multiline editing.
-use crate::ai::{AiConfig, AiContext, AiRequest, AiResponse, AiWorker};
+use crate::ai::{AiConfig, AiContext, AiRequest, AiRequestKind, AiResponse, AiWorker};
 use crate::completer::{self, common_prefix, Completion, CompletionKind};
 use crate::environment::ShellState;
 use crate::highlighter;
@@ -52,9 +52,10 @@ pub struct Editor {
     vi_pending: Option<char>,
     ai_worker: Option<AiWorker>,
     ai_include_extended_context: bool,
-    ai_pending: bool,
-    ai_explain_mode: bool,
+    ai_request_sequence: u64,
+    active_ai_request: Option<ActiveAiRequest>,
     ai_saved_input: Option<AiInputSnapshot>,
+    ai_explanation: Option<String>,
     ai_error: Option<String>,
     pub last_error_info: Option<(String, String, i32)>,
     pub last_error_execution_id: Option<String>,
@@ -64,6 +65,7 @@ pub struct Editor {
     last_cursor_snapshot: usize,
     last_suggestion_snapshot: Option<String>,
     last_menu_snapshot: Option<usize>,
+    last_ai_explanation_snapshot: Option<String>,
     last_ai_error_snapshot: Option<String>,
     /// Byte stolen from the kernel input queue by `swallow_enter_tail` that
     /// turned out not to be part of a CR+LF Enter; replayed as typed input at
@@ -78,10 +80,26 @@ struct AiInputSnapshot {
     suggestion: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveAiRequest {
+    request_id: u64,
+    kind: AiRequestKind,
+}
+
+#[derive(Clone)]
+struct WorkflowInputSnapshot {
+    buffer: String,
+    cursor: usize,
+    suggestion: Option<String>,
+}
+
 struct WorkflowMode {
     query: String,
     results: Vec<workflows::Workflow>,
     selected: usize,
+    original_input: WorkflowInputSnapshot,
+    session: Option<workflows::WorkflowSession>,
+    suggestion_selected: Option<usize>,
 }
 
 struct CompletionMenu {
@@ -128,9 +146,10 @@ impl Editor {
             vi_pending: None,
             ai_worker,
             ai_include_extended_context,
-            ai_pending: false,
-            ai_explain_mode: false,
+            ai_request_sequence: 0,
+            active_ai_request: None,
             ai_saved_input: None,
+            ai_explanation: None,
             ai_error: None,
             last_error_info: None,
             last_error_execution_id: None,
@@ -142,6 +161,7 @@ impl Editor {
             last_cursor_snapshot: 0,
             last_suggestion_snapshot: None,
             last_menu_snapshot: None,
+            last_ai_explanation_snapshot: None,
             last_ai_error_snapshot: None,
             pushback_byte: None,
         }
@@ -152,6 +172,9 @@ impl Editor {
         state: &mut ShellState,
         history: &mut History,
     ) -> io::Result<Option<String>> {
+        // A new shell prompt is a hard generation boundary. Replies from the
+        // previous prompt may still arrive, but can no longer mutate this one.
+        self.invalidate_ai_request(false);
         self.buffer.clear();
         self.cursor = 0;
         self.suggestion = None;
@@ -159,6 +182,7 @@ impl Editor {
         self.completion_menu = None;
         self.search_mode = None;
         self.workflow_mode = None;
+        self.ai_explanation = None;
         self.ai_error = None;
         self.vi_mode = ViMode::Insert;
         self.vi_pending = None;
@@ -210,6 +234,9 @@ impl Editor {
         terminal::enable_raw_mode()?;
         stdout().execute(event::EnableBracketedPaste).ok();
         let result = self.edit_loop(state, history);
+        // Submit, Ctrl-C, EOF and terminal hangup all leave through this seam.
+        // Invalidate before the next prompt can observe a late worker reply.
+        self.invalidate_ai_request(false);
         if let Ok(Some(line)) = &result {
             self.swallow_enter_tail(!line.is_empty());
         }
@@ -297,10 +324,34 @@ impl Editor {
                 consecutive_timeouts = 0;
                 match event::read()? {
                     Event::Key(key) => {
+                        // Input is also cancellation. Generate/fix temporarily
+                        // replace the line with a progress marker; restore the
+                        // request snapshot before applying this key so a reply
+                        // from the same request cannot overwrite text entered
+                        // while it was in flight. Explain keeps the line in
+                        // place, but editing still makes its response stale.
+                        let cancelled_ai = self.cancel_ai_for_user_input();
+                        let cancelling_workflow =
+                            self.workflow_mode.is_some() && key.code == KeyCode::Esc;
+                        // Enter while a generated/fixed command is pending is
+                        // cancellation, not permission to submit the progress
+                        // marker or immediately enqueue the same request again.
+                        if matches!(
+                            cancelled_ai,
+                            Some(AiRequestKind::Generate | AiRequestKind::Fix)
+                        ) && key.code == KeyCode::Enter
+                        {
+                            self.ai_error = None;
+                            self.ai_explanation = None;
+                            self.update_suggestion(history, state);
+                            self.repaint(state)?;
+                            continue;
+                        }
                         // AI failures are rendered as a transient status line. Any
                         // subsequent key dismisses it while leaving the restored
                         // command buffer intact.
                         self.ai_error = None;
+                        self.ai_explanation = None;
                         // Typing with the menu open narrows it rather than
                         // closing it: the list was opened *because* the word
                         // was ambiguous, and the natural way to resolve that
@@ -362,12 +413,21 @@ impl Editor {
                             }
                         }
 
-                        self.update_suggestion(history, state);
+                        // Workflow cancellation restores the exact suggestion
+                        // snapshot (including an AI ghost that history cannot
+                        // reconstruct), so do not immediately overwrite it.
+                        if !cancelling_workflow {
+                            self.update_suggestion(history, state);
+                        }
                         self.repaint(state)?;
                     }
                     Event::Paste(text) => {
+                        self.cancel_ai_for_user_input();
                         self.ai_error = None;
-                        if text.chars().all(|ch| {
+                        self.ai_explanation = None;
+                        if self.workflow_mode.is_some() {
+                            self.handle_workflow_paste(&text, state);
+                        } else if text.chars().all(|ch| {
                             ch == '\n' || !crate::terminal_text::is_terminal_ambiguous(ch)
                         }) {
                             self.buffer.insert_str(self.cursor, &text);
@@ -397,15 +457,11 @@ impl Editor {
                 StdinPoll::Ready => {} // loop; the drain above will read it
                 StdinPoll::Timeout => {
                     consecutive_timeouts = consecutive_timeouts.saturating_add(1);
-                    // Check for AI response
-                    if self.ai_pending {
-                        if let Some(ref worker) = self.ai_worker {
-                            if let Some(resp) = worker.try_recv() {
-                                self.ai_pending = false;
-                                self.apply_ai_response(resp);
-                                self.repaint(state)?;
-                            }
-                        }
+                    // Drain even when no request is active: cancelled requests
+                    // can finish late, and leaving one queued would block the
+                    // single-flight worker from delivering the current reply.
+                    if self.drain_ai_responses() {
+                        self.repaint(state)?;
                     }
                 }
             }
@@ -448,6 +504,13 @@ impl Editor {
         }
         if self.search_mode.is_some() {
             return self.handle_search_key(key, history);
+        }
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('g'), KeyModifiers::CONTROL)
+        ) {
+            self.open_workflow(state);
+            return Ok(KeyAction::Continue);
         }
 
         match state.editing_mode {
@@ -541,14 +604,6 @@ impl Editor {
                     query: String::new(),
                     results: Vec::new(),
                     rich_results: Vec::new(),
-                    selected: 0,
-                });
-            }
-            (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
-                let all = state.workflow_registry.search("");
-                self.workflow_mode = Some(WorkflowMode {
-                    query: String::new(),
-                    results: all.into_iter().cloned().collect(),
                     selected: 0,
                 });
             }
@@ -1124,77 +1179,246 @@ impl Editor {
         Ok(KeyAction::Continue)
     }
 
-    fn handle_workflow_key(
-        &mut self,
-        key: KeyEvent,
-        state: &mut ShellState,
-    ) -> io::Result<KeyAction> {
-        let wf_mode = self.workflow_mode.as_mut().unwrap();
-        match key.code {
-            KeyCode::Esc => {
-                self.workflow_mode = None;
+    fn handle_workflow_key(&mut self, key: KeyEvent, state: &ShellState) -> io::Result<KeyAction> {
+        if key.code == KeyCode::Esc {
+            self.cancel_workflow();
+            return Ok(KeyAction::Continue);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.cancel_workflow();
+                    return Ok(KeyAction::Interrupt);
+                }
+                KeyCode::Char('d') => {
+                    self.cancel_workflow();
+                    return Ok(KeyAction::Eof);
+                }
+                _ => {}
             }
+        }
+
+        let filling_parameters = self
+            .workflow_mode
+            .as_ref()
+            .is_some_and(|mode| mode.session.is_some());
+        if filling_parameters {
+            self.handle_workflow_parameter_key(key);
+        } else {
+            self.handle_workflow_search_key(key, state);
+        }
+        Ok(KeyAction::Continue)
+    }
+
+    fn handle_workflow_search_key(&mut self, key: KeyEvent, state: &ShellState) {
+        match key.code {
             KeyCode::Enter => {
-                if let Some(wf) = wf_mode.results.get(wf_mode.selected).cloned() {
-                    let rendered = workflows::fill_template(
-                        &wf.command,
-                        &wf.parameters
-                            .iter()
-                            .map(|p| {
-                                (
-                                    p.name.clone(),
-                                    p.default
-                                        .clone()
-                                        .unwrap_or_else(|| format!("{{{{{}}}}}", p.name)),
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                    self.buffer = rendered;
-                    self.cursor = self.buffer.len();
-                    self.workflow_mode = None;
+                let selected = self
+                    .workflow_mode
+                    .as_ref()
+                    .and_then(|mode| mode.results.get(mode.selected).cloned());
+                let Some(workflow) = selected else {
+                    return;
+                };
+                match workflows::WorkflowSession::new(workflow) {
+                    Ok(session) if session.is_complete() => match session.render() {
+                        Ok(command) => self.finish_workflow(command),
+                        Err(error) => self.ai_error = Some(format!("Workflow error: {error}")),
+                    },
+                    Ok(session) => {
+                        if let Some(mode) = self.workflow_mode.as_mut() {
+                            mode.session = Some(session);
+                            mode.suggestion_selected = None;
+                        }
+                    }
+                    Err(error) => self.ai_error = Some(format!("Workflow error: {error}")),
                 }
             }
             KeyCode::Up => {
-                if wf_mode.selected > 0 {
-                    wf_mode.selected -= 1;
+                if let Some(mode) = self.workflow_mode.as_mut() {
+                    mode.selected = mode.selected.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
-                if !wf_mode.results.is_empty() {
-                    wf_mode.selected = (wf_mode.selected + 1).min(wf_mode.results.len() - 1);
+                if let Some(mode) = self.workflow_mode.as_mut() {
+                    if !mode.results.is_empty() {
+                        mode.selected = (mode.selected + 1).min(mode.results.len() - 1);
+                    }
                 }
             }
             KeyCode::Backspace => {
-                wf_mode.query.pop();
-                wf_mode.results = state
-                    .workflow_registry
-                    .search(&wf_mode.query)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                wf_mode.selected = 0;
+                if let Some(mode) = self.workflow_mode.as_mut() {
+                    mode.query.pop();
+                    mode.results = state
+                        .workflow_registry
+                        .search(&mode.query)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    mode.selected = 0;
+                }
             }
-            KeyCode::Char(c)
+            KeyCode::Char(character)
                 if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
             {
-                if crate::terminal_text::is_terminal_ambiguous(c) {
-                    return Ok(KeyAction::Continue);
+                if crate::terminal_text::is_terminal_ambiguous(character) {
+                    return;
                 }
-                wf_mode.query.push(c);
-                wf_mode.results = state
-                    .workflow_registry
-                    .search(&wf_mode.query)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                wf_mode.selected = 0;
+                if let Some(mode) = self.workflow_mode.as_mut() {
+                    mode.query.push(character);
+                    mode.results = state
+                        .workflow_registry
+                        .search(&mode.query)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    mode.selected = 0;
+                }
             }
-            _ => {
-                self.workflow_mode = None;
-            }
+            _ => {}
         }
-        Ok(KeyAction::Continue)
+    }
+
+    fn handle_workflow_parameter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                let completed_command = self.workflow_mode.as_mut().and_then(|mode| {
+                    let session = mode.session.as_mut()?;
+                    mode.suggestion_selected = None;
+                    if session.current_index() + 1 >= session.parameter_count() {
+                        // Rendering can fail (most notably at the bounded
+                        // expansion limit).  Validate the completed command
+                        // before advancing to the terminal session state so
+                        // the user can still edit the final parameter.
+                        Some(session.preview())
+                    } else {
+                        session.advance();
+                        None
+                    }
+                });
+                match completed_command {
+                    Some(Ok(command)) => self.finish_workflow(command),
+                    None => {}
+                    Some(Err(error)) => self.ai_error = Some(format!("Workflow error: {error}")),
+                }
+            }
+            KeyCode::Tab | KeyCode::Down => self.step_workflow_suggestion(1),
+            KeyCode::BackTab | KeyCode::Up => self.step_workflow_suggestion(-1),
+            KeyCode::Backspace => {
+                if let Some(mode) = self.workflow_mode.as_mut() {
+                    if let Some(session) = mode.session.as_mut() {
+                        session.pop_current();
+                    }
+                    mode.suggestion_selected = None;
+                }
+            }
+            KeyCode::Char(character)
+                if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if crate::terminal_text::is_terminal_ambiguous(character) {
+                    return;
+                }
+                if let Some(mode) = self.workflow_mode.as_mut() {
+                    let result = mode
+                        .session
+                        .as_mut()
+                        .map(|session| session.push_current(character));
+                    mode.suggestion_selected = None;
+                    if let Some(Err(error)) = result {
+                        self.ai_error = Some(format!("Workflow error: {error}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_workflow_paste(&mut self, text: &str, state: &ShellState) {
+        if !crate::terminal_text::is_safe_inline(text) {
+            self.ai_error =
+                Some("Workflow paste rejected: invisible or terminal-control text".to_string());
+            return;
+        }
+        let Some(mode) = self.workflow_mode.as_mut() else {
+            return;
+        };
+        if let Some(session) = mode.session.as_mut() {
+            let value = format!("{}{}", session.current_value().unwrap_or_default(), text);
+            if let Err(error) = session.set_current_value(value) {
+                self.ai_error = Some(format!("Workflow error: {error}"));
+            }
+            mode.suggestion_selected = None;
+        } else {
+            mode.query.push_str(text);
+            mode.results = state
+                .workflow_registry
+                .search(&mode.query)
+                .into_iter()
+                .cloned()
+                .collect();
+            mode.selected = 0;
+        }
+    }
+
+    fn step_workflow_suggestion(&mut self, direction: isize) {
+        let Some(mode) = self.workflow_mode.as_mut() else {
+            return;
+        };
+        let Some(session) = mode.session.as_mut() else {
+            return;
+        };
+        let suggestions = session
+            .current_placeholder()
+            .map(|parameter| parameter.suggestions.clone())
+            .unwrap_or_default();
+        if suggestions.is_empty() {
+            return;
+        }
+
+        let next = match mode.suggestion_selected {
+            Some(selected) => {
+                (selected as isize + direction).rem_euclid(suggestions.len() as isize) as usize
+            }
+            None if direction < 0 => suggestions.len() - 1,
+            None => 0,
+        };
+        if let Err(error) = session.set_current_value(suggestions[next].clone()) {
+            self.ai_error = Some(format!("Workflow error: {error}"));
+            return;
+        }
+        mode.suggestion_selected = Some(next);
+    }
+
+    fn open_workflow(&mut self, state: &ShellState) {
+        let results = state.workflow_registry.all().into_iter().cloned().collect();
+        self.workflow_mode = Some(WorkflowMode {
+            query: String::new(),
+            results,
+            selected: 0,
+            original_input: WorkflowInputSnapshot {
+                buffer: self.buffer.clone(),
+                cursor: self.cursor,
+                suggestion: self.suggestion.clone(),
+            },
+            session: None,
+            suggestion_selected: None,
+        });
+    }
+
+    fn finish_workflow(&mut self, command: String) {
+        self.buffer = command;
+        self.cursor = self.buffer.len();
+        self.suggestion = None;
+        self.workflow_mode = None;
+    }
+
+    fn cancel_workflow(&mut self) {
+        let Some(mode) = self.workflow_mode.take() else {
+            return;
+        };
+        self.buffer = mode.original_input.buffer;
+        self.cursor = mode.original_input.cursor.min(self.buffer.len());
+        self.suggestion = mode.original_input.suggestion;
     }
 
     /// Narrow the open menu by one typed character, or widen it by one
@@ -1412,6 +1636,76 @@ impl Editor {
         self.ai_error = None;
     }
 
+    fn restore_ai_input(&mut self) {
+        if let Some(saved) = self.ai_saved_input.take() {
+            self.buffer = saved.buffer;
+            self.cursor = saved.cursor.min(self.buffer.len());
+            self.suggestion = saved.suggestion;
+        }
+    }
+
+    /// End the editor's ownership of an in-flight request. The worker may keep
+    /// doing I/O, but its reply is no longer authorized to change editor state.
+    fn invalidate_ai_request(&mut self, restore_input: bool) {
+        self.active_ai_request = None;
+        if restore_input {
+            self.restore_ai_input();
+        } else {
+            self.ai_saved_input = None;
+        }
+
+        // Free any occupied response slot now. A response that arrives after
+        // this drain is rejected by its request ID on the next periodic drain.
+        while self
+            .ai_worker
+            .as_ref()
+            .and_then(AiWorker::try_recv)
+            .is_some()
+        {}
+    }
+
+    fn cancel_ai_for_user_input(&mut self) -> Option<AiRequestKind> {
+        let kind = self.active_ai_request.map(|request| request.kind);
+        if kind.is_some() {
+            self.invalidate_ai_request(true);
+        }
+        kind
+    }
+
+    fn begin_ai_request(
+        &mut self,
+        kind: AiRequestKind,
+        prompt: String,
+        context: AiContext,
+    ) -> bool {
+        // Beginning a new operation supersedes any older prompt, even if the
+        // worker has not finished it yet.
+        self.invalidate_ai_request(true);
+        self.ai_explanation = None;
+        self.ai_error = None;
+
+        let Some(request_id) = self.ai_request_sequence.checked_add(1) else {
+            self.ai_error = Some("AI error: request ID space exhausted".to_string());
+            return false;
+        };
+        self.ai_request_sequence = request_id;
+        let request = AiRequest {
+            request_id,
+            kind,
+            prompt,
+            context,
+        };
+        if !self
+            .ai_worker
+            .as_ref()
+            .is_some_and(|worker| worker.request(request))
+        {
+            return false;
+        }
+        self.active_ai_request = Some(ActiveAiRequest { request_id, kind });
+        true
+    }
+
     fn trigger_ai_generate(
         &mut self,
         prompt_text: &str,
@@ -1421,15 +1715,12 @@ impl Editor {
         if self.ai_worker.is_none() {
             return false;
         }
+        self.invalidate_ai_request(true);
         let ctx = self.build_ai_context(state, history);
-        if !self.ai_worker.as_ref().unwrap().request(AiRequest {
-            prompt: prompt_text.to_string(),
-            context: ctx,
-        }) {
+        if !self.begin_ai_request(AiRequestKind::Generate, prompt_text.to_string(), ctx) {
             return false;
         }
         self.snapshot_ai_input();
-        self.ai_pending = true;
         self.buffer.clear();
         self.buffer.push_str("[AI...]");
         self.cursor = self.buffer.len();
@@ -1440,15 +1731,12 @@ impl Editor {
         if self.last_error_info.is_none() || self.ai_worker.is_none() {
             return false;
         }
+        self.invalidate_ai_request(true);
         let ctx = self.build_ai_context(state, history);
-        if !self.ai_worker.as_ref().unwrap().request(AiRequest {
-            prompt: String::new(),
-            context: ctx,
-        }) {
+        if !self.begin_ai_request(AiRequestKind::Fix, String::new(), ctx) {
             return false;
         }
         self.snapshot_ai_input();
-        self.ai_pending = true;
         self.buffer.clear();
         self.buffer.push_str("[AI fixing...]");
         self.cursor = self.buffer.len();
@@ -1459,58 +1747,96 @@ impl Editor {
         if self.ai_worker.is_none() {
             return false;
         }
+        self.invalidate_ai_request(true);
         let mut ctx = self.build_ai_context(state, history);
         ctx.last_error = None;
-        let prompt = format!(
-            "Explain this shell command briefly (one line per flag/component): {}",
-            self.buffer
-        );
-        if !self.ai_worker.as_ref().unwrap().request(AiRequest {
-            prompt,
-            context: ctx,
-        }) {
+        let command = self.buffer.clone();
+        if !self.begin_ai_request(AiRequestKind::Explain, command, ctx) {
             return false;
         }
-        self.snapshot_ai_input();
-        self.ai_pending = true;
-        self.ai_explain_mode = true;
         true
     }
 
-    fn apply_ai_response(&mut self, response: AiResponse) {
-        self.ai_pending = false;
-        self.ai_explain_mode = false;
-        match response {
-            AiResponse::Suggestion(command) => {
+    /// Apply only the response currently authorized by both ID and operation
+    /// kind. Returns whether visible editor state changed.
+    fn apply_ai_response(&mut self, response: AiResponse) -> bool {
+        let Some(active) = self.active_ai_request else {
+            return false;
+        };
+        if response.request_id() != active.request_id {
+            return false;
+        }
+        self.active_ai_request = None;
+
+        match (active.kind, response) {
+            (
+                AiRequestKind::Generate | AiRequestKind::Fix,
+                AiResponse::Suggestion { command, .. },
+            ) => {
                 if !crate::terminal_text::is_safe_inline(&command) {
-                    if let Some(saved) = self.ai_saved_input.take() {
-                        self.buffer = saved.buffer;
-                        self.cursor = saved.cursor.min(self.buffer.len());
-                        self.suggestion = saved.suggestion;
-                    }
+                    self.restore_ai_input();
                     self.ai_error =
                         Some("AI error: suggestion contained invisible terminal text".to_string());
-                    return;
+                    return true;
                 }
                 self.ai_saved_input = None;
+                self.ai_explanation = None;
                 self.ai_error = None;
                 self.buffer.clear();
                 self.cursor = 0;
                 self.suggestion = Some(command);
+                true
             }
-            AiResponse::Error(error) => {
-                if let Some(saved) = self.ai_saved_input.take() {
-                    self.buffer = saved.buffer;
-                    self.cursor = saved.cursor.min(self.buffer.len());
-                    self.suggestion = saved.suggestion;
-                }
-                self.ai_error = Some(format_ai_error(&error));
+            (AiRequestKind::Explain, AiResponse::Explanation { explanation, .. }) => {
+                let explanation = match crate::ai::validate_explanation(&explanation) {
+                    Ok(explanation) => explanation,
+                    Err(_) => {
+                        self.restore_ai_input();
+                        self.ai_explanation = None;
+                        self.ai_error = Some(
+                            "AI error: explanation contained unsafe terminal text".to_string(),
+                        );
+                        return true;
+                    }
+                };
+                // The explanation has no path to either executable state:
+                // buffer and suggestion deliberately remain untouched.
+                self.ai_saved_input = None;
+                self.ai_explanation = Some(explanation);
+                self.ai_error = None;
+                true
+            }
+            (_, AiResponse::Error { message, .. }) => {
+                self.restore_ai_input();
+                self.ai_explanation = None;
+                self.ai_error = Some(format_ai_error(&message));
+                true
+            }
+            _ => {
+                // A type/operation mismatch is a protocol error. In
+                // particular, a Suggestion tagged with an Explain ID is never
+                // allowed to become executable state.
+                self.restore_ai_input();
+                self.ai_explanation = None;
+                self.ai_error = Some("AI error: mismatched response type".to_string());
+                true
             }
         }
     }
 
+    fn drain_ai_responses(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(response) = self.ai_worker.as_ref().and_then(AiWorker::try_recv) {
+            changed |= self.apply_ai_response(response);
+        }
+        changed
+    }
+
     fn update_suggestion(&mut self, history: &History, state: &ShellState) {
-        if self.completion_menu.is_some() || self.search_mode.is_some() {
+        if self.completion_menu.is_some()
+            || self.search_mode.is_some()
+            || self.workflow_mode.is_some()
+        {
             self.suggestion = None;
             return;
         }
@@ -1568,6 +1894,7 @@ impl Editor {
             && self.buffer == self.last_buffer_snapshot
             && self.suggestion == self.last_suggestion_snapshot
             && menu_sel == self.last_menu_snapshot
+            && self.ai_explanation == self.last_ai_explanation_snapshot
             && self.ai_error == self.last_ai_error_snapshot
             && self.cursor != self.last_cursor_snapshot;
 
@@ -1575,6 +1902,7 @@ impl Editor {
         self.last_cursor_snapshot = self.cursor;
         self.last_suggestion_snapshot = self.suggestion.clone();
         self.last_menu_snapshot = menu_sel;
+        self.last_ai_explanation_snapshot = self.ai_explanation.clone();
         self.last_ai_error_snapshot = self.ai_error.clone();
 
         let mut out = stdout();
@@ -1838,14 +2166,30 @@ impl Editor {
             cursor_row = rows_above_input + geometry.cursor_row;
             cursor_col = geometry.cursor_col;
 
-            if let Some(ref error) = self.ai_error {
+            if let Some(ref explanation) = self.ai_explanation {
+                out.queue(Print("\r\n"))?;
+                out.queue(SetForegroundColor(Color::Cyan))?;
+                out.queue(SetAttribute(Attribute::Bold))?;
+                out.queue(Print("AI explanation"))?;
+                out.queue(ResetColor)?;
+                out.queue(SetAttribute(Attribute::Reset))?;
+                rendered_lines += 1;
+                for line in explanation.split('\n') {
+                    out.queue(Print("\r\n"))?;
+                    out.queue(SetForegroundColor(Color::DarkGrey))?;
+                    out.queue(Print(line))?;
+                    out.queue(ResetColor)?;
+                    rendered_lines += 1 + wrap_extra_rows(display_width(line), self.terminal_width);
+                }
+            } else if let Some(ref error) = self.ai_error {
                 out.queue(Print("\r\n"))?;
                 out.queue(SetForegroundColor(Color::Red))?;
                 out.queue(Print(error))?;
                 out.queue(ResetColor)?;
                 rendered_lines += 1 + wrap_extra_rows(display_width(error), self.terminal_width);
             // Phase 16d — signature hint line below the input. Only when nothing
-            // else owns this slot: no completion menu, widget mode, or AI error.
+            // else owns this slot: no completion menu, widget mode, AI explanation,
+            // or AI error.
             } else if show_signature_hint
                 && self.completion_menu.is_none()
                 && self.workflow_mode.is_none()
@@ -2099,83 +2443,259 @@ impl Editor {
             out.queue(Print("\r\n"))?;
             rendered_lines += 1;
 
-            // Header
-            out.queue(SetForegroundColor(Color::Magenta))?;
-            out.queue(SetAttribute(Attribute::Bold))?;
-            out.queue(Print(" WORKFLOWS "))?;
-            out.queue(ResetColor)?;
-            out.queue(SetForegroundColor(Color::Yellow))?;
-            out.queue(Print(format!(
-                "[{}/{}] ",
-                wf_mode.results.len(),
-                wf_mode.results.len()
-            )))?;
-            out.queue(ResetColor)?;
-            let query_width = (self.terminal_width as usize).saturating_sub(2);
-            let (query, _) = history_panel_text(&wf_mode.query, query_width);
-            out.queue(Print(format!("❯ {query}")))?;
-            out.queue(Print("\r\n"))?;
-            rendered_lines += 1;
+            if let Some(ref session) = wf_mode.session {
+                let workflow = session.workflow();
+                let parameter = session.current_placeholder();
+                out.queue(SetForegroundColor(Color::Magenta))?;
+                out.queue(SetAttribute(Attribute::Bold))?;
+                out.queue(Print(" WORKFLOW "))?;
+                out.queue(ResetColor)?;
+                out.queue(SetForegroundColor(Color::Yellow))?;
+                let progress = format!(
+                    " [{}/{}]",
+                    session.current_index() + 1,
+                    session.parameter_count()
+                );
+                let max_name_width = (self.terminal_width as usize)
+                    .saturating_sub(display_width(" WORKFLOW ") + display_width(&progress));
+                let (workflow_name, _) = history_panel_text(&workflow.name, max_name_width);
+                let header = format!("{workflow_name}{progress}");
+                out.queue(Print(&header))?;
+                out.queue(ResetColor)?;
+                out.queue(Print("\r\n"))?;
+                rendered_lines += 1 + wrap_extra_rows(
+                    display_width(" WORKFLOW ") + display_width(&header),
+                    self.terminal_width,
+                );
 
-            let max_show = 10usize.min(self.terminal_height as usize / 3);
-            for (i, wf) in wf_mode.results.iter().take(max_show).enumerate() {
-                let is_sel = i == wf_mode.selected;
+                if let Some(parameter) = parameter {
+                    let parameter_prefix = "  ";
+                    let max_parameter_width = (self.terminal_width as usize)
+                        .saturating_sub(display_width(parameter_prefix));
+                    let (parameter_name, parameter_width) =
+                        history_panel_text(&parameter.name, max_parameter_width);
+                    out.queue(SetForegroundColor(Color::Cyan))?;
+                    out.queue(SetAttribute(Attribute::Bold))?;
+                    out.queue(Print(format!("{parameter_prefix}{parameter_name}")))?;
+                    out.queue(ResetColor)?;
+                    let mut parameter_line_width =
+                        display_width(parameter_prefix) + parameter_width;
+                    if let Some(description) = parameter.description.as_deref() {
+                        let separator = " — ";
+                        let separator_width = display_width(separator);
+                        let max_description = (self.terminal_width as usize)
+                            .saturating_sub(parameter_line_width + separator_width);
+                        let (description, description_width) =
+                            history_panel_text(description, max_description);
+                        if !description.is_empty() {
+                            out.queue(SetAttribute(Attribute::Dim))?;
+                            out.queue(Print(format!("{separator}{description}")))?;
+                            out.queue(SetAttribute(Attribute::Reset))?;
+                            parameter_line_width += separator_width + description_width;
+                        }
+                    }
+                    out.queue(Print("\r\n"))?;
+                    rendered_lines +=
+                        1 + wrap_extra_rows(parameter_line_width, self.terminal_width);
 
-                if is_sel {
+                    if let Some(default) = parameter.default.as_deref() {
+                        let (default, _) = history_panel_text(
+                            default,
+                            (self.terminal_width as usize).saturating_sub(13),
+                        );
+                        let line = format!("  default: {default}");
+                        out.queue(SetForegroundColor(Color::DarkGrey))?;
+                        out.queue(Print(&line))?;
+                        out.queue(ResetColor)?;
+                        out.queue(Print("\r\n"))?;
+                        rendered_lines +=
+                            1 + wrap_extra_rows(display_width(&line), self.terminal_width);
+                    }
+
+                    let value = session.current_value().unwrap_or_default();
+                    let (value, _) =
+                        history_panel_text(value, (self.terminal_width as usize).saturating_sub(5));
+                    let line = format!("  ❯ {value}");
                     out.queue(SetForegroundColor(Color::Green))?;
                     out.queue(SetAttribute(Attribute::Bold))?;
-                    out.queue(Print("▸ "))?;
-                } else {
-                    out.queue(Print("  "))?;
-                }
-
-                // Workflow name
-                out.queue(SetForegroundColor(if is_sel {
-                    Color::Green
-                } else {
-                    Color::Cyan
-                }))?;
-                out.queue(SetAttribute(Attribute::Bold))?;
-                let (name, name_width) = history_panel_text(&wf.name, 20);
-                out.queue(Print(name))?;
-                out.queue(Print(" ".repeat(20usize.saturating_sub(name_width))))?;
-                out.queue(ResetColor)?;
-
-                // Description
-                out.queue(SetAttribute(Attribute::Dim))?;
-                let max_desc = (self.terminal_width as usize).saturating_sub(25);
-                let (desc, _) = history_panel_text(&wf.description, max_desc);
-                out.queue(Print(&desc))?;
-                out.queue(ResetColor)?;
-
-                out.queue(Print("\r\n"))?;
-                rendered_lines += 1;
-
-                // Show command preview for selected item
-                if is_sel {
-                    out.queue(Print("    "))?;
-                    out.queue(SetAttribute(Attribute::Dim))?;
-                    out.queue(SetForegroundColor(Color::White))?;
-                    let (cmd_preview, _) = history_panel_text(
-                        &wf.command,
-                        (self.terminal_width as usize).saturating_sub(6),
-                    );
-                    out.queue(Print(&cmd_preview))?;
+                    out.queue(Print(&line))?;
                     out.queue(ResetColor)?;
                     out.queue(Print("\r\n"))?;
-                    rendered_lines += 1;
-                }
-            }
+                    rendered_lines +=
+                        1 + wrap_extra_rows(display_width(&line), self.terminal_width);
 
-            if wf_mode.results.len() > max_show {
-                out.queue(SetAttribute(Attribute::Dim))?;
-                out.queue(Print(format!(
-                    "  ... +{} more",
-                    wf_mode.results.len() - max_show
-                )))?;
+                    if !parameter.suggestions.is_empty() {
+                        let total = parameter.suggestions.len();
+                        let selected = wf_mode.suggestion_selected.unwrap_or(0).min(total - 1);
+                        let max_visible = 5usize.min(total);
+                        let offset = centered_scroll_offset(selected, total, max_visible);
+                        out.queue(SetForegroundColor(Color::DarkGrey))?;
+                        out.queue(Print("  suggestions (Tab/↑/↓):"))?;
+                        out.queue(ResetColor)?;
+                        out.queue(Print("\r\n"))?;
+                        rendered_lines += 1 + wrap_extra_rows(
+                            display_width("  suggestions (Tab/↑/↓):"),
+                            self.terminal_width,
+                        );
+                        for (index, suggestion) in parameter
+                            .suggestions
+                            .iter()
+                            .enumerate()
+                            .skip(offset)
+                            .take(max_visible)
+                        {
+                            let selected = wf_mode.suggestion_selected == Some(index);
+                            if selected {
+                                out.queue(SetBackgroundColor(Color::Rgb {
+                                    r: 50,
+                                    g: 50,
+                                    b: 80,
+                                }))?;
+                                out.queue(SetForegroundColor(Color::White))?;
+                                out.queue(SetAttribute(Attribute::Bold))?;
+                            } else {
+                                out.queue(SetForegroundColor(Color::DarkGrey))?;
+                            }
+                            let (suggestion, _) = history_panel_text(
+                                suggestion,
+                                (self.terminal_width as usize).saturating_sub(6),
+                            );
+                            let line = format!("    {suggestion}");
+                            out.queue(Print(&line))?;
+                            out.queue(SetBackgroundColor(Color::Reset))?;
+                            out.queue(ResetColor)?;
+                            out.queue(SetAttribute(Attribute::Reset))?;
+                            out.queue(Print("\r\n"))?;
+                            rendered_lines +=
+                                1 + wrap_extra_rows(display_width(&line), self.terminal_width);
+                        }
+                    }
+
+                    if let Ok(preview) = session.preview() {
+                        let (preview, _) = history_panel_text(
+                            &preview,
+                            (self.terminal_width as usize).saturating_sub(12),
+                        );
+                        let line = format!("  command: {preview}");
+                        out.queue(SetForegroundColor(Color::DarkGrey))?;
+                        out.queue(Print(&line))?;
+                        out.queue(ResetColor)?;
+                        out.queue(Print("\r\n"))?;
+                        rendered_lines +=
+                            1 + wrap_extra_rows(display_width(&line), self.terminal_width);
+                    }
+                }
+            } else {
+                let total = wf_mode.results.len();
+                let position = if total == 0 {
+                    0
+                } else {
+                    wf_mode.selected.min(total - 1) + 1
+                };
+                out.queue(SetForegroundColor(Color::Magenta))?;
+                out.queue(SetAttribute(Attribute::Bold))?;
+                out.queue(Print(" WORKFLOWS "))?;
                 out.queue(ResetColor)?;
+                out.queue(SetForegroundColor(Color::Yellow))?;
+                let progress = format!("[{position}/{total}] ");
+                out.queue(Print(&progress))?;
+                out.queue(ResetColor)?;
+                let query_prefix = "❯ ";
+                let fixed_width = display_width(" WORKFLOWS ")
+                    + display_width(&progress)
+                    + display_width(query_prefix);
+                let query_width = panel_remaining_width(
+                    self.terminal_width,
+                    &[" WORKFLOWS ", &progress, query_prefix],
+                );
+                let (query, _) = history_panel_text(&wf_mode.query, query_width);
+                out.queue(Print(format!("{query_prefix}{query}")))?;
                 out.queue(Print("\r\n"))?;
-                rendered_lines += 1;
+                rendered_lines +=
+                    1 + wrap_extra_rows(fixed_width + display_width(&query), self.terminal_width);
+
+                let max_show = 10usize
+                    .min((self.terminal_height as usize / 3).max(1))
+                    .min(total);
+                let scroll_offset = centered_scroll_offset(wf_mode.selected, total, max_show);
+                if scroll_offset > 0 {
+                    let line = format!("  ↑ {scroll_offset} more above");
+                    out.queue(SetForegroundColor(Color::DarkGrey))?;
+                    out.queue(Print(&line))?;
+                    out.queue(ResetColor)?;
+                    out.queue(Print("\r\n"))?;
+                    rendered_lines +=
+                        1 + wrap_extra_rows(display_width(&line), self.terminal_width);
+                }
+
+                for (index, workflow) in wf_mode
+                    .results
+                    .iter()
+                    .enumerate()
+                    .skip(scroll_offset)
+                    .take(max_show)
+                {
+                    let selected = index == wf_mode.selected;
+                    if selected {
+                        out.queue(SetBackgroundColor(Color::Rgb {
+                            r: 50,
+                            g: 50,
+                            b: 80,
+                        }))?;
+                        out.queue(SetForegroundColor(Color::White))?;
+                        out.queue(SetAttribute(Attribute::Bold))?;
+                        out.queue(Print("▸ "))?;
+                    } else {
+                        out.queue(Print("  "))?;
+                        out.queue(SetForegroundColor(Color::Cyan))?;
+                    }
+                    let marker_width = display_width("▸ ");
+                    let available = (self.terminal_width as usize).saturating_sub(marker_width);
+                    let name_column = 20usize.min(available);
+                    let (name, name_width) = history_panel_text(&workflow.name, name_column);
+                    out.queue(Print(name))?;
+                    out.queue(Print(" ".repeat(name_column.saturating_sub(name_width))))?;
+                    let max_description = available.saturating_sub(name_column);
+                    let (description, description_width) =
+                        history_panel_text(&workflow.description, max_description);
+                    if !selected {
+                        out.queue(SetAttribute(Attribute::Dim))?;
+                    }
+                    out.queue(Print(description))?;
+                    out.queue(SetBackgroundColor(Color::Reset))?;
+                    out.queue(ResetColor)?;
+                    out.queue(SetAttribute(Attribute::Reset))?;
+                    out.queue(Print("\r\n"))?;
+                    rendered_lines += 1 + wrap_extra_rows(
+                        marker_width + name_column + description_width,
+                        self.terminal_width,
+                    );
+
+                    if selected {
+                        let (preview, _) = history_panel_text(
+                            &workflow.command,
+                            (self.terminal_width as usize).saturating_sub(6),
+                        );
+                        let line = format!("    {preview}");
+                        out.queue(SetForegroundColor(Color::DarkGrey))?;
+                        out.queue(Print(&line))?;
+                        out.queue(ResetColor)?;
+                        out.queue(Print("\r\n"))?;
+                        rendered_lines +=
+                            1 + wrap_extra_rows(display_width(&line), self.terminal_width);
+                    }
+                }
+
+                let below = total.saturating_sub(scroll_offset + max_show);
+                if below > 0 {
+                    let line = format!("  ↓ {below} more below");
+                    out.queue(SetForegroundColor(Color::DarkGrey))?;
+                    out.queue(Print(&line))?;
+                    out.queue(ResetColor)?;
+                    out.queue(Print("\r\n"))?;
+                    rendered_lines +=
+                        1 + wrap_extra_rows(display_width(&line), self.terminal_width);
+                }
             }
         }
 
@@ -2609,11 +3129,27 @@ fn display_width(s: &str) -> usize {
     w
 }
 
+fn panel_remaining_width(term_width: u16, fixed_parts: &[&str]) -> usize {
+    let fixed_width = fixed_parts.iter().map(|part| display_width(part)).sum();
+    (term_width as usize).saturating_sub(fixed_width)
+}
+
 fn char_width(c: char) -> usize {
     if c == '\0' {
         return 0;
     }
     UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Choose a window that keeps `selected` visible and near its centre.
+fn centered_scroll_offset(selected: usize, total: usize, visible: usize) -> usize {
+    if total == 0 || visible == 0 || visible >= total {
+        return 0;
+    }
+    selected
+        .min(total - 1)
+        .saturating_sub(visible / 2)
+        .min(total - visible)
 }
 
 /// Extra terminal rows a line of `width` display columns occupies beyond its
@@ -2751,6 +3287,39 @@ fn find_next_word_boundary(s: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn test_workflow(
+        command: &str,
+        parameters: Vec<workflows::WorkflowParam>,
+    ) -> workflows::Workflow {
+        workflows::Workflow {
+            name: "test-workflow".into(),
+            description: "exercise workflow editing".into(),
+            command: command.into(),
+            parameters,
+            tags: Vec::new(),
+        }
+    }
+
+    fn workflow_mode_with(
+        workflow: workflows::Workflow,
+        buffer: &str,
+        cursor: usize,
+        suggestion: Option<&str>,
+    ) -> WorkflowMode {
+        WorkflowMode {
+            query: String::new(),
+            results: vec![workflow],
+            selected: 0,
+            original_input: WorkflowInputSnapshot {
+                buffer: buffer.into(),
+                cursor,
+                suggestion: suggestion.map(str::to_string),
+            },
+            session: None,
+            suggestion_selected: None,
+        }
+    }
+
     fn menu_of(texts: &[&str], word: &str) -> CompletionMenu {
         CompletionMenu {
             completions: texts
@@ -2767,6 +3336,286 @@ mod tests {
             word_start: 4,
             original_word: word.to_string(),
         }
+    }
+
+    #[test]
+    fn workflow_search_scroll_always_keeps_the_selection_visible() {
+        assert_eq!(centered_scroll_offset(0, 20, 5), 0);
+        assert_eq!(centered_scroll_offset(9, 20, 5), 7);
+        assert_eq!(centered_scroll_offset(19, 20, 5), 15);
+        assert_eq!(centered_scroll_offset(99, 20, 5), 15);
+        assert_eq!(centered_scroll_offset(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn parameterless_workflow_only_inserts_its_command() {
+        let mut editor = Editor::new();
+        editor.buffer = "keep me".into();
+        editor.cursor = editor.buffer.len();
+        editor.workflow_mode = Some(workflow_mode_with(
+            test_workflow("git status", Vec::new()),
+            &editor.buffer,
+            editor.cursor,
+            None,
+        ));
+        let state = ShellState::new(false);
+
+        let action = editor
+            .handle_workflow_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state)
+            .unwrap();
+
+        assert!(
+            matches!(action, KeyAction::Continue),
+            "selection never submits"
+        );
+        assert_eq!(editor.buffer, "git status");
+        assert_eq!(editor.cursor, editor.buffer.len());
+        assert!(editor.workflow_mode.is_none());
+    }
+
+    #[test]
+    fn workflow_parameters_edit_traverse_suggestions_and_finish_in_the_buffer() {
+        let parameter = workflows::WorkflowParam {
+            name: "target".into(),
+            description: Some("where to deploy".into()),
+            default: None,
+            suggestions: vec!["staging".into(), "production".into()],
+        };
+        let mut editor = Editor::new();
+        editor.buffer = "original".into();
+        editor.cursor = editor.buffer.len();
+        editor.workflow_mode = Some(workflow_mode_with(
+            test_workflow("deploy {{target}}", vec![parameter]),
+            &editor.buffer,
+            editor.cursor,
+            None,
+        ));
+        let state = ShellState::new(false);
+
+        editor
+            .handle_workflow_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state);
+        assert_eq!(
+            editor.buffer, "original",
+            "filling does not mutate the line"
+        );
+        assert!(editor
+            .workflow_mode
+            .as_ref()
+            .and_then(|mode| mode.session.as_ref())
+            .is_some());
+
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            editor
+                .workflow_mode
+                .as_ref()
+                .unwrap()
+                .session
+                .as_ref()
+                .unwrap()
+                .current_value(),
+            Some("x")
+        );
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            editor
+                .workflow_mode
+                .as_ref()
+                .unwrap()
+                .session
+                .as_ref()
+                .unwrap()
+                .current_value(),
+            Some("staging")
+        );
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            editor
+                .workflow_mode
+                .as_ref()
+                .unwrap()
+                .session
+                .as_ref()
+                .unwrap()
+                .current_value(),
+            Some("staging")
+        );
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        editor
+            .handle_workflow_parameter_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT));
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(editor.buffer, "deploy stagin!");
+        assert_eq!(editor.cursor, editor.buffer.len());
+        assert!(editor.workflow_mode.is_none());
+    }
+
+    #[test]
+    fn workflow_completion_failure_keeps_the_last_parameter_editable() {
+        let parameter = workflows::WorkflowParam {
+            name: "value".into(),
+            description: None,
+            default: None,
+            suggestions: Vec::new(),
+        };
+        let mut editor = Editor::new();
+        editor.buffer = "original".into();
+        editor.cursor = editor.buffer.len();
+        editor.workflow_mode = Some(workflow_mode_with(
+            test_workflow(&"{{value}}".repeat(7_000), vec![parameter]),
+            &editor.buffer,
+            editor.cursor,
+            None,
+        ));
+        let state = ShellState::new(false);
+        editor
+            .handle_workflow_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state);
+        editor.handle_workflow_paste(&"x".repeat(200), &state);
+
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let session = editor
+            .workflow_mode
+            .as_ref()
+            .and_then(|mode| mode.session.as_ref())
+            .expect("failed render keeps the workflow session open");
+        assert_eq!(session.current_index(), 0);
+        assert_eq!(session.current_value().unwrap().len(), 200);
+        assert!(editor.ai_error.is_some());
+
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            editor
+                .workflow_mode
+                .as_ref()
+                .unwrap()
+                .session
+                .as_ref()
+                .unwrap()
+                .current_value()
+                .unwrap()
+                .len(),
+            199
+        );
+    }
+
+    #[test]
+    fn workflow_modal_preserves_interrupt_and_eof_actions() {
+        let mut editor = Editor::new();
+        editor.buffer = "echo keep".into();
+        editor.cursor = editor.buffer.len();
+        editor.workflow_mode = Some(workflow_mode_with(
+            test_workflow("git status", Vec::new()),
+            &editor.buffer,
+            editor.cursor,
+            None,
+        ));
+        let state = ShellState::new(false);
+
+        let action = editor
+            .handle_workflow_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &state,
+            )
+            .unwrap();
+        assert!(matches!(action, KeyAction::Interrupt));
+        assert_eq!(editor.buffer, "echo keep");
+        assert!(editor.workflow_mode.is_none());
+
+        editor.workflow_mode = Some(workflow_mode_with(
+            test_workflow("git status", Vec::new()),
+            &editor.buffer,
+            editor.cursor,
+            None,
+        ));
+        let action = editor
+            .handle_workflow_key(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &state,
+            )
+            .unwrap();
+        assert!(matches!(action, KeyAction::Eof));
+        assert_eq!(editor.buffer, "echo keep");
+        assert!(editor.workflow_mode.is_none());
+    }
+
+    #[test]
+    fn workflow_search_query_budget_includes_the_full_header() {
+        let progress = "[4096/4096] ";
+        let marker = "❯ ";
+        let width = 32;
+        let remaining = panel_remaining_width(width, &[" WORKFLOWS ", progress, marker]);
+        let (query, query_width) = history_panel_text(&"雪".repeat(100), remaining);
+
+        assert!(
+            display_width(" WORKFLOWS ")
+                + display_width(progress)
+                + display_width(marker)
+                + query_width
+                <= width as usize
+        );
+        assert!(query.ends_with('…'));
+    }
+
+    #[test]
+    fn escape_from_parameter_filling_restores_the_exact_input_snapshot() {
+        let parameter = workflows::WorkflowParam {
+            name: "value".into(),
+            description: None,
+            default: Some("default".into()),
+            suggestions: Vec::new(),
+        };
+        let mut editor = Editor::new();
+        editor.buffer = "echo keep".into();
+        editor.cursor = 4;
+        editor.suggestion = Some(" this ghost".into());
+        editor.workflow_mode = Some(workflow_mode_with(
+            test_workflow("echo {{value}}", vec![parameter]),
+            &editor.buffer,
+            editor.cursor,
+            editor.suggestion.as_deref(),
+        ));
+        let state = ShellState::new(false);
+        editor
+            .handle_workflow_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state);
+        editor.handle_workflow_parameter_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        editor
+            .handle_workflow_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &state)
+            .unwrap();
+
+        assert_eq!(editor.buffer, "echo keep");
+        assert_eq!(editor.cursor, 4);
+        assert_eq!(editor.suggestion.as_deref(), Some(" this ghost"));
+        assert!(editor.workflow_mode.is_none());
+    }
+
+    #[test]
+    fn post_key_suggestion_refresh_is_skipped_after_workflow_escape() {
+        let mut editor = Editor::new();
+        editor.buffer = "echo keep".into();
+        editor.cursor = editor.buffer.len();
+        editor.suggestion = Some(" --ai-only-ghost".into());
+        editor.workflow_mode = Some(workflow_mode_with(
+            test_workflow("git status", Vec::new()),
+            &editor.buffer,
+            editor.cursor,
+            editor.suggestion.as_deref(),
+        ));
+        let state = ShellState::new(false);
+        let history = History::new(10);
+        let cancelling_workflow = editor.workflow_mode.is_some();
+
+        editor
+            .handle_workflow_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &state)
+            .unwrap();
+        if !cancelling_workflow {
+            editor.update_suggestion(&history, &state);
+        }
+
+        assert_eq!(editor.buffer, "echo keep");
+        assert_eq!(editor.suggestion.as_deref(), Some(" --ai-only-ghost"));
     }
 
     #[test]
@@ -2928,11 +3777,15 @@ mod tests {
         editor.snapshot_ai_input();
         editor.buffer = "[AI...]".to_string();
         editor.cursor = editor.buffer.len();
-        editor.ai_pending = true;
+        editor.active_ai_request = Some(ActiveAiRequest {
+            request_id: 4,
+            kind: AiRequestKind::Generate,
+        });
 
-        editor.apply_ai_response(AiResponse::Error(
-            "\x1b[31mservice unavailable\x1b[0m\ntry again\u{202e}\u{200b}".to_string(),
-        ));
+        assert!(editor.apply_ai_response(AiResponse::Error {
+            request_id: 4,
+            message: "\x1b[31mservice unavailable\x1b[0m\ntry again\u{202e}\u{200b}".to_string(),
+        }));
 
         assert_eq!(editor.buffer, "# list project files");
         assert_eq!(editor.cursor, editor.buffer.len());
@@ -2941,7 +3794,142 @@ mod tests {
             editor.ai_error.as_deref(),
             Some("AI error: service unavailable try again\\u{202e}\\u{200b}")
         );
-        assert!(!editor.ai_pending);
+        assert!(editor.active_ai_request.is_none());
+    }
+
+    #[test]
+    fn explanations_are_read_only_and_never_become_suggestions() {
+        let mut editor = Editor::new();
+        editor.ai_worker = None;
+        editor.buffer = "git status --short".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.suggestion = Some(" --branch".to_string());
+        editor.active_ai_request = Some(ActiveAiRequest {
+            request_id: 8,
+            kind: AiRequestKind::Explain,
+        });
+
+        assert!(editor.apply_ai_response(AiResponse::Explanation {
+            request_id: 8,
+            explanation: "git status inspects the work tree\n--short selects compact output"
+                .to_string(),
+        }));
+
+        assert_eq!(editor.buffer, "git status --short");
+        assert_eq!(editor.cursor, editor.buffer.len());
+        assert_eq!(editor.suggestion.as_deref(), Some(" --branch"));
+        assert_eq!(
+            editor.ai_explanation.as_deref(),
+            Some("git status inspects the work tree\n--short selects compact output")
+        );
+
+        // Even a response constructed with the wrong variant but the right ID
+        // cannot route an Explain operation into executable state.
+        editor.active_ai_request = Some(ActiveAiRequest {
+            request_id: 9,
+            kind: AiRequestKind::Explain,
+        });
+        assert!(editor.apply_ai_response(AiResponse::Suggestion {
+            request_id: 9,
+            command: "rm -rf important".to_string(),
+        }));
+        assert_eq!(editor.buffer, "git status --short");
+        assert_eq!(editor.suggestion.as_deref(), Some(" --branch"));
+        assert_eq!(
+            editor.ai_error.as_deref(),
+            Some("AI error: mismatched response type")
+        );
+    }
+
+    #[test]
+    fn stale_ai_responses_are_ignored_without_disturbing_the_active_request() {
+        let mut editor = Editor::new();
+        editor.ai_worker = None;
+        editor.buffer = "[AI...]".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.active_ai_request = Some(ActiveAiRequest {
+            request_id: 12,
+            kind: AiRequestKind::Generate,
+        });
+
+        assert!(!editor.apply_ai_response(AiResponse::Suggestion {
+            request_id: 11,
+            command: "echo stale".to_string(),
+        }));
+        assert_eq!(editor.buffer, "[AI...]");
+        assert_eq!(editor.suggestion, None);
+        assert_eq!(
+            editor.active_ai_request,
+            Some(ActiveAiRequest {
+                request_id: 12,
+                kind: AiRequestKind::Generate,
+            })
+        );
+
+        assert!(!editor.apply_ai_response(AiResponse::Error {
+            request_id: 10,
+            message: "stale failure".to_string(),
+        }));
+        assert_eq!(editor.ai_error, None);
+    }
+
+    #[test]
+    fn editing_cancels_ai_and_restores_input_before_the_keystroke() {
+        let mut editor = Editor::new();
+        editor.ai_worker = None;
+        editor.buffer = "# list project files".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.snapshot_ai_input();
+        editor.buffer = "[AI...]".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.active_ai_request = Some(ActiveAiRequest {
+            request_id: 21,
+            kind: AiRequestKind::Generate,
+        });
+
+        assert_eq!(
+            editor.cancel_ai_for_user_input(),
+            Some(AiRequestKind::Generate)
+        );
+        editor.buffer.insert(editor.cursor, '!');
+        editor.cursor += 1;
+
+        assert_eq!(editor.buffer, "# list project files!");
+        assert_eq!(editor.cursor, editor.buffer.len());
+        assert!(editor.active_ai_request.is_none());
+        assert!(editor.ai_saved_input.is_none());
+        assert!(!editor.apply_ai_response(AiResponse::Suggestion {
+            request_id: 21,
+            command: "echo stale".to_string(),
+        }));
+        assert_eq!(editor.buffer, "# list project files!");
+    }
+
+    #[test]
+    fn editing_during_explanation_invalidates_it_without_changing_the_line() {
+        let mut editor = Editor::new();
+        editor.ai_worker = None;
+        editor.buffer = "git status".to_string();
+        editor.cursor = editor.buffer.len();
+        editor.active_ai_request = Some(ActiveAiRequest {
+            request_id: 22,
+            kind: AiRequestKind::Explain,
+        });
+
+        assert_eq!(
+            editor.cancel_ai_for_user_input(),
+            Some(AiRequestKind::Explain)
+        );
+        editor.buffer.push_str(" --short");
+        editor.cursor = editor.buffer.len();
+
+        assert_eq!(editor.buffer, "git status --short");
+        assert!(editor.active_ai_request.is_none());
+        assert!(!editor.apply_ai_response(AiResponse::Explanation {
+            request_id: 22,
+            explanation: "stale explanation".to_string(),
+        }));
+        assert_eq!(editor.ai_explanation, None);
     }
 
     #[test]

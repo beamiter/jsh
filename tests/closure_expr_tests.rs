@@ -144,6 +144,30 @@ fn each_string_concat() {
     assert_eq!(p, serde_json::json!(["alice!", "bob!"]));
 }
 
+#[test]
+fn closure_string_literals_preserve_unicode() {
+    let (out, err, code) = run(r#"range 1..2 | each {|n| "雪🌨️"} | to-json"#, "");
+    assert_eq!(code, 0, "stderr: {}", err);
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(parsed, serde_json::json!(["雪🌨️", "雪🌨️"]));
+}
+
+#[test]
+fn parallel_closures_preserve_unicode() {
+    let (out, err, code) = run(r#"range 1..2 | par-each {|n| "雪🌨️"} | to-json"#, "");
+    assert_eq!(code, 0, "stderr: {}", err);
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(parsed, serde_json::json!(["雪🌨️", "雪🌨️"]));
+}
+
+#[test]
+fn unknown_escape_before_unicode_preserves_the_character_boundary() {
+    let (out, err, code) = run(r#"range 1..1 | each {|n| "é\\雪🌨️"} | to-json"#, "");
+    assert_eq!(code, 0, "stderr: {}", err);
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(parsed, serde_json::json!(["é\\雪🌨️"]));
+}
+
 // ---------------------------------------------------------------------------
 // update with closure expression body
 // ---------------------------------------------------------------------------

@@ -465,9 +465,15 @@ impl Shell {
                 self.state.last_exit_code = builtins::EXIT_CODE.load(Ordering::SeqCst);
                 return self.finish_interactive();
             }
+            if signal::pending_status().is_some() {
+                return self.finish_interactive();
+            }
             config::refresh_shell_integrations(&mut self.state);
             if builtins::EXIT_REQUESTED.load(Ordering::SeqCst) {
                 self.state.last_exit_code = builtins::EXIT_CODE.load(Ordering::SeqCst);
+                return self.finish_interactive();
+            }
+            if signal::pending_status().is_some() {
                 return self.finish_interactive();
             }
             init_interactive_job_control();

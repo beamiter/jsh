@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use jsh::ai::{AiConfig, AiContext, AiProvider, AiRequest, AiResponse, AiWorker};
+use jsh::ai::{AiConfig, AiContext, AiProvider, AiRequest, AiRequestKind, AiResponse, AiWorker};
 
 /// Serve exactly one request, returning the raw body jsh sent.
 fn serve_once(reply_json: &'static str) -> (String, mpsc::Receiver<String>) {
@@ -93,6 +93,8 @@ fn round_trip(reply_json: &'static str) -> (String, AiResponse) {
     let (base_url, body_rx) = serve_once(reply_json);
     let worker = AiWorker::new(config(base_url));
     worker.request(AiRequest {
+        request_id: 37,
+        kind: AiRequestKind::Generate,
         prompt: "retry the migration".to_string(),
         context: hostile_context(),
     });
@@ -114,12 +116,19 @@ fn a_hostile_model_reply_never_reaches_the_line_buffer() {
         r#"{"message":{"content":"echo hi\u001b]52;c;cm0gLXJmIH4=\u0007\nrm -rf ~/important"}}"#,
     );
     match response {
-        AiResponse::Error(error) => {
-            assert!(error.contains("control character"), "{error}");
-            assert!(error.contains("U+001B"), "{error}");
+        AiResponse::Error {
+            request_id,
+            message,
+        } => {
+            assert_eq!(request_id, 37);
+            assert!(message.contains("control character"), "{message}");
+            assert!(message.contains("U+001B"), "{message}");
         }
-        AiResponse::Suggestion(command) => {
+        AiResponse::Suggestion { command, .. } => {
             panic!("escape sequence reached the prompt as a suggestion: {command:?}")
+        }
+        AiResponse::Explanation { explanation, .. } => {
+            panic!("generation returned an explanation: {explanation:?}")
         }
     }
 }
@@ -128,8 +137,17 @@ fn a_hostile_model_reply_never_reaches_the_line_buffer() {
 fn a_clean_fenced_reply_still_becomes_a_single_line_suggestion() {
     let (_, response) = round_trip(r#"{"message":{"content":"```sh\nls -la\n```"}}"#);
     match response {
-        AiResponse::Suggestion(command) => assert_eq!(command, "ls -la"),
-        AiResponse::Error(error) => panic!("clean reply rejected: {error}"),
+        AiResponse::Suggestion {
+            request_id,
+            command,
+        } => {
+            assert_eq!(request_id, 37);
+            assert_eq!(command, "ls -la");
+        }
+        AiResponse::Error { message, .. } => panic!("clean reply rejected: {message}"),
+        AiResponse::Explanation { explanation, .. } => {
+            panic!("generation returned an explanation: {explanation:?}")
+        }
     }
 }
 

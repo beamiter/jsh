@@ -55,10 +55,10 @@ jobs:
           shared-key: clippy
 
       - name: Clippy with all features
-        run: cargo clippy --all-targets --all-features --locked
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Clippy without default features
-        run: cargo clippy --all-targets --no-default-features --locked
+        run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
 
   test-default:
     name: Tests (AI enabled)
@@ -77,7 +77,7 @@ jobs:
           shared-key: tests-default
 
       - name: Run tests with all features
-        run: cargo test --all-features --locked
+        run: cargo test --all-features --locked --no-fail-fast
 
   test-core:
     name: Tests (core only)
@@ -96,7 +96,45 @@ jobs:
           shared-key: tests-core
 
       - name: Run tests without default features
-        run: cargo test --no-default-features --locked
+        run: cargo test --no-default-features --locked --no-fail-fast
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs
+
+      - name: Build API documentation
+        run: cargo doc --all-features --locked --no-deps
+
+  macos-check:
+    name: macOS source compatibility
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-check
+
+      - name: Check all targets with all features
+        run: cargo check --all-targets --all-features --locked
 
   installer:
     # Keep this display name stable for existing required-check rules. The job

@@ -18,6 +18,33 @@ const MAX_CONFIG_HELPER_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONFIG_HELPER_STDERR_BYTES: usize = 512 * 1024;
 const CONFIG_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Run a startup helper without making an interactive termination request wait
+/// for the helper's (potentially long) timeout.  Startup imports run before the
+/// editor gets a chance to observe signals, so cancellation has to be wired
+/// into the bounded child session itself.
+fn run_startup_helper(
+    command: &mut std::process::Command,
+    new_session: bool,
+) -> io::Result<std::process::Output> {
+    let cancelled = || crate::signal::pending_status().is_some();
+    crate::io_guard::bounded_command_session(
+        command,
+        crate::io_guard::BoundedCommand {
+            stdout_limit: MAX_CONFIG_HELPER_STDOUT_BYTES,
+            stderr_limit: MAX_CONFIG_HELPER_STDERR_BYTES,
+            timeout: CONFIG_HELPER_TIMEOUT,
+            stdin: None,
+            cancel: Some(&cancelled),
+            die_with_parent: false,
+            new_session,
+        },
+    )
+}
+
+fn interrupted_by_shell_signal(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted && crate::signal::pending_status().is_some()
+}
+
 pub fn load_config(state: &mut ShellState) {
     // Startup may source a ~/.jshrc that only exists once the pre-rename
     // ~/.rshrc has been copied across.
@@ -160,13 +187,9 @@ shopt 2>/dev/null || true
         .arg("jsh-config")
         .arg(path)
         .env("HISTFILE", "/dev/null");
-    match crate::io_guard::bounded_command_output_detached(
-        &mut command,
-        MAX_CONFIG_HELPER_STDOUT_BYTES,
-        MAX_CONFIG_HELPER_STDERR_BYTES,
-        CONFIG_HELPER_TIMEOUT,
-    ) {
+    match run_startup_helper(&mut command, true) {
         Ok(output) => parse_bash_output(&String::from_utf8_lossy(&output.stdout), state),
+        Err(error) if interrupted_by_shell_signal(&error) => {}
         Err(error) => eprintln!("jsh: bash startup import failed for {path:?}: {error}"),
     }
 }
@@ -208,12 +231,7 @@ fn load_conda_hook(state: &mut ShellState) {
 
     let mut command = std::process::Command::new(&conda_cmd);
     command.args(["shell.posix", "hook"]);
-    let output = match crate::io_guard::bounded_command_output(
-        &mut command,
-        MAX_CONFIG_HELPER_STDOUT_BYTES,
-        MAX_CONFIG_HELPER_STDERR_BYTES,
-        CONFIG_HELPER_TIMEOUT,
-    ) {
+    let output = match run_startup_helper(&mut command, false) {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             eprintln!(
@@ -226,6 +244,7 @@ fn load_conda_hook(state: &mut ShellState) {
             );
             return;
         }
+        Err(error) if interrupted_by_shell_signal(&error) => return,
         Err(error) => {
             eprintln!(
                 "jsh: conda: could not run {} for its shell hook: {error}",

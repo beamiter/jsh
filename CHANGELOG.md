@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Command discovery now has one catalog shared by dispatch checks, `help`,
+  `compgen`, interactive completion, syntax highlighting, and typo repair.
+  Every shipped command has reachable help; value commands such as `def` and
+  `reverse` no longer disappear from some discovery surfaces, while bare
+  `ls`/`ps` retain their external-command behavior.
+- AI generation, repair, and explanation are distinct request types. `Alt-E`
+  explanations render in a bounded read-only panel and can never enter the
+  executable buffer; request IDs also make late replies harmless after
+  `Ctrl-C`, submission, user edits, or a newer request.
+- The Ctrl-G workflow picker now fills parameters interactively, exposes
+  defaults and suggestions, scrolls with its selection, restores the original
+  line on cancellation, and only inserts the completed command for review.
+  The new `workflow`/`wf` builtin lists and inspects the same registry. Literal
+  Docker/Go/Helm moustache expressions remain untouched unless their names are
+  declared workflow parameters. The public Rust workflow rendering/session
+  helpers now return `Result` so validation and size failures are explicit.
+- Agent command capture now creates close-on-exec pipes. A detached continuous
+  writer receives `SIGPIPE` when capture ends instead of surviving with an
+  orphaned one-shot jsh process; the regression test verifies process exit as
+  well as prompt latency. The portable fallback preserves macOS source builds,
+  now covered by CI.
+- Closure expression string literals now preserve UTF-8, including through
+  `par-each`; non-ASCII text is decoded by character rather than by byte.
+- Interactive startup helpers now cancel promptly on termination signals, so a
+  slow Conda hook cannot delay SIGTERM shutdown or leave the terminal hanging.
+- CI now enforces warning-free Clippy for both feature sets, runs both feature
+  test suites without stopping at the first failing target (while retaining
+  doctests and avoiding benchmark execution), and builds API docs.
+
 - Interactive SSH entry now accepts recognised session options after the
   destination, matching OpenSSH spellings such as `ssh host -p 2222`, so these
   sessions still receive remote jsh completion and suggestions.

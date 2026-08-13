@@ -404,6 +404,20 @@ notice and the trusted system instructions share a strict 64 KiB byte ceiling.
 jsh fails the request rather than truncating the system prompt or silently
 discarding the notice.
 
+The interactive editor exposes three review-first AI actions:
+
+- Type `# describe the command you want` and press Enter to request a command
+  suggestion. The reply stays as ghost text until you explicitly accept it.
+- Press `Ctrl-F` after a failed command to request a corrected suggestion.
+- Press `Alt-E` with a command on the line to open a read-only explanation.
+  Explanations use a separate model contract and display panel; they can never
+  become command text or be submitted with Enter.
+
+Each request carries an editor generation ID. Leaving the prompt with
+`Ctrl-C`, submitting, editing while a response is pending, or starting another
+request invalidates the old ID, so a late provider response cannot replace
+newer input.
+
 ### Agent mode
 
 The `agent` builtin runs a review-first agent loop on the shared
@@ -509,8 +523,34 @@ never why, and why is the first question when an answer looks wrong.
 
 ## Workflows
 
-Local workflow definitions live in `~/.jsh/workflows/`; press `Ctrl-G` in the
-editor to search the workflow registry and fill its parameters.
+Press `Ctrl-G` to search the local workflow registry. Choosing a workflow walks
+through its parameters, showing descriptions, defaults, and suggestions, then
+places the rendered command on the line for review; it never executes the
+command. `Esc` cancels and restores the line that was present before opening
+the workflow picker.
+
+Workflow files live in `~/.jsh/workflows/`. Each `.json` file can contain one
+workflow or an array. A minimal definition is:
+
+```json
+{
+  "name": "serve",
+  "description": "Serve a directory over HTTP",
+  "command": "python3 -m http.server {{port}} --directory {{path}}",
+  "parameters": [
+    {"name": "port", "default": "8000", "suggestions": ["8000", "8080"]},
+    {"name": "path", "description": "Directory to serve", "default": "."}
+  ],
+  "tags": ["python", "http"]
+}
+```
+
+Only names declared in `parameters` are substituted. Other moustache syntax is
+left untouched, so commands may safely contain Docker/Go/Helm expressions such
+as `{{.Id}}`.
+
+Use `workflow list` (or `wf list`) to inspect names and
+`workflow show NAME` to inspect a template without entering the picker.
 
 ## Development
 
@@ -518,9 +558,10 @@ The main verification commands are:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --locked
-cargo test --all-features --locked
-cargo test --no-default-features --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-features --locked --no-fail-fast
+cargo test --no-default-features --locked --no-fail-fast
+cargo doc --all-features --locked --no-deps
 cargo build --release --all-features --locked
 shellcheck -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 ./scripts/test-install-jsh.sh

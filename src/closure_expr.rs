@@ -141,21 +141,29 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 let mut s = String::new();
                 while j < bytes.len() && bytes[j] != b'"' {
                     if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                        match bytes[j + 1] {
-                            b'n' => s.push('\n'),
-                            b't' => s.push('\t'),
-                            b'r' => s.push('\r'),
-                            b'\\' => s.push('\\'),
-                            b'"' => s.push('"'),
+                        let escaped = src[j + 1..]
+                            .chars()
+                            .next()
+                            .expect("a byte after a backslash starts a UTF-8 character");
+                        match escaped {
+                            'n' => s.push('\n'),
+                            't' => s.push('\t'),
+                            'r' => s.push('\r'),
+                            '\\' => s.push('\\'),
+                            '"' => s.push('"'),
                             other => {
                                 s.push('\\');
-                                s.push(other as char);
+                                s.push(other);
                             }
                         }
-                        j += 2;
+                        j += 1 + escaped.len_utf8();
                     } else {
-                        s.push(bytes[j] as char);
-                        j += 1;
+                        let ch = src[j..]
+                            .chars()
+                            .next()
+                            .expect("a source byte index starts a UTF-8 character");
+                        s.push(ch);
+                        j += ch.len_utf8();
                     }
                 }
                 if j >= bytes.len() {
