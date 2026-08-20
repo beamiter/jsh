@@ -271,6 +271,27 @@ assert "a value that is not a terminal name is dropped" \
     [ "$(session_field TERM)" = "xterm" ]
 assert "an unset variable is not forwarded as empty" [ -z "$(session_field COLORTERM)" ]
 
+echo "== a different architecture never receives the local binary =="
+ARM_BIN="${ROOT}/arm-bin"
+mkdir -p "${ARM_BIN}"
+cat > "${ARM_BIN}/uname" <<'EOF'
+#!/bin/sh
+case "$1" in
+    -s) echo Linux ;;
+    -m) echo aarch64 ;;
+    *) exec /usr/bin/uname "$@" ;;
+esac
+EOF
+chmod +x "${ARM_BIN}/uname"
+out="$(FAKE_DOCKER_PATH="${ARM_BIN}:/usr/local/bin:/usr/bin:/bin" run -v 2>&1)"
+rc=$?
+indent "${out}"
+assert "exit 0 through the fallback" [ ${rc} -eq 0 ]
+assert "reports the ARM destination" matches "${out}" 'arch=aarch64'
+assert "falls back when no ARM release exists" matches "${out}" 'falling back to shell integration'
+assert "does not lend the local x86 binary" lacks "${out}" 'the local jsh is static; lending it'
+assert "does not push the local x86 binary" lacks "${out}" 'pushing .*/stub/jsh'
+
 echo "== persist again: cache hit, no transfer =="
 before="$(stat -c %Y "${cached_bin}")"
 out="$(run -v 2>&1)"

@@ -21,8 +21,10 @@
 //!     reshapes the session (`-N`, `-L`, `-W`, `-T`, …) or that this module
 //!     does not recognise, leaves the command exactly as typed;
 //!   * only when the running jsh is static (or a staged musl artifact
-//!     exists) — without a binary to push there is nothing to offer, and the
-//!     launcher's own fallback would burn seconds discovering that;
+//!     exists) — without a binary to offer there is nothing to start from;
+//!     the launcher still checks the destination architecture before lending
+//!     that binary and falls back to an architecture-matched release or the
+//!     destination shell when it cannot deploy one;
 //!   * `command ssh …` bypasses this entirely, and `JSH_SSH_SHELL=off` turns
 //!     it off for good.
 //!
@@ -67,20 +69,34 @@ pub(crate) fn upgrade_entry(argv: &[String], state: &ShellState) -> Option<Vec<S
     let binary = crate::container::static_jsh()?;
     let launcher = published_launcher()?;
 
+    let rewritten = launcher_command(&destination, &flags, &binary, &launcher);
+    eprintln!("jsh: bringing jsh to {destination} for this session (`command ssh` connects plain)");
+    Some(rewritten)
+}
+
+fn launcher_command(
+    destination: &str,
+    flags: &[String],
+    binary: &Path,
+    launcher: &Path,
+) -> Vec<String> {
     let mut rewritten = vec![
         "/bin/sh".to_string(),
         launcher.display().to_string(),
         "--persist".to_string(),
-        "--artifact".to_string(),
+        // This is a candidate, not an explicit cross-architecture artifact.
+        // The launcher lends it only when the destination has the same
+        // architecture; otherwise it stages the matching release or safely
+        // falls back to shell integration / plain ssh.
+        "--local-jsh".to_string(),
         binary.display().to_string(),
-        destination.clone(),
+        destination.to_string(),
     ];
     if !flags.is_empty() {
         rewritten.push("--".to_string());
-        rewritten.extend(flags);
+        rewritten.extend_from_slice(flags);
     }
-    eprintln!("jsh: bringing jsh to {destination} for this session (`command ssh` connects plain)");
-    Some(rewritten)
+    rewritten
 }
 
 fn enabled(state: &ShellState) -> bool {
@@ -282,6 +298,33 @@ mod tests {
                 "should not have rewritten: ssh {line}"
             );
         }
+    }
+
+    #[test]
+    fn the_running_binary_is_an_architecture_checked_candidate() {
+        let flags = args("-p 2222 -C");
+        let command = launcher_command(
+            "ubuntu@arm-box",
+            &flags,
+            Path::new("/cache/jsh/container/jsh"),
+            Path::new("/cache/jsh/jsh-remote.sh"),
+        );
+        assert_eq!(
+            command,
+            [
+                "/bin/sh",
+                "/cache/jsh/jsh-remote.sh",
+                "--persist",
+                "--local-jsh",
+                "/cache/jsh/container/jsh",
+                "ubuntu@arm-box",
+                "--",
+                "-p",
+                "2222",
+                "-C",
+            ]
+        );
+        assert!(!command.iter().any(|arg| arg == "--artifact"));
     }
 
     #[test]
