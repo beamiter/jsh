@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-13
+Updated: 2026-08-21
 
 This baseline unifies command discovery, separates executable AI suggestions
 from read-only explanations, completes workflow parameter filling, and fixes
@@ -70,13 +70,15 @@ and installer hardening described below.
   longer mutates `~/.jsh_z` or emits a persistence warning from an otherwise
   unrelated non-interactive command.
 
-- The optional Agent integration now exact-pins jagent 0.6. jsh only
-  constructs its serialize-only `Message` values and keeps its own session
-  envelope behind the existing allocation-aware decoder; no direct jagent
-  transcript deserialization or compatibility wire path remains. The model
-  transport's 1 MiB body cap continues to run before its JSON value is built;
-  the exact pin also carries jagent's independent raw-byte and decoded-frame
-  ceilings for any future streaming integration.
+- The optional Agent integration now exact-pins jagent 0.7 and uses
+  `prepare_agent_request`/`AgentRequestSpec` plus
+  `accept_agent_response` end to end. The cancellable HTTP child returns the
+  intact provider envelope instead of discarding completion/tool metadata;
+  the parent decodes it with the same prepared value that built the request.
+  `JSH_AGENT_PROTOCOL=text|native-tools` selects the wire encoding (Text is the
+  compatible default), while both converge on the same explicit proposal
+  review state machine. Local action-size, visual-spoof, and danger-policy
+  backports removed by this migration now come from the shared 0.7 core.
 
 - The single outbound AI funnel uses jagent's reported request builder and
   fails closed if jagent would omit anything after jsh has already bounded the

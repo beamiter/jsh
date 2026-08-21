@@ -469,8 +469,8 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jagent"
-version = "0.6.0"
-source = "git+https://github.com/beamiter/jagent.git?rev=a09fd1563b862f96bed7047834720aeb31c163e2#a09fd1563b862f96bed7047834720aeb31c163e2"
+version = "0.7.0"
+source = "git+https://github.com/beamiter/jagent.git?rev=9d1e913c46bdeb99ec43a58ac97b67f7a607fa96#9d1e913c46bdeb99ec43a58ac97b67f7a607fa96"
 dependencies = [
  "regex",
  "serde",

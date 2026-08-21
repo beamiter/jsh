@@ -25,7 +25,7 @@ dirs = "6.0.0"
 nix = { version = "0.31.3", features = ["process", "fs", "signal", "term", "user"] }
 ureq = { version = "3", optional = true }
 # Pin the policy engine so a branch move cannot silently change the contract.
-jagent = { git = "https://github.com/beamiter/jagent.git", rev = "a09fd1563b862f96bed7047834720aeb31c163e2", optional = true }
+jagent = { git = "https://github.com/beamiter/jagent.git", rev = "9d1e913c46bdeb99ec43a58ac97b67f7a607fa96", optional = true }
 serde_yaml = "0.9"
 toml = "1.1"
 quick-xml = { version = "0.41", features = ["serialize"] }

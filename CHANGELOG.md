@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Agent transport now uses jagent 0.7's protocol-bound preparation and
+  response path end to end. Provider envelopes return intact from the
+  cancellable HTTP child, preserving completion metadata and enabling
+  `JSH_AGENT_PROTOCOL=native-tools` without bypassing proposal review. The
+  previous local action-size, Unicode, and danger-policy backports were removed
+  in favor of the shared core and its preparation report.
+
 - Command discovery now has one catalog shared by dispatch checks, `help`,
   `compgen`, interactive completion, syntax highlighting, and typo repair.
   Every shipped command has reachable help; value commands such as `def` and

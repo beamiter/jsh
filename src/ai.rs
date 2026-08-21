@@ -17,8 +17,10 @@
 /// - **Shell context is untrusted data, not instruction.** cwd, `git status`
 ///   output, history lines and captured failure output are attacker-influenced
 ///   (a filename in a cloned repo is enough). They travel in the USER role
-///   inside labelled, JSON-escaped envelopes, and they reach the wire through
-///   exactly one funnel — [`build_redacted_chat_request`] — which redacts them.
+///   inside labelled, JSON-escaped envelopes. Editor AI reaches the wire
+///   through exactly one funnel — [`build_redacted_chat_request`] — while the
+///   command-executing Agent uses jagent's protocol-bound
+///   `prepare_agent_request`; both redact history structurally.
 use std::sync::mpsc;
 use std::thread;
 
@@ -1792,17 +1794,18 @@ mod ai_tests {
         assert!(request.body.contains("[REDACTED:url-password]"));
     }
 
-    /// Redaction must stay structural. `build_redacted_chat_request` is the
-    /// only place in jsh allowed to call jagent's reported request builder;
-    /// legacy builder calls are forbidden because they discard the omission
-    /// report. If another call site appears, unredacted context or silent
-    /// history loss could reach the wire, so fail here instead. (The needles
-    /// are assembled at runtime so this test's own source does not count as a
-    /// match.)
+    /// Redaction must stay structural. Ordinary chat has one reported-builder
+    /// funnel in this module; the command-executing Agent must instead use
+    /// jagent 0.7's high-level preparation boundary exactly once. Legacy or
+    /// low-level Agent builder calls could decouple protocol, prompt, response
+    /// parsing, or omission diagnostics, so fail if one reappears. (Needles
+    /// are assembled at runtime so this test's own source does not count.)
     #[test]
-    fn the_request_funnel_is_the_only_caller_of_a_jagent_request_builder() {
+    fn chat_and_agent_each_use_their_single_safe_request_funnel() {
         let reported = format!("build_chat{}request_with_report(", '_');
         let legacy = format!("build_chat{}request(", '_');
+        let agent_prepare = format!("prepare_agent{}request(", '_');
+        let agent_spec = format!("AgentRequestSpec::{}(", "new");
         assert_eq!(
             include_str!("ai.rs").matches(reported.as_str()).count(),
             1,
@@ -1811,7 +1814,7 @@ mod ai_tests {
         assert_eq!(
             include_str!("agent.rs").matches(reported.as_str()).count(),
             0,
-            "agent.rs must go through crate::ai::build_redacted_chat_request"
+            "agent.rs must not manually pair a low-level reported builder"
         );
         assert_eq!(
             include_str!("ai.rs").matches(legacy.as_str()).count(),
@@ -1822,6 +1825,20 @@ mod ai_tests {
             include_str!("agent.rs").matches(legacy.as_str()).count(),
             0,
             "agent.rs must not use the legacy builder that discards omission reports"
+        );
+        assert_eq!(
+            include_str!("agent.rs")
+                .matches(agent_prepare.as_str())
+                .count(),
+            1,
+            "agent.rs must prepare exactly once through jagent's high-level boundary"
+        );
+        assert_eq!(
+            include_str!("agent.rs")
+                .matches(agent_spec.as_str())
+                .count(),
+            1,
+            "agent.rs must bind every request to an explicit Agent protocol"
         );
     }
 

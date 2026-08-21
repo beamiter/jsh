@@ -12,12 +12,12 @@
 //! - `JSH_AGENT_AUTO_APPROVE_READONLY` — retired compatibility switch; when
 //!   set, jsh warns and continues to require explicit approval
 
-use crate::ai::{build_redacted_chat_request, AiConfig};
+use crate::ai::AiConfig;
 use crate::environment::ShellState;
 use jagent::provider::{ChatConfig, HttpRequest, Message, Provider};
 use jagent::{
-    AgentSession, AgentState, ApprovedCommand, EnvironmentMeta, GitMeta, ModelOutcome, Role,
-    SessionError,
+    prepare_agent_request, AgentProtocol, AgentRequestSpec, AgentResponse, AgentSession,
+    AgentState, ApprovedCommand, EnvironmentMeta, GitMeta, ModelOutcome, Role, SessionError,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
@@ -44,9 +44,6 @@ const MAX_CAPTURED_OUTPUT_BYTES: usize = 128 * 1024;
 /// inherited descriptor; cap the final drain so it cannot pin the Agent loop.
 const MAX_POST_EXIT_DRAIN_BYTES: usize = 1024 * 1024;
 const MAX_CONSECUTIVE_PROTOCOL_RETRIES: u32 = 2;
-/// Mirrors jagent's current pre-parse action ceiling. The exact dependency pin
-/// predates this guard, so jsh applies it before handing a reply to that parser.
-const MAX_AGENT_ACTION_JSON_BYTES: usize = 128 * 1024;
 const MAX_AGENT_SESSION_TURNS: u32 = 1_000;
 const INTERNAL_AGENT_CHILD_FLAG: &str = "--jsh-internal-agent-child";
 const AGENT_CHILD_SESSION_ID: &str = "agent-child";
@@ -107,6 +104,14 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
     };
     let chat = chat_config(&ai_config);
     let share_context = ai_config.allows_extended_context();
+    let protocol =
+        match configured_agent_protocol(std::env::var("JSH_AGENT_PROTOCOL").ok().as_deref()) {
+            Ok(protocol) => protocol,
+            Err(message) => {
+                eprintln!("agent: {message}");
+                return 1;
+            }
+        };
 
     let goal = if args.is_empty() {
         match read_line("agent goal> ") {
@@ -145,67 +150,40 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                     session.turns_used() + 1,
                     session.max_turns()
                 ));
-                let reply = match request_model(&chat, &session, share_context, &agent_cwd) {
-                    Ok(reply) => reply,
-                    Err(error) => {
-                        if let Some(status) = take_agent_interrupt(&mut session, state) {
-                            return status;
+                let reply =
+                    match request_model(&chat, &session, share_context, &agent_cwd, protocol) {
+                        Ok(reply) => reply,
+                        Err(error) => {
+                            if let Some(status) = take_agent_interrupt(&mut session, state) {
+                                return status;
+                            }
+                            let _ = session.model_failed(&error);
+                            let error = crate::ai::redact_sensitive_text(&error);
+                            eprintln!(
+                                "{}",
+                                terminal_safe_message(
+                                    "agent: model request failed: ",
+                                    &error,
+                                    MAX_AGENT_DISPLAY_BYTES
+                                )
+                            );
+                            if session.can_retry_model() && confirm("retry? [y/N] ") {
+                                let _ = session.retry_model();
+                                continue;
+                            }
+                            return 1;
                         }
-                        let _ = session.model_failed(&error);
-                        let error = crate::ai::redact_sensitive_text(&error);
-                        eprintln!(
-                            "{}",
-                            terminal_safe_message(
-                                "agent: model request failed: ",
-                                &error,
-                                MAX_AGENT_DISPLAY_BYTES
-                            )
-                        );
-                        if session.can_retry_model() && confirm("retry? [y/N] ") {
-                            let _ = session.retry_model();
-                            continue;
-                        }
-                        return 1;
-                    }
-                };
+                    };
                 if let Some(status) = take_agent_interrupt(&mut session, state) {
                     return status;
                 }
-                if !agent_reply_within_budget(&reply) {
-                    // Advance the pinned session through its normal protocol-
-                    // error transition without asking serde_json to allocate
-                    // from the oversized reply.
-                    let _ = session.accept_model_reply("");
-                    eprintln!(
-                        "agent: model reply violated the protocol: reply exceeds the \
-                         {MAX_AGENT_ACTION_JSON_BYTES} byte action limit"
-                    );
-                    if protocol_retries < MAX_CONSECUTIVE_PROTOCOL_RETRIES
-                        && session.can_retry_model()
-                    {
-                        protocol_retries += 1;
-                        let _ = session.retry_model();
-                    }
-                    continue;
-                }
-                match session.accept_model_reply(&reply) {
+                match session.accept_agent_response(&reply) {
                     Ok(ModelOutcome::Proposal {
                         id,
                         command,
                         danger: _,
                     }) => {
-                        if !crate::terminal_text::is_safe_inline(&command) {
-                            // Current jagent rejects this during action parsing.
-                            // The pinned core does not, so reject the proposal
-                            // locally before it can reach insert/edit/execute.
-                            let _ = session.reject(id);
-                            eprintln!(
-                                "agent: model reply violated the protocol: command contains \
-                                 invisible or bidirectional formatting"
-                            );
-                            continue;
-                        }
-                        let danger = current_danger(&command);
+                        let danger = jagent::is_dangerous(&command);
                         protocol_retries = 0;
                         let approved = match review_proposal(&mut session, id, &command, danger) {
                             ReviewOutcome::Approved(approved) => approved,
@@ -390,7 +368,7 @@ fn review_proposal(
                 }
                 match session.edit_and_approve(id, edited) {
                     Ok(approved) => {
-                        let danger = current_danger(&approved.command);
+                        let danger = jagent::is_dangerous(&approved.command);
                         if !confirm_danger(&approved, danger) {
                             session.cancel();
                             return ReviewOutcome::Quit;
@@ -449,170 +427,37 @@ fn confirm_danger(approved: &ApprovedCommand, danger: Option<&'static str>) -> b
     }
 }
 
-/// The exact jagent pin still provides the base classifier. These additions
-/// mirror the current jagent safety policy so the integration gets new
-/// destructive-operation warnings without depending on unpublished source.
-fn current_danger(command: &str) -> Option<&'static str> {
-    jagent::is_dangerous(command).or_else(|| supplemental_danger(command))
-}
-
-fn supplemental_danger(command: &str) -> Option<&'static str> {
-    let lower = command.trim().to_ascii_lowercase();
-    let tokens: Vec<&str> = lower
-        .split_whitespace()
-        .map(|token| token.trim_matches([';', '|', '&', '(', ')']))
-        .filter(|token| !token.is_empty())
-        .collect();
-    let effective = strip_command_prefixes(&tokens);
-    match effective.first().copied() {
-        Some("hostname") if effective.len() > 1 => {
-            return Some("hostname arguments can change the system hostname");
-        }
-        Some("date")
-            if effective[1..]
-                .iter()
-                .any(|arg| *arg == "-s" || *arg == "--set" || arg.starts_with("--set=")) =>
-        {
-            return Some("date --set changes the system clock");
-        }
-        Some("truncate" | "shred") => return Some("can irreversibly destroy file contents"),
-        Some("wipefs") => return Some("wipefs can erase filesystem signatures"),
-        Some("kubectl") if effective.get(1) == Some(&"delete") => {
-            return Some("kubectl delete removes cluster resources");
-        }
-        Some("terraform") if effective.get(1) == Some(&"destroy") => {
-            return Some("terraform destroy removes managed infrastructure");
-        }
-        _ => {}
-    }
-    if let Some((subcommand, arguments)) = local_git_subcommand(effective) {
-        if subcommand == "restore" {
-            return Some("git restore can discard uncommitted work");
-        }
-        if subcommand == "checkout"
-            && (arguments.contains(&"--")
-                || arguments
-                    .iter()
-                    .any(|token| *token == "-f" || *token == "--force"))
-        {
-            return Some("git checkout can discard uncommitted work");
-        }
-        if subcommand == "branch"
-            && arguments
-                .iter()
-                .any(|token| matches!(*token, "-d" | "--delete" | "--delete-force"))
-        {
-            return Some("forced branch deletion can discard commits");
-        }
-        if subcommand == "stash"
-            && arguments
-                .first()
-                .is_some_and(|action| matches!(*action, "drop" | "clear"))
-        {
-            return Some("git stash removal can discard saved work");
-        }
-    }
-    for runtime in ["docker", "podman"] {
-        if let Some(index) = effective.iter().position(|token| *token == runtime) {
-            let action = &effective[index + 1..];
-            if action.first().is_some_and(|subcommand| {
-                matches!(*subcommand, "rm" | "rmi")
-                    || (*subcommand == "volume" && action.get(1) == Some(&"rm"))
-            }) {
-                return Some("container removal can permanently delete runtime data");
-            }
-        }
-    }
-    None
-}
-
-fn strip_command_prefixes<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
-    let mut index = 0;
-    loop {
-        while tokens.get(index).is_some_and(|token| {
-            token.split_once('=').is_some_and(|(name, _)| {
-                let mut chars = name.chars();
-                chars
-                    .next()
-                    .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-                    && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-            })
-        }) {
-            index += 1;
-        }
-        match tokens.get(index).copied() {
-            Some("command") => {
-                index += 1;
-                while tokens
-                    .get(index)
-                    .is_some_and(|token| token.starts_with('-'))
-                {
-                    index += 1;
-                }
-            }
-            Some("env") => {
-                index += 1;
-                while let Some(option) = tokens.get(index) {
-                    if !option.starts_with('-') {
-                        break;
-                    }
-                    let takes_value = matches!(*option, "-u" | "--unset" | "-c" | "--chdir");
-                    index += 1;
-                    if takes_value && index < tokens.len() {
-                        index += 1;
-                    }
-                }
-            }
-            _ => break,
-        }
-    }
-    &tokens[index..]
-}
-
-fn local_git_subcommand<'a>(tokens: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
-    if tokens.first() != Some(&"git") {
-        return None;
-    }
-    let mut index = 1;
-    while let Some(token) = tokens.get(index).copied() {
-        if matches!(token, "-c" | "--git-dir" | "--work-tree" | "--namespace") {
-            index = index.saturating_add(2);
-        } else if token.starts_with('-') {
-            index += 1;
-        } else {
-            return Some((token, &tokens[index + 1..]));
-        }
-    }
-    None
-}
-
 fn request_model(
     chat: &ChatConfig,
     session: &AgentSession,
     share_context: bool,
     agent_cwd: &Path,
-) -> Result<String, String> {
+    protocol: AgentProtocol,
+) -> Result<AgentResponse, String> {
     let environment = environment_meta(share_context, agent_cwd);
     if crate::signal::pending_status().is_some() {
         return Err("interrupted".to_string());
     }
     // Transcript observations replay real terminal output, which is where API
-    // keys and connection strings show up. The scrubbing no longer happens
-    // here: `crate::ai::build_redacted_chat_request` is the single outbound
-    // funnel and redacts the system text and every turn on the way, so this
-    // call site cannot forget it (and neither can the next one).
-    let user_text = jagent::agent_user_prompt(&session.build_user_prompt(), &environment, None);
-    let request = build_redacted_chat_request(
-        chat,
-        Some(&jagent::build_agent_system_prompt()),
-        &[Message {
-            role: Role::User,
-            text: user_text,
-        }],
-    )
-    .map_err(|error| error.to_string())?;
-
-    model_request(request, chat.provider)
+    // keys and connection strings show up. AgentRequestSpec's secure default
+    // redacts every history turn and binds this protocol to its matching
+    // system prompt, provider schema, and response decoder.
+    let user_text = jagent::agent_user_prompt(
+        &session.build_user_prompt_with(protocol),
+        &environment,
+        None,
+    );
+    let history = [Message {
+        role: Role::User,
+        text: user_text,
+    }];
+    let prepared = prepare_agent_request(chat, AgentRequestSpec::new(&history, protocol))
+        .map_err(|error| error.to_string())?;
+    debug_assert!(prepared.report.redaction_enabled);
+    let raw = model_request(prepared.request.clone(), chat.provider)?;
+    prepared
+        .parse_response(&raw)
+        .map_err(|error| error.to_string())
 }
 
 /// Perform one model request in a child process, so cancelling it ends it.
@@ -635,7 +480,7 @@ fn request_model(
 ///
 /// The envelope travels on stdin rather than argv because it carries the API
 /// key, and argv is world-readable through `/proc`.
-fn model_request(request: HttpRequest, provider: Provider) -> Result<String, String> {
+fn model_request(request: HttpRequest, provider: Provider) -> Result<Vec<u8>, String> {
     if crate::signal::pending_status().is_some() {
         return Err("interrupted".to_string());
     }
@@ -678,7 +523,7 @@ fn model_request(request: HttpRequest, provider: Provider) -> Result<String, Str
     };
 
     match output.stdout.split_first() {
-        Some((&MODEL_CHILD_OK, body)) => Ok(String::from_utf8_lossy(body).into_owned()),
+        Some((&MODEL_CHILD_OK, body)) => Ok(body.to_vec()),
         Some((&MODEL_CHILD_ERR, message)) => Err(String::from_utf8_lossy(message).into_owned()),
         // No framing byte at all means the child died before it could answer —
         // a signal, or a binary that is not this jsh. Its stderr is untrusted
@@ -804,7 +649,7 @@ pub(crate) fn run_internal_model_request(args: &[std::ffi::OsString]) -> Option<
     }
 }
 
-fn perform_model_request(request: HttpRequest, provider: Provider) -> Result<String, String> {
+fn perform_model_request(request: HttpRequest, _provider: Provider) -> Result<String, String> {
     let agent = agent_http_client();
     let mut post = agent.post(&request.url);
     for (name, value) in &request.headers {
@@ -825,19 +670,12 @@ fn perform_model_request(request: HttpRequest, provider: Provider) -> Result<Str
         // are deliberately not echoed before protocol validation.
         return Err(format!("HTTP {}", status.as_u16()));
     }
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|error| format!("invalid response JSON: {error}"))?;
-    let parsed = crate::ai::parse_bounded_chat_response(provider, &json)
-        .map_err(|error| error.to_string())?;
-    if parsed.reached_token_limit {
-        // `parse_chat_response` would append a human-readable advisory note
-        // here, which the strict JSON protocol parser would then reject with a
-        // confusing "invalid JSON". Report the real cause instead.
-        return Err(format!(
-            "model stopped at the {AGENT_MAX_TOKENS}-token output limit; its reply is truncated"
-        ));
-    }
-    Ok(parsed.text)
+    // Keep the provider body intact. The parent still owns the
+    // PreparedAgentRequest that created this request and parses these bytes
+    // through its bound provider/protocol decoder before session ingestion.
+    // Parsing in this transport child used to erase completion metadata and
+    // made native-tool replies impossible to carry back safely.
+    Ok(text)
 }
 
 fn agent_http_client() -> ureq::Agent {
@@ -1401,8 +1239,14 @@ fn configured_max_turns(value: Option<&str>) -> u32 {
         .min(MAX_AGENT_SESSION_TURNS)
 }
 
-fn agent_reply_within_budget(reply: &str) -> bool {
-    reply.len() <= MAX_AGENT_ACTION_JSON_BYTES
+fn configured_agent_protocol(value: Option<&str>) -> Result<AgentProtocol, &'static str> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("text") => Ok(AgentProtocol::Text),
+        Some("native-tools" | "native_tools" | "tools") => Ok(AgentProtocol::NativeTools),
+        Some(_) => Err(
+            "JSH_AGENT_PROTOCOL must be 'text' or 'native-tools' (text is the compatible default)",
+        ),
+    }
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -1535,16 +1379,20 @@ fn terminal_safe_message(prefix: &str, value: &str, max_bytes: usize) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_child_command, agent_http_client, agent_reply_within_budget, bounded_git_stdout,
-        capture_pipe_cloexec, configured_max_turns, current_danger, git_meta, git_worktree_dirty,
+        agent_child_command, agent_http_client, bounded_git_stdout, capture_pipe_cloexec,
+        configured_agent_protocol, configured_max_turns, git_meta, git_worktree_dirty,
         run_captured, run_captured_to, run_internal_agent_child, run_internal_model_request,
         terminal_safe_inline_text, terminal_safe_message, terminal_safe_text, AgentChildTransport,
-        AGENT_CHILD_COMMAND_ENV, MAX_AGENT_ACTION_JSON_BYTES, MAX_AGENT_COMMAND_DISPLAY_BYTES,
-        MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_SESSION_TURNS,
+        AGENT_CHILD_COMMAND_ENV, MAX_AGENT_COMMAND_DISPLAY_BYTES, MAX_AGENT_DISPLAY_BYTES,
+        MAX_AGENT_SESSION_TURNS,
     };
     use super::{decode_model_request, encode_model_request};
     use crate::environment::ShellState;
-    use jagent::provider::{HttpRequest, Provider};
+    use jagent::provider::{ChatConfig, HttpRequest, Message, Provider, Role};
+    use jagent::{
+        prepare_agent_request as prepare_request, AgentProtocol, AgentRequestSpec as RequestSpec,
+        AgentSession, ModelOutcome,
+    };
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -1892,19 +1740,22 @@ mod tests {
     }
 
     #[test]
-    fn pinned_jagent_boundaries_are_enforced_locally() {
+    fn jagent_boundaries_and_protocol_selection_are_shared() {
         assert_eq!(configured_max_turns(None), 16);
         assert_eq!(configured_max_turns(Some("0")), 16);
         assert_eq!(
             configured_max_turns(Some("4294967295")),
             MAX_AGENT_SESSION_TURNS
         );
-        assert!(agent_reply_within_budget(
-            &"x".repeat(MAX_AGENT_ACTION_JSON_BYTES)
-        ));
-        assert!(!agent_reply_within_budget(
-            &"x".repeat(MAX_AGENT_ACTION_JSON_BYTES + 1)
-        ));
+        assert_eq!(
+            configured_agent_protocol(None),
+            Ok(jagent::AgentProtocol::Text)
+        );
+        assert_eq!(
+            configured_agent_protocol(Some("native-tools")),
+            Ok(jagent::AgentProtocol::NativeTools)
+        );
+        assert!(configured_agent_protocol(Some("guess")).is_err());
         for command in [
             "hostname build-node",
             "date --set=tomorrow",
@@ -1917,7 +1768,57 @@ mod tests {
             "kubectl delete namespace prod",
             "terraform destroy -auto-approve",
         ] {
-            assert!(current_danger(command).is_some(), "missed {command}");
+            assert!(jagent::is_dangerous(command).is_some(), "missed {command}");
+        }
+    }
+
+    #[test]
+    fn native_tools_provider_envelopes_follow_the_prepared_request_into_session() {
+        let fixtures: [(Provider, &[u8]); 3] = [
+            (
+                Provider::Anthropic,
+                br#"{"content":[{"type":"tool_use","id":"toolu_1","name":"run","input":{"command":"pwd"}}],"stop_reason":"tool_use"}"#,
+            ),
+            (
+                Provider::OpenAiCompatible,
+                br#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"run","arguments":"{\"command\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ),
+            (
+                Provider::Ollama,
+                br#"{"message":{"content":"","tool_calls":[{"function":{"name":"run","arguments":{"command":"pwd"}}}]},"done":true,"done_reason":"stop"}"#,
+            ),
+        ];
+
+        for (provider, body) in fixtures {
+            let history = [Message {
+                role: Role::User,
+                text: "inspect".into(),
+            }];
+            let config = ChatConfig {
+                provider,
+                api_key: (provider == Provider::Anthropic).then(|| "test-key".into()),
+                model: "test-model".into(),
+                base_url: provider.default_base_url().into(),
+                max_tokens: 128,
+                temperature: Some(0.0),
+            };
+            let prepared = prepare_request(
+                &config,
+                RequestSpec::new(&history, AgentProtocol::NativeTools),
+            )
+            .unwrap();
+            assert_eq!(prepared.protocol(), AgentProtocol::NativeTools);
+            assert!(prepared.request.body.contains("\"tools\""));
+
+            let response = prepared.parse_response(body).unwrap();
+            let mut session = AgentSession::new(4);
+            session.submit_user("inspect").unwrap();
+            let ModelOutcome::Proposal { command, .. } =
+                session.accept_agent_response(&response).unwrap()
+            else {
+                panic!("{provider:?} did not produce a proposal")
+            };
+            assert_eq!(command, "pwd", "{provider:?}");
         }
     }
 }

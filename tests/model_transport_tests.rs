@@ -93,10 +93,13 @@ fn the_transport_child_performs_the_request_and_frames_its_answer() {
 
     assert!(request.starts_with("POST "), "request={request:?}");
     // The child is the one that made the request, and it answers with a single
-    // framing byte so a provider failure is distinguishable from a transport
-    // failure without parsing prose.
-    assert_eq!(stdout.first(), Some(&b'-'), "stdout={stdout:?}");
-    assert!(!status.success());
+    // framing byte followed by the exact provider envelope. Protocol parsing
+    // belongs to the parent's PreparedAgentRequest, which still carries the
+    // request's provider and Text/NativeTools selection; the transport must
+    // not erase completion or tool-call metadata first.
+    assert_eq!(stdout.first(), Some(&b'+'), "stdout={stdout:?}");
+    assert_eq!(&stdout[1..], b"nonsense");
+    assert!(status.success());
 }
 
 #[test]
