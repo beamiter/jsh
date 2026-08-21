@@ -6,6 +6,8 @@
 //! information without ever including credential values.
 
 #[cfg(feature = "ai")]
+use crate::agent::AgentProtocolConfigError;
+#[cfg(feature = "ai")]
 use crate::ai::{AiConfig, AiProvider};
 use serde::Serialize;
 use std::ffi::CString;
@@ -594,6 +596,7 @@ fn ai_check(checks: &mut Vec<Check>) {
                 AiProvider::Anthropic => "Anthropic",
                 AiProvider::Ollama => "Ollama",
             };
+            agent_protocol_check(checks, &config);
             if crate::ai::validate_config(&config).is_err() {
                 checks.push(warn(
                     "ai.configuration",
@@ -641,6 +644,39 @@ fn ai_check(checks: &mut Vec<Check>) {
             "ai.configuration",
             "AI is disabled until JSH_AI_PROVIDER or JSH_AI_ENABLED explicitly opts in",
         )),
+    }
+}
+
+#[cfg(feature = "ai")]
+fn agent_protocol_check(checks: &mut Vec<Check>, config: &AiConfig) {
+    let provider = config.chat_config(1, None).provider;
+    match crate::agent::configured_agent_protocol_from_env(provider) {
+        Ok(protocol) => {
+            let peer = if std::env::var_os("JSH_AGENT_PEER_CAPABILITIES").is_some() {
+                "advertised peer"
+            } else {
+                "legacy text-compatible peer"
+            };
+            checks.push(pass(
+                "ai.agent_protocol",
+                format!(
+                    "Agent protocol '{}' is supported for complete delivery with the {peer}",
+                    protocol.as_wire_name()
+                ),
+            ));
+        }
+        Err(error) => {
+            let category = match error {
+                AgentProtocolConfigError::InvalidProtocol => "invalid",
+                AgentProtocolConfigError::InvalidPeer(_) => "malformed or unsupported",
+                AgentProtocolConfigError::UnsupportedSelection(_) => "unsupported",
+            };
+            checks.push(warn(
+                "ai.agent_protocol",
+                format!("Agent protocol negotiation is {category}: {error}"),
+                "use a canonical bounded JSH_AGENT_PEER_CAPABILITIES token and select text or native-tools; omit both variables for legacy text compatibility",
+            ));
+        }
     }
 }
 

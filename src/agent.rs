@@ -9,6 +9,8 @@
 //! Configuration reuses the `JSH_AI_*` environment contract from `crate::ai`,
 //! plus:
 //! - `JSH_AGENT_MAX_TURNS` — model-turn budget (default 16)
+//! - `JSH_AGENT_PROTOCOL` — explicit `text`/`native-tools` request protocol
+//! - `JSH_AGENT_PEER_CAPABILITIES` — strict bounded jagent capability token
 //! - `JSH_AGENT_AUTO_APPROVE_READONLY` — retired compatibility switch; when
 //!   set, jsh warns and continues to require explicit approval
 
@@ -16,8 +18,9 @@ use crate::ai::AiConfig;
 use crate::environment::ShellState;
 use jagent::provider::{ChatConfig, HttpRequest, Message, Provider};
 use jagent::{
-    prepare_agent_request, AgentProtocol, AgentRequestSpec, AgentResponse, AgentSession,
-    AgentState, ApprovedCommand, EnvironmentMeta, GitMeta, ModelOutcome, Role, SessionError,
+    agent_capabilities, prepare_agent_request, AgentCapabilities, AgentDelivery, AgentProtocol,
+    AgentRequestSpec, AgentResponse, AgentSession, AgentState, ApprovedCommand, CapabilityError,
+    EnvironmentMeta, GitMeta, ModelOutcome, Role, SessionError,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
@@ -45,6 +48,11 @@ const MAX_CAPTURED_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_POST_EXIT_DRAIN_BYTES: usize = 1024 * 1024;
 const MAX_CONSECUTIVE_PROTOCOL_RETRIES: u32 = 2;
 const MAX_AGENT_SESSION_TURNS: u32 = 1_000;
+const AGENT_PROTOCOL_ENV: &str = "JSH_AGENT_PROTOCOL";
+const AGENT_PEER_CAPABILITIES_ENV: &str = "JSH_AGENT_PEER_CAPABILITIES";
+/// A peer that predates capability discovery can only be assumed to understand
+/// the historical JSON-in-text, complete-response path.
+const LEGACY_AGENT_PEER_CAPABILITIES: &str = "jagent-agent/1;protocols=text;delivery=complete";
 const INTERNAL_AGENT_CHILD_FLAG: &str = "--jsh-internal-agent-child";
 const AGENT_CHILD_SESSION_ID: &str = "agent-child";
 const AGENT_CHILD_STATE_DIR_ENV: &str = "JSH_AGENT_CHILD_STATE_DIR";
@@ -104,14 +112,13 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
     };
     let chat = chat_config(&ai_config);
     let share_context = ai_config.allows_extended_context();
-    let protocol =
-        match configured_agent_protocol(std::env::var("JSH_AGENT_PROTOCOL").ok().as_deref()) {
-            Ok(protocol) => protocol,
-            Err(message) => {
-                eprintln!("agent: {message}");
-                return 1;
-            }
-        };
+    let protocol = match configured_agent_protocol_from_env(chat.provider) {
+        Ok(protocol) => protocol,
+        Err(error) => {
+            eprintln!("agent: {error}");
+            return 1;
+        }
+    };
 
     let goal = if args.is_empty() {
         match read_line("agent goal> ") {
@@ -1239,14 +1246,85 @@ fn configured_max_turns(value: Option<&str>) -> u32 {
         .min(MAX_AGENT_SESSION_TURNS)
 }
 
-fn configured_agent_protocol(value: Option<&str>) -> Result<AgentProtocol, &'static str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentProtocolConfigError {
+    InvalidProtocol,
+    InvalidPeer(CapabilityError),
+    UnsupportedSelection(AgentProtocol),
+}
+
+impl std::fmt::Display for AgentProtocolConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidProtocol => write!(
+                formatter,
+                "{AGENT_PROTOCOL_ENV} must be 'text' or 'native-tools' (text is the compatible default)"
+            ),
+            Self::InvalidPeer(CapabilityError::TooLarge) => write!(
+                formatter,
+                "{AGENT_PEER_CAPABILITIES_ENV} exceeds the bounded capability-token limit"
+            ),
+            Self::InvalidPeer(CapabilityError::Malformed) => write!(
+                formatter,
+                "{AGENT_PEER_CAPABILITIES_ENV} is not a canonical agent capability token"
+            ),
+            Self::InvalidPeer(CapabilityError::UnsupportedVersion(_)) => write!(
+                formatter,
+                "{AGENT_PEER_CAPABILITIES_ENV} uses an unsupported capability version"
+            ),
+            Self::UnsupportedSelection(protocol) => write!(
+                formatter,
+                "agent protocol '{}' is not supported by both the configured provider and peer for complete delivery",
+                protocol.as_wire_name()
+            ),
+        }
+    }
+}
+
+fn requested_agent_protocol(
+    value: Option<&str>,
+) -> Result<AgentProtocol, AgentProtocolConfigError> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         None | Some("text") => Ok(AgentProtocol::Text),
         Some("native-tools" | "native_tools" | "tools") => Ok(AgentProtocol::NativeTools),
-        Some(_) => Err(
-            "JSH_AGENT_PROTOCOL must be 'text' or 'native-tools' (text is the compatible default)",
-        ),
+        Some(_) => Err(AgentProtocolConfigError::InvalidProtocol),
     }
+}
+
+fn configured_agent_protocol(
+    provider: Provider,
+    protocol_value: Option<&str>,
+    peer_value: Option<&str>,
+) -> Result<AgentProtocol, AgentProtocolConfigError> {
+    let protocol = requested_agent_protocol(protocol_value)?;
+    let peer = AgentCapabilities::from_wire(peer_value.unwrap_or(LEGACY_AGENT_PEER_CAPABILITIES))
+        .map_err(AgentProtocolConfigError::InvalidPeer)?;
+    let local = agent_capabilities(provider);
+    local
+        .negotiate_with(peer, &[protocol], AgentDelivery::Complete)
+        .ok_or(AgentProtocolConfigError::UnsupportedSelection(protocol))
+}
+
+pub(crate) fn configured_agent_protocol_from_env(
+    provider: Provider,
+) -> Result<AgentProtocol, AgentProtocolConfigError> {
+    let protocol = match std::env::var(AGENT_PROTOCOL_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(AgentProtocolConfigError::InvalidProtocol)
+        }
+    };
+    let peer = match std::env::var(AGENT_PEER_CAPABILITIES_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(AgentProtocolConfigError::InvalidPeer(
+                CapabilityError::Malformed,
+            ))
+        }
+    };
+    configured_agent_protocol(provider, protocol.as_deref(), peer.as_deref())
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -1383,8 +1461,8 @@ mod tests {
         configured_agent_protocol, configured_max_turns, git_meta, git_worktree_dirty,
         run_captured, run_captured_to, run_internal_agent_child, run_internal_model_request,
         terminal_safe_inline_text, terminal_safe_message, terminal_safe_text, AgentChildTransport,
-        AGENT_CHILD_COMMAND_ENV, MAX_AGENT_COMMAND_DISPLAY_BYTES, MAX_AGENT_DISPLAY_BYTES,
-        MAX_AGENT_SESSION_TURNS,
+        AgentProtocolConfigError, AGENT_CHILD_COMMAND_ENV, MAX_AGENT_COMMAND_DISPLAY_BYTES,
+        MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_SESSION_TURNS,
     };
     use super::{decode_model_request, encode_model_request};
     use crate::environment::ShellState;
@@ -1748,14 +1826,21 @@ mod tests {
             MAX_AGENT_SESSION_TURNS
         );
         assert_eq!(
-            configured_agent_protocol(None),
+            configured_agent_protocol(Provider::Ollama, None, None),
             Ok(jagent::AgentProtocol::Text)
         );
         assert_eq!(
-            configured_agent_protocol(Some("native-tools")),
+            configured_agent_protocol(
+                Provider::Ollama,
+                Some("native-tools"),
+                Some(jagent::AGENT_CAPABILITIES_V1_WIRE),
+            ),
             Ok(jagent::AgentProtocol::NativeTools)
         );
-        assert!(configured_agent_protocol(Some("guess")).is_err());
+        assert_eq!(
+            configured_agent_protocol(Provider::Ollama, Some("guess"), None),
+            Err(AgentProtocolConfigError::InvalidProtocol)
+        );
         for command in [
             "hostname build-node",
             "date --set=tomorrow",
@@ -1770,6 +1855,80 @@ mod tests {
         ] {
             assert!(jagent::is_dangerous(command).is_some(), "missed {command}");
         }
+    }
+
+    #[test]
+    fn complete_peer_negotiation_is_strict_and_default_text_is_stable_for_every_provider() {
+        const TEXT_COMPLETE: &str = "jagent-agent/1;protocols=text;delivery=complete";
+        const NATIVE_COMPLETE: &str = "jagent-agent/1;protocols=native-tools;delivery=complete";
+        const STREAMING_ONLY: &str =
+            "jagent-agent/1;protocols=text,native-tools;delivery=streaming";
+
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            assert_eq!(
+                configured_agent_protocol(provider, None, None),
+                Ok(AgentProtocol::Text),
+                "legacy default drifted for {provider:?}"
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, None, Some(jagent::AGENT_CAPABILITIES_V1_WIRE),),
+                Ok(AgentProtocol::Text),
+                "capability discovery must not silently opt {provider:?} into native tools"
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, Some("text"), Some(TEXT_COMPLETE)),
+                Ok(AgentProtocol::Text)
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, Some("native-tools"), Some(NATIVE_COMPLETE),),
+                Ok(AgentProtocol::NativeTools)
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, Some("native-tools"), Some(TEXT_COMPLETE)),
+                Err(AgentProtocolConfigError::UnsupportedSelection(
+                    AgentProtocol::NativeTools
+                ))
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, None, Some(NATIVE_COMPLETE)),
+                Err(AgentProtocolConfigError::UnsupportedSelection(
+                    AgentProtocol::Text
+                ))
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, Some("text"), Some(STREAMING_ONLY)),
+                Err(AgentProtocolConfigError::UnsupportedSelection(
+                    AgentProtocol::Text
+                )),
+                "jsh's complete-only transport must reject streaming-only {provider:?} peers"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_peer_capabilities_are_bounded_and_never_echoed() {
+        let secret = "not-a-token-jsh-peer-secret";
+        let error =
+            configured_agent_protocol(Provider::OpenAiCompatible, Some("text"), Some(secret))
+                .unwrap_err();
+        assert_eq!(
+            error,
+            AgentProtocolConfigError::InvalidPeer(jagent::CapabilityError::Malformed)
+        );
+        assert!(!error.to_string().contains(secret));
+
+        let oversized = "x".repeat(jagent::MAX_AGENT_CAPABILITIES_WIRE_BYTES + 1);
+        let error = configured_agent_protocol(Provider::Anthropic, Some("text"), Some(&oversized))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            AgentProtocolConfigError::InvalidPeer(jagent::CapabilityError::TooLarge)
+        );
+        assert!(!error.to_string().contains(&oversized));
     }
 
     #[test]

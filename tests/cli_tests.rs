@@ -180,6 +180,48 @@ fn doctor_json_never_echoes_credentials_or_helper_side_channel_warnings() {
     assert!(value["summary"]["warnings"].as_u64().unwrap_or(0) >= 1);
 }
 
+#[cfg(feature = "ai")]
+#[test]
+fn doctor_reports_agent_capability_errors_without_echoing_peer_tokens() {
+    let cases = [
+        (
+            "not-a-token-jsh-peer-secret-must-not-leak",
+            "malformed or unsupported",
+        ),
+        (
+            "jagent-agent/1;protocols=text;delivery=complete",
+            "unsupported",
+        ),
+    ];
+    for (peer, category) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
+            .args(["doctor", "--json"])
+            .env("JSH_AI_PROVIDER", "ollama")
+            .env("JSH_AGENT_PROTOCOL", "native-tools")
+            .env("JSH_AGENT_PEER_CAPABILITIES", peer)
+            .output()
+            .expect("run doctor with invalid Agent negotiation");
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+        let rendered = text(&output.stdout);
+        assert!(!rendered.contains(peer), "doctor echoed peer token");
+        let report: serde_json::Value =
+            serde_json::from_str(&rendered).expect("doctor JSON report");
+        let check = report["checks"]
+            .as_array()
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .find(|check| check["name"] == "ai.agent_protocol")
+            })
+            .expect("Agent protocol diagnostic");
+        assert_eq!(check["level"], "warn");
+        assert!(check["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(category)));
+    }
+}
+
 #[test]
 fn malformed_cli_exits_two_with_a_diagnostic() {
     for args in [vec!["--unknown"], vec!["-c"], vec!["--rcfile"]] {

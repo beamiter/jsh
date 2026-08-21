@@ -155,7 +155,9 @@ Important options:
 - `--help` and `--version` report the binary's interface and version.
 - `doctor [--json] [--strict] [--rcfile FILE]` performs a read-only environment
   check. JSON reports carry `schema_version` and `healthy`; strict mode exits 1
-  on warnings. Reports describe credential presence, never values.
+  on warnings. Reports describe credential presence, never values, and report
+  malformed or unsupported Agent capability negotiation without echoing the
+  supplied capability token.
 
 Long options that take one value also accept `=` syntax, including
 `--command=...`, `--rcfile=...`, and `--session=...`. Repeating `--rcfile` or
@@ -444,11 +446,26 @@ and never become proposals.
 Agent requests use jagent 0.7's bound request/response path: the selected
 system prompt, provider schema, delivery protocol, secret redaction report,
 response decoder, and session ingestion cannot drift apart. The compatible
-default is the JSON-in-text protocol. Set `JSH_AGENT_PROTOCOL=native-tools` to
-use provider-native `run`/`say`/`done` calls; all three built-in providers are
-supported. An unknown value is rejected rather than guessed. Tool calls remain
-proposals and pass through exactly the same review prompt—selecting the native
-wire format never grants execution permission.
+default is the JSON-in-text protocol over one complete response. A terminal or
+other peer can advertise its protocol/delivery support through the canonical,
+at-most-256-byte `JSH_AGENT_PEER_CAPABILITIES` token, for example:
+
+```sh
+export JSH_AGENT_PEER_CAPABILITIES='jagent-agent/1;protocols=text,native-tools;delivery=complete'
+export JSH_AGENT_PROTOCOL=native-tools
+```
+
+If the peer variable is absent, jsh assumes only the legacy `text+complete`
+path; discovery never silently opts an existing integration into native tools.
+An explicit `JSH_AGENT_PROTOCOL` remains authoritative, but jsh rejects it
+unless both the selected provider and peer advertise that protocol with
+`complete` delivery. The current transport does not negotiate streaming.
+Malformed, non-canonical, future-version, whitespace-bearing, duplicate, or
+oversized peer tokens are rejected without being printed. All three built-in
+providers support native `run`/`say`/`done` calls. Tool calls remain proposals
+and pass through exactly the same review prompt—selecting the native wire
+format never grants execution permission. Run `jsh doctor` to inspect the
+effective negotiation without contacting the provider or exposing credentials.
 
 The agent keeps its own working directory: an approved `cd` carries into the
 following turns (shown as `cwd → …`), while the interactive shell's cwd is

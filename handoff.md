@@ -79,6 +79,12 @@ and installer hardening described below.
   compatible default), while both converge on the same explicit proposal
   review state machine. Local action-size, visual-spoof, and danger-policy
   backports removed by this migration now come from the shared 0.7 core.
+- The pin advances to jagent `d52002e` and jsh now intersects provider support
+  with a strict `JSH_AGENT_PEER_CAPABILITIES` token before preparing a request.
+  Missing discovery retains the legacy Text+Complete path; explicit protocol
+  selection wins only when both sides support it, and this transport never
+  guesses streaming. `jsh doctor` reports malformed/version/unsupported
+  negotiation using bounded generic diagnostics that never echo the token.
 
 - The single outbound AI funnel uses jagent's reported request builder and
   fails closed if jagent would omit anything after jsh has already bounded the

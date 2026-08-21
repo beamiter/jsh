@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Agent peers can advertise a strict, versioned protocol/delivery token through
+  `JSH_AGENT_PEER_CAPABILITIES`. Legacy peers still default to Text+Complete;
+  explicit native-tools selection now fails unless both provider and peer
+  support Complete delivery. Doctor reports malformed and unsupported
+  negotiation without printing the token.
 - Agent transport now uses jagent 0.7's protocol-bound preparation and
   response path end to end. Provider envelopes return intact from the
   cancellable HTTP child, preserving completion metadata and enabling
