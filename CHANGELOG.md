@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Agent command execution now distinguishes a real process exit from failure
+  to create the private snapshot, pipe, or child. Setup and signal failures use
+  jagent's explicit failure lifecycle and never masquerade as exit code 1. A
+  separate CLOEXEC readiness pipe also covers claim/load/cwd failures inside
+  the spawned one-shot child; its stdout/stderr cannot forge readiness.
 - Agent peers can advertise a strict, versioned protocol/delivery token through
   `JSH_AGENT_PEER_CAPABILITIES`. Legacy peers still default to Text+Complete;
   explicit native-tools selection now fails unless both provider and peer

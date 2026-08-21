@@ -20,7 +20,7 @@ use jagent::provider::{ChatConfig, HttpRequest, Message, Provider};
 use jagent::{
     agent_capabilities, prepare_agent_request, AgentCapabilities, AgentDelivery, AgentProtocol,
     AgentRequestSpec, AgentResponse, AgentSession, AgentState, ApprovedCommand, CapabilityError,
-    EnvironmentMeta, GitMeta, ModelOutcome, Role, SessionError,
+    CommandExecutionFailure, EnvironmentMeta, GitMeta, ModelOutcome, Role, SessionError,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
@@ -59,7 +59,9 @@ const AGENT_CHILD_STATE_DIR_ENV: &str = "JSH_AGENT_CHILD_STATE_DIR";
 const AGENT_CHILD_CWD_ENV: &str = "JSH_AGENT_CHILD_CWD";
 const AGENT_CHILD_REPORT_ENV: &str = "JSH_AGENT_CHILD_REPORT";
 const AGENT_CHILD_COMMAND_ENV: &str = "JSH_AGENT_CHILD_COMMAND";
+const AGENT_CHILD_CONTROL_FD_ENV: &str = "JSH_AGENT_CHILD_CONTROL_FD";
 const AGENT_CHILD_CLAIM_DIR: &str = "claimed";
+const AGENT_CHILD_READY: u8 = b'R';
 static AGENT_CHILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Argument that turns this binary into a one-shot HTTP transport for its own
 /// parent. See [`model_request`].
@@ -79,6 +81,182 @@ const MODEL_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_se
 const MODEL_CHILD_OK: u8 = b'+';
 const MODEL_CHILD_ERR: u8 = b'-';
 const MAX_MODEL_CHILD_STDERR_BYTES: usize = 8 * 1024;
+
+/// Result returned by the one-shot command boundary.
+///
+/// This stays private while jsh is exact-pinned to the current jagent 0.7
+/// revision. It routes through that revision's distinct success/failure
+/// observation APIs, so setup and signal failures never masquerade as exit 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapturedExecution {
+    Exited {
+        exit_code: i32,
+        output: String,
+    },
+    Failed {
+        failure: CommandExecutionFailure,
+        detail: String,
+    },
+}
+
+impl CapturedExecution {
+    fn exited(exit_code: i32, output: String) -> Self {
+        Self::Exited { exit_code, output }
+    }
+
+    fn failed(failure: CommandExecutionFailure, detail: impl Into<String>) -> Self {
+        Self::Failed {
+            failure,
+            detail: detail.into(),
+        }
+    }
+
+    fn record(
+        self,
+        session: &mut AgentSession,
+        proposal_id: jagent::ProposalId,
+    ) -> Result<(), SessionError> {
+        match self {
+            Self::Exited { exit_code, output } => session.observe(proposal_id, exit_code, &output),
+            Self::Failed { failure, detail } => {
+                session.observe_execution_failure(proposal_id, failure, &detail)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Exited { exit_code, .. } => Some(*exit_code),
+            Self::Failed { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn evidence(&self) -> &str {
+        match self {
+            Self::Exited { output, .. } => output,
+            Self::Failed { detail, .. } => detail,
+        }
+    }
+
+    #[cfg(test)]
+    fn failure(&self) -> Option<CommandExecutionFailure> {
+        match self {
+            Self::Exited { .. } => None,
+            Self::Failed { failure, .. } => Some(*failure),
+        }
+    }
+}
+
+/// Child-owned writer for the one-byte command-readiness channel.
+///
+/// The parent arranges for one pipe writer to survive only the exec that
+/// starts the one-shot jsh. This constructor immediately restores CLOEXEC and
+/// validates that the inherited descriptor is a write-only pipe. Signalling
+/// readiness consumes the writer, so no user command can inherit it.
+struct AgentChildControl(File);
+
+impl AgentChildControl {
+    fn from_env() -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+
+        let raw = std::env::var_os(AGENT_CHILD_CONTROL_FD_ENV).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "missing Agent child control descriptor",
+            )
+        })?;
+        std::env::remove_var(AGENT_CHILD_CONTROL_FD_ENV);
+        let descriptor = raw
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|descriptor| *descriptor > nix::libc::STDERR_FILENO)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid Agent child control descriptor",
+                )
+            })?;
+
+        let descriptor_flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) };
+        let status_flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFL) };
+        let mut metadata = std::mem::MaybeUninit::<nix::libc::stat>::zeroed();
+        let stat_result = unsafe { nix::libc::fstat(descriptor, metadata.as_mut_ptr()) };
+        if descriptor_flags < 0 || status_flags < 0 || stat_result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFIFO
+            || status_flags & nix::libc::O_ACCMODE != nix::libc::O_WRONLY
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Agent child control descriptor is not a write-only pipe",
+            ));
+        }
+        if unsafe {
+            nix::libc::fcntl(
+                descriptor,
+                nix::libc::F_SETFD,
+                descriptor_flags | nix::libc::FD_CLOEXEC,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // SAFETY: the descriptor was inherited specifically for this child,
+        // validated above, and is consumed exactly once by this owner.
+        Ok(Self(unsafe { File::from_raw_fd(descriptor) }))
+    }
+
+    fn signal_ready(mut self) -> std::io::Result<()> {
+        self.0.write_all(&[AGENT_CHILD_READY])?;
+        self.0.flush()
+    }
+}
+
+#[derive(Debug, Default)]
+struct AgentChildReadiness {
+    ready: bool,
+    closed: bool,
+    invalid: bool,
+}
+
+fn drain_agent_child_readiness(
+    descriptor: std::os::fd::BorrowedFd<'_>,
+    readiness: &mut AgentChildReadiness,
+) {
+    if readiness.closed {
+        return;
+    }
+    let mut bytes = [0_u8; 16];
+    loop {
+        match nix::unistd::read(descriptor, &mut bytes) {
+            Ok(0) => {
+                readiness.closed = true;
+                return;
+            }
+            Ok(count) => {
+                for byte in &bytes[..count] {
+                    if *byte == AGENT_CHILD_READY && !readiness.ready {
+                        readiness.ready = true;
+                    } else {
+                        readiness.invalid = true;
+                    }
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EAGAIN) => return,
+            Err(_) => {
+                readiness.invalid = true;
+                readiness.closed = true;
+                return;
+            }
+        }
+    }
+}
 
 /// Create the Agent capture pipe with close-on-exec set on both original
 /// descriptors. Linux and Android can do this atomically. Other Unix targets
@@ -205,14 +383,11 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                             }
                             ReviewOutcome::Quit => return 0,
                         };
-                        let (exit_code, output) =
-                            run_captured(&approved.command, state, &mut agent_cwd);
+                        let execution = run_captured(&approved.command, state, &mut agent_cwd);
                         if let Some(status) = take_agent_interrupt(&mut session, state) {
                             return status;
                         }
-                        if let Err(error) =
-                            session.observe(approved.proposal_id, exit_code, &output)
-                        {
+                        if let Err(error) = execution.record(&mut session, approved.proposal_id) {
                             eprintln!("agent: {error}");
                             return 1;
                         }
@@ -836,8 +1011,9 @@ impl Drop for AgentChildTransport {
 }
 
 /// Dispatch the undocumented one-shot child mode before normal CLI parsing.
-/// The marker alone is insufficient: all three private transport values must
-/// be present and the snapshot loader enforces ownership/link/size rules.
+/// The marker alone is insufficient: all three private path values plus the
+/// inherited control descriptor must be present, and the snapshot loader
+/// enforces ownership/link/size rules.
 pub(crate) fn internal_child_entrypoint() -> Option<i32> {
     let args = std::env::args_os().collect::<Vec<_>>();
     // The transport child is dispatched from the same place, and before the
@@ -863,6 +1039,13 @@ pub(crate) fn internal_child_entrypoint() -> Option<i32> {
 fn run_internal_agent_child(command: &str) -> i32 {
     use std::os::unix::ffi::OsStrExt;
 
+    let control = match AgentChildControl::from_env() {
+        Ok(control) => control,
+        Err(error) => {
+            eprintln!("jsh: internal Agent child control setup failed: {error}");
+            return 2;
+        }
+    };
     let Some(state_dir) = std::env::var_os(AGENT_CHILD_STATE_DIR_ENV).map(PathBuf::from) else {
         eprintln!("jsh: internal Agent child is missing its state directory");
         return 2;
@@ -880,6 +1063,7 @@ fn run_internal_agent_child(command: &str) -> i32 {
         AGENT_CHILD_CWD_ENV,
         AGENT_CHILD_REPORT_ENV,
         AGENT_CHILD_COMMAND_ENV,
+        AGENT_CHILD_CONTROL_FD_ENV,
     ] {
         std::env::remove_var(name);
     }
@@ -917,6 +1101,7 @@ fn run_internal_agent_child(command: &str) -> i32 {
         AGENT_CHILD_CWD_ENV,
         AGENT_CHILD_REPORT_ENV,
         AGENT_CHILD_COMMAND_ENV,
+        AGENT_CHILD_CONTROL_FD_ENV,
     ] {
         state.unset_var(name);
         std::env::remove_var(name);
@@ -926,6 +1111,15 @@ fn run_internal_agent_child(command: &str) -> i32 {
         return 1;
     }
     state.export_var("PWD", &agent_cwd.to_string_lossy());
+
+    // This is the exact execution boundary. Claim, decode, state restore, and
+    // cwd setup have all succeeded; failures before this byte are never
+    // reported to the Agent as a real shell exit. Consuming the writer closes
+    // it before parsing or executing attacker-influenced command text.
+    if let Err(error) = control.signal_ready() {
+        eprintln!("jsh: Agent command readiness failed: {error}");
+        return 1;
+    }
 
     let code = match crate::parser::parse(command) {
         Ok(commands) => crate::executor::execute_program(&commands, &mut state),
@@ -957,7 +1151,11 @@ fn agent_child_command(
     command: &str,
     transport: &AgentChildTransport,
     cwd: &Path,
+    control_writer: &std::os::fd::OwnedFd,
 ) -> std::io::Result<std::process::Command> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
     let mut child = std::process::Command::new(std::env::current_exe()?);
     #[cfg(not(test))]
     child.args([INTERNAL_AGENT_CHILD_FLAG, command]);
@@ -973,7 +1171,30 @@ fn agent_child_command(
     child
         .env(AGENT_CHILD_STATE_DIR_ENV, &transport.dir)
         .env(AGENT_CHILD_CWD_ENV, cwd)
-        .env(AGENT_CHILD_REPORT_ENV, &transport.report);
+        .env(AGENT_CHILD_REPORT_ENV, &transport.report)
+        .env(
+            AGENT_CHILD_CONTROL_FD_ENV,
+            control_writer.as_raw_fd().to_string(),
+        );
+    let control_descriptor = control_writer.as_raw_fd();
+    // SAFETY: the closure performs only one fcntl on an already-open pipe
+    // descriptor. Clearing CLOEXEC in this forked child does not change the
+    // parent's descriptor table or leak through concurrent parent spawns.
+    unsafe {
+        child.pre_exec(move || {
+            let flags = nix::libc::fcntl(control_descriptor, nix::libc::F_GETFD);
+            if flags < 0
+                || nix::libc::fcntl(
+                    control_descriptor,
+                    nix::libc::F_SETFD,
+                    flags & !nix::libc::FD_CLOEXEC,
+                ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     Ok(child)
 }
 
@@ -1018,7 +1239,11 @@ fn read_agent_cwd_report(path: &Path) -> std::io::Result<Option<PathBuf>> {
 /// biases toward non-interactive commands. A private one-shot snapshot gives
 /// the child the current aliases/functions/options without running Rust code
 /// after `fork()` in the multi-threaded interactive process.
-fn run_captured(command: &str, state: &mut ShellState, agent_cwd: &mut PathBuf) -> (i32, String) {
+fn run_captured(
+    command: &str,
+    state: &mut ShellState,
+    agent_cwd: &mut PathBuf,
+) -> CapturedExecution {
     let mut stdout = std::io::stdout();
     run_captured_to(command, state, agent_cwd, &mut stdout)
 }
@@ -1028,12 +1253,7 @@ fn run_captured_to(
     state: &mut ShellState,
     agent_cwd: &mut PathBuf,
     terminal_output: &mut dyn Write,
-) -> (i32, String) {
-    use nix::unistd::{close, read};
-    use std::os::unix::io::{BorrowedFd, IntoRawFd};
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::Stdio;
-
+) -> CapturedExecution {
     let shell_cwd = std::env::current_dir().unwrap_or_default();
     if *agent_cwd == shell_cwd {
         println!(
@@ -1058,7 +1278,35 @@ fn run_captured_to(
     }
     let transport = match AgentChildTransport::new(state, agent_cwd) {
         Ok(transport) => transport,
-        Err(error) => return (1, format!("[jsh: Agent state snapshot failed: {error}]")),
+        Err(error) => {
+            return CapturedExecution::failed(
+                CommandExecutionFailure::FailedToStart,
+                format!("[jsh: Agent state snapshot failed: {error}]"),
+            )
+        }
+    };
+    run_captured_with_transport(command, &transport, agent_cwd, terminal_output)
+}
+
+fn run_captured_with_transport(
+    command: &str,
+    transport: &AgentChildTransport,
+    agent_cwd: &mut PathBuf,
+    terminal_output: &mut dyn Write,
+) -> CapturedExecution {
+    use nix::unistd::{close, read};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let (control_reader, control_writer) = match capture_pipe_cloexec() {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            return CapturedExecution::failed(
+                CommandExecutionFailure::FailedToStart,
+                format!("[jsh: Agent readiness pipe failed: {error}]"),
+            )
+        }
     };
     // Neither end may leak through the exec that starts the one-shot jsh.
     // `stdout_file` is duplicated onto fd 1 by `Command`; dup2 clears
@@ -1069,23 +1317,35 @@ fn run_captured_to(
     // leaves the descendant and its waiting jsh parent orphaned indefinitely.
     let (r, w) = match capture_pipe_cloexec() {
         Ok(fds) => (fds.0.into_raw_fd(), fds.1),
-        Err(error) => return (1, format!("[jsh: pipe failed: {error}]")),
+        Err(error) => {
+            return CapturedExecution::failed(
+                CommandExecutionFailure::FailedToStart,
+                format!("[jsh: pipe failed: {error}]"),
+            )
+        }
     };
     let stdout_file = File::from(w);
     let stderr_file = match stdout_file.try_clone() {
         Ok(file) => file,
         Err(error) => {
             close(r).ok();
-            return (1, format!("[jsh: pipe clone failed: {error}]"));
+            return CapturedExecution::failed(
+                CommandExecutionFailure::FailedToStart,
+                format!("[jsh: pipe clone failed: {error}]"),
+            );
         }
     };
-    let mut child_command = match agent_child_command(command, &transport, agent_cwd) {
-        Ok(command) => command,
-        Err(error) => {
-            close(r).ok();
-            return (1, format!("[jsh: Agent child setup failed: {error}]"));
-        }
-    };
+    let mut child_command =
+        match agent_child_command(command, transport, agent_cwd, &control_writer) {
+            Ok(command) => command,
+            Err(error) => {
+                close(r).ok();
+                return CapturedExecution::failed(
+                    CommandExecutionFailure::FailedToStart,
+                    format!("[jsh: Agent child setup failed: {error}]"),
+                );
+            }
+        };
     child_command
         .stdin(Stdio::inherit())
         .stdout(Stdio::from(stdout_file))
@@ -1094,49 +1354,77 @@ fn run_captured_to(
         Ok(child) => child,
         Err(error) => {
             close(r).ok();
-            return (1, format!("[jsh: Agent child spawn failed: {error}]"));
+            return CapturedExecution::failed(
+                CommandExecutionFailure::FailedToStart,
+                format!("[jsh: Agent child spawn failed: {error}]"),
+            );
         }
     };
+    // The forked child owns the only remaining writer. EOF without its READY
+    // byte is therefore authoritative evidence that user command execution
+    // was never entered.
+    drop(control_writer);
     let child_pid = i32::try_from(child.id()).ok();
     drop(child_command);
 
     let flags = unsafe { nix::libc::fcntl(r, nix::libc::F_GETFL) };
+    let control_flags = unsafe { nix::libc::fcntl(control_reader.as_raw_fd(), nix::libc::F_GETFL) };
     if flags < 0
         || unsafe { nix::libc::fcntl(r, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) } < 0
+        || control_flags < 0
+        || unsafe {
+            nix::libc::fcntl(
+                control_reader.as_raw_fd(),
+                nix::libc::F_SETFL,
+                control_flags | nix::libc::O_NONBLOCK,
+            )
+        } < 0
     {
         let _ = child.kill();
         let _ = child.wait();
         close(r).ok();
-        return (1, "[jsh: failed to make capture pipe non-blocking]".into());
+        return CapturedExecution::failed(
+            CommandExecutionFailure::Cancelled,
+            "[jsh: capture setup failed after the Agent child started]",
+        );
     }
 
     let mut captured: Vec<u8> = Vec::new();
     let mut truncated = false;
     let mut buffer = [0_u8; 4096];
-    let mut child_status = None;
+    let mut child_status: Option<Result<i32, String>> = None;
     let mut output_open = true;
     let mut post_exit_bytes = 0usize;
     let mut forwarded_signal = None;
-    let mut refresh_child_status = |status: &mut Option<i32>| {
+    let mut readiness = AgentChildReadiness::default();
+    let mut refresh_child_status = |status: &mut Option<Result<i32, String>>| {
         if status.is_some() {
             return;
         }
         match child.try_wait() {
             Ok(Some(exit)) => {
-                *status = Some(
-                    exit.code()
-                        .unwrap_or_else(|| 128 + exit.signal().unwrap_or(1)),
-                );
+                *status = Some(match (exit.code(), exit.signal()) {
+                    (Some(code), _) => Ok(code),
+                    (None, Some(signal)) => Err(format!(
+                        "[jsh: Agent command boundary terminated by signal {signal}]"
+                    )),
+                    (None, None) => {
+                        Err("[jsh: Agent command boundary ended without a status]".into())
+                    }
+                });
             }
             Ok(None) => {}
-            Err(_) => {
+            Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                *status = Some(1);
+                *status = Some(Err(format!(
+                    "[jsh: could not observe Agent command completion: {error}]"
+                )));
             }
         }
     };
     'capture: loop {
+        drain_agent_child_readiness(control_reader.as_fd(), &mut readiness);
         if let Some(status) = crate::signal::pending_status() {
             let signal = status.saturating_sub(128);
             if signal > 0 && forwarded_signal != Some(signal) {
@@ -1188,12 +1476,18 @@ fn run_captured_to(
                 Err(nix::errno::Errno::EAGAIN) => break,
                 Err(_) => {
                     output_open = false;
+                    truncated = true;
                     break;
                 }
             }
         }
 
+        drain_agent_child_readiness(control_reader.as_fd(), &mut readiness);
+
         if child_status.is_some() {
+            // A READY written before exit is ordered before the writer closes;
+            // one last drain observes it even when the process was very short.
+            drain_agent_child_readiness(control_reader.as_fd(), &mut readiness);
             break;
         }
         if output_open {
@@ -1210,27 +1504,60 @@ fn run_captured_to(
         }
     }
     close(r).ok();
-    let exit_code = child_status.unwrap_or(1);
-    if let Ok(Some(reported)) = read_agent_cwd_report(&transport.report) {
-        if reported != *agent_cwd && reported.is_dir() {
-            println!(
-                "  {}",
-                dim(&format!(
-                    "cwd → {}",
-                    terminal_safe_inline_text(
-                        &reported.as_os_str().to_string_lossy(),
-                        MAX_AGENT_DISPLAY_BYTES
-                    )
-                ))
-            );
-            *agent_cwd = reported;
+    let child_status = child_status.unwrap_or_else(|| {
+        Err("[jsh: Agent command boundary ended without an observable status]".into())
+    });
+    if readiness.ready && !readiness.invalid {
+        if let Ok(Some(reported)) = read_agent_cwd_report(&transport.report) {
+            if reported != *agent_cwd && reported.is_dir() {
+                println!(
+                    "  {}",
+                    dim(&format!(
+                        "cwd → {}",
+                        terminal_safe_inline_text(
+                            &reported.as_os_str().to_string_lossy(),
+                            MAX_AGENT_DISPLAY_BYTES
+                        )
+                    ))
+                );
+                *agent_cwd = reported;
+            }
         }
     }
     let mut output = String::from_utf8_lossy(&captured).to_string();
     if truncated {
         output.push_str("\n[jsh: further output not captured]");
     }
-    (exit_code, output)
+    if readiness.invalid {
+        let mut detail = String::from(
+            "[jsh: Agent readiness channel failed; command execution result is unknown]",
+        );
+        if !output.trim().is_empty() {
+            detail.push('\n');
+            detail.push_str(&output);
+        }
+        return CapturedExecution::failed(CommandExecutionFailure::Cancelled, detail);
+    }
+    if !readiness.ready {
+        let mut detail =
+            String::from("[jsh: Agent child failed before entering user command execution]");
+        if !output.trim().is_empty() {
+            detail.push('\n');
+            detail.push_str(&output);
+        }
+        return CapturedExecution::failed(CommandExecutionFailure::FailedToStart, detail);
+    }
+
+    match child_status {
+        Ok(exit_code) => CapturedExecution::exited(exit_code, output),
+        Err(mut detail) => {
+            if !output.trim().is_empty() {
+                detail.push('\n');
+                detail.push_str(&output);
+            }
+            CapturedExecution::failed(CommandExecutionFailure::Cancelled, detail)
+        }
+    }
 }
 
 fn max_turns() -> u32 {
@@ -1458,18 +1785,19 @@ fn terminal_safe_message(prefix: &str, value: &str, max_bytes: usize) -> String 
 mod tests {
     use super::{
         agent_child_command, agent_http_client, bounded_git_stdout, capture_pipe_cloexec,
-        configured_agent_protocol, configured_max_turns, git_meta, git_worktree_dirty,
-        run_captured, run_captured_to, run_internal_agent_child, run_internal_model_request,
-        terminal_safe_inline_text, terminal_safe_message, terminal_safe_text, AgentChildTransport,
-        AgentProtocolConfigError, AGENT_CHILD_COMMAND_ENV, MAX_AGENT_COMMAND_DISPLAY_BYTES,
-        MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_SESSION_TURNS,
+        configured_agent_protocol, configured_max_turns, drain_agent_child_readiness, git_meta,
+        git_worktree_dirty, run_captured, run_captured_to, run_captured_with_transport,
+        run_internal_agent_child, run_internal_model_request, terminal_safe_inline_text,
+        terminal_safe_message, terminal_safe_text, AgentChildReadiness, AgentChildTransport,
+        AgentProtocolConfigError, CapturedExecution, AGENT_CHILD_COMMAND_ENV, AGENT_CHILD_READY,
+        MAX_AGENT_COMMAND_DISPLAY_BYTES, MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_SESSION_TURNS,
     };
     use super::{decode_model_request, encode_model_request};
     use crate::environment::ShellState;
     use jagent::provider::{ChatConfig, HttpRequest, Message, Provider, Role};
     use jagent::{
         prepare_agent_request as prepare_request, AgentProtocol, AgentRequestSpec as RequestSpec,
-        AgentSession, ModelOutcome,
+        AgentSession, CommandExecutionFailure, ModelOutcome, Turn,
     };
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -1559,6 +1887,7 @@ mod tests {
 
     #[test]
     fn one_shot_snapshot_is_atomically_claimed_by_only_one_process() {
+        use std::io::Read as _;
         use std::process::Stdio;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1571,28 +1900,164 @@ mod tests {
         let command = format!("/usr/bin/printf x >> '{}'", marker.display());
 
         let spawn = || {
-            let mut command =
-                agent_child_command(&command, &transport, &cwd).expect("child command");
+            let (control_reader, control_writer) =
+                capture_pipe_cloexec().expect("child control pipe");
+            let mut command = agent_child_command(&command, &transport, &cwd, &control_writer)
+                .expect("child command");
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn Agent child")
+                .stderr(Stdio::null());
+            let child = command.spawn().expect("spawn Agent child");
+            drop(control_writer);
+            (child, control_reader)
         };
-        let mut first = spawn();
-        let mut second = spawn();
-        let mut statuses = [
-            first.wait().expect("first Agent child").code(),
-            second.wait().expect("second Agent child").code(),
+        let (mut first, first_control) = spawn();
+        let (mut second, second_control) = spawn();
+        let read_control = |reader: std::os::fd::OwnedFd| {
+            let mut bytes = Vec::new();
+            std::fs::File::from(reader)
+                .read_to_end(&mut bytes)
+                .expect("read child control");
+            bytes
+        };
+        let mut outcomes = [
+            (
+                first.wait().expect("first Agent child").code(),
+                read_control(first_control),
+            ),
+            (
+                second.wait().expect("second Agent child").code(),
+                read_control(second_control),
+            ),
         ];
-        statuses.sort_unstable();
+        outcomes.sort_by_key(|(status, _)| *status);
 
-        assert_eq!(statuses, [Some(0), Some(1)]);
+        assert_eq!(outcomes[0], (Some(0), vec![AGENT_CHILD_READY]));
+        assert_eq!(outcomes[1], (Some(1), Vec::new()));
         assert_eq!(
             std::fs::read_to_string(marker).expect("execution marker"),
             "x"
         );
+    }
+
+    #[test]
+    fn pre_spawn_failure_has_no_fake_exit_status_and_restores_as_failure() {
+        let mut state = ShellState::new(false);
+        // Force the private child snapshot over its 4 MiB encoded ceiling.
+        // This deterministically fails before Command::spawn, exercising the
+        // production setup-failure route rather than only constructing the
+        // enum directly in the test.
+        state
+            .env_vars
+            .insert("AGENT_OVERSIZED_STATE".into(), "x".repeat(5 * 1024 * 1024));
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut terminal_output = std::io::sink();
+        let execution: CapturedExecution = run_captured_to(
+            "/usr/bin/printf must-not-run",
+            &mut state,
+            &mut cwd,
+            &mut terminal_output,
+        );
+        assert_eq!(execution.exit_code(), None);
+        assert_eq!(
+            execution.failure(),
+            Some(CommandExecutionFailure::FailedToStart)
+        );
+        assert!(execution.evidence().contains("state snapshot failed"));
+
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"check"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = session.approve(id).unwrap();
+        execution.record(&mut session, id).unwrap();
+        assert!(matches!(
+            session.transcript().last(),
+            Some(Turn::ProtocolError(message))
+                if message.contains("failed to start")
+                    && message.contains("no normal exit status")
+                    && !message.contains("Output (exit=1)")
+        ));
+        let restored = AgentSession::restore(session.snapshot().unwrap()).unwrap();
+        assert_eq!(restored.state(), jagent::AgentState::AwaitingModel);
+    }
+
+    #[test]
+    fn child_exit_one_before_ready_is_an_execution_failure() {
+        let state = ShellState::new(false);
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let transport = AgentChildTransport::new(&state, &cwd).expect("Agent transport");
+        // Make the already-created child capability unusable after the parent
+        // setup phase. The spawned child will fail its one-shot claim and exit
+        // 1, exactly the path that used to look like a real command failure.
+        std::fs::remove_file(&transport.snapshot).expect("remove public snapshot");
+        let temp = tempfile::tempdir().expect("execution marker directory");
+        let marker = temp.path().join("must-not-exist");
+        let command = format!("/usr/bin/printf ran > '{}'", marker.display());
+        let mut terminal_output = std::io::sink();
+        let execution =
+            run_captured_with_transport(&command, &transport, &mut cwd, &mut terminal_output);
+        assert_eq!(execution.exit_code(), None);
+        assert_eq!(
+            execution.failure(),
+            Some(CommandExecutionFailure::FailedToStart)
+        );
+        assert!(execution
+            .evidence()
+            .contains("failed before entering user command execution"));
+        assert!(
+            !marker.exists(),
+            "pre-ready child executed the user command"
+        );
+
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"check"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = session.approve(id).unwrap();
+        execution.record(&mut session, id).unwrap();
+        assert!(matches!(
+            session.transcript().last(),
+            Some(Turn::ProtocolError(message))
+                if message.contains("failed to start")
+                    && message.contains("no normal exit status")
+        ));
+        assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn real_exit_one_remains_a_normal_observation() {
+        let mut state = ShellState::new(false);
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut terminal_output = std::io::sink();
+        let execution = run_captured_to("false", &mut state, &mut cwd, &mut terminal_output);
+        assert_eq!(execution.exit_code(), Some(1));
+        assert_eq!(execution.failure(), None);
+
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"false"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = session.approve(id).unwrap();
+        execution.record(&mut session, id).unwrap();
+        assert!(matches!(
+            session.transcript().last(),
+            Some(Turn::Observation { exit_code: 1, .. })
+        ));
+        assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
     }
 
     #[test]
@@ -1601,9 +2066,9 @@ mod tests {
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let started = Instant::now();
 
-        let (status, _) = run_captured("sleep 1 &", &mut state, &mut cwd);
+        let execution = run_captured("sleep 1 &", &mut state, &mut cwd);
 
-        assert_eq!(status, 0);
+        assert_eq!(execution.exit_code(), Some(0));
         assert!(
             started.elapsed() < Duration::from_millis(750),
             "background stdout descriptor delayed Agent completion for {:?}",
@@ -1625,16 +2090,15 @@ mod tests {
              agent-writer '{quoted_pid_file}' & sleep 0.1"
         );
 
-        let (status, observation) =
-            run_captured_to(&command, &mut state, &mut cwd, &mut terminal_output);
+        let execution = run_captured_to(&command, &mut state, &mut cwd, &mut terminal_output);
 
-        assert_eq!(status, 0);
+        assert_eq!(execution.exit_code(), Some(0));
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "continuous background output delayed Agent completion for {:?}",
             started.elapsed()
         );
-        assert!(observation.contains("further output not captured"));
+        assert!(execution.evidence().contains("further output not captured"));
 
         // The capture reader is the only thing keeping the writer alive. Once
         // run_captured_to closes it, the writer must receive SIGPIPE and the
@@ -1680,6 +2144,32 @@ mod tests {
     }
 
     #[test]
+    fn readiness_channel_accepts_exactly_one_private_marker() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd;
+
+        let inspect = |bytes: &[u8]| {
+            let (reader, writer) = capture_pipe_cloexec().expect("readiness pipe");
+            let mut writer = std::fs::File::from(writer);
+            writer.write_all(bytes).expect("write readiness fixture");
+            drop(writer);
+            let mut readiness = AgentChildReadiness::default();
+            drain_agent_child_readiness(reader.as_fd(), &mut readiness);
+            readiness
+        };
+
+        let valid = inspect(&[AGENT_CHILD_READY]);
+        assert!(valid.ready);
+        assert!(valid.closed);
+        assert!(!valid.invalid);
+
+        for invalid in [vec![b'+'], vec![AGENT_CHILD_READY, AGENT_CHILD_READY]] {
+            let readiness = inspect(&invalid);
+            assert!(readiness.invalid, "accepted control bytes {invalid:?}");
+        }
+    }
+
+    #[test]
     fn cwd_report_preserves_significant_trailing_whitespace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("directory with trailing space ");
@@ -1689,9 +2179,9 @@ mod tests {
         let mut terminal_output = std::io::sink();
         let command = format!("cd '{}'", target.display());
 
-        let (status, _) = run_captured_to(&command, &mut state, &mut cwd, &mut terminal_output);
+        let execution = run_captured_to(&command, &mut state, &mut cwd, &mut terminal_output);
 
-        assert_eq!(status, 0);
+        assert_eq!(execution.exit_code(), Some(0));
         assert_eq!(cwd, target);
     }
 
@@ -1714,10 +2204,10 @@ mod tests {
         let mut terminal_output = std::io::sink();
         let command = "agent_alias; agent_fn; /usr/bin/printf ':%s:%s' \"$AGENT_SNAPSHOT_VALUE\" \"$-\"; AGENT_SNAPSHOT_VALUE=child-value; alias agent_alias='/usr/bin/printf child-alias'";
 
-        let (status, observation) =
-            run_captured_to(command, &mut state, &mut cwd, &mut terminal_output);
+        let execution = run_captured_to(command, &mut state, &mut cwd, &mut terminal_output);
 
-        assert_eq!(status, 0);
+        assert_eq!(execution.exit_code(), Some(0));
+        let observation = execution.evidence();
         assert!(
             observation.contains("alias-ok:function-ok:parent-value:"),
             "restored Agent state produced unexpected output: {observation:?}"

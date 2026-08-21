@@ -85,6 +85,19 @@ and installer hardening described below.
   selection wins only when both sides support it, and this transport never
   guesses streaming. `jsh doctor` reports malformed/version/unsupported
   negotiation using bounded generic diagnostics that never echo the token.
+- Approved-command capture now carries a typed private `Exited`/`Failed`
+  result into jagent's existing observation APIs. Snapshot, pipe, setup, and
+  spawn failures are reported as `FailedToStart`. The one-shot child has a
+  separate CLOEXEC readiness pipe and emits its sole byte only after claim,
+  bounded load, state restore, and cwd setup; stdout/stderr are never control
+  data, so an internal child exit 1 before READY is also `FailedToStart`.
+  Post-READY signal or status-observation failures use the current pin's
+  conservative `Cancelled` bucket because it has no signal/unknown variant.
+  None becomes synthetic exit code 1. Regressions cover parent pre-spawn
+  failure, child pre-READY exit 1, real post-READY exit 1, one-winner readiness,
+  and jagent snapshot restore. jagent's compatibility-first v1 emission, v2
+  peer-aware opt-in, and public execution-outcome type must be published first;
+  only then should jsh repin and replace this compatibility bridge.
 
 - The single outbound AI funnel uses jagent's reported request builder and
   fails closed if jagent would omit anything after jsh has already bounded the

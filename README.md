@@ -439,9 +439,17 @@ The model may only *propose* one command per turn. Every proposal shows a
 dangerous commands additionally require typing `RUN`. `[i]` moves the command
 into your next editor prompt for manual review without executing it and ends
 the session. Approved commands execute through the normal jsh parser with
-output teed to the terminal, and a bounded sample plus the exit code is fed
-back as the next model turn's observation. Malformed model replies fail closed
-and never become proposals.
+output teed to the terminal, and a bounded sample plus a real exit code is fed
+back as the next model turn's observation. If the private snapshot, pipe, or
+child boundary cannot start—or the boundary terminates without a normal
+status—jsh records an explicit execution failure instead of fabricating exit
+code 1. Parent and child coordinate over a separate one-byte readiness pipe:
+the child closes it only after snapshot claim/load, state restore, and cwd
+setup succeed, before parsing or executing the user command. stdout/stderr can
+never forge that signal. A signal or status-observation failure after READY is
+reported through jagent 0.7's conservative `Cancelled` compatibility bucket;
+it is not claimed to be a normal shell exit. Malformed model replies fail
+closed and never become proposals.
 
 Agent requests use jagent 0.7's bound request/response path: the selected
 system prompt, provider schema, delivery protocol, secret redaction report,
@@ -466,6 +474,11 @@ providers support native `run`/`say`/`done` calls. Tool calls remain proposals
 and pass through exactly the same review prompt—selecting the native wire
 format never grants execution permission. Run `jsh doctor` to inspect the
 effective negotiation without contacting the provider or exposing credentials.
+Capability-token v2, which can express exact protocol/delivery pairs rather
+than a Cartesian product, is staged as an explicit peer-aware opt-in in jagent;
+its default emission remains v1 for rolling-upgrade safety. jsh continues to
+consume the reproducible pinned v1 contract until that upstream revision can
+be published and exact-pinned.
 
 The agent keeps its own working directory: an approved `cd` carries into the
 following turns (shown as `cwd → …`), while the interactive shell's cwd is
