@@ -182,6 +182,43 @@ fn doctor_json_never_echoes_credentials_or_helper_side_channel_warnings() {
 
 #[cfg(feature = "ai")]
 #[test]
+fn doctor_rejects_exact_transport_values_without_echoing_credentials() {
+    let cases = [
+        ("JSH_AI_MODEL", " gpt-4o-mini"),
+        ("JSH_AI_BASE_URL", "https://2130706433/v1"),
+        ("OPENAI_API_KEY", "doctor secret must-not-leak"),
+    ];
+    for (name, value) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
+            .args(["doctor", "--json"])
+            .env("JSH_AI_PROVIDER", "openai")
+            .env("OPENAI_API_KEY", "safe-doctor-key")
+            .env(name, value)
+            .output()
+            .expect("run doctor with invalid AI transport configuration");
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+        let rendered = text(&output.stdout);
+        assert!(!rendered.contains(value), "doctor echoed invalid value");
+        let report: serde_json::Value =
+            serde_json::from_str(&rendered).expect("doctor JSON report");
+        let check = report["checks"]
+            .as_array()
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .find(|check| check["name"] == "ai.configuration")
+            })
+            .expect("AI configuration diagnostic");
+        assert_eq!(check["level"], "warn");
+        assert!(check["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid")));
+    }
+}
+
+#[cfg(feature = "ai")]
+#[test]
 fn doctor_reports_agent_capability_errors_without_echoing_peer_tokens() {
     let cases = [
         (

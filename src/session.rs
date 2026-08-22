@@ -73,13 +73,15 @@ const SKIP_ENV_VARS: &[&str] = &[
     // would carry another host's home directory into a later local session,
     // where `~` would then point somewhere that does not exist here.
     "JSH_REAL_HOME",
-    // One-shot Agent child transport. These paths are capabilities for a
-    // private snapshot/report directory and must never survive into a command
-    // or a persisted terminal session.
+    // One-shot Agent child transport. These values identify a private
+    // snapshot directory or inherited pipe capabilities and must never
+    // survive into a command or a persisted terminal session.
     "JSH_AGENT_CHILD_STATE_DIR",
     "JSH_AGENT_CHILD_CWD",
-    "JSH_AGENT_CHILD_REPORT",
     "JSH_AGENT_CHILD_COMMAND",
+    "JSH_AGENT_CHILD_CONTROL_FD",
+    "JSH_AGENT_CHILD_CWD_REPORT_FD",
+    "JSH_AGENT_CHILD_CWD_NONCE_FD",
 ];
 
 /// Environment variable names that are likely to hold credentials. Session

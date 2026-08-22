@@ -446,7 +446,13 @@ status—jsh records an explicit execution failure instead of fabricating exit
 code 1. Parent and child coordinate over a separate one-byte readiness pipe:
 the child closes it only after snapshot claim/load, state restore, and cwd
 setup succeed, before parsing or executing the user command. stdout/stderr can
-never forge that signal. A signal or status-observation failure after READY is
+never forge that signal. Authentication requires one exact marker followed by
+EOF. Control, final-cwd, and one-shot nonce descriptors must be three distinct
+FIFO identities, not aliases under different fd numbers. The final cwd is a
+nonce-bound length-prefixed frame: its prefix is checked incrementally, reads
+have fixed per-pass work budgets, and malformed input closes the parent reader
+so a writer cannot turn rejection into a shutdown hang. A signal or
+status-observation failure after READY is
 reported through jagent 0.7's conservative `Cancelled` compatibility bucket;
 it is not claimed to be a normal shell exit. Malformed model replies fail
 closed and never become proposals.

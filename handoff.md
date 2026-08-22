@@ -1,12 +1,67 @@
 # Engineering handoff
 
-Updated: 2026-08-21
+Updated: 2026-08-22
 
 This baseline unifies command discovery, separates executable AI suggestions
 from read-only explanations, completes workflow parameter filling, and fixes
 Agent capture and closure UTF-8 regressions on top of the diagnostics, AI,
 persistence, execution I/O, parser/completion, terminal text, helper-resolution,
 and installer hardening described below.
+
+## 2026-08-22 ten-round AI and Agent boundary hardening
+
+1. `AiConfig` Debug exposes only provider/length/presence metadata.
+2. `AiRequest` and nested `AiContext` Debug expose counts and byte lengths,
+   never prompt, cwd, history, Git, or failure contents.
+3. An explicitly empty or padded `JSH_AI_MODEL` is preserved for validation
+   instead of silently selecting the default model.
+4. `JSH_AI_BASE_URL` follows the same exact-value, absence-only default rule.
+5. Ollama proxies can use exact `OLLAMA_API_KEY` or the app-scoped fallback;
+   invalid key bytes still fail at the shared request boundary.
+6. Explain-command JSON escapes its own closing-tag spelling without changing
+   the string obtained by JSON decoding.
+7. The extra shell-context JSON envelope applies the same representation-safe
+   closing-tag rule.
+8. Agent READY authentication now requires the marker followed by clean EOF,
+   not merely a marker observed on an open channel.
+9. Inherited control/report/nonce descriptors accept only canonical ASCII
+   decimal spellings with no signs, spaces, or leading-zero aliases.
+10. The fixed-size cwd capability nonce is checked with a full-length,
+    non-short-circuit XOR comparison before any reported cwd is considered.
+
+## 2026-08-22 twenty-round Agent child-channel hardening
+
+1. Readiness failures now retain a typed unexpected/duplicate/read issue.
+2. The channel accepts one exact `R` marker and no alternative byte.
+3. A readiness drain has a fixed 64-byte work budget per event-loop pass.
+4. The readiness state machine stops reading immediately after its first
+   protocol issue.
+5. Authentication still requires both the one marker and clean EOF.
+6. Descriptor environment text has an explicit 10-byte pre-parse ceiling.
+7. Control, cwd-report, and nonce channels must be three distinct FIFO
+   identities, not merely three different descriptor numbers.
+8. Nonce input requires exactly 32 bytes followed by EOF; short and extra
+   inputs have direct regressions.
+9. The cwd accumulator records its declared expected frame size as soon as the
+   eight-byte prefix arrives.
+10. A wrong magic prefix is rejected on the first mismatching byte.
+11. Zero and oversized declared cwd lengths are rejected before the payload is
+    retained.
+12. Any byte beyond the declared frame size rejects the report immediately.
+13. Each cwd-report drain is capped at 64 KiB while a maximum legal frame
+    completes across successive nonblocking passes.
+14. An invalid report closes the parent reader, giving a would-be flooding
+    writer `EPIPE` instead of allowing it to block child shutdown.
+15. Cumulative received-byte accounting remains available without retaining
+    bytes past the frame ceiling.
+16. Encoded and decoded cwd paths explicitly reject NUL bytes.
+17. Empty/relative cwd paths remain invalid at both encode and decode gates.
+18. Frame-buffer Debug and setup errors expose status/counts only, never cwd or
+    nonce bytes; cwd setup errors no longer echo the path.
+19. Regressions cover duplicate readiness floods, early malformed frames,
+    invalid-writer closure, and the 65,576-byte maximum valid frame.
+20. README now documents EOF authentication, distinct pipe identities,
+    incremental framing, per-pass fairness, and fail-closed reader shutdown.
 
 ## Completed since the previous handoff
 

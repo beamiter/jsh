@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Agent child control channels now use typed, byte-budgeted nonblocking state
+  machines. READY requires one marker plus EOF; the cwd frame rejects bad
+  magic, length, nonce, NUL, and extra bytes as soon as decidable, and an
+  invalid report closes the reader so a flooding same-process writer cannot
+  hang child shutdown. The three inherited channels must also identify three
+  distinct FIFOs, and descriptor/nonce text has exact size and EOF contracts.
+- Agent command capture now carries jagent's public `CommandExecutionOutcome`
+  from the one-shot child boundary directly into `observe_execution`, removing
+  the local compatibility enum while preserving real-exit versus failed-start
+  semantics. Capability negotiation replies in the decoded peer's schema
+  version. Final cwd state now returns over a separately framed, bounded
+  CLOEXEC pipe rather than an enumerable file; the child clears the capability
+  name and keeps the writer CLOEXEC before approved commands run, while the
+  parent accepts exactly one complete, nonce-authenticated raw-path frame.
+  Closing or replacing that same-process writer makes the update fail closed
+  instead of aborting the child. AI
+  model/base-URL/key validation also uses the exact bytes
+  that request construction sees, including fail-closed numeric hosts and
+  visible-ASCII credentials.
 - Agent command execution now distinguishes a real process exit from failure
   to create the private snapshot, pipe, or child. Setup and signal failures use
   jagent's explicit failure lifecycle and never masquerade as exit code 1. A

@@ -18,13 +18,14 @@ use crate::ai::AiConfig;
 use crate::environment::ShellState;
 use jagent::provider::{ChatConfig, HttpRequest, Message, Provider};
 use jagent::{
-    agent_capabilities, prepare_agent_request, AgentCapabilities, AgentDelivery, AgentProtocol,
-    AgentRequestSpec, AgentResponse, AgentSession, AgentState, ApprovedCommand, CapabilityError,
-    CommandExecutionFailure, EnvironmentMeta, GitMeta, ModelOutcome, Role, SessionError,
+    agent_capabilities_for_peer, prepare_agent_request, AgentCapabilities, AgentDelivery,
+    AgentProtocol, AgentRequestSpec, AgentResponse, AgentSession, AgentState, ApprovedCommand,
+    CapabilityError, CommandExecutionFailure, CommandExecutionOutcome, EnvironmentMeta, GitMeta,
+    ModelOutcome, Role, SessionError,
 };
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -57,11 +58,21 @@ const INTERNAL_AGENT_CHILD_FLAG: &str = "--jsh-internal-agent-child";
 const AGENT_CHILD_SESSION_ID: &str = "agent-child";
 const AGENT_CHILD_STATE_DIR_ENV: &str = "JSH_AGENT_CHILD_STATE_DIR";
 const AGENT_CHILD_CWD_ENV: &str = "JSH_AGENT_CHILD_CWD";
-const AGENT_CHILD_REPORT_ENV: &str = "JSH_AGENT_CHILD_REPORT";
 const AGENT_CHILD_COMMAND_ENV: &str = "JSH_AGENT_CHILD_COMMAND";
 const AGENT_CHILD_CONTROL_FD_ENV: &str = "JSH_AGENT_CHILD_CONTROL_FD";
+const AGENT_CHILD_CWD_REPORT_FD_ENV: &str = "JSH_AGENT_CHILD_CWD_REPORT_FD";
+const AGENT_CHILD_CWD_NONCE_FD_ENV: &str = "JSH_AGENT_CHILD_CWD_NONCE_FD";
 const AGENT_CHILD_CLAIM_DIR: &str = "claimed";
 const AGENT_CHILD_READY: u8 = b'R';
+const AGENT_CHILD_CWD_FRAME_MAGIC: [u8; 4] = *b"JCW1";
+const AGENT_CHILD_CWD_NONCE_BYTES: usize = 32;
+const AGENT_CHILD_CWD_FRAME_HEADER_BYTES: usize = 8 + AGENT_CHILD_CWD_NONCE_BYTES;
+const MAX_AGENT_CHILD_CWD_BYTES: usize = 64 * 1024;
+const MAX_AGENT_CHILD_CWD_FRAME_BYTES: usize =
+    AGENT_CHILD_CWD_FRAME_HEADER_BYTES + MAX_AGENT_CHILD_CWD_BYTES;
+const MAX_AGENT_CHILD_DESCRIPTOR_TEXT_BYTES: usize = 10;
+const MAX_AGENT_CHILD_READINESS_DRAIN_BYTES: usize = 64;
+const MAX_AGENT_CHILD_CWD_DRAIN_BYTES: usize = 64 * 1024;
 static AGENT_CHILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Argument that turns this binary into a one-shot HTTP transport for its own
 /// parent. See [`model_request`].
@@ -82,72 +93,10 @@ const MODEL_CHILD_OK: u8 = b'+';
 const MODEL_CHILD_ERR: u8 = b'-';
 const MAX_MODEL_CHILD_STDERR_BYTES: usize = 8 * 1024;
 
-/// Result returned by the one-shot command boundary.
-///
-/// This stays private while jsh is exact-pinned to the current jagent 0.7
-/// revision. It routes through that revision's distinct success/failure
-/// observation APIs, so setup and signal failures never masquerade as exit 1.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CapturedExecution {
-    Exited {
-        exit_code: i32,
-        output: String,
-    },
-    Failed {
-        failure: CommandExecutionFailure,
-        detail: String,
-    },
-}
-
-impl CapturedExecution {
-    fn exited(exit_code: i32, output: String) -> Self {
-        Self::Exited { exit_code, output }
-    }
-
-    fn failed(failure: CommandExecutionFailure, detail: impl Into<String>) -> Self {
-        Self::Failed {
-            failure,
-            detail: detail.into(),
-        }
-    }
-
-    fn record(
-        self,
-        session: &mut AgentSession,
-        proposal_id: jagent::ProposalId,
-    ) -> Result<(), SessionError> {
-        match self {
-            Self::Exited { exit_code, output } => session.observe(proposal_id, exit_code, &output),
-            Self::Failed { failure, detail } => {
-                session.observe_execution_failure(proposal_id, failure, &detail)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn exit_code(&self) -> Option<i32> {
-        match self {
-            Self::Exited { exit_code, .. } => Some(*exit_code),
-            Self::Failed { .. } => None,
-        }
-    }
-
-    #[cfg(test)]
-    fn evidence(&self) -> &str {
-        match self {
-            Self::Exited { output, .. } => output,
-            Self::Failed { detail, .. } => detail,
-        }
-    }
-
-    #[cfg(test)]
-    fn failure(&self) -> Option<CommandExecutionFailure> {
-        match self {
-            Self::Exited { .. } => None,
-            Self::Failed { failure, .. } => Some(*failure),
-        }
-    }
-}
+/// The one-shot child now carries jagent's public typed result end to end.
+/// Keeping a local name documents the process boundary without maintaining a
+/// compatibility enum or duplicating the session-ingestion match.
+type CapturedExecution = CommandExecutionOutcome;
 
 /// Child-owned writer for the one-byte command-readiness channel.
 ///
@@ -159,56 +108,7 @@ struct AgentChildControl(File);
 
 impl AgentChildControl {
     fn from_env() -> std::io::Result<Self> {
-        use std::os::fd::FromRawFd;
-
-        let raw = std::env::var_os(AGENT_CHILD_CONTROL_FD_ENV).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "missing Agent child control descriptor",
-            )
-        })?;
-        std::env::remove_var(AGENT_CHILD_CONTROL_FD_ENV);
-        let descriptor = raw
-            .to_str()
-            .and_then(|value| value.parse::<i32>().ok())
-            .filter(|descriptor| *descriptor > nix::libc::STDERR_FILENO)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "invalid Agent child control descriptor",
-                )
-            })?;
-
-        let descriptor_flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) };
-        let status_flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFL) };
-        let mut metadata = std::mem::MaybeUninit::<nix::libc::stat>::zeroed();
-        let stat_result = unsafe { nix::libc::fstat(descriptor, metadata.as_mut_ptr()) };
-        if descriptor_flags < 0 || status_flags < 0 || stat_result < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let metadata = unsafe { metadata.assume_init() };
-        if metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFIFO
-            || status_flags & nix::libc::O_ACCMODE != nix::libc::O_WRONLY
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Agent child control descriptor is not a write-only pipe",
-            ));
-        }
-        if unsafe {
-            nix::libc::fcntl(
-                descriptor,
-                nix::libc::F_SETFD,
-                descriptor_flags | nix::libc::FD_CLOEXEC,
-            )
-        } < 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        // SAFETY: the descriptor was inherited specifically for this child,
-        // validated above, and is consumed exactly once by this owner.
-        Ok(Self(unsafe { File::from_raw_fd(descriptor) }))
+        inherited_agent_child_pipe_writer(AGENT_CHILD_CONTROL_FD_ENV, "control", &[], &[]).map(Self)
     }
 
     fn signal_ready(mut self) -> std::io::Result<()> {
@@ -217,44 +117,611 @@ impl AgentChildControl {
     }
 }
 
+/// Child-owned writer for the final cwd frame. It survives only the exec that
+/// starts the one-shot jsh; taking it restores CLOEXEC before any approved
+/// command can spawn an external process.
+///
+/// This deliberately keeps a raw descriptor rather than a `File`. An approved
+/// command can run a persistent shell builtin such as `exec 9>&-` in this same
+/// process. If it closes the report descriptor behind a Rust I/O owner, that
+/// owner's destructor aborts on the resulting I/O-safety violation. Keeping
+/// the descriptor raw lets the final report fail closed instead. The original
+/// FIFO identity and CLOEXEC bit are revalidated before any write or close, so
+/// a descriptor that the command closed and reused is never treated as ours.
+struct AgentChildCwdReport {
+    descriptor: std::os::fd::RawFd,
+    identity: AgentChildPipeIdentity,
+}
+
+impl AgentChildCwdReport {
+    fn from_env(
+        control_descriptor: i32,
+        control_identity: AgentChildPipeIdentity,
+    ) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        let writer = inherited_agent_child_pipe_writer(
+            AGENT_CHILD_CWD_REPORT_FD_ENV,
+            "cwd report",
+            &[control_descriptor],
+            &[control_identity],
+        )?;
+        let descriptor = writer.as_raw_fd();
+        let identity = agent_child_pipe_identity(descriptor)?;
+        Ok(Self {
+            descriptor: writer.into_raw_fd(),
+            identity,
+        })
+    }
+
+    fn finish(self, cwd: &Path, nonce: &[u8; AGENT_CHILD_CWD_NONCE_BYTES]) -> std::io::Result<()> {
+        let result = (|| {
+            self.validate_identity()?;
+            let frame = encode_agent_child_cwd_frame(cwd, nonce)?;
+            write_all_agent_child_pipe(self.descriptor, &frame)
+        })();
+        // There is no `Drop` close: after an approved command, this number may
+        // name no descriptor or a completely unrelated one. Close only while
+        // it still identifies the inherited CLOEXEC FIFO writer.
+        if self.validate_identity().is_ok() {
+            unsafe {
+                nix::libc::close(self.descriptor);
+            }
+        }
+        result
+    }
+
+    fn validate_identity(&self) -> std::io::Result<()> {
+        let descriptor_flags = unsafe { nix::libc::fcntl(self.descriptor, nix::libc::F_GETFD) };
+        let status_flags = unsafe { nix::libc::fcntl(self.descriptor, nix::libc::F_GETFL) };
+        let metadata = agent_child_pipe_metadata(self.descriptor)?;
+        if descriptor_flags < 0
+            || descriptor_flags & nix::libc::FD_CLOEXEC == 0
+            || status_flags < 0
+            || status_flags & nix::libc::O_ACCMODE != nix::libc::O_WRONLY
+            || metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFIFO
+            || AgentChildPipeIdentity::from_metadata(&metadata) != self.identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Agent child cwd report descriptor was closed, replaced, or modified",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AgentChildPipeIdentity {
+    device: nix::libc::dev_t,
+    inode: nix::libc::ino_t,
+}
+
+impl AgentChildPipeIdentity {
+    const fn from_metadata(metadata: &nix::libc::stat) -> Self {
+        Self {
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
+        }
+    }
+}
+
+fn agent_child_pipe_metadata(descriptor: std::os::fd::RawFd) -> std::io::Result<nix::libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<nix::libc::stat>::zeroed();
+    if unsafe { nix::libc::fstat(descriptor, metadata.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstat` returned success and initialized the full structure.
+    Ok(unsafe { metadata.assume_init() })
+}
+
+fn agent_child_pipe_identity(
+    descriptor: std::os::fd::RawFd,
+) -> std::io::Result<AgentChildPipeIdentity> {
+    agent_child_pipe_metadata(descriptor)
+        .map(|metadata| AgentChildPipeIdentity::from_metadata(&metadata))
+}
+
+fn agent_child_pipe_identities_are_distinct(identities: &[AgentChildPipeIdentity]) -> bool {
+    identities.iter().enumerate().all(|(index, identity)| {
+        !identities[..index]
+            .iter()
+            .any(|previous| previous == identity)
+    })
+}
+
+fn write_all_agent_child_pipe(
+    descriptor: std::os::fd::RawFd,
+    mut bytes: &[u8],
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = unsafe {
+            nix::libc::write(
+                descriptor,
+                bytes.as_ptr().cast::<nix::libc::c_void>(),
+                bytes.len(),
+            )
+        };
+        if written > 0 {
+            bytes = &bytes[written as usize..];
+        } else if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "Agent child cwd report pipe accepted zero bytes",
+            ));
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inherited_agent_child_pipe_writer(
+    env_name: &str,
+    purpose: &str,
+    forbidden_descriptors: &[i32],
+    forbidden_identities: &[AgentChildPipeIdentity],
+) -> std::io::Result<File> {
+    use std::os::fd::FromRawFd;
+
+    let raw = std::env::var_os(env_name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("missing Agent child {purpose} descriptor"),
+        )
+    })?;
+    // Clear the capability name before parsing or validating it. Even a
+    // malformed inherited value must not survive into restored shell state.
+    std::env::remove_var(env_name);
+    let descriptor = parse_agent_child_descriptor(&raw)
+        .filter(|descriptor| {
+            *descriptor > nix::libc::STDERR_FILENO && !forbidden_descriptors.contains(descriptor)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid Agent child {purpose} descriptor"),
+            )
+        })?;
+
+    let descriptor_flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) };
+    let status_flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFL) };
+    let mut metadata = std::mem::MaybeUninit::<nix::libc::stat>::zeroed();
+    let stat_result = unsafe { nix::libc::fstat(descriptor, metadata.as_mut_ptr()) };
+    if descriptor_flags < 0 || status_flags < 0 || stat_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFIFO
+        || status_flags & nix::libc::O_ACCMODE != nix::libc::O_WRONLY
+        || forbidden_identities.contains(&AgentChildPipeIdentity::from_metadata(&metadata))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Agent child {purpose} descriptor is not a write-only pipe"),
+        ));
+    }
+    if unsafe {
+        nix::libc::fcntl(
+            descriptor,
+            nix::libc::F_SETFD,
+            descriptor_flags | nix::libc::FD_CLOEXEC,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: the descriptor was inherited specifically for this child,
+    // validated above, and is consumed exactly once by this owner.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+/// Parse the decimal descriptor spelling produced by `RawFd::to_string`.
+/// Reject signs, whitespace, Unicode digits, and leading-zero aliases so an
+/// inherited capability has exactly one accepted textual representation.
+fn parse_agent_child_descriptor(value: &std::ffi::OsStr) -> Option<i32> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if value.as_bytes().len() > MAX_AGENT_CHILD_DESCRIPTOR_TEXT_BYTES {
+        return None;
+    }
+    let value = value.to_str()?;
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn read_agent_child_cwd_nonce_from_env(
+    forbidden_descriptors: &[i32],
+    forbidden_identities: &[AgentChildPipeIdentity],
+) -> std::io::Result<[u8; AGENT_CHILD_CWD_NONCE_BYTES]> {
+    use std::os::fd::FromRawFd;
+
+    let raw = std::env::var_os(AGENT_CHILD_CWD_NONCE_FD_ENV).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing Agent child cwd nonce descriptor",
+        )
+    })?;
+    std::env::remove_var(AGENT_CHILD_CWD_NONCE_FD_ENV);
+    let descriptor = parse_agent_child_descriptor(&raw)
+        .filter(|descriptor| {
+            *descriptor > nix::libc::STDERR_FILENO && !forbidden_descriptors.contains(descriptor)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid Agent child cwd nonce descriptor",
+            )
+        })?;
+
+    let descriptor_flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) };
+    let status_flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFL) };
+    let mut metadata = std::mem::MaybeUninit::<nix::libc::stat>::zeroed();
+    let stat_result = unsafe { nix::libc::fstat(descriptor, metadata.as_mut_ptr()) };
+    if descriptor_flags < 0 || status_flags < 0 || stat_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFIFO
+        || status_flags & nix::libc::O_ACCMODE != nix::libc::O_RDONLY
+        || forbidden_identities.contains(&AgentChildPipeIdentity::from_metadata(&metadata))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Agent child cwd nonce descriptor is not a read-only pipe",
+        ));
+    }
+    if unsafe {
+        nix::libc::fcntl(
+            descriptor,
+            nix::libc::F_SETFD,
+            descriptor_flags | nix::libc::FD_CLOEXEC,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: validation above establishes a distinct inherited read end and
+    // this function takes its sole ownership.
+    let mut reader = unsafe { File::from_raw_fd(descriptor) };
+    read_exact_agent_child_cwd_nonce(&mut reader)
+}
+
+fn read_exact_agent_child_cwd_nonce(
+    reader: &mut impl Read,
+) -> std::io::Result<[u8; AGENT_CHILD_CWD_NONCE_BYTES]> {
+    let mut nonce = [0_u8; AGENT_CHILD_CWD_NONCE_BYTES];
+    reader.read_exact(&mut nonce)?;
+    let mut extra = [0_u8; 1];
+    if reader.read(&mut extra)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Agent child cwd nonce channel contained extra bytes",
+        ));
+    }
+    Ok(nonce)
+}
+
+fn encode_agent_child_cwd_frame(
+    cwd: &Path,
+    nonce: &[u8; AGENT_CHILD_CWD_NONCE_BYTES],
+) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = cwd.as_os_str().as_bytes();
+    if raw.is_empty()
+        || raw.len() > MAX_AGENT_CHILD_CWD_BYTES
+        || raw.contains(&0)
+        || !cwd.is_absolute()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Agent cwd is empty, relative, or exceeds its byte limit",
+        ));
+    }
+    let length = u32::try_from(raw.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Agent cwd exceeds its frame limit",
+        )
+    })?;
+    let mut frame = Vec::with_capacity(AGENT_CHILD_CWD_FRAME_HEADER_BYTES + raw.len());
+    frame.extend_from_slice(&AGENT_CHILD_CWD_FRAME_MAGIC);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(nonce);
+    frame.extend_from_slice(raw);
+    Ok(frame)
+}
+
+fn decode_agent_child_cwd_frame(
+    frame: &[u8],
+    expected_nonce: &[u8; AGENT_CHILD_CWD_NONCE_BYTES],
+) -> std::io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    if frame.len() < AGENT_CHILD_CWD_FRAME_HEADER_BYTES
+        || frame[..4] != AGENT_CHILD_CWD_FRAME_MAGIC
+        || !agent_child_nonce_matches(
+            &frame[8..AGENT_CHILD_CWD_FRAME_HEADER_BYTES],
+            expected_nonce,
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid Agent cwd frame header or nonce",
+        ));
+    }
+    let length =
+        u32::from_be_bytes(frame[4..8].try_into().expect("fixed cwd frame header")) as usize;
+    let expected = AGENT_CHILD_CWD_FRAME_HEADER_BYTES.checked_add(length);
+    if length == 0 || length > MAX_AGENT_CHILD_CWD_BYTES || expected != Some(frame.len()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated, extra, or oversized Agent cwd frame",
+        ));
+    }
+    let raw = &frame[AGENT_CHILD_CWD_FRAME_HEADER_BYTES..];
+    if raw.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Agent cwd frame contains a NUL byte",
+        ));
+    }
+    let cwd = PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec()));
+    if !cwd.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Agent cwd frame contains a relative path",
+        ));
+    }
+    Ok(cwd)
+}
+
+/// Compare the fixed-size capability without a data-dependent early return.
+fn agent_child_nonce_matches(actual: &[u8], expected: &[u8; AGENT_CHILD_CWD_NONCE_BYTES]) -> bool {
+    if actual.len() != AGENT_CHILD_CWD_NONCE_BYTES {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for index in 0..AGENT_CHILD_CWD_NONCE_BYTES {
+        difference |= actual[index] ^ expected[index];
+    }
+    std::hint::black_box(difference) == 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentChildReadinessIssue {
+    UnexpectedMarker,
+    DuplicateMarker,
+    ReadError,
+}
+
 #[derive(Debug, Default)]
 struct AgentChildReadiness {
     ready: bool,
     closed: bool,
-    invalid: bool,
+    received_bytes: usize,
+    issue: Option<AgentChildReadinessIssue>,
+}
+
+impl AgentChildReadiness {
+    fn authenticated(&self) -> bool {
+        self.ready && self.closed && self.issue.is_none()
+    }
+
+    fn invalid(&self) -> bool {
+        self.issue.is_some()
+    }
 }
 
 fn drain_agent_child_readiness(
     descriptor: std::os::fd::BorrowedFd<'_>,
     readiness: &mut AgentChildReadiness,
 ) {
-    if readiness.closed {
+    if readiness.closed || readiness.invalid() {
         return;
     }
     let mut bytes = [0_u8; 16];
-    loop {
-        match nix::unistd::read(descriptor, &mut bytes) {
+    let mut drained = 0_usize;
+    while drained < MAX_AGENT_CHILD_READINESS_DRAIN_BYTES {
+        let available = (MAX_AGENT_CHILD_READINESS_DRAIN_BYTES - drained).min(bytes.len());
+        match nix::unistd::read(descriptor, &mut bytes[..available]) {
             Ok(0) => {
                 readiness.closed = true;
                 return;
             }
             Ok(count) => {
+                drained = drained.saturating_add(count);
+                readiness.received_bytes = readiness.received_bytes.saturating_add(count);
                 for byte in &bytes[..count] {
                     if *byte == AGENT_CHILD_READY && !readiness.ready {
                         readiness.ready = true;
+                    } else if *byte == AGENT_CHILD_READY {
+                        readiness.issue = Some(AgentChildReadinessIssue::DuplicateMarker);
+                        return;
                     } else {
-                        readiness.invalid = true;
+                        readiness.issue = Some(AgentChildReadinessIssue::UnexpectedMarker);
+                        return;
                     }
                 }
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::EAGAIN) => return,
             Err(_) => {
-                readiness.invalid = true;
+                readiness.issue = Some(AgentChildReadinessIssue::ReadError);
                 readiness.closed = true;
                 return;
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentChildCwdFrameIssue {
+    InvalidMagic,
+    InvalidLength,
+    NonceMismatch,
+    ExtraBytes,
+    TruncatedFrame,
+    ReadError,
+}
+
+#[derive(Default)]
+struct AgentChildCwdFrameBuffer {
+    bytes: Vec<u8>,
+    closed: bool,
+    received_bytes: usize,
+    expected_bytes: Option<usize>,
+    issue: Option<AgentChildCwdFrameIssue>,
+}
+
+impl std::fmt::Debug for AgentChildCwdFrameBuffer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentChildCwdFrameBuffer")
+            .field("stored_bytes", &self.bytes.len())
+            .field("received_bytes", &self.received_bytes)
+            .field("expected_bytes", &self.expected_bytes)
+            .field("closed", &self.closed)
+            .field("issue", &self.issue)
+            .finish()
+    }
+}
+
+impl AgentChildCwdFrameBuffer {
+    fn observe(&mut self, bytes: &[u8], expected_nonce: &[u8; AGENT_CHILD_CWD_NONCE_BYTES]) {
+        self.received_bytes = self.received_bytes.saturating_add(bytes.len());
+        if self.issue.is_some() {
+            return;
+        }
+        let remaining = MAX_AGENT_CHILD_CWD_FRAME_BYTES.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        if bytes.len() > remaining {
+            self.issue = Some(AgentChildCwdFrameIssue::ExtraBytes);
+            return;
+        }
+
+        let magic_prefix_bytes = self.bytes.len().min(AGENT_CHILD_CWD_FRAME_MAGIC.len());
+        if self.bytes[..magic_prefix_bytes] != AGENT_CHILD_CWD_FRAME_MAGIC[..magic_prefix_bytes] {
+            self.issue = Some(AgentChildCwdFrameIssue::InvalidMagic);
+            return;
+        }
+        if self.bytes.len() >= 8 && self.expected_bytes.is_none() {
+            let length = u32::from_be_bytes(
+                self.bytes[4..8]
+                    .try_into()
+                    .expect("complete cwd length header"),
+            ) as usize;
+            if length == 0 || length > MAX_AGENT_CHILD_CWD_BYTES {
+                self.issue = Some(AgentChildCwdFrameIssue::InvalidLength);
+                return;
+            }
+            self.expected_bytes = AGENT_CHILD_CWD_FRAME_HEADER_BYTES.checked_add(length);
+        }
+        if self.bytes.len() >= AGENT_CHILD_CWD_FRAME_HEADER_BYTES
+            && !agent_child_nonce_matches(
+                &self.bytes[8..AGENT_CHILD_CWD_FRAME_HEADER_BYTES],
+                expected_nonce,
+            )
+        {
+            self.issue = Some(AgentChildCwdFrameIssue::NonceMismatch);
+            return;
+        }
+        if self
+            .expected_bytes
+            .is_some_and(|expected| self.bytes.len() > expected)
+        {
+            self.issue = Some(AgentChildCwdFrameIssue::ExtraBytes);
+        }
+    }
+
+    fn finish_eof(&mut self) {
+        self.closed = true;
+        if self.issue.is_none() && self.expected_bytes != Some(self.bytes.len()) {
+            self.issue = Some(AgentChildCwdFrameIssue::TruncatedFrame);
+        }
+    }
+
+    fn should_close_reader(&self) -> bool {
+        self.closed || self.issue.is_some()
+    }
+
+    fn decode(
+        &self,
+        expected_nonce: &[u8; AGENT_CHILD_CWD_NONCE_BYTES],
+    ) -> std::io::Result<PathBuf> {
+        if !self.closed || self.issue.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Agent cwd frame did not close cleanly",
+            ));
+        }
+        decode_agent_child_cwd_frame(&self.bytes, expected_nonce)
+    }
+}
+
+fn drain_agent_child_cwd_frame(
+    descriptor: std::os::fd::BorrowedFd<'_>,
+    report: &mut AgentChildCwdFrameBuffer,
+    expected_nonce: &[u8; AGENT_CHILD_CWD_NONCE_BYTES],
+) {
+    if report.should_close_reader() {
+        return;
+    }
+    let mut bytes = [0_u8; 4096];
+    let mut drained = 0_usize;
+    while drained < MAX_AGENT_CHILD_CWD_DRAIN_BYTES {
+        let available = (MAX_AGENT_CHILD_CWD_DRAIN_BYTES - drained).min(bytes.len());
+        match nix::unistd::read(descriptor, &mut bytes[..available]) {
+            Ok(0) => {
+                report.finish_eof();
+                return;
+            }
+            Ok(count) => {
+                drained = drained.saturating_add(count);
+                report.observe(&bytes[..count], expected_nonce);
+                if report.issue.is_some() {
+                    return;
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EAGAIN) => return,
+            Err(_) => {
+                report.issue = Some(AgentChildCwdFrameIssue::ReadError);
+                report.closed = true;
+                return;
+            }
+        }
+    }
+}
+
+fn drain_agent_child_cwd_reader(
+    reader: &mut Option<std::os::fd::OwnedFd>,
+    report: &mut AgentChildCwdFrameBuffer,
+    expected_nonce: &[u8; AGENT_CHILD_CWD_NONCE_BYTES],
+) {
+    use std::os::fd::AsFd;
+
+    let Some(descriptor) = reader.as_ref() else {
+        return;
+    };
+    drain_agent_child_cwd_frame(descriptor.as_fd(), report, expected_nonce);
+    if report.should_close_reader() {
+        // Closing on an invalid frame prevents a hostile same-process writer
+        // from filling the pipe and blocking the one-shot child at shutdown.
+        // Valid frames close here only after EOF has authenticated their end.
+        reader.take();
     }
 }
 
@@ -278,6 +745,24 @@ fn capture_pipe_cloexec() -> nix::Result<(std::os::fd::OwnedFd, std::os::fd::Own
         fcntl(&writer, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
         Ok((reader, writer))
     }
+}
+
+fn agent_child_cwd_nonce_channel(
+) -> std::io::Result<([u8; AGENT_CHILD_CWD_NONCE_BYTES], std::os::fd::OwnedFd)> {
+    let mut random = File::open("/dev/urandom")?;
+    let mut nonce = [0_u8; AGENT_CHILD_CWD_NONCE_BYTES];
+    loop {
+        random.read_exact(&mut nonce)?;
+        if nonce.iter().any(|byte| *byte != 0) {
+            break;
+        }
+    }
+    let (reader, writer) = capture_pipe_cloexec().map_err(std::io::Error::from)?;
+    let mut writer = File::from(writer);
+    writer.write_all(&nonce)?;
+    writer.flush()?;
+    drop(writer);
+    Ok((nonce, reader))
 }
 
 pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
@@ -387,7 +872,9 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                         if let Some(status) = take_agent_interrupt(&mut session, state) {
                             return status;
                         }
-                        if let Err(error) = execution.record(&mut session, approved.proposal_id) {
+                        if let Err(error) =
+                            session.observe_execution(approved.proposal_id, execution)
+                        {
                             eprintln!("agent: {error}");
                             return 1;
                         }
@@ -935,7 +1422,6 @@ struct AgentChildTransport {
     snapshot: PathBuf,
     claim_dir: PathBuf,
     claimed_snapshot: PathBuf,
-    report: PathBuf,
 }
 
 impl AgentChildTransport {
@@ -957,7 +1443,6 @@ impl AgentChildTransport {
                     let snapshot = dir.join(format!("{AGENT_CHILD_SESSION_ID}.json"));
                     let claim_dir = dir.join(AGENT_CHILD_CLAIM_DIR);
                     let claimed_snapshot = claim_dir.join(format!("{AGENT_CHILD_SESSION_ID}.json"));
-                    let report = dir.join("cwd-report");
                     if let Err(error) = fs::DirBuilder::new().mode(0o700).create(&claim_dir) {
                         let _ = fs::remove_dir(&dir);
                         return Err(error);
@@ -979,7 +1464,6 @@ impl AgentChildTransport {
                         snapshot,
                         claim_dir,
                         claimed_snapshot,
-                        report,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1004,16 +1488,15 @@ impl Drop for AgentChildTransport {
         // behind instead of recursively deleting an unexpected path.
         let _ = fs::remove_file(&self.snapshot);
         let _ = fs::remove_file(&self.claimed_snapshot);
-        let _ = fs::remove_file(&self.report);
         let _ = fs::remove_dir(&self.claim_dir);
         let _ = fs::remove_dir(&self.dir);
     }
 }
 
 /// Dispatch the undocumented one-shot child mode before normal CLI parsing.
-/// The marker alone is insufficient: all three private path values plus the
-/// inherited control descriptor must be present, and the snapshot loader
-/// enforces ownership/link/size rules.
+/// The marker alone is insufficient: the two private path values, both pipe
+/// writers, and the one-shot nonce reader must be present; the snapshot loader
+/// independently enforces ownership/link/size rules.
 pub(crate) fn internal_child_entrypoint() -> Option<i32> {
     let args = std::env::args_os().collect::<Vec<_>>();
     // The transport child is dispatched from the same place, and before the
@@ -1037,12 +1520,36 @@ pub(crate) fn internal_child_entrypoint() -> Option<i32> {
 }
 
 fn run_internal_agent_child(command: &str) -> i32 {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::fd::AsRawFd;
 
     let control = match AgentChildControl::from_env() {
         Ok(control) => control,
         Err(error) => {
             eprintln!("jsh: internal Agent child control setup failed: {error}");
+            return 2;
+        }
+    };
+    let control_identity = match agent_child_pipe_identity(control.0.as_raw_fd()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("jsh: internal Agent child control identity failed: {error}");
+            return 2;
+        }
+    };
+    let cwd_report = match AgentChildCwdReport::from_env(control.0.as_raw_fd(), control_identity) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("jsh: internal Agent child cwd report setup failed: {error}");
+            return 2;
+        }
+    };
+    let cwd_nonce = match read_agent_child_cwd_nonce_from_env(
+        &[control.0.as_raw_fd(), cwd_report.descriptor],
+        &[control_identity, cwd_report.identity],
+    ) {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            eprintln!("jsh: internal Agent child cwd nonce setup failed: {error}");
             return 2;
         }
     };
@@ -1054,16 +1561,13 @@ fn run_internal_agent_child(command: &str) -> i32 {
         eprintln!("jsh: internal Agent child is missing its working directory");
         return 2;
     };
-    let Some(report_path) = std::env::var_os(AGENT_CHILD_REPORT_ENV).map(PathBuf::from) else {
-        eprintln!("jsh: internal Agent child is missing its cwd report path");
-        return 2;
-    };
     for name in [
         AGENT_CHILD_STATE_DIR_ENV,
         AGENT_CHILD_CWD_ENV,
-        AGENT_CHILD_REPORT_ENV,
         AGENT_CHILD_COMMAND_ENV,
         AGENT_CHILD_CONTROL_FD_ENV,
+        AGENT_CHILD_CWD_REPORT_FD_ENV,
+        AGENT_CHILD_CWD_NONCE_FD_ENV,
     ] {
         std::env::remove_var(name);
     }
@@ -1099,15 +1603,16 @@ fn run_internal_agent_child(command: &str) -> i32 {
     for name in [
         AGENT_CHILD_STATE_DIR_ENV,
         AGENT_CHILD_CWD_ENV,
-        AGENT_CHILD_REPORT_ENV,
         AGENT_CHILD_COMMAND_ENV,
         AGENT_CHILD_CONTROL_FD_ENV,
+        AGENT_CHILD_CWD_REPORT_FD_ENV,
+        AGENT_CHILD_CWD_NONCE_FD_ENV,
     ] {
         state.unset_var(name);
         std::env::remove_var(name);
     }
     if let Err(error) = std::env::set_current_dir(&agent_cwd) {
-        eprintln!("jsh: Agent cwd {agent_cwd:?} is unavailable: {error}");
+        eprintln!("jsh: Agent cwd is unavailable: {error}");
         return 1;
     }
     state.export_var("PWD", &agent_cwd.to_string_lossy());
@@ -1130,18 +1635,8 @@ fn run_internal_agent_child(command: &str) -> i32 {
     };
 
     if let Ok(final_cwd) = std::env::current_dir() {
-        let result = (|| {
-            let mut report = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-                .mode(0o600)
-                .open(&report_path)?;
-            report.set_permissions(fs::Permissions::from_mode(0o600))?;
-            report.write_all(final_cwd.as_os_str().as_bytes())
-        })();
-        if let Err(error) = result {
-            eprintln!("jsh: Agent cwd report failed for {report_path:?}: {error}");
+        if let Err(error) = cwd_report.finish(&final_cwd, &cwd_nonce) {
+            eprintln!("jsh: Agent cwd report failed: {error}");
         }
     }
     code
@@ -1152,9 +1647,23 @@ fn agent_child_command(
     transport: &AgentChildTransport,
     cwd: &Path,
     control_writer: &std::os::fd::OwnedFd,
+    cwd_report_writer: &std::os::fd::OwnedFd,
+    cwd_nonce_reader: &std::os::fd::OwnedFd,
 ) -> std::io::Result<std::process::Command> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
+
+    let channel_identities = [
+        agent_child_pipe_identity(control_writer.as_raw_fd())?,
+        agent_child_pipe_identity(cwd_report_writer.as_raw_fd())?,
+        agent_child_pipe_identity(cwd_nonce_reader.as_raw_fd())?,
+    ];
+    if !agent_child_pipe_identities_are_distinct(&channel_identities) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Agent child channels must use three distinct pipes",
+        ));
+    }
 
     let mut child = std::process::Command::new(std::env::current_exe()?);
     #[cfg(not(test))]
@@ -1171,66 +1680,46 @@ fn agent_child_command(
     child
         .env(AGENT_CHILD_STATE_DIR_ENV, &transport.dir)
         .env(AGENT_CHILD_CWD_ENV, cwd)
-        .env(AGENT_CHILD_REPORT_ENV, &transport.report)
         .env(
             AGENT_CHILD_CONTROL_FD_ENV,
             control_writer.as_raw_fd().to_string(),
+        )
+        .env(
+            AGENT_CHILD_CWD_REPORT_FD_ENV,
+            cwd_report_writer.as_raw_fd().to_string(),
+        )
+        .env(
+            AGENT_CHILD_CWD_NONCE_FD_ENV,
+            cwd_nonce_reader.as_raw_fd().to_string(),
         );
     let control_descriptor = control_writer.as_raw_fd();
-    // SAFETY: the closure performs only one fcntl on an already-open pipe
-    // descriptor. Clearing CLOEXEC in this forked child does not change the
+    let cwd_report_descriptor = cwd_report_writer.as_raw_fd();
+    let cwd_nonce_descriptor = cwd_nonce_reader.as_raw_fd();
+    // SAFETY: the closure performs only fcntl on already-open pipe
+    // descriptors. Clearing CLOEXEC in this forked child does not change the
     // parent's descriptor table or leak through concurrent parent spawns.
     unsafe {
         child.pre_exec(move || {
-            let flags = nix::libc::fcntl(control_descriptor, nix::libc::F_GETFD);
-            if flags < 0
-                || nix::libc::fcntl(
-                    control_descriptor,
-                    nix::libc::F_SETFD,
-                    flags & !nix::libc::FD_CLOEXEC,
-                ) < 0
-            {
-                return Err(std::io::Error::last_os_error());
+            for descriptor in [
+                control_descriptor,
+                cwd_report_descriptor,
+                cwd_nonce_descriptor,
+            ] {
+                let flags = nix::libc::fcntl(descriptor, nix::libc::F_GETFD);
+                if flags < 0
+                    || nix::libc::fcntl(
+                        descriptor,
+                        nix::libc::F_SETFD,
+                        flags & !nix::libc::FD_CLOEXEC,
+                    ) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
     }
     Ok(child)
-}
-
-fn read_agent_cwd_report(path: &Path) -> std::io::Result<Option<PathBuf>> {
-    use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::MetadataExt;
-
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { nix::libc::geteuid() }
-        || metadata.len() > 64 * 1024
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid Agent cwd report",
-        ));
-    }
-    let mut bytes = Vec::new();
-    std::io::Read::take(&mut file, 64 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.is_empty() || bytes.len() > 64 * 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid Agent cwd report size",
-        ));
-    }
-    Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(bytes))))
 }
 
 /// Run one approved command through a fresh jsh process, teeing combined
@@ -1308,6 +1797,24 @@ fn run_captured_with_transport(
             )
         }
     };
+    let (cwd_report_reader, cwd_report_writer) = match capture_pipe_cloexec() {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            return CapturedExecution::failed(
+                CommandExecutionFailure::FailedToStart,
+                format!("[jsh: Agent cwd report pipe failed: {error}]"),
+            )
+        }
+    };
+    let (cwd_nonce, cwd_nonce_reader) = match agent_child_cwd_nonce_channel() {
+        Ok(channel) => channel,
+        Err(error) => {
+            return CapturedExecution::failed(
+                CommandExecutionFailure::FailedToStart,
+                format!("[jsh: Agent cwd nonce channel failed: {error}]"),
+            )
+        }
+    };
     // Neither end may leak through the exec that starts the one-shot jsh.
     // `stdout_file` is duplicated onto fd 1 by `Command`; dup2 clears
     // FD_CLOEXEC on that destination, while the original writer and, most
@@ -1335,17 +1842,23 @@ fn run_captured_with_transport(
             );
         }
     };
-    let mut child_command =
-        match agent_child_command(command, transport, agent_cwd, &control_writer) {
-            Ok(command) => command,
-            Err(error) => {
-                close(r).ok();
-                return CapturedExecution::failed(
-                    CommandExecutionFailure::FailedToStart,
-                    format!("[jsh: Agent child setup failed: {error}]"),
-                );
-            }
-        };
+    let mut child_command = match agent_child_command(
+        command,
+        transport,
+        agent_cwd,
+        &control_writer,
+        &cwd_report_writer,
+        &cwd_nonce_reader,
+    ) {
+        Ok(command) => command,
+        Err(error) => {
+            close(r).ok();
+            return CapturedExecution::failed(
+                CommandExecutionFailure::FailedToStart,
+                format!("[jsh: Agent child setup failed: {error}]"),
+            );
+        }
+    };
     child_command
         .stdin(Stdio::inherit())
         .stdout(Stdio::from(stdout_file))
@@ -1364,11 +1877,20 @@ fn run_captured_with_transport(
     // byte is therefore authoritative evidence that user command execution
     // was never entered.
     drop(control_writer);
+    // The internal child owns the sole report writer. It restores CLOEXEC as
+    // soon as it takes the descriptor, so approved external processes cannot
+    // delay EOF or synthesize a cwd frame.
+    drop(cwd_report_writer);
+    // The child consumes and closes the pre-filled nonce reader before it
+    // restores or executes shell state; the parent keeps only its own copy.
+    drop(cwd_nonce_reader);
     let child_pid = i32::try_from(child.id()).ok();
     drop(child_command);
 
     let flags = unsafe { nix::libc::fcntl(r, nix::libc::F_GETFL) };
     let control_flags = unsafe { nix::libc::fcntl(control_reader.as_raw_fd(), nix::libc::F_GETFL) };
+    let cwd_report_flags =
+        unsafe { nix::libc::fcntl(cwd_report_reader.as_raw_fd(), nix::libc::F_GETFL) };
     if flags < 0
         || unsafe { nix::libc::fcntl(r, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) } < 0
         || control_flags < 0
@@ -1377,6 +1899,14 @@ fn run_captured_with_transport(
                 control_reader.as_raw_fd(),
                 nix::libc::F_SETFL,
                 control_flags | nix::libc::O_NONBLOCK,
+            )
+        } < 0
+        || cwd_report_flags < 0
+        || unsafe {
+            nix::libc::fcntl(
+                cwd_report_reader.as_raw_fd(),
+                nix::libc::F_SETFL,
+                cwd_report_flags | nix::libc::O_NONBLOCK,
             )
         } < 0
     {
@@ -1388,6 +1918,7 @@ fn run_captured_with_transport(
             "[jsh: capture setup failed after the Agent child started]",
         );
     }
+    let mut cwd_report_reader = Some(cwd_report_reader);
 
     let mut captured: Vec<u8> = Vec::new();
     let mut truncated = false;
@@ -1397,6 +1928,7 @@ fn run_captured_with_transport(
     let mut post_exit_bytes = 0usize;
     let mut forwarded_signal = None;
     let mut readiness = AgentChildReadiness::default();
+    let mut cwd_report = AgentChildCwdFrameBuffer::default();
     let mut refresh_child_status = |status: &mut Option<Result<i32, String>>| {
         if status.is_some() {
             return;
@@ -1425,6 +1957,7 @@ fn run_captured_with_transport(
     };
     'capture: loop {
         drain_agent_child_readiness(control_reader.as_fd(), &mut readiness);
+        drain_agent_child_cwd_reader(&mut cwd_report_reader, &mut cwd_report, &cwd_nonce);
         if let Some(status) = crate::signal::pending_status() {
             let signal = status.saturating_sub(128);
             if signal > 0 && forwarded_signal != Some(signal) {
@@ -1483,32 +2016,40 @@ fn run_captured_with_transport(
         }
 
         drain_agent_child_readiness(control_reader.as_fd(), &mut readiness);
+        drain_agent_child_cwd_reader(&mut cwd_report_reader, &mut cwd_report, &cwd_nonce);
 
         if child_status.is_some() {
             // A READY written before exit is ordered before the writer closes;
             // one last drain observes it even when the process was very short.
             drain_agent_child_readiness(control_reader.as_fd(), &mut readiness);
+            drain_agent_child_cwd_reader(&mut cwd_report_reader, &mut cwd_report, &cwd_nonce);
             break;
         }
-        if output_open {
-            let mut descriptor = nix::libc::pollfd {
-                fd: r,
+        let mut descriptors = [
+            nix::libc::pollfd {
+                fd: if output_open { r } else { -1 },
                 events: nix::libc::POLLIN | nix::libc::POLLHUP | nix::libc::POLLERR,
                 revents: 0,
-            };
-            unsafe {
-                nix::libc::poll(&mut descriptor, 1, 100);
-            }
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            },
+            nix::libc::pollfd {
+                fd: cwd_report_reader
+                    .as_ref()
+                    .map_or(-1, std::os::fd::AsRawFd::as_raw_fd),
+                events: nix::libc::POLLIN | nix::libc::POLLHUP | nix::libc::POLLERR,
+                revents: 0,
+            },
+        ];
+        unsafe {
+            nix::libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 100);
         }
     }
     close(r).ok();
+    drain_agent_child_cwd_reader(&mut cwd_report_reader, &mut cwd_report, &cwd_nonce);
     let child_status = child_status.unwrap_or_else(|| {
         Err("[jsh: Agent command boundary ended without an observable status]".into())
     });
-    if readiness.ready && !readiness.invalid {
-        if let Ok(Some(reported)) = read_agent_cwd_report(&transport.report) {
+    if readiness.authenticated() {
+        if let Ok(reported) = cwd_report.decode(&cwd_nonce) {
             if reported != *agent_cwd && reported.is_dir() {
                 println!(
                     "  {}",
@@ -1528,7 +2069,7 @@ fn run_captured_with_transport(
     if truncated {
         output.push_str("\n[jsh: further output not captured]");
     }
-    if readiness.invalid {
+    if readiness.invalid() || !readiness.closed {
         let mut detail = String::from(
             "[jsh: Agent readiness channel failed; command execution result is unknown]",
         );
@@ -1626,7 +2167,10 @@ fn configured_agent_protocol(
     let protocol = requested_agent_protocol(protocol_value)?;
     let peer = AgentCapabilities::from_wire(peer_value.unwrap_or(LEGACY_AGENT_PEER_CAPABILITIES))
         .map_err(AgentProtocolConfigError::InvalidPeer)?;
-    let local = agent_capabilities(provider);
+    // Reply in the peer's schema version so an exact-pair v2 capability set
+    // remains exact if a provider's matrix becomes asymmetric in the future.
+    // Compatibility-first v1 peers still receive the legacy Cartesian form.
+    let local = agent_capabilities_for_peer(provider, peer);
     local
         .negotiate_with(peer, &[protocol], AgentDelivery::Complete)
         .ok_or(AgentProtocolConfigError::UnsupportedSelection(protocol))
@@ -1784,12 +2328,14 @@ fn terminal_safe_message(prefix: &str, value: &str, max_bytes: usize) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_child_command, agent_http_client, bounded_git_stdout, capture_pipe_cloexec,
-        configured_agent_protocol, configured_max_turns, drain_agent_child_readiness, git_meta,
-        git_worktree_dirty, run_captured, run_captured_to, run_captured_with_transport,
+        agent_child_command, agent_child_cwd_nonce_channel, agent_http_client, bounded_git_stdout,
+        capture_pipe_cloexec, configured_agent_protocol, configured_max_turns,
+        decode_agent_child_cwd_frame, drain_agent_child_readiness, encode_agent_child_cwd_frame,
+        git_meta, git_worktree_dirty, run_captured, run_captured_to, run_captured_with_transport,
         run_internal_agent_child, run_internal_model_request, terminal_safe_inline_text,
         terminal_safe_message, terminal_safe_text, AgentChildReadiness, AgentChildTransport,
         AgentProtocolConfigError, CapturedExecution, AGENT_CHILD_COMMAND_ENV, AGENT_CHILD_READY,
+        MAX_AGENT_CHILD_CWD_BYTES, MAX_AGENT_CHILD_CWD_FRAME_BYTES,
         MAX_AGENT_COMMAND_DISPLAY_BYTES, MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_SESSION_TURNS,
     };
     use super::{decode_model_request, encode_model_request};
@@ -1799,8 +2345,105 @@ mod tests {
         prepare_agent_request as prepare_request, AgentProtocol, AgentRequestSpec as RequestSpec,
         AgentSession, CommandExecutionFailure, ModelOutcome, Turn,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn cwd_report_frame_is_absolute_bounded_and_exactly_one_message() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let cwd = PathBuf::from("/tmp/agent-cwd");
+        let nonce = [b'n'; 32];
+        let frame = encode_agent_child_cwd_frame(&cwd, &nonce).unwrap();
+        assert_eq!(decode_agent_child_cwd_frame(&frame, &nonce).unwrap(), cwd);
+        assert!(decode_agent_child_cwd_frame(&frame, &[b'x'; 32]).is_err());
+
+        for invalid in [
+            Vec::new(),
+            frame[..7].to_vec(),
+            frame[..frame.len() - 1].to_vec(),
+            {
+                let mut extra = frame.clone();
+                extra.push(b'x');
+                extra
+            },
+        ] {
+            assert!(
+                decode_agent_child_cwd_frame(&invalid, &nonce).is_err(),
+                "accepted malformed cwd frame {invalid:?}"
+            );
+        }
+        assert!(encode_agent_child_cwd_frame(Path::new("relative/path"), &nonce).is_err());
+        assert!(encode_agent_child_cwd_frame(
+            &PathBuf::from(format!("/{}", "x".repeat(MAX_AGENT_CHILD_CWD_BYTES))),
+            &nonce,
+        )
+        .is_err());
+
+        let nul_path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/nul\0path".to_vec()));
+        assert!(encode_agent_child_cwd_frame(&nul_path, &nonce).is_err());
+        let mut nul_frame = frame;
+        *nul_frame.last_mut().unwrap() = 0;
+        assert!(decode_agent_child_cwd_frame(&nul_frame, &nonce).is_err());
+    }
+
+    #[test]
+    fn inherited_descriptor_spelling_is_canonical_decimal() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            super::parse_agent_child_descriptor(OsStr::new("37")),
+            Some(37)
+        );
+        for invalid in [
+            "",
+            "+37",
+            " 37",
+            "37 ",
+            "037",
+            "-37",
+            "٣٧",
+            "2147483648",
+            "99999999999",
+        ] {
+            assert_eq!(
+                super::parse_agent_child_descriptor(OsStr::new(invalid)),
+                None,
+                "accepted descriptor spelling {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cwd_nonce_comparison_requires_an_exact_full_match() {
+        let expected = [0x5a; 32];
+        assert!(super::agent_child_nonce_matches(&expected, &expected));
+        for index in [0, 15, 31] {
+            let mut different = expected;
+            different[index] ^= 1;
+            assert!(!super::agent_child_nonce_matches(&different, &expected));
+        }
+        assert!(!super::agent_child_nonce_matches(
+            &expected[..31],
+            &expected
+        ));
+    }
+
+    #[test]
+    fn cwd_nonce_channel_requires_exact_length_and_eof() {
+        let nonce = [0x7a; 32];
+        let mut exact = nonce.as_slice();
+        assert_eq!(
+            super::read_exact_agent_child_cwd_nonce(&mut exact).unwrap(),
+            nonce
+        );
+        let mut short = &nonce[..31];
+        assert!(super::read_exact_agent_child_cwd_nonce(&mut short).is_err());
+        let mut extra = nonce.to_vec();
+        extra.push(0xff);
+        let mut extra = extra.as_slice();
+        assert!(super::read_exact_agent_child_cwd_nonce(&mut extra).is_err());
+    }
 
     #[test]
     fn a_model_request_envelope_round_trips() {
@@ -1902,18 +2545,30 @@ mod tests {
         let spawn = || {
             let (control_reader, control_writer) =
                 capture_pipe_cloexec().expect("child control pipe");
-            let mut command = agent_child_command(&command, &transport, &cwd, &control_writer)
-                .expect("child command");
+            let (cwd_reader, cwd_writer) = capture_pipe_cloexec().expect("child cwd pipe");
+            let (cwd_nonce, cwd_nonce_reader) =
+                agent_child_cwd_nonce_channel().expect("child cwd nonce");
+            let mut command = agent_child_command(
+                &command,
+                &transport,
+                &cwd,
+                &control_writer,
+                &cwd_writer,
+                &cwd_nonce_reader,
+            )
+            .expect("child command");
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             let child = command.spawn().expect("spawn Agent child");
             drop(control_writer);
-            (child, control_reader)
+            drop(cwd_writer);
+            drop(cwd_nonce_reader);
+            (child, control_reader, cwd_reader, cwd_nonce)
         };
-        let (mut first, first_control) = spawn();
-        let (mut second, second_control) = spawn();
+        let (mut first, first_control, first_cwd, first_nonce) = spawn();
+        let (mut second, second_control, second_cwd, second_nonce) = spawn();
         let read_control = |reader: std::os::fd::OwnedFd| {
             let mut bytes = Vec::new();
             std::fs::File::from(reader)
@@ -1921,20 +2576,38 @@ mod tests {
                 .expect("read child control");
             bytes
         };
+        let read_cwd = |reader: std::os::fd::OwnedFd| {
+            let mut bytes = Vec::new();
+            std::fs::File::from(reader)
+                .read_to_end(&mut bytes)
+                .expect("read child cwd");
+            bytes
+        };
         let mut outcomes = [
             (
                 first.wait().expect("first Agent child").code(),
                 read_control(first_control),
+                read_cwd(first_cwd),
+                first_nonce,
             ),
             (
                 second.wait().expect("second Agent child").code(),
                 read_control(second_control),
+                read_cwd(second_cwd),
+                second_nonce,
             ),
         ];
-        outcomes.sort_by_key(|(status, _)| *status);
+        outcomes.sort_by_key(|(status, _, _, _)| *status);
 
-        assert_eq!(outcomes[0], (Some(0), vec![AGENT_CHILD_READY]));
-        assert_eq!(outcomes[1], (Some(1), Vec::new()));
+        assert_eq!(outcomes[0].0, Some(0));
+        assert_eq!(outcomes[0].1, vec![AGENT_CHILD_READY]);
+        assert_eq!(
+            decode_agent_child_cwd_frame(&outcomes[0].2, &outcomes[0].3).unwrap(),
+            cwd
+        );
+        assert_eq!(outcomes[1].0, Some(1));
+        assert!(outcomes[1].1.is_empty());
+        assert!(outcomes[1].2.is_empty());
         assert_eq!(
             std::fs::read_to_string(marker).expect("execution marker"),
             "x"
@@ -1975,7 +2648,7 @@ mod tests {
             panic!("expected proposal")
         };
         let _approved = session.approve(id).unwrap();
-        execution.record(&mut session, id).unwrap();
+        session.observe_execution(id, execution).unwrap();
         assert!(matches!(
             session.transcript().last(),
             Some(Turn::ProtocolError(message))
@@ -2024,7 +2697,7 @@ mod tests {
             panic!("expected proposal")
         };
         let _approved = session.approve(id).unwrap();
-        execution.record(&mut session, id).unwrap();
+        session.observe_execution(id, execution).unwrap();
         assert!(matches!(
             session.transcript().last(),
             Some(Turn::ProtocolError(message))
@@ -2052,7 +2725,7 @@ mod tests {
             panic!("expected proposal")
         };
         let _approved = session.approve(id).unwrap();
-        execution.record(&mut session, id).unwrap();
+        session.observe_execution(id, execution).unwrap();
         assert!(matches!(
             session.transcript().last(),
             Some(Turn::Observation { exit_code: 1, .. })
@@ -2161,12 +2834,174 @@ mod tests {
         let valid = inspect(&[AGENT_CHILD_READY]);
         assert!(valid.ready);
         assert!(valid.closed);
-        assert!(!valid.invalid);
+        assert!(!valid.invalid());
+        assert!(valid.authenticated());
+
+        let incomplete = AgentChildReadiness {
+            ready: true,
+            closed: false,
+            received_bytes: 1,
+            issue: None,
+        };
+        assert!(!incomplete.authenticated());
 
         for invalid in [vec![b'+'], vec![AGENT_CHILD_READY, AGENT_CHILD_READY]] {
             let readiness = inspect(&invalid);
-            assert!(readiness.invalid, "accepted control bytes {invalid:?}");
+            assert!(readiness.invalid(), "accepted control bytes {invalid:?}");
         }
+    }
+
+    #[test]
+    fn readiness_drain_stops_at_the_first_typed_protocol_issue() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd;
+
+        let (reader, writer) = capture_pipe_cloexec().expect("readiness pipe");
+        let mut writer = std::fs::File::from(writer);
+        writer
+            .write_all(&[AGENT_CHILD_READY; 64])
+            .expect("write duplicate markers");
+        drop(writer);
+        let mut readiness = AgentChildReadiness::default();
+        drain_agent_child_readiness(reader.as_fd(), &mut readiness);
+        assert_eq!(
+            readiness.issue,
+            Some(super::AgentChildReadinessIssue::DuplicateMarker)
+        );
+        assert!(readiness.received_bytes <= 16);
+        assert!(!readiness.authenticated());
+    }
+
+    #[test]
+    fn cwd_frame_rejects_bad_prefix_length_nonce_and_extra_bytes_early() {
+        let nonce = [0x5a; 32];
+
+        let mut bad_magic = super::AgentChildCwdFrameBuffer::default();
+        bad_magic.observe(b"X", &nonce);
+        assert_eq!(
+            bad_magic.issue,
+            Some(super::AgentChildCwdFrameIssue::InvalidMagic)
+        );
+
+        let mut bad_length = super::AgentChildCwdFrameBuffer::default();
+        bad_length.observe(b"JCW1\0\0\0\0", &nonce);
+        assert_eq!(
+            bad_length.issue,
+            Some(super::AgentChildCwdFrameIssue::InvalidLength)
+        );
+
+        let frame = encode_agent_child_cwd_frame(Path::new("/tmp/agent-cwd"), &nonce).unwrap();
+        let mut wrong_nonce = super::AgentChildCwdFrameBuffer::default();
+        wrong_nonce.observe(&frame, &[0xa5; 32]);
+        assert_eq!(
+            wrong_nonce.issue,
+            Some(super::AgentChildCwdFrameIssue::NonceMismatch)
+        );
+
+        let mut extra = super::AgentChildCwdFrameBuffer::default();
+        extra.observe(&frame, &nonce);
+        extra.observe(b"x", &nonce);
+        assert_eq!(
+            extra.issue,
+            Some(super::AgentChildCwdFrameIssue::ExtraBytes)
+        );
+
+        let mut truncated = super::AgentChildCwdFrameBuffer::default();
+        truncated.observe(&frame[..8], &nonce);
+        truncated.finish_eof();
+        assert_eq!(
+            truncated.issue,
+            Some(super::AgentChildCwdFrameIssue::TruncatedFrame)
+        );
+    }
+
+    #[test]
+    fn maximum_cwd_frame_crosses_one_drain_budget_and_still_authenticates() {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use std::io::Write as _;
+
+        let nonce = [0x3c; 32];
+        let cwd = PathBuf::from(format!("/{}", "x".repeat(MAX_AGENT_CHILD_CWD_BYTES - 1)));
+        let frame = encode_agent_child_cwd_frame(&cwd, &nonce).unwrap();
+        assert_eq!(frame.len(), MAX_AGENT_CHILD_CWD_FRAME_BYTES);
+        let (reader, writer) = capture_pipe_cloexec().expect("cwd frame pipe");
+        let flags = fcntl(&reader, FcntlArg::F_GETFL).expect("reader flags");
+        fcntl(
+            &reader,
+            FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+        )
+        .expect("nonblocking reader");
+        let writer_thread = std::thread::spawn(move || {
+            let mut writer = std::fs::File::from(writer);
+            writer.write_all(&frame)
+        });
+
+        let mut reader = Some(reader);
+        let mut report = super::AgentChildCwdFrameBuffer::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reader.is_some() && Instant::now() < deadline {
+            super::drain_agent_child_cwd_reader(&mut reader, &mut report, &nonce);
+            std::thread::yield_now();
+        }
+        assert!(reader.is_none(), "maximum frame did not reach EOF");
+        writer_thread.join().unwrap().unwrap();
+        assert_eq!(report.received_bytes, MAX_AGENT_CHILD_CWD_FRAME_BYTES);
+        assert_eq!(report.decode(&nonce).unwrap(), cwd);
+
+        // Debug/status accounting must never reveal the path bytes.
+        let debug = format!("{report:?}");
+        assert!(!debug.contains("xxxxxxxx"));
+        assert!(debug.contains("received_bytes"));
+    }
+
+    #[test]
+    fn invalid_cwd_frame_closes_the_reader_instead_of_draining_a_flood() {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use std::io::Write as _;
+
+        let nonce = [0x42; 32];
+        let (reader, writer) = capture_pipe_cloexec().expect("cwd frame pipe");
+        let flags = fcntl(&reader, FcntlArg::F_GETFL).expect("reader flags");
+        fcntl(
+            &reader,
+            FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+        )
+        .expect("nonblocking reader");
+        let mut writer = std::fs::File::from(writer);
+        writer.write_all(b"not-a-frame").unwrap();
+        let mut reader = Some(reader);
+        let mut report = super::AgentChildCwdFrameBuffer::default();
+        super::drain_agent_child_cwd_reader(&mut reader, &mut report, &nonce);
+        assert!(reader.is_none());
+        assert_eq!(
+            report.issue,
+            Some(super::AgentChildCwdFrameIssue::InvalidMagic)
+        );
+        assert!(writer.write_all(b"continued flood").is_err());
+    }
+
+    #[test]
+    fn all_three_agent_channels_require_distinct_pipe_identities() {
+        use std::os::fd::AsRawFd;
+
+        let (_reader_a, writer_a) = capture_pipe_cloexec().unwrap();
+        let (_reader_b, writer_b) = capture_pipe_cloexec().unwrap();
+        let (_reader_c, writer_c) = capture_pipe_cloexec().unwrap();
+        let writer_a = std::fs::File::from(writer_a);
+        let duplicate_a = writer_a.try_clone().unwrap();
+        let identity_a = super::agent_child_pipe_identity(writer_a.as_raw_fd()).unwrap();
+        let duplicate_identity = super::agent_child_pipe_identity(duplicate_a.as_raw_fd()).unwrap();
+        let identity_b = super::agent_child_pipe_identity(writer_b.as_raw_fd()).unwrap();
+        let identity_c = super::agent_child_pipe_identity(writer_c.as_raw_fd()).unwrap();
+
+        assert!(super::agent_child_pipe_identities_are_distinct(&[
+            identity_a, identity_b, identity_c,
+        ]));
+        assert!(!super::agent_child_pipe_identities_are_distinct(&[
+            identity_a,
+            duplicate_identity,
+            identity_c,
+        ]));
     }
 
     #[test]
@@ -2183,6 +3018,96 @@ mod tests {
 
         assert_eq!(execution.exit_code(), Some(0));
         assert_eq!(cwd, target);
+    }
+
+    #[test]
+    fn enumerable_files_cannot_forge_the_private_cwd_report_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("cwd fixtures");
+        let forged = root.path().join("forged");
+        let reported = root.path().join("reported");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::create_dir(&reported).unwrap();
+
+        let state = ShellState::new(false);
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let transport = AgentChildTransport::new(&state, &cwd).expect("Agent transport");
+        // This was the old discoverable protocol name. Its contents and
+        // permissions are now irrelevant because the parent owns an unnamed
+        // pipe reader created after the private snapshot.
+        let obsolete_report = transport.dir.join("cwd-report");
+        std::fs::write(&obsolete_report, forged.as_os_str().as_encoded_bytes()).unwrap();
+        std::fs::set_permissions(&obsolete_report, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let mut terminal_output = std::io::sink();
+        let command = format!("cd '{}'", reported.display());
+
+        let execution =
+            run_captured_with_transport(&command, &transport, &mut cwd, &mut terminal_output);
+
+        assert_eq!(execution.exit_code(), Some(0));
+        assert_eq!(cwd, reported);
+        std::fs::remove_file(obsolete_report).unwrap();
+    }
+
+    #[test]
+    fn same_process_fd_tampering_cannot_authenticate_a_forged_cwd_frame() {
+        let root = tempfile::tempdir().expect("cwd fixtures");
+        let forged = root.path().join("forged");
+        let actual = root.path().join("actual");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::create_dir(&actual).unwrap();
+
+        let wrong_nonce = [0xa5; 32];
+        let forged_frame = encode_agent_child_cwd_frame(&forged, &wrong_nonce).unwrap();
+        let escaped_frame = forged_frame
+            .iter()
+            .map(|byte| format!("\\{:03o}", byte))
+            .collect::<Vec<_>>()
+            .join("");
+        // An external child can reopen same-user descriptors through
+        // /proc/$PPID/fd even though CLOEXEC kept them out of its own table.
+        // It writes a structurally valid frame with a guessed nonce to every
+        // writable parent descriptor. Quoted `exec` arguments then exercise
+        // jsh's persistent same-process close path over every plausible fd,
+        // preventing the genuine final frame from being appended.
+        let attack = format!(
+            "/bin/sh -c 'payload=\"{escaped_frame}\"; for target in /proc/$PPID/fd/*; do fd=${{target##*/}}; test \"$fd\" -ge 3 2>/dev/null || continue; /usr/bin/printf \"%b\" \"$payload\" 2>/dev/null > \"$target\" || :; done'"
+        );
+        let closes = (3..=1024)
+            .map(|descriptor| format!("exec '{descriptor}>&-'"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let command = format!("{attack}; {closes}; cd '{}'", actual.display());
+
+        let mut state = ShellState::new(false);
+        let original = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut cwd = original.clone();
+        let mut terminal_output = std::io::sink();
+        let execution = run_captured_to(&command, &mut state, &mut cwd, &mut terminal_output);
+
+        assert_eq!(execution.exit_code(), Some(0), "{}", execution.evidence());
+        // The attack also closes the internal child's stderr, so the expected
+        // fail-closed report diagnostic is intentionally not observable here.
+        // A clean exit proves that closing the raw report descriptor no longer
+        // trips Rust's owned-fd abort; refusing both candidate cwd values proves
+        // that neither the guessed frame nor a post-tamper frame was accepted.
+        assert_eq!(cwd, original, "forged cwd frame was accepted");
+        assert_ne!(cwd, forged);
+        assert_ne!(cwd, actual);
+    }
+
+    #[test]
+    fn approved_external_process_inherits_neither_report_env_nor_writer() {
+        let mut state = ShellState::new(false);
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut terminal_output = std::io::sink();
+        let command = "/bin/sh -c 'test -z \"${JSH_AGENT_CHILD_CWD_REPORT_FD+x}\" || exit 90; fd=3; while test $fd -le 255; do test ! -e /proc/self/fd/$fd || { printf inherited-fd-%s $fd; exit 91; }; fd=$((fd + 1)); done'";
+
+        let execution = run_captured_to(command, &mut state, &mut cwd, &mut terminal_output);
+
+        assert_eq!(execution.exit_code(), Some(0), "{}", execution.evidence());
+        assert!(!execution.evidence().contains("inherited-fd"));
     }
 
     #[test]
