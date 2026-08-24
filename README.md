@@ -354,6 +354,11 @@ status, and duration. Oversized commands are explicitly marked as truncated
 rather than being presented as exact. The execution ID correlates terminal
 scrollback with jsh's structured context.
 
+Percent-encoded newline and tab bytes remain structural command text, so a
+multiline command has the same identity in OSC metadata and the JSONL execution
+journal. Repeated semantic metadata aliases are treated as ambiguous by the
+shared terminal parser rather than resolved last-wins.
+
 Query that context either inside an interactive jsh or from another process:
 
 ```sh
@@ -403,6 +408,12 @@ OS, and current-directory path. Cloud requests do not additionally include
 recent history or Git status unless
 `JSH_AI_SHARE_CONTEXT=1` is set. Generated commands are suggestions: inspect
 them before execution, especially when they contain destructive operations.
+Plain HTTP is accepted only for a syntactic loopback origin, for any provider;
+remote endpoints require HTTPS. This supports local OpenAI-compatible and
+Anthropic proxies as well as Ollama without weakening cloud transport. A
+validated loopback HTTP request also bypasses environment proxy settings so
+its credentials cannot leave the loopback hop; HTTPS keeps the user's normal
+proxy configuration.
 Every editor-AI history window uses jagent's reported request builder. If
 older turns are omitted, jsh tells the model that its context is incomplete;
 that notice and the trusted system instructions share a strict 64 KiB byte
@@ -481,10 +492,15 @@ and pass through exactly the same review prompt—selecting the native wire
 format never grants execution permission. Run `jsh doctor` to inspect the
 effective negotiation without contacting the provider or exposing credentials.
 Capability-token v2, which can express exact protocol/delivery pairs rather
-than a Cartesian product, is staged as an explicit peer-aware opt-in in jagent;
-its default emission remains v1 for rolling-upgrade safety. jsh continues to
-consume the reproducible pinned v1 contract until that upstream revision can
-be published and exact-pinned.
+than a Cartesian product, remains an explicit peer-aware opt-in; default
+emission is v1 for rolling-upgrade safety. jsh exact-pins the revision that
+supports both and replies in the decoded peer's schema version.
+
+Before either the ordinary AI client or the independently invokable hidden
+Agent transport child touches DNS or an HTTP socket, it revalidates the decoded
+public request's origin, canonical unique headers, JSON-object body, and byte
+ceilings. Malformed child envelopes and unknown provider names are rejected
+without echoing caller-controlled values.
 
 The agent keeps its own working directory: an approved `cd` carries into the
 following turns (shown as `cwd → …`), while the interactive shell's cwd is
@@ -504,8 +520,9 @@ mutations change the interactive shell's state (`cd` persists only within the
 agent session). AI worker queues hold at most one bounded request and response;
 a detached descendant inheriting the output pipe cannot hold the Agent turn
 open after the direct child exits. `Ctrl-C` also releases the Agent promptly
-while a provider connection is stalled; until that bounded socket request has
-finished shutting down, jsh refuses to start a second Agent request.
+while a provider connection is stalled: cancellation kills and reaps the
+transport process group, so there is no abandoned prior request or
+single-flight shutdown gate blocking the next one.
 
 Local context queries never send journal data over the network. Local Ollama
 may use the most recent failed execution's captured terminal output for command

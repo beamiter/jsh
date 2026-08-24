@@ -15,8 +15,11 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+
+use jagent::provider::MAX_REQUEST_JSON_BYTES;
 
 const FLAG: &str = "--jsh-internal-model-request";
 
@@ -48,6 +51,150 @@ fn spawn_transport(envelope: &str) -> std::process::Child {
         .expect("write envelope");
     drop(stdin);
     child
+}
+
+fn spawn_transport_with_proxy(envelope: &str, proxy: std::net::SocketAddr) -> std::process::Child {
+    let proxy = format!("http://{proxy}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
+        .arg(FLAG)
+        .env("ALL_PROXY", &proxy)
+        .env("all_proxy", &proxy)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn proxied transport child");
+    let mut stdin = child.stdin.take().expect("transport stdin");
+    stdin
+        .write_all(envelope.as_bytes())
+        .expect("write envelope");
+    drop(stdin);
+    child
+}
+
+fn read_http_head(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("bound probe read");
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while bytes.len() < 64 * 1024 && !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break
+            }
+            Err(_) => break,
+        }
+    }
+    bytes
+}
+
+fn capture_one_connection(
+    listener: TcpListener,
+    done: Arc<AtomicBool>,
+    act_as_proxy: bool,
+) -> Option<Vec<u8>> {
+    listener
+        .set_nonblocking(true)
+        .expect("make capture listener nonblocking");
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut captured = read_http_head(&mut stream);
+                if act_as_proxy && captured.starts_with(b"CONNECT ") {
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .expect("answer proxy CONNECT");
+                    captured.extend_from_slice(&read_http_head(&mut stream));
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+                return Some(captured);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if done.load(Ordering::Acquire) {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("capture listener failed: {error}"),
+        }
+    }
+}
+
+/// Run one deliberately invalid hidden-child envelope alongside a local
+/// provider probe. The probe answers if reached so a regression fails quickly
+/// instead of hanging on the transport's response deadline.
+fn assert_rejected_before_network(
+    label: &str,
+    expected_error: &str,
+    build_envelope: impl FnOnce(std::net::SocketAddr) -> serde_json::Value,
+) -> Vec<u8> {
+    let listener = TcpListener::bind("0.0.0.0:0").expect("bind provider probe");
+    listener
+        .set_nonblocking(true)
+        .expect("make provider probe nonblocking");
+    let address = listener.local_addr().expect("provider probe address");
+    let reached = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let server = {
+        let reached = Arc::clone(&reached);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        reached.store(true, Ordering::Release);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                        );
+                        let _ = stream.flush();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("provider probe failed: {error}"),
+                }
+            }
+        })
+    };
+
+    let envelope = build_envelope(address).to_string();
+    let output = spawn_transport(&envelope)
+        .wait_with_output()
+        .expect("await rejected transport child");
+    done.store(true, Ordering::Release);
+    server.join().expect("provider probe thread");
+
+    assert_eq!(output.status.code(), Some(1), "case={label}");
+    assert_eq!(output.stdout.first(), Some(&b'-'), "case={label}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(expected_error),
+        "case={label}, stdout={:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !reached.load(Ordering::Acquire),
+        "invalid transport reached the network: {label}"
+    );
+    output.stdout
 }
 
 #[test]
@@ -103,6 +250,53 @@ fn the_transport_child_performs_the_request_and_frames_its_answer() {
 }
 
 #[test]
+fn loopback_http_credentials_bypass_environment_proxies() {
+    let target = TcpListener::bind("127.0.0.1:0").expect("bind direct provider");
+    let target_address = target.local_addr().expect("direct provider address");
+    let proxy = TcpListener::bind("127.0.0.1:0").expect("bind fake proxy");
+    let proxy_address = proxy.local_addr().expect("fake proxy address");
+    let done = Arc::new(AtomicBool::new(false));
+    let target_thread = {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || capture_one_connection(target, done, false))
+    };
+    let proxy_thread = {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || capture_one_connection(proxy, done, true))
+    };
+
+    let secret = "Bearer direct-loopback-sentinel";
+    let request = serde_json::json!({
+        "v": 1,
+        "provider": "openai-compatible",
+        "url": format!("http://{target_address}/v1/chat/completions"),
+        "headers": [
+            ["content-type", "application/json"],
+            ["authorization", secret]
+        ],
+        "body": "{}",
+    })
+    .to_string();
+    let output = spawn_transport_with_proxy(&request, proxy_address)
+        .wait_with_output()
+        .expect("await loopback transport child");
+    done.store(true, Ordering::Release);
+    let direct = target_thread.join().expect("direct provider thread");
+    let proxied = proxy_thread.join().expect("fake proxy thread");
+
+    assert!(output.status.success(), "stdout={:?}", output.stdout);
+    assert_eq!(output.stdout, b"+{}");
+    let direct =
+        String::from_utf8_lossy(direct.as_deref().expect("direct provider was not reached"));
+    assert!(direct.contains(secret), "direct request={direct:?}");
+    assert!(
+        proxied.is_none(),
+        "loopback credentials reached the environment proxy: {:?}",
+        String::from_utf8_lossy(proxied.as_deref().unwrap_or_default())
+    );
+}
+
+#[test]
 fn a_malformed_envelope_is_reported_without_touching_the_network() {
     let mut child = spawn_transport("not an envelope");
     let mut stdout = Vec::new();
@@ -120,6 +314,80 @@ fn a_malformed_envelope_is_reported_without_touching_the_network() {
         "stdout={stdout:?}"
     );
     assert_eq!(status.code(), Some(1));
+}
+
+#[test]
+fn decoded_public_requests_are_revalidated_before_the_hidden_child_touches_network() {
+    let request = |address: std::net::SocketAddr| {
+        serde_json::json!({
+            "v": 1,
+            "provider": "ollama",
+            "url": format!("http://127.0.0.1:{}", address.port()),
+            "headers": [["content-type", "application/json"]],
+            "body": "{}",
+        })
+    };
+
+    assert_rejected_before_network("duplicate header", "invalid model request", |address| {
+        let mut value = request(address);
+        value["headers"] = serde_json::json!([
+            ["content-type", "application/json"],
+            ["content-type", "application/json"]
+        ]);
+        value
+    });
+    assert_rejected_before_network("non-canonical header", "invalid model request", |address| {
+        let mut value = request(address);
+        value["headers"] = serde_json::json!([["Content-Type", "application/json"]]);
+        value
+    });
+    assert_rejected_before_network("non-object body", "invalid model request", |address| {
+        let mut value = request(address);
+        value["body"] = serde_json::Value::String("[]".to_string());
+        value
+    });
+    assert_rejected_before_network("oversized body", "invalid model request", |address| {
+        let mut value = request(address);
+        value["body"] = serde_json::Value::String(format!(
+            "{{\"payload\":\"{}\"}}",
+            "x".repeat(MAX_REQUEST_JSON_BYTES)
+        ));
+        value
+    });
+    assert_rejected_before_network(
+        "remote cleartext origin",
+        "invalid model request",
+        |address| {
+            let mut value = request(address);
+            // 0.0.0.0 is syntactically non-loopback. On common kernels it still
+            // reaches the local wildcard listener, making the probe a useful
+            // positive detector if the validation call is ever removed.
+            value["url"] = serde_json::Value::String(format!("http://0.0.0.0:{}", address.port()));
+            value
+        },
+    );
+    assert_rejected_before_network("port zero", "invalid model request", |address| {
+        let mut value = request(address);
+        value["url"] = serde_json::Value::String("http://127.0.0.1:0".to_string());
+        value
+    });
+}
+
+#[test]
+fn unknown_provider_diagnostics_do_not_echo_the_untrusted_name() {
+    let secret = "provider-secret-value-must-not-be-echoed";
+    let output =
+        assert_rejected_before_network("unknown provider", "unknown provider", |address| {
+            serde_json::json!({
+                "v": 1,
+                "provider": secret,
+                "url": format!("http://127.0.0.1:{}", address.port()),
+                "headers": [["content-type", "application/json"]],
+                "body": "{}",
+            })
+        });
+    let output = String::from_utf8_lossy(&output);
+    assert!(!output.contains(secret), "stdout={output:?}");
 }
 
 #[test]

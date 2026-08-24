@@ -22,6 +22,11 @@ pub const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub const COMPACTED_JOURNAL_TARGET_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_RETAINED_EXECUTIONS: usize = 2_000;
+/// Maximum bytes in the execution identifier shared with terminal OSC 133
+/// metadata and terminal-produced output events.
+pub const MAX_EXECUTION_ID_BYTES: usize = 192;
+/// Maximum bytes in a persistent terminal-session identifier.
+pub const MAX_SESSION_ID_BYTES: usize = 128;
 const MAX_JOURNAL_READ_BYTES: u64 = MAX_JOURNAL_FILE_BYTES + MAX_EVENT_LINE_BYTES as u64 + 1;
 const JOURNAL_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const JOURNAL_LOCK_RETRY: Duration = Duration::from_millis(10);
@@ -529,7 +534,7 @@ pub fn execution_id(session_id: Option<&str>, seq: u64) -> String {
 
 fn validate_execution_id(id: &str) -> io::Result<&str> {
     if !id.is_empty()
-        && id.len() <= 192
+        && id.len() <= MAX_EXECUTION_ID_BYTES
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -544,12 +549,7 @@ fn validate_execution_id(id: &str) -> io::Result<&str> {
 }
 
 fn validate_session_id(id: &str) -> io::Result<&str> {
-    if !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if is_valid_session_id(id) {
         Ok(id)
     } else {
         Err(io::Error::new(
@@ -557,6 +557,18 @@ fn validate_session_id(id: &str) -> io::Result<&str> {
             "invalid session ID",
         ))
     }
+}
+
+/// Exact grammar shared by execution-journal records and OSC 7770 emission.
+///
+/// Session identifiers are correlation keys, so callers must reject invalid
+/// values rather than truncate or escape them into a different valid key.
+pub(crate) fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_SESSION_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
@@ -910,6 +922,47 @@ mod tests {
         assert_eq!(journal.show("jsh-a").unwrap().unwrap().seq, 7);
         assert_eq!(journal.list(Some("tab-1"), 1).unwrap().len(), 1);
         assert!(journal.list(Some("another-tab"), 10).unwrap().is_empty());
+    }
+
+    /// Golden event emitted by `jterm_core::execution_journal`. Keep this
+    /// independent of jsh's private `ExecutionEvent` serializer so a field or
+    /// tag drift on either side breaks an explicit interoperability test.
+    #[test]
+    fn folds_jterm_core_v1_output_event_fixture() {
+        let (_dir, journal) = journal();
+        journal
+            .record_start(
+                "jsh-core-fixture",
+                Some("tab-1"),
+                9,
+                "printf one\nprintf two",
+                "/tmp",
+                10,
+            )
+            .unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(journal.path())
+            .unwrap();
+        writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-core-fixture\",\"text\":\"one\\ntwo\",\"truncated\":false,\"total_bytes\":7,\"captured_at_ms\":12}}").unwrap();
+        drop(file);
+
+        let record = journal.get("jsh-core-fixture").unwrap().unwrap();
+        assert_eq!(record.command, "printf one\nprintf two");
+        assert_eq!(record.output.unwrap().text, "one\ntwo");
+    }
+
+    #[test]
+    fn public_journal_contract_values_match_jterm_core_v1() {
+        assert_eq!(EXECUTION_JOURNAL_VERSION, 1);
+        assert_eq!(MAX_EVENT_LINE_BYTES, 1024 * 1024);
+        assert_eq!(MAX_EXECUTION_ID_BYTES, 192);
+        assert_eq!(MAX_SESSION_ID_BYTES, 128);
+        assert_eq!(MAX_COMMAND_BYTES, 64 * 1024);
+        assert_eq!(MAX_CWD_BYTES, 4 * 1024);
+        assert_eq!(MAX_OUTPUT_BYTES, 256 * 1024);
+        assert_eq!(MAX_JOURNAL_FILE_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAX_RETAINED_EXECUTIONS, 2_000);
     }
 
     #[test]

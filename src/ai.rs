@@ -30,7 +30,12 @@ use jagent::prompt::{agent_user_prompt_tagged, BlockContext, EnvironmentMeta};
 use jagent::provider::{
     bound_history_with, build_chat_request_with_report, parse_chat_response_full, BuiltRequest,
     ChatConfig, ChatResponse, HttpRequest, Message, Provider, ProviderError, Role,
-    MAX_MODEL_TEXT_BYTES, MAX_REQUEST_SYSTEM_BYTES,
+    MAX_MODEL_BYTES as MAX_AI_MODEL_BYTES, MAX_MODEL_TEXT_BYTES,
+    MAX_REQUEST_HEADERS as MAX_AI_HEADERS, MAX_REQUEST_SYSTEM_BYTES,
+};
+#[cfg(all(feature = "ai", test))]
+use jagent::provider::{
+    MAX_API_KEY_BYTES as MAX_AI_API_KEY_BYTES, MAX_BASE_URL_BYTES as MAX_AI_BASE_URL_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,14 +266,6 @@ const MAX_AI_OS_BYTES: usize = 128;
 const MAX_AI_ERROR_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_AI_ERROR_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_AI_ERROR_BYTES: usize = 16 * 1024;
-#[cfg(feature = "ai")]
-const MAX_AI_API_KEY_BYTES: usize = 16 * 1024;
-#[cfg(feature = "ai")]
-const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
-#[cfg(feature = "ai")]
-const MAX_AI_MODEL_BYTES: usize = 1024;
-#[cfg(feature = "ai")]
-const MAX_AI_HEADERS: usize = 16;
 #[cfg(feature = "ai")]
 const MAX_AI_HEADER_BYTES: usize = 32 * 1024;
 #[cfg(feature = "ai")]
@@ -848,15 +845,12 @@ fn require_no_builder_omission(built: BuiltRequest) -> Result<HttpRequest, Provi
     Ok(built.request)
 }
 
-/// Backport the credential/header validation from the current jagent source at
-/// jsh's single request funnel while Cargo remains pinned to a published,
-/// reproducible commit. `http` header values must never be constructed from a
-/// control-bearing or effectively unbounded environment variable.
+/// Apply jagent's current configuration contract plus jsh's deliberately
+/// stricter display policy for model names. Request-value validation is
+/// repeated separately at each network boundary because `HttpRequest` keeps
+/// public mutable fields for compatibility.
 #[cfg(feature = "ai")]
 fn validate_transport_config(chat: &ChatConfig) -> Result<(), ProviderError> {
-    // Start with the pinned jagent boundary so model/base URL/max-token and
-    // temperature semantics are exactly those used by request construction.
-    // The checks below are deliberate integration-level tightenings only.
     chat.validate()?;
 
     let model = chat.model.as_str();
@@ -871,32 +865,6 @@ fn validate_transport_config(chat: &ChatConfig) -> Result<(), ProviderError> {
             "model is empty, unsafe, or exceeds its byte limit".into(),
         ));
     }
-    validate_ai_base_url(chat.provider, &chat.base_url)?;
-    if let Some(api_key) = chat.api_key.as_deref() {
-        if api_key.is_empty() {
-            return Err(ProviderError::InvalidConfiguration(
-                "API key must not be empty".into(),
-            ));
-        }
-        if api_key.len() > MAX_AI_API_KEY_BYTES {
-            return Err(ProviderError::InvalidConfiguration(
-                "API key exceeds its byte limit".into(),
-            ));
-        }
-        if api_key.chars().any(char::is_control) {
-            return Err(ProviderError::InvalidConfiguration(
-                "API key contains a control character".into(),
-            ));
-        }
-        // Current jagent validates control bytes but still trims credentials.
-        // jsh sends the configured bytes only after this stricter forward
-        // compatibility gate, matching jagent's next exact-key contract.
-        if !api_key.bytes().all(|byte| matches!(byte, 0x21..=0x7e)) {
-            return Err(ProviderError::InvalidConfiguration(
-                "API key must contain only visible ASCII characters with no whitespace".into(),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -909,53 +877,12 @@ pub(crate) fn validate_config(config: &AiConfig) -> Result<(), ProviderError> {
 }
 
 #[cfg(feature = "ai")]
-fn validate_ai_base_url(provider: Provider, base_url: &str) -> Result<(), ProviderError> {
-    let invalid = || {
-        ProviderError::InvalidConfiguration(
-            "base URL must be a bounded absolute HTTPS URL without credentials, query, \
-             fragment, backslashes, controls, or ambiguous Unicode (HTTP is allowed only for a \
-             loopback Ollama endpoint)"
-                .into(),
-        )
-    };
-    if base_url.is_empty()
-        || base_url.len() > MAX_AI_BASE_URL_BYTES
-        || base_url.contains('\\')
-        || base_url.contains('#')
-        || base_url.contains('?')
-        || !crate::terminal_text::is_safe_inline(base_url)
-    {
-        return Err(invalid());
-    }
-    let uri: ureq::http::Uri = base_url.parse().map_err(|_| invalid())?;
-    let scheme = uri.scheme_str().ok_or_else(invalid)?;
-    let host = uri
-        .host()
-        .filter(|host| !host.is_empty())
-        .ok_or_else(invalid)?;
-    if uri
-        .authority()
-        .is_some_and(|authority| authority.as_str().contains('@'))
-        || uri.query().is_some()
-    {
-        return Err(invalid());
-    }
-    match scheme {
-        "https" => Ok(()),
-        "http"
-            if provider == Provider::Ollama
-                && (host.eq_ignore_ascii_case("localhost")
-                    || host == "127.0.0.1"
-                    || host == "::1") =>
-        {
-            Ok(())
-        }
-        _ => Err(invalid()),
-    }
-}
-
-#[cfg(feature = "ai")]
 fn validate_outbound_request(request: &HttpRequest) -> Result<(), ProviderError> {
+    // `HttpRequest` keeps public fields for compatibility. Re-apply jagent's
+    // complete URL/header/body contract at the last in-process handoff rather
+    // than relying only on the builder having produced a valid value.
+    request.validate_transport()?;
+
     let header_bytes = request
         .headers
         .iter()
@@ -1122,9 +1049,19 @@ fn process_request(_config: &AiConfig, request: &AiRequest) -> AiResponse {
     }
 }
 
+/// Return whether a transport-validated request must ignore environment proxy
+/// settings. jagent accepts plain HTTP only for a syntactic loopback origin;
+/// allowing an HTTP(S)_PROXY/ALL_PROXY hop here would send the request -- and
+/// its provider credentials -- to a non-loopback peer after that validation.
 #[cfg(feature = "ai")]
-fn ai_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+pub(crate) fn request_must_bypass_proxy(request: &HttpRequest) -> Result<bool, ProviderError> {
+    request.validate_transport()?;
+    Ok(request.url.starts_with("http://"))
+}
+
+#[cfg(feature = "ai")]
+fn ai_agent(bypass_environment_proxy: bool) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
         // Provider credentials include custom headers such as `x-api-key`;
         // ureq cannot know to strip all of them on a cross-origin redirect.
         .max_redirects(0)
@@ -1134,14 +1071,23 @@ fn ai_agent() -> ureq::Agent {
         .timeout_send_body(Some(std::time::Duration::from_secs(10)))
         // Keep non-2xx as a normal response so the provider's error body can be
         // read and reported instead of a bare status code.
-        .http_status_as_error(false)
-        .build()
-        .into()
+        .http_status_as_error(false);
+    let config = if bypass_environment_proxy {
+        config.proxy(None)
+    } else {
+        config
+    };
+    config.build().into()
 }
 
 #[cfg(feature = "ai")]
 fn post_json(request: &HttpRequest) -> Result<serde_json::Value, String> {
-    let agent = ai_agent();
+    // This is the final boundary before an HTTP client sees the public,
+    // mutable request value. Keep the same postcondition as the Agent child
+    // transport even if a future caller bypasses the normal builder funnel.
+    let bypass_environment_proxy = request_must_bypass_proxy(request)
+        .map_err(|error| format!("Request validation failed: {error}"))?;
+    let agent = ai_agent(bypass_environment_proxy);
     let mut post = agent.post(&request.url);
     for (name, value) in &request.headers {
         post = post.header(name, value);
@@ -1681,7 +1627,7 @@ mod ai_tests {
 
     #[test]
     fn outbound_ai_transport_rejects_ambiguous_endpoints_and_redirects() {
-        assert_eq!(ai_agent().config().max_redirects(), 0);
+        assert_eq!(ai_agent(false).config().max_redirects(), 0);
 
         let invalid = [
             "http://api.openai.com/v1",
@@ -1705,10 +1651,21 @@ mod ai_tests {
         assert!(build_redacted_chat_request(&oversized, None, &[]).is_err());
 
         let mut local = chat();
-        local.provider = Provider::Ollama;
-        local.api_key = None;
-        local.base_url = "http://localhost:11434".to_string();
-        assert!(build_redacted_chat_request(&local, None, &[]).is_ok());
+        // jagent's origin contract is provider-neutral: local
+        // OpenAI-compatible/Anthropic proxies are as legitimate as Ollama,
+        // while remote cleartext remains forbidden for all three.
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            local.provider = provider;
+            local.base_url = "http://127.0.0.42:11434".to_string();
+            let request = build_redacted_chat_request(&local, None, &[])
+                .unwrap_or_else(|error| panic!("provider={provider:?}: {error}"));
+            assert!(request_must_bypass_proxy(&request).unwrap());
+            assert!(ai_agent(true).config().proxy().is_none());
+        }
         local.base_url = "http://example.com:11434".to_string();
         assert!(build_redacted_chat_request(&local, None, &[]).is_err());
     }

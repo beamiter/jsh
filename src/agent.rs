@@ -1153,6 +1153,12 @@ fn model_request(request: HttpRequest, provider: Provider) -> Result<Vec<u8>, St
     if crate::signal::pending_status().is_some() {
         return Err("interrupted".to_string());
     }
+    // `HttpRequest` is intentionally public and cloneable. Validate again at
+    // the process boundary so an integration-side mutation is rejected before
+    // credentials are serialized into the private child envelope.
+    request
+        .validate_transport()
+        .map_err(|error| format!("invalid model request: {error}"))?;
     let envelope = encode_model_request(&request, provider);
     if envelope.len() > MAX_MODEL_REQUEST_ENVELOPE_BYTES {
         return Err("model request is too large to send".to_string());
@@ -1232,7 +1238,10 @@ fn decode_model_request(envelope: &str) -> Result<(HttpRequest, Provider), Strin
         "anthropic" => Provider::Anthropic,
         "openai-compatible" => Provider::OpenAiCompatible,
         "ollama" => Provider::Ollama,
-        other => return Err(format!("unknown provider: {other}")),
+        // Do not reflect an untrusted envelope value into the control reply.
+        // The caller only needs the bounded classification, not the bytes it
+        // supplied.
+        _ => return Err("unknown provider".to_string()),
     };
     let mut headers = Vec::new();
     for entry in value
@@ -1319,7 +1328,13 @@ pub(crate) fn run_internal_model_request(args: &[std::ffi::OsString]) -> Option<
 }
 
 fn perform_model_request(request: HttpRequest, _provider: Provider) -> Result<String, String> {
-    let agent = agent_http_client();
+    // The hidden child is an independently invokable process boundary. Its
+    // stdin is untrusted even though the ordinary parent creates it, so the
+    // decoded public request must pass jagent's complete transport contract
+    // immediately before any HTTP client or resolver sees it.
+    let bypass_environment_proxy = crate::ai::request_must_bypass_proxy(&request)
+        .map_err(|error| format!("invalid model request: {error}"))?;
+    let agent = agent_http_client(bypass_environment_proxy);
     let mut post = agent.post(&request.url);
     for (name, value) in &request.headers {
         post = post.header(name, value);
@@ -1347,8 +1362,8 @@ fn perform_model_request(request: HttpRequest, _provider: Provider) -> Result<St
     Ok(text)
 }
 
-fn agent_http_client() -> ureq::Agent {
-    ureq::Agent::config_builder()
+fn agent_http_client(bypass_environment_proxy: bool) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
         .max_redirects(0)
         .timeout_connect(Some(std::time::Duration::from_secs(5)))
         .timeout_recv_response(Some(std::time::Duration::from_secs(120)))
@@ -1356,9 +1371,13 @@ fn agent_http_client() -> ureq::Agent {
         .timeout_send_body(Some(std::time::Duration::from_secs(10)))
         // Keep non-2xx as a normal response so the provider's error body can be
         // read and reported instead of a bare status code.
-        .http_status_as_error(false)
-        .build()
-        .into()
+        .http_status_as_error(false);
+    let config = if bypass_environment_proxy {
+        config.proxy(None)
+    } else {
+        config
+    };
+    config.build().into()
 }
 
 fn chat_config(ai_config: &AiConfig) -> ChatConfig {
@@ -2513,7 +2532,8 @@ mod tests {
 
     #[test]
     fn agent_provider_credentials_never_cross_redirects() {
-        assert_eq!(agent_http_client().config().max_redirects(), 0);
+        assert_eq!(agent_http_client(false).config().max_redirects(), 0);
+        assert!(agent_http_client(true).config().proxy().is_none());
     }
 
     #[test]

@@ -21,8 +21,6 @@ const MAX_OSC_CWD_BYTES: usize = 4 * 1024;
 const MAX_OSC_TITLE_BYTES: usize = 1024;
 /// Matches jterm_core's own notification field cap (MAX_NOTIFICATION_CHARS).
 const MAX_OSC_NOTIFICATION_BYTES: usize = 1024;
-/// jterm_core rejects session ids longer than 1024 chars outright.
-const MAX_OSC_SESSION_ID_BYTES: usize = 1024;
 
 // ── The single sink ───────────────────────────────────────────
 //
@@ -281,14 +279,17 @@ pub fn command_finished(exit_code: i32, execution_id: &str, duration_ms: u64, cw
 /// This is a custom jsh-specific OSC used by jterm4 to associate
 /// a terminal pane with a persistent session.
 pub fn report_session_id(session_id: &str) {
-    emit(&session_id_packet(session_id));
+    if let Some(packet) = session_id_packet(session_id) {
+        emit(&packet);
+    }
 }
 
-fn session_id_packet(session_id: &str) -> String {
-    format!(
-        "\x1b]7770;{}\x07",
-        escape_osc_text(session_id, MAX_OSC_SESSION_ID_BYTES, true)
-    )
+fn session_id_packet(session_id: &str) -> Option<String> {
+    // This value is a persistent correlation key, not display text. Escaping
+    // or truncating malformed input could transform two distinct caller
+    // values into the same valid identifier, so preserve it exactly or emit
+    // no frame at all.
+    crate::execution::is_valid_session_id(session_id).then(|| format!("\x1b]7770;{session_id}\x07"))
 }
 
 // ── OSC 9: Desktop Notification ───────────────────────────────
@@ -518,15 +519,38 @@ mod tests {
     }
 
     #[test]
-    fn session_id_packet_escapes_controls_but_keeps_real_ids_intact() {
+    fn session_id_packet_keeps_valid_ids_exact_and_rejects_invalid_ids() {
         assert_eq!(
             session_id_packet("jsh-cbf29ce484222325-1c3a36-19fb219b03a"),
-            "\x1b]7770;jsh-cbf29ce484222325-1c3a36-19fb219b03a\x07"
+            Some("\x1b]7770;jsh-cbf29ce484222325-1c3a36-19fb219b03a\x07".to_string())
         );
 
-        let hostile = session_id_packet("id\x07\x1b]52;c;x\x07");
-        assert_eq!(hostile, "\x1b]7770;id%07%1B]52%3Bc%3Bx%07\x07");
-        assert_single_framing(&hostile);
+        assert_eq!(session_id_packet(""), None);
+        for hostile in [
+            "id\x07\x1b]52;c;x\x07",
+            "id;other",
+            "id.with-dot",
+            "id%2Descaped",
+            "会话",
+        ] {
+            assert_eq!(session_id_packet(hostile), None, "id={hostile:?}");
+        }
+    }
+
+    #[test]
+    fn session_id_packet_never_truncates_distinct_oversized_ids_to_one_key() {
+        let common_prefix = "a".repeat(crate::execution::MAX_SESSION_ID_BYTES);
+        let first = format!("{common_prefix}x");
+        let second = format!("{common_prefix}y");
+
+        assert_eq!(common_prefix.len(), crate::execution::MAX_SESSION_ID_BYTES);
+        assert_eq!(
+            session_id_packet(&common_prefix),
+            Some(format!("\x1b]7770;{common_prefix}\x07"))
+        );
+        assert_eq!(first.len(), crate::execution::MAX_SESSION_ID_BYTES + 1);
+        assert_eq!(session_id_packet(&first), None);
+        assert_eq!(session_id_packet(&second), None);
     }
 
     #[test]

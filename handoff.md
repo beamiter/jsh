@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-22
+Updated: 2026-08-24
 
 This baseline unifies command discovery, separates executable AI suggestions
 from read-only explanations, completes workflow parameter filling, and fixes
@@ -65,6 +65,21 @@ and installer hardening described below.
 
 ## Completed since the previous handoff
 
+- The jagent pin advances to `fcb9768` and both ordinary AI and Agent traffic
+  adopt its full `HttpRequest::validate_transport` postcondition. The hidden
+  model child revalidates its decoded public request immediately before
+  constructing an HTTP client, so duplicate/non-canonical headers,
+  non-object/oversized bodies, remote cleartext origins, and port zero never
+  reach DNS or a socket. Unknown provider values are classified without being
+  echoed. Loopback HTTP policy is now provider-neutral, matching jagent and
+  jterm_core for local OpenAI-compatible and Anthropic proxies as well as
+  Ollama. Both ureq clients force these validated clear-text loopback requests
+  to connect directly rather than forwarding credentials through an inherited
+  `*_PROXY`; HTTPS retains the user's proxy configuration.
+- The public execution-journal v1 bounds now include execution/session id
+  ceilings, and a frozen jterm_core output-event fixture is folded by jsh's
+  own reader. Its twin core fixture covers start/finish/output, multiline
+  commands, and the migrated `rsh_execution_version` spelling.
 - `command_catalog` is the discovery contract above the classic and value
   execution tables. Help, command completion, `compgen`, highlighting, typo
   repair, and builtin classification now consume its sorted, unique view.
