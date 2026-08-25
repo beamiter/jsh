@@ -145,6 +145,94 @@ fn exit_without_argument_uses_last_status_and_stops_execution() {
 }
 
 #[test]
+fn assignment_only_command_uses_the_last_command_substitution_status() {
+    let output = run_c("out=$(sh -c 'exit 7')");
+    assert_eq!(output.status.code(), Some(7), "stderr: {}", stderr(&output));
+
+    let output = run_c("first=$(false) second=$(true)");
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+
+    let output = run_c("first=$(true) second=$(sh -c 'exit 9')");
+    assert_eq!(output.status.code(), Some(9), "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn command_substitution_honors_exit_and_its_own_errexit() {
+    let output = run_c(
+        "out=$(exit 7; printf SHOULD_NOT); \
+         printf '<%s>|%s\\n' \"$out\" \"$?\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "<>|7\n");
+
+    let output = run_c(
+        "out=$(set -e; false; printf SHOULD_NOT); \
+         printf '<%s>|%s\\n' \"$out\" \"$?\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "<>|1\n");
+}
+
+#[test]
+fn command_substitution_err_trap_inheritance_is_opt_in() {
+    let output = run_c(
+        "trap 'printf OUTER' ERR; out=$(false); \
+         printf '<%s>|%s\\n' \"$out\" \"$?\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "OUTER<>|1\n");
+
+    let output = run_c(
+        "trap 'printf OUTER' ERR; \
+         out=$(trap 'printf INNER' ERR; false); \
+         printf '<%s>|%s\\n' \"$out\" \"$?\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "OUTER<INNER>|1\n");
+
+    let output = run_c(
+        "set -E; trap 'printf OUTER' ERR; out=$(false); \
+         printf '<%s>|%s\\n' \"$out\" \"$?\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "OUTER<OUTER>|1\n");
+}
+
+#[test]
+fn command_substitution_errexit_inheritance_is_opt_in() {
+    let output = run_c(
+        "set -e; out=$(false; printf SURVIVES); \
+         printf 'outer:<%s>\\n' \"$out\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "outer:<SURVIVES>\n");
+
+    let output = run_c(
+        "set -e; shopt -s inherit_errexit; \
+         out=$(false; printf SHOULD_NOT); printf SHOULD_NOT_RUN",
+    );
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
+fn failed_assignment_only_substitution_obeys_err_trap_and_errexit() {
+    let output = run_c(
+        "trap 'printf \"ERR:%s\\n\" \"$?\"' ERR; \
+         out=$(sh -c 'exit 7'); printf 'after:%s\\n' \"$?\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output).lines().collect::<Vec<_>>(),
+        ["ERR:7", "after:7"]
+    );
+
+    let output = run_c("set -e; out=$(false); echo SHOULD_NOT_RUN");
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    assert!(!stdout(&output).contains("SHOULD_NOT_RUN"));
+}
+
+#[test]
 fn failglob_reports_an_error_and_returns_nonzero() {
     let output = run_c("shopt -s failglob; echo /definitely-no-jsh-match-*; echo SHOULD_NOT_RUN");
     assert_eq!(output.status.code(), Some(1));

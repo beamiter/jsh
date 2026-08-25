@@ -1,12 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-08-24
+Updated: 2026-08-25
 
 This baseline unifies command discovery, separates executable AI suggestions
 from read-only explanations, completes workflow parameter filling, and fixes
-Agent capture and closure UTF-8 regressions on top of the diagnostics, AI,
-persistence, execution I/O, parser/completion, terminal text, helper-resolution,
-and installer hardening described below.
+Agent capture, closure UTF-8, and assignment-only command-substitution status
+regressions on top of the diagnostics, AI, persistence, execution I/O,
+parser/completion, terminal text, helper-resolution, and installer hardening
+described below.
 
 ## 2026-08-22 ten-round AI and Agent boundary hardening
 
@@ -65,14 +66,31 @@ and installer hardening described below.
 
 ## Completed since the previous handoff
 
-- The jagent pin advances to `fcb9768` and both ordinary AI and Agent traffic
+- `expand_command_sub` now records the reaped child's exact exit or signal
+  status at the existing `ShellState` handoff. Assignment-only commands consume
+  the last such status, including across multiple assignments, so
+  `out=$(false)` no longer returns 0 and bypasses `ERR`/`set -e`. Pipe, fork,
+  and wait failures fail closed with status 1. The child executes its parsed
+  body through `execute_program`, so `exit` and an explicitly enabled `set -e`
+  stop the body instead of letting a later command overwrite output and status.
+  Before that handoff it applies Bash's inheritance gates: parent `errexit` is
+  cleared unless `inherit_errexit` is enabled, and the inherited `ERR` trap is
+  cleared unless tracked `errtrace`/`set -E` is enabled. A trap declared inside
+  the substitution remains intact. Execution regressions cover arbitrary
+  nonzero status, rightmost-substitution precedence, both child termination
+  paths, default and opt-in inheritance, explicit inner traps, outer `ERR`, and
+  outer errexit.
+- The jagent pin advances to `2570e5e` and both ordinary AI and Agent traffic
   adopt its full `HttpRequest::validate_transport` postcondition. The hidden
   model child revalidates its decoded public request immediately before
   constructing an HTTP client, so duplicate/non-canonical headers,
-  non-object/oversized bodies, remote cleartext origins, and port zero never
-  reach DNS or a socket. Unknown provider values are classified without being
-  echoed. Loopback HTTP policy is now provider-neutral, matching jagent and
-  jterm_core for local OpenAI-compatible and Anthropic proxies as well as
+  duplicate top-level body members, non-object/oversized bodies, remote
+  cleartext origins, and port zero never reach DNS or a socket. The new shared
+  raw-JSON preflight also rejects recursive duplicate members across complete
+  responses, stream deltas, JSON-in-text actions, and native-tool arguments
+  before session ingestion. Unknown provider values are classified without
+  being echoed. Loopback HTTP policy is now provider-neutral, matching jagent
+  and jterm_core for local OpenAI-compatible and Anthropic proxies as well as
   Ollama. Both ureq clients force these validated clear-text loopback requests
   to connect directly rather than forwarding credentials through an inherited
   `*_PROXY`; HTTPS retains the user's proxy configuration.

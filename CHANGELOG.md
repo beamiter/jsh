@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The jagent revision is exact-pinned at `2570e5e`. Agent request bodies now
+  reject duplicate top-level JSON members at the final transport boundary, and
+  complete/streaming response and action decoding rejects duplicate object
+  members recursively before anything can become a proposal.
+- Assignment-only commands now preserve the exit status of their last command
+  substitution. `out=$(false)` therefore returns 1, fires an `ERR` trap, and
+  obeys `set -e` instead of silently reporting success. Command-substitution
+  children also use the normal program termination gate, so `exit` and an
+  explicitly enabled `set -e` cannot fall through to later commands that
+  overwrite their status. Parent `errexit` and `ERR` state is reset by default;
+  `inherit_errexit` and `errtrace` now provide Bash-compatible opt-in
+  inheritance.
 - Agent child control channels now use typed, byte-budgeted nonblocking state
   machines. READY requires one marker plus EOF; the cwd frame rejects bad
   magic, length, nonce, NUL, and extra bytes as soon as decidable, and an

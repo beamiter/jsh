@@ -1886,11 +1886,13 @@ fn cmp_int(a: &str, b: &str, f: fn(i64, i64) -> bool) -> i32 {
 /// `shell_opts.tracked_opts` so they are neither silently mistaken for
 /// positional parameters nor lost across `eval "$(set +o)"`.
 ///
-/// Remembered-but-not-enforced today: allexport, braceexpand, errtrace,
-/// functrace, hashall, histexpand, history, ignoreeof, interactive-comments,
-/// keyword, monitor, noclobber, noexec, nolog, notify, onecmd, physical, posix,
-/// privileged, verbose. Rejecting them instead would be worse: bash accepts
-/// them, so `set -a` in a real script must not become a hard error.
+/// `errtrace` remains stored in the generic tracked map, but command
+/// substitution enforces its ERR-trap inheritance effect. Remembered but not
+/// otherwise enforced today: allexport, braceexpand, functrace, hashall,
+/// histexpand, history, ignoreeof, interactive-comments, keyword, monitor,
+/// noclobber, noexec, nolog, notify, onecmd, physical, posix, privileged,
+/// verbose. Rejecting them instead would be worse: bash accepts them, so
+/// `set -a` in a real script must not become a hard error.
 pub(crate) const SET_OPTIONS: &[(&str, Option<char>)] = &[
     ("allexport", Some('a')),
     ("braceexpand", Some('B')),

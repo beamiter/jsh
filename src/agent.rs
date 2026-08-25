@@ -3415,4 +3415,31 @@ mod tests {
             assert_eq!(command, "pwd", "{provider:?}");
         }
     }
+
+    #[test]
+    fn duplicate_native_tool_arguments_fail_before_becoming_a_proposal() {
+        let history = [Message {
+            role: Role::User,
+            text: "inspect".into(),
+        }];
+        let config = ChatConfig {
+            provider: Provider::OpenAiCompatible,
+            api_key: None,
+            model: "test-model".into(),
+            base_url: Provider::OpenAiCompatible.default_base_url().into(),
+            max_tokens: 128,
+            temperature: Some(0.0),
+        };
+        let prepared = prepare_request(
+            &config,
+            RequestSpec::new(&history, AgentProtocol::NativeTools),
+        )
+        .unwrap();
+        let duplicate = br#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"run","arguments":"{\"command\":\"first\",\"command\":\"second\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+
+        let response = prepared.parse_response(duplicate).unwrap();
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        assert!(session.accept_agent_response(&response).is_err());
+    }
 }

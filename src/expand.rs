@@ -1393,13 +1393,40 @@ fn expand_tilde(user: &str, state: &mut ShellState) -> String {
     }
 }
 
-fn expand_command_sub(cmd: &str, state: &mut crate::environment::ShellState) -> String {
+/// Apply Bash's command-substitution inheritance rules to the forked copy.
+///
+/// Command substitutions clear `errexit` unless `inherit_errexit` is enabled,
+/// and reset an inherited ERR trap unless `errtrace`/`-E` is enabled. This
+/// happens before parsing the body, so a trap explicitly installed by the body
+/// remains authoritative.
+fn prepare_command_substitution_child(state: &mut ShellState) {
+    state.interactive = false;
+    if !state.shell_opts.inherit_errexit {
+        state.shell_opts.errexit = false;
+    }
+    let inherit_err_trap = state
+        .shell_opts
+        .tracked_opts
+        .get("errtrace")
+        .copied()
+        .unwrap_or(false);
+    if !inherit_err_trap {
+        state.traps.remove("ERR");
+    }
+}
+
+fn expand_command_sub(cmd: &str, state: &mut ShellState) -> String {
+    use nix::errno::Errno;
+    use nix::sys::wait::WaitStatus;
     use nix::unistd::{close, fork, pipe, read, ForkResult};
     use std::os::unix::io::{BorrowedFd, IntoRawFd};
 
     let (r, w) = match pipe() {
         Ok(fds) => (fds.0.into_raw_fd(), fds.1.into_raw_fd()),
-        Err(_) => return String::new(),
+        Err(_) => {
+            state.last_command_sub_status = Some(1);
+            return String::new();
+        }
     };
 
     match unsafe { fork() } {
@@ -1410,15 +1437,14 @@ fn expand_command_sub(cmd: &str, state: &mut crate::environment::ShellState) -> 
             }
             close(w).ok();
 
-            state.interactive = false;
+            prepare_command_substitution_child(state);
             match crate::parser::parse(cmd) {
-                Ok(cmds) => {
-                    let mut code = 0;
-                    for c in &cmds {
-                        code = crate::executor::execute_complete_command(c, state);
-                    }
-                    std::process::exit(code);
-                }
+                // A command substitution is a complete non-interactive shell
+                // program. Reuse its program-level exit/control-flow/errexit
+                // gates rather than executing every parsed command
+                // unconditionally and letting a later command overwrite the
+                // status from `exit` or `set -e`.
+                Ok(cmds) => std::process::exit(crate::executor::execute_program(&cmds, state)),
                 Err(_) => std::process::exit(2),
             }
         }
@@ -1434,7 +1460,21 @@ fn expand_command_sub(cmd: &str, state: &mut crate::environment::ShellState) -> 
                 }
             }
             close(r).ok();
-            nix::sys::wait::waitpid(child, None).ok();
+            let status = loop {
+                match nix::sys::wait::waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => break code,
+                    Ok(WaitStatus::Signaled(_, signal, _)) => break 128 + signal as i32,
+                    // No status-changing flags were requested, but keep
+                    // waiting if a platform reports an intermediate state.
+                    Ok(_) => continue,
+                    Err(Errno::EINTR) => continue,
+                    Err(_) => break 1,
+                }
+            };
+            // An assignment-only simple command has the status of its last
+            // command substitution. Record this after reaping so multiple
+            // substitutions naturally leave the rightmost one's status.
+            state.last_command_sub_status = Some(status);
             let mut s = String::from_utf8_lossy(&output).to_string();
             while s.ends_with('\n') || s.ends_with('\r') {
                 s.pop();
@@ -1444,6 +1484,7 @@ fn expand_command_sub(cmd: &str, state: &mut crate::environment::ShellState) -> 
         Err(_) => {
             close(r).ok();
             close(w).ok();
+            state.last_command_sub_status = Some(1);
             String::new()
         }
     }

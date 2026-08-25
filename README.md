@@ -171,6 +171,14 @@ CLI errors and syntax errors exit with status `2`. Command-not-found and
 missing-script failures use `127`; commands or scripts that cannot be
 executed or read use `126`.
 
+An assignment-only command takes the status of its last command substitution,
+as in Bash: `out=$(false)` returns `1`. That status also reaches `ERR` traps and
+`set -e`, so a failed substitution cannot be mistaken for a successful setup
+step. Inside the substitution, `exit` and an explicitly enabled `set -e` stop
+the remaining commands before their output or status can replace the failure.
+The parent shell's `errexit` and `ERR` trap are reset there by default, matching
+Bash; `shopt -s inherit_errexit` and `set -E` opt into inheriting them.
+
 ## Startup and persistent state
 
 Interactive shells import `~/.bashrc` by default for compatibility. Use
@@ -466,7 +474,8 @@ so a writer cannot turn rejection into a shutdown hang. A signal or
 status-observation failure after READY is
 reported through jagent 0.7's conservative `Cancelled` compatibility bucket;
 it is not claimed to be a normal shell exit. Malformed model replies fail
-closed and never become proposals.
+closed and never become proposals; duplicate JSON object members are rejected
+recursively instead of being resolved by decoder order.
 
 Agent requests use jagent 0.7's bound request/response path: the selected
 system prompt, provider schema, delivery protocol, secret redaction report,
@@ -499,8 +508,9 @@ supports both and replies in the decoded peer's schema version.
 Before either the ordinary AI client or the independently invokable hidden
 Agent transport child touches DNS or an HTTP socket, it revalidates the decoded
 public request's origin, canonical unique headers, JSON-object body, and byte
-ceilings. Malformed child envelopes and unknown provider names are rejected
-without echoing caller-controlled values.
+ceilings, including unique top-level body members. Malformed child envelopes
+and unknown provider names are rejected without echoing caller-controlled
+values.
 
 The agent keeps its own working directory: an approved `cd` carries into the
 following turns (shown as `cwd → …`), while the interactive shell's cwd is

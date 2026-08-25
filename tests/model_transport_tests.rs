@@ -346,6 +346,16 @@ fn decoded_public_requests_are_revalidated_before_the_hidden_child_touches_netwo
         value["body"] = serde_json::Value::String("[]".to_string());
         value
     });
+    assert_rejected_before_network(
+        "duplicate body member",
+        "invalid model request",
+        |address| {
+            let mut value = request(address);
+            value["body"] =
+                serde_json::Value::String(r#"{"model":"first","model":"second"}"#.to_string());
+            value
+        },
+    );
     assert_rejected_before_network("oversized body", "invalid model request", |address| {
         let mut value = request(address);
         value["body"] = serde_json::Value::String(format!(
