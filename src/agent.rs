@@ -1221,20 +1221,31 @@ fn encode_model_request(request: &HttpRequest, provider: Provider) -> String {
     .to_string()
 }
 
+/// Strict private wire schema for the independently invokable transport
+/// child. Deriving directly into a struct makes serde reject repeated known
+/// fields instead of applying `Value`'s last-member-wins rule; unknown fields
+/// are rejected so the parent and child cannot silently disagree about a
+/// future envelope revision.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRequestEnvelope {
+    v: u64,
+    provider: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
 fn decode_model_request(envelope: &str) -> Result<(HttpRequest, Provider), String> {
-    let value: serde_json::Value =
-        serde_json::from_str(envelope).map_err(|error| format!("malformed request: {error}"))?;
-    if value.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+    // Do not reflect serde diagnostics: an unknown field or variant name is
+    // controlled by the caller, while the child protocol only needs a stable
+    // bounded classification.
+    let envelope: ModelRequestEnvelope =
+        serde_json::from_str(envelope).map_err(|_| "malformed request".to_string())?;
+    if envelope.v != 1 {
         return Err("unsupported request version".to_string());
     }
-    let text = |key: &str| -> Result<String, String> {
-        value
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| format!("request is missing {key}"))
-    };
-    let provider = match text("provider")?.as_str() {
+    let provider = match envelope.provider.as_str() {
         "anthropic" => Provider::Anthropic,
         "openai-compatible" => Provider::OpenAiCompatible,
         "ollama" => Provider::Ollama,
@@ -1243,29 +1254,11 @@ fn decode_model_request(envelope: &str) -> Result<(HttpRequest, Provider), Strin
         // supplied.
         _ => return Err("unknown provider".to_string()),
     };
-    let mut headers = Vec::new();
-    for entry in value
-        .get("headers")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "request is missing headers".to_string())?
-    {
-        let pair = entry
-            .as_array()
-            .filter(|pair| pair.len() == 2)
-            .ok_or_else(|| "malformed header".to_string())?;
-        let name = pair[0]
-            .as_str()
-            .ok_or_else(|| "malformed header name".to_string())?;
-        let value = pair[1]
-            .as_str()
-            .ok_or_else(|| "malformed header value".to_string())?;
-        headers.push((name.to_string(), value.to_string()));
-    }
     Ok((
         HttpRequest {
-            url: text("url")?,
-            headers,
-            body: text("body")?,
+            url: envelope.url,
+            headers: envelope.headers,
+            body: envelope.body,
         },
         provider,
     ))
@@ -1343,12 +1336,16 @@ fn perform_model_request(request: HttpRequest, _provider: Provider) -> Result<St
         .send(request.body.as_str())
         .map_err(|error| error.to_string())?;
     let status = response.status();
-    let text = response
+    // ureq applies this configured limit to wire bytes below its content
+    // decoder. Preserve that bound, then cap the decoded reader separately so
+    // a small transparently decoded response (currently gzip) cannot expand
+    // into an unbounded String in this independently invokable child.
+    let decoded = response
         .body_mut()
         .with_config()
         .limit(MAX_AGENT_RESPONSE_BYTES)
-        .read_to_string()
-        .map_err(|error| format!("read error: {error}"))?;
+        .reader();
+    let text = read_model_response_bounded(decoded)?;
     if !status.is_success() {
         // The response body is untrusted terminal data. Provider diagnostics
         // are deliberately not echoed before protocol validation.
@@ -1359,6 +1356,20 @@ fn perform_model_request(request: HttpRequest, _provider: Provider) -> Result<St
     // through its bound provider/protocol decoder before session ingestion.
     // Parsing in this transport child used to erase completion metadata and
     // made native-tool replies impossible to carry back safely.
+    Ok(text)
+}
+
+fn read_model_response_bounded(reader: impl Read) -> Result<String, String> {
+    let mut reader = reader.take(MAX_AGENT_RESPONSE_BYTES + 1);
+    let mut text = String::new();
+    reader
+        .read_to_string(&mut text)
+        .map_err(|error| format!("read error: {error}"))?;
+    if text.len() as u64 > MAX_AGENT_RESPONSE_BYTES {
+        return Err(format!(
+            "model response exceeds the {MAX_AGENT_RESPONSE_BYTES}-byte decoded limit"
+        ));
+    }
     Ok(text)
 }
 
@@ -2350,12 +2361,13 @@ mod tests {
         agent_child_command, agent_child_cwd_nonce_channel, agent_http_client, bounded_git_stdout,
         capture_pipe_cloexec, configured_agent_protocol, configured_max_turns,
         decode_agent_child_cwd_frame, drain_agent_child_readiness, encode_agent_child_cwd_frame,
-        git_meta, git_worktree_dirty, run_captured, run_captured_to, run_captured_with_transport,
-        run_internal_agent_child, run_internal_model_request, terminal_safe_inline_text,
-        terminal_safe_message, terminal_safe_text, AgentChildReadiness, AgentChildTransport,
-        AgentProtocolConfigError, CapturedExecution, AGENT_CHILD_COMMAND_ENV, AGENT_CHILD_READY,
-        MAX_AGENT_CHILD_CWD_BYTES, MAX_AGENT_CHILD_CWD_FRAME_BYTES,
-        MAX_AGENT_COMMAND_DISPLAY_BYTES, MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_SESSION_TURNS,
+        git_meta, git_worktree_dirty, read_model_response_bounded, run_captured, run_captured_to,
+        run_captured_with_transport, run_internal_agent_child, run_internal_model_request,
+        terminal_safe_inline_text, terminal_safe_message, terminal_safe_text, AgentChildReadiness,
+        AgentChildTransport, AgentProtocolConfigError, CapturedExecution, AGENT_CHILD_COMMAND_ENV,
+        AGENT_CHILD_READY, MAX_AGENT_CHILD_CWD_BYTES, MAX_AGENT_CHILD_CWD_FRAME_BYTES,
+        MAX_AGENT_COMMAND_DISPLAY_BYTES, MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_RESPONSE_BYTES,
+        MAX_AGENT_SESSION_TURNS,
     };
     use super::{decode_model_request, encode_model_request};
     use crate::environment::ShellState;
@@ -2487,6 +2499,21 @@ mod tests {
     }
 
     #[test]
+    fn decoded_model_response_has_an_outer_allocation_bound() {
+        let exact = vec![b'x'; MAX_AGENT_RESPONSE_BYTES as usize];
+        assert_eq!(
+            read_model_response_bounded(std::io::Cursor::new(exact))
+                .unwrap()
+                .len(),
+            MAX_AGENT_RESPONSE_BYTES as usize
+        );
+
+        let expanded = vec![b'x'; MAX_AGENT_RESPONSE_BYTES as usize + 1];
+        let error = read_model_response_bounded(std::io::Cursor::new(expanded)).unwrap_err();
+        assert!(error.contains("decoded limit"), "{error}");
+    }
+
+    #[test]
     fn a_malformed_envelope_is_refused_rather_than_guessed() {
         // The envelope carries a URL and an API key into a request this process
         // is about to make. Every field is required; none is defaulted.
@@ -2500,6 +2527,13 @@ mod tests {
             r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":1}"#,
             r#"{"v":1,"provider":"ollama","url":"http://x","headers":[["only-one"]],"body":"{}"}"#,
             r#"{"v":1,"provider":"ollama","url":"http://x","headers":[[1,2]],"body":"{}"}"#,
+            r#"{"v":1,"v":1,"provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"headers":[],"body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":"{}","body":"{}"}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":"{}","future":true}"#,
+            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":"{}"} trailing"#,
         ] {
             assert!(
                 decode_model_request(envelope).is_err(),

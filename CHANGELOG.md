@@ -2,10 +2,20 @@
 
 ## Unreleased
 
-- The jagent revision is exact-pinned at `2570e5e`. Agent request bodies now
-  reject duplicate top-level JSON members at the final transport boundary, and
-  complete/streaming response and action decoding rejects duplicate object
-  members recursively before anything can become a proposal.
+- The jagent revision is exact-pinned at `a462ec8`. Ordinary editor AI replies
+  now remain bounded raw bytes until jagent's canonical response decoder, so a
+  recursive duplicate member cannot be erased by `serde_json::Value` and turn
+  into an executable last-wins suggestion. Agent request bodies reject
+  duplicate JSON members recursively at the final transport boundary, while
+  complete/streaming response and action decoding rejects duplicates
+  recursively before anything can become a proposal. The independently
+  invokable model-transport child also decodes its private envelope directly
+  into a strict typed schema, rejecting duplicate or unknown outer fields
+  before DNS or a socket. Ordinary and Agent response limits are enforced again
+  after content decoding, preventing a small compressed body from expanding
+  into an unbounded JSON allocation or child-process String. Feature-unified
+  serde_json RawValue sentinel
+  members are rejected before they can trigger a second unchecked JSON parse.
 - Assignment-only commands now preserve the exit status of their last command
   substitution. `out=$(false)` therefore returns 1, fires an `ERR` trap, and
   obeys `set -e` instead of silently reporting success. Command-substitution

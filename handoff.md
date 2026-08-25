@@ -80,20 +80,27 @@ described below.
   nonzero status, rightmost-substitution precedence, both child termination
   paths, default and opt-in inheritance, explicit inner traps, outer `ERR`, and
   outer errexit.
-- The jagent pin advances to `2570e5e` and both ordinary AI and Agent traffic
+- The jagent pin advances to `a462ec8` and both ordinary AI and Agent traffic
   adopt its full `HttpRequest::validate_transport` postcondition. The hidden
   model child revalidates its decoded public request immediately before
   constructing an HTTP client, so duplicate/non-canonical headers,
-  duplicate top-level body members, non-object/oversized bodies, remote
+  duplicate body members recursively, non-object/oversized bodies, remote
   cleartext origins, and port zero never reach DNS or a socket. The new shared
   raw-JSON preflight also rejects recursive duplicate members across complete
   responses, stream deltas, JSON-in-text actions, and native-tool arguments
-  before session ingestion. Unknown provider values are classified without
-  being echoed. Loopback HTTP policy is now provider-neutral, matching jagent
-  and jterm_core for local OpenAI-compatible and Anthropic proxies as well as
-  Ollama. Both ureq clients force these validated clear-text loopback requests
-  to connect directly rather than forwarding credentials through an inherited
-  `*_PROXY`; HTTPS retains the user's proxy configuration.
+  before session ingestion. Ordinary editor AI now carries bounded response
+  bytes directly into that preflight instead of first decoding a last-wins
+  `serde_json::Value`. The independently invokable hidden transport also
+  decodes its private outer envelope into a deny-unknown-fields typed schema,
+  rejecting duplicate or unknown fields before DNS or a socket. Unknown
+  provider values are classified without being echoed. Loopback HTTP policy is
+  now provider-neutral, matching jagent and jterm_core for local
+  OpenAI-compatible and Anthropic proxies as well as Ollama. Both ureq clients
+  force these validated clear-text loopback requests to connect directly
+  rather than forwarding credentials through an inherited `*_PROXY`; HTTPS
+  retains the user's proxy configuration. The shared preflight also rejects
+  serde_json's private RawValue sentinel before a feature-unified Value decoder
+  could reinterpret its string as a second, unchecked JSON document.
 - The public execution-journal v1 bounds now include execution/session id
   ceilings, and a frozen jterm_core output-event fixture is folded by jsh's
   own reader. Its twin core fixture covers start/finish/output, multiline
@@ -257,6 +264,9 @@ described below.
   to wait for. The child is this same binary, so TLS verification, the
   zero-redirect policy, the response header caps and the body ceiling are the
   unchanged code in `perform_model_request`; only where it runs moved. The
+  ceiling now wraps the transparently decoded body reader (currently gzip) as
+  well as ureq's lower wire reader, so compressed responses cannot expand into
+  an unbounded child String. The
   envelope travels on stdin — never argv — because it carries the API key, and
   it is jsh's own versioned JSON rather than serde on jagent's types.
 - `io_guard::bounded_command_session` generalises `bounded_command_output` with a
@@ -322,9 +332,11 @@ described below.
   cache's permissions and symlink safety. It also injects a failed installed-
   binary self-check to verify both atomic rollback and the truthful fallback
   when the rollback rename itself fails.
-- `post_json` enforces explicit response-header count and cumulative-byte limits
-  before reading a body. The body cap already existed; headers are parsed and
-  retained before it applies.
+- `post_chat_response` enforces explicit response-header count and
+  cumulative-byte limits before reading a body. The body cap is applied both
+  below ureq's content decoder and to the decoded reader, so compressed input
+  cannot expand past the jagent JSON envelope ceiling; headers are parsed and
+  retained before either body limit applies.
 
 ## Remaining boundaries
 
@@ -336,12 +348,11 @@ manifest, verified against a key pinned in the installer, is the missing half.
 That needs a release-side signing decision, so it is deliberately not
 approximated here.
 
-After changing either canonical script, synchronize and test every vendored jterm
-copy. `jterm_core/scripts/install-jsh.sh` and `forge/scripts/install-jsh.sh`
-carry `install-jsh.sh`; `jterm_core/scripts/jsh-remote.sh` carries the launcher.
-All three vendor bodies match script revision
-`fd605616b56bd73265a3a6141c814938aa2859f9`; each differs from its canonical
-copy only by a four-line provenance header.
+After changing either canonical script, synchronize and test every vendored
+jterm copy. `jterm_core/scripts/install-jsh.sh` carries `install-jsh.sh`, and
+`jterm_core/scripts/jsh-remote.sh` carries the launcher. Both vendor bodies
+match script revision `fd605616b56bd73265a3a6141c814938aa2859f9`; each differs
+from its canonical copy only by a four-line provenance header.
 
 ## Release checks
 

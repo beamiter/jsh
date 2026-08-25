@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use jagent::provider::MAX_REQUEST_JSON_BYTES;
 
 const FLAG: &str = "--jsh-internal-model-request";
@@ -146,6 +148,16 @@ fn assert_rejected_before_network(
     expected_error: &str,
     build_envelope: impl FnOnce(std::net::SocketAddr) -> serde_json::Value,
 ) -> Vec<u8> {
+    assert_raw_envelope_rejected_before_network(label, expected_error, |address| {
+        build_envelope(address).to_string()
+    })
+}
+
+fn assert_raw_envelope_rejected_before_network(
+    label: &str,
+    expected_error: &str,
+    build_envelope: impl FnOnce(std::net::SocketAddr) -> String,
+) -> Vec<u8> {
     let listener = TcpListener::bind("0.0.0.0:0").expect("bind provider probe");
     listener
         .set_nonblocking(true)
@@ -176,7 +188,7 @@ fn assert_rejected_before_network(
         })
     };
 
-    let envelope = build_envelope(address).to_string();
+    let envelope = build_envelope(address);
     let output = spawn_transport(&envelope)
         .wait_with_output()
         .expect("await rejected transport child");
@@ -195,6 +207,20 @@ fn assert_rejected_before_network(
         "invalid transport reached the network: {label}"
     );
     output.stdout
+}
+
+#[test]
+fn duplicate_outer_envelope_members_are_rejected_before_network() {
+    assert_raw_envelope_rejected_before_network(
+        "duplicate outer URL",
+        "malformed request",
+        |address| {
+            let url = format!("http://127.0.0.1:{}", address.port());
+            format!(
+                r#"{{"v":1,"provider":"ollama","url":"{url}","url":"{url}","headers":[["content-type","application/json"]],"body":"{{}}"}}"#
+            )
+        },
+    );
 }
 
 #[test]
@@ -247,6 +273,48 @@ fn the_transport_child_performs_the_request_and_frames_its_answer() {
     assert_eq!(stdout.first(), Some(&b'+'), "stdout={stdout:?}");
     assert_eq!(&stdout[1..], b"nonsense");
     assert!(status.success());
+}
+
+#[test]
+fn compressed_response_is_bounded_after_content_decoding() {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder
+        .write_all(&vec![b'x'; 1024 * 1024 + 1])
+        .expect("compress expanded response");
+    let compressed = encoder.finish().expect("finish compressed response");
+    assert!(compressed.len() < 64 * 1024, "fixture is not compressible");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
+    let address = listener.local_addr().expect("provider address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let _ = read_http_head(&mut stream);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            compressed.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .expect("write response head");
+        stream
+            .write_all(&compressed)
+            .expect("write compressed response");
+        stream.flush().expect("flush compressed response");
+    });
+
+    let output = spawn_transport(&envelope(&format!("http://{address}")))
+        .wait_with_output()
+        .expect("await bounded transport child");
+    server.join().expect("provider server");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout.first(), Some(&b'-'));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("decoded limit"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stdout.len() < 1024, "oversized reply escaped child");
 }
 
 #[test]

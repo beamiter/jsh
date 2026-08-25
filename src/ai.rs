@@ -25,17 +25,21 @@ use std::sync::mpsc;
 use std::thread;
 
 #[cfg(feature = "ai")]
+use std::io::Read;
+
+#[cfg(feature = "ai")]
 use jagent::prompt::{agent_user_prompt_tagged, BlockContext, EnvironmentMeta};
 #[cfg(feature = "ai")]
 use jagent::provider::{
-    bound_history_with, build_chat_request_with_report, parse_chat_response_full, BuiltRequest,
-    ChatConfig, ChatResponse, HttpRequest, Message, Provider, ProviderError, Role,
-    MAX_MODEL_BYTES as MAX_AI_MODEL_BYTES, MAX_MODEL_TEXT_BYTES,
-    MAX_REQUEST_HEADERS as MAX_AI_HEADERS, MAX_REQUEST_SYSTEM_BYTES,
+    bound_history_with, build_chat_request_with_report, parse_chat_response_full_bytes,
+    BuiltRequest, ChatConfig, ChatResponse, HttpRequest, Message, Provider, ProviderError, Role,
+    MAX_MODEL_BYTES as MAX_AI_MODEL_BYTES, MAX_REQUEST_HEADERS as MAX_AI_HEADERS,
+    MAX_REQUEST_SYSTEM_BYTES,
 };
 #[cfg(all(feature = "ai", test))]
 use jagent::provider::{
     MAX_API_KEY_BYTES as MAX_AI_API_KEY_BYTES, MAX_BASE_URL_BYTES as MAX_AI_BASE_URL_BYTES,
+    MAX_MODEL_TEXT_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,7 +273,7 @@ const MAX_AI_ERROR_BYTES: usize = 16 * 1024;
 #[cfg(feature = "ai")]
 const MAX_AI_HEADER_BYTES: usize = 32 * 1024;
 #[cfg(feature = "ai")]
-const MAX_AI_RESPONSE_BODY_BYTES: u64 = 1024 * 1024;
+const MAX_AI_RESPONSE_BODY_BYTES: u64 = jagent::provider::MAX_RESPONSE_JSON_BYTES as u64;
 /// Response *headers* are read into memory before any body limit applies, so
 /// they need bounds of their own. A provider answers with a couple of dozen
 /// short headers; a hostile or broken endpoint can answer with thousands.
@@ -904,73 +908,16 @@ fn validate_outbound_request(request: &HttpRequest) -> Result<(), ProviderError>
     Ok(())
 }
 
-/// Parse one provider response after enforcing the cumulative assistant-text
-/// budget before jagent's pinned parser joins block arrays. The pinned parser
-/// checks the final string, but its older join path can allocate the complete
-/// aggregate first; this preflight mirrors jagent's current bounded join.
+/// Parse one provider response through jagent's canonical encoded-envelope
+/// boundary. Keeping the network bytes intact until this call is important:
+/// decoding to `serde_json::Value` first would erase duplicate object members
+/// before jagent can reject the ambiguous response.
 #[cfg(feature = "ai")]
 pub(crate) fn parse_bounded_chat_response(
     provider: Provider,
-    response: &serde_json::Value,
+    response: &[u8],
 ) -> Result<ChatResponse, ProviderError> {
-    let mut total = 0usize;
-    let mut parts = 0usize;
-    let mut account = |text: &str| -> Result<(), ProviderError> {
-        let separator = usize::from(parts > 0);
-        total = total
-            .checked_add(separator)
-            .and_then(|value| value.checked_add(text.len()))
-            .ok_or(ProviderError::ResponseTooLarge {
-                limit: MAX_MODEL_TEXT_BYTES,
-            })?;
-        if total > MAX_MODEL_TEXT_BYTES {
-            return Err(ProviderError::ResponseTooLarge {
-                limit: MAX_MODEL_TEXT_BYTES,
-            });
-        }
-        parts += 1;
-        Ok(())
-    };
-
-    match provider {
-        Provider::Anthropic => {
-            if let Some(blocks) = response
-                .get("content")
-                .and_then(serde_json::Value::as_array)
-            {
-                for block in blocks {
-                    if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
-                        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
-                            account(text)?;
-                        }
-                    }
-                }
-            }
-        }
-        Provider::OpenAiCompatible => {
-            if let Some(content) = response.pointer("/choices/0/message/content") {
-                if let Some(text) = content.as_str() {
-                    account(text)?;
-                } else if let Some(blocks) = content.as_array() {
-                    for block in blocks {
-                        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
-                            account(text)?;
-                        }
-                    }
-                }
-            }
-        }
-        Provider::Ollama => {
-            if let Some(text) = response
-                .pointer("/message/content")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| response.get("response").and_then(serde_json::Value::as_str))
-            {
-                account(text)?;
-            }
-        }
-    }
-    parse_chat_response_full(provider, response)
+    parse_chat_response_full_bytes(provider, response)
 }
 
 #[cfg(feature = "ai")]
@@ -994,11 +941,7 @@ fn process_request(config: &AiConfig, request: &AiRequest) -> AiResponse {
         Err(error) => return ai_error_response(request.request_id, error),
     };
 
-    let json = match post_json(&http) {
-        Ok(json) => json,
-        Err(error) => return ai_error_response(request.request_id, error),
-    };
-    let parsed = match parse_bounded_chat_response(chat.provider, &json) {
+    let parsed = match post_chat_response(&http, chat.provider) {
         Ok(parsed) => parsed,
         Err(error) => return ai_error_response(request.request_id, error),
     };
@@ -1081,7 +1024,7 @@ fn ai_agent(bypass_environment_proxy: bool) -> ureq::Agent {
 }
 
 #[cfg(feature = "ai")]
-fn post_json(request: &HttpRequest) -> Result<serde_json::Value, String> {
+fn post_chat_response(request: &HttpRequest, provider: Provider) -> Result<ChatResponse, String> {
     // This is the final boundary before an HTTP client sees the public,
     // mutable request value. Keep the same postcondition as the Agent child
     // transport even if a future caller bypasses the normal builder funnel.
@@ -1097,25 +1040,54 @@ fn post_json(request: &HttpRequest) -> Result<serde_json::Value, String> {
         .map_err(|error| format!("Request failed: {error}"))?;
     let status = response.status();
     response_headers_within_limits(response.headers())?;
-    let text = response
+    // ureq's configured limit sits below its content decoder. Keep that wire
+    // bound, then apply our own outer reader cap to the decoded bytes so a
+    // small transparently decoded body (currently gzip) cannot expand into an
+    // unbounded allocation.
+    let decoded = response
         .body_mut()
         .with_config()
         .limit(MAX_AI_RESPONSE_BODY_BYTES)
-        .read_to_string()
-        .map_err(|error| format!("Read error: {error}"))?;
-    let json = match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(json) => json,
-        // Never echo the raw body: it is unvalidated bytes from the network.
-        Err(error) if status.is_success() => return Err(format!("Parse error: {error}")),
-        Err(_) => return Err(format!("HTTP {}", status.as_u16())),
-    };
-    if let Some(message) = provider_error_message(&json) {
-        return Err(message.to_string());
+        .reader();
+    let body = read_response_body_bounded(decoded)?;
+
+    // This must be the first JSON decoder to observe a successful response.
+    // Besides the encoded and joined-text budgets, jagent's byte entry point
+    // rejects duplicate members recursively before retaining a Value.
+    let parsed = parse_bounded_chat_response(provider, &body);
+
+    // Preserve the provider-error precedence of the old transport even for a
+    // mixed envelope that also contains apparently usable assistant text.
+    // A successful canonical parse has already proved the bytes unambiguous;
+    // on any parser error, run the same public structural preflight before a
+    // Value decoder is allowed to inspect the error member. Duplicate bytes
+    // therefore never reach serde_json's last-member-wins representation.
+    if parsed.is_ok() || jagent::validate_no_duplicate_members(&body).is_ok() {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(message) = provider_error_message(&json) {
+                return Err(message.to_string());
+            }
+        }
     }
     if !status.is_success() {
         return Err(format!("HTTP {}", status.as_u16()));
     }
-    Ok(json)
+    parsed.map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "ai")]
+fn read_response_body_bounded(reader: impl Read) -> Result<Vec<u8>, String> {
+    let mut reader = reader.take(MAX_AI_RESPONSE_BODY_BYTES + 1);
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|error| format!("Read error: {error}"))?;
+    if body.len() as u64 > MAX_AI_RESPONSE_BODY_BYTES {
+        return Err(format!(
+            "Response body exceeds the {MAX_AI_RESPONSE_BODY_BYTES}-byte decoded limit"
+        ));
+    }
+    Ok(body)
 }
 
 /// Refuse a response whose headers alone are unreasonable.
@@ -1527,6 +1499,7 @@ mod ai_tests {
                 {"type": "text", "text": half},
             ]
         });
+        let response = serde_json::to_vec(&response).unwrap();
         assert!(matches!(
             parse_bounded_chat_response(Provider::Anthropic, &response),
             Err(ProviderError::ResponseTooLarge {
@@ -1623,6 +1596,21 @@ mod ai_tests {
         assert!(response_headers_within_limits(&too_large)
             .unwrap_err()
             .contains("exceed the"));
+    }
+
+    #[test]
+    fn decoded_response_body_has_an_outer_allocation_bound() {
+        let exact = vec![b'x'; MAX_AI_RESPONSE_BODY_BYTES as usize];
+        assert_eq!(
+            read_response_body_bounded(std::io::Cursor::new(exact))
+                .unwrap()
+                .len(),
+            MAX_AI_RESPONSE_BODY_BYTES as usize
+        );
+
+        let expanded = vec![b'x'; MAX_AI_RESPONSE_BODY_BYTES as usize + 1];
+        let error = read_response_body_bounded(std::io::Cursor::new(expanded)).unwrap_err();
+        assert!(error.contains("decoded limit"), "{error}");
     }
 
     #[test]
@@ -1991,6 +1979,8 @@ mod ai_tests {
         let legacy = format!("build_chat{}request(", '_');
         let agent_prepare = format!("prepare_agent{}request(", '_');
         let agent_spec = format!("AgentRequestSpec::{}(", "new");
+        let byte_response = format!("parse_chat_response_full{}(", "_bytes");
+        let decoded_response = format!("parse_chat_response{}(", "_full");
         assert_eq!(
             include_str!("ai.rs").matches(reported.as_str()).count(),
             1,
@@ -2024,6 +2014,20 @@ mod ai_tests {
                 .count(),
             1,
             "agent.rs must bind every request to an explicit Agent protocol"
+        );
+        assert_eq!(
+            include_str!("ai.rs")
+                .matches(byte_response.as_str())
+                .count(),
+            1,
+            "ordinary chat must parse exactly once through jagent's raw-byte response boundary"
+        );
+        assert_eq!(
+            include_str!("ai.rs")
+                .matches(decoded_response.as_str())
+                .count(),
+            0,
+            "ordinary chat must not erase duplicate response members in a decoded Value"
         );
     }
 
@@ -2059,7 +2063,8 @@ mod ai_tests {
             ),
         ];
         for (provider, body) in bodies {
-            let text = parse_chat_response_full(provider, &body).unwrap().text;
+            let body = serde_json::to_vec(&body).unwrap();
+            let text = parse_bounded_chat_response(provider, &body).unwrap().text;
             assert!(
                 validate_suggestion(&text).is_err(),
                 "{provider:?} let the escape sequence through"
@@ -2082,7 +2087,8 @@ mod ai_tests {
             ),
         ];
         for (provider, body) in clean {
-            let text = parse_chat_response_full(provider, &body).unwrap().text;
+            let body = serde_json::to_vec(&body).unwrap();
+            let text = parse_bounded_chat_response(provider, &body).unwrap().text;
             assert_eq!(validate_suggestion(&text).unwrap(), "ls -la");
         }
     }

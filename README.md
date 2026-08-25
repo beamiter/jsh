@@ -508,9 +508,15 @@ supports both and replies in the decoded peer's schema version.
 Before either the ordinary AI client or the independently invokable hidden
 Agent transport child touches DNS or an HTTP socket, it revalidates the decoded
 public request's origin, canonical unique headers, JSON-object body, and byte
-ceilings, including unique top-level body members. Malformed child envelopes
+ceilings, including unique body members at every depth. Malformed child envelopes
 and unknown provider names are rejected without echoing caller-controlled
-values.
+values; duplicate or unknown outer envelope fields are rejected as well.
+Successful ordinary editor AI replies remain bounded raw bytes until jagent's
+canonical decoder has rejected recursive duplicate members, so an ambiguous
+last-wins value can never become a suggestion. Both ordinary and Agent
+provider responses are capped again after transparent content decoding
+(currently gzip), so compressed input cannot expand beyond the same
+encoded-envelope ceiling in memory.
 
 The agent keeps its own working directory: an approved `cd` carries into the
 following turns (shown as `cwd → …`), while the interactive shell's cwd is

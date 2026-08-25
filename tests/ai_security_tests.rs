@@ -152,6 +152,92 @@ fn a_clean_fenced_reply_still_becomes_a_single_line_suggestion() {
 }
 
 #[test]
+fn duplicate_model_response_members_fail_closed_before_a_suggestion() {
+    // `serde_json::Value` keeps the last repeated member. If the transport
+    // decodes before jagent's raw-response preflight, these ambiguous bytes
+    // become an apparently ordinary executable suggestion.
+    let (_, response) = round_trip(r#"{"message":{"content":"echo FIRST","content":"echo LAST"}}"#);
+    match response {
+        AiResponse::Error {
+            request_id,
+            message,
+        } => {
+            assert_eq!(request_id, 37);
+            assert!(
+                message.contains("duplicate JSON object member"),
+                "{message}"
+            );
+            assert!(!message.contains("echo FIRST"), "{message}");
+            assert!(!message.contains("echo LAST"), "{message}");
+        }
+        AiResponse::Suggestion { command, .. } => {
+            panic!("ambiguous model response became a suggestion: {command:?}")
+        }
+        AiResponse::Explanation { explanation, .. } => {
+            panic!("generation returned an explanation: {explanation:?}")
+        }
+    }
+}
+
+#[test]
+fn raw_value_feature_cannot_reinterpret_an_ambiguous_model_response() {
+    // Keep serde_json's raw_value feature active in this test graph. Without
+    // jagent's encoded-byte preflight, its private sentinel could make a later
+    // Value decode reinterpret the embedded duplicate-member document.
+    let feature_probe =
+        serde_json::value::RawValue::from_string("null".to_string()).expect("raw value feature");
+    assert_eq!(feature_probe.get(), "null");
+
+    let (_, response) = round_trip(
+        r#"{"$serde_json::private::RawValue":"{\"message\":{\"content\":\"echo FIRST\",\"content\":\"echo LAST\"}}"}"#,
+    );
+    match response {
+        AiResponse::Error {
+            request_id,
+            message,
+        } => {
+            assert_eq!(request_id, 37);
+            assert!(message.contains("reserved JSON object member"), "{message}");
+            assert!(!message.contains("RawValue"), "{message}");
+            assert!(!message.contains("echo FIRST"), "{message}");
+            assert!(!message.contains("echo LAST"), "{message}");
+        }
+        AiResponse::Suggestion { command, .. } => {
+            panic!("reserved raw-value response became a suggestion: {command:?}")
+        }
+        AiResponse::Explanation { explanation, .. } => {
+            panic!("reserved raw-value response became an explanation: {explanation:?}")
+        }
+    }
+}
+
+#[test]
+fn provider_error_wins_over_mixed_success_content() {
+    // Providers occasionally return an error object alongside a partially
+    // populated success shape. Preserve the historical error-first behavior:
+    // the assistant text must not become a command merely because jagent can
+    // decode it as a response.
+    let (_, response) =
+        round_trip(r#"{"error":"quota exhausted","message":{"content":"echo MUST_NOT_SURFACE"}}"#);
+    match response {
+        AiResponse::Error {
+            request_id,
+            message,
+        } => {
+            assert_eq!(request_id, 37);
+            assert!(message.contains("quota exhausted"), "{message}");
+            assert!(!message.contains("MUST_NOT_SURFACE"), "{message}");
+        }
+        AiResponse::Suggestion { command, .. } => {
+            panic!("mixed provider error became a suggestion: {command:?}")
+        }
+        AiResponse::Explanation { explanation, .. } => {
+            panic!("mixed provider error became an explanation: {explanation:?}")
+        }
+    }
+}
+
+#[test]
 fn untrusted_shell_context_stays_out_of_the_system_role() {
     let (body, _) = round_trip(r#"{"message":{"content":"ls"}}"#);
     let sent: serde_json::Value = serde_json::from_str(&body).expect("request body is JSON");
