@@ -443,6 +443,36 @@ fn encode_agent_child_cwd_frame(
     Ok(frame)
 }
 
+/// Close every inherited descriptor outside the protocol set. The process
+/// that launched the one-shot child may hold arbitrary non-CLOEXEC
+/// descriptors (an inotify instance, a session socket, a stray log pipe) that
+/// its own CLOEXEC discipline never covered; without this scrub they would be
+/// inherited by the approved external command, leaking host capabilities the
+/// Agent protocol is designed to withhold. Everything the child opens after
+/// this point is CLOEXEC by Rust's default, so approved commands stay clean.
+/// Failures are ignored on purpose: a descriptor that cannot be queried or
+/// closed here was either never inherited or is already gone, and the
+/// protocol descriptors themselves are validated before any use regardless.
+fn close_inherited_descriptors_except(keep: &[i32]) {
+    // Collect first: the directory iterator itself holds a descriptor into
+    // /proc/self/fd, and closing it mid-iteration would truncate the scan.
+    let inherited: Vec<i32> = match std::fs::read_dir("/proc/self/fd") {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+            .collect(),
+        // No procfs means no way to enumerate; the CLOEXEC discipline above
+        // still covers every descriptor jsh itself creates.
+        Err(_) => return,
+    };
+    for descriptor in inherited {
+        if descriptor <= nix::libc::STDERR_FILENO || keep.contains(&descriptor) {
+            continue;
+        }
+        unsafe { nix::libc::close(descriptor) };
+    }
+}
+
 fn decode_agent_child_cwd_frame(
     frame: &[u8],
     expected_nonce: &[u8; AGENT_CHILD_CWD_NONCE_BYTES],
@@ -1583,6 +1613,7 @@ fn run_internal_agent_child(command: &str) -> i32 {
             return 2;
         }
     };
+    close_inherited_descriptors_except(&[control.0.as_raw_fd(), cwd_report.descriptor]);
     let Some(state_dir) = std::env::var_os(AGENT_CHILD_STATE_DIR_ENV).map(PathBuf::from) else {
         eprintln!("jsh: internal Agent child is missing its state directory");
         return 2;
