@@ -60,6 +60,24 @@ jobs:
       - name: Clippy without default features
         run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
 
+  supply-chain:
+    # Added after jsh was found shipping serde_yaml 0.9.34+deprecated: an
+    # abandoned crate with no successor release, so Dependabot had nothing to
+    # bump it to and no other job here ever looked at an advisory. Without this
+    # step an unpatchable dependency can sit in the tree indefinitely with every
+    # check green. Policy and its reasoning live in deny.toml.
+    name: Supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check advisories, banned crates, and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources
+
   test-default:
     name: Tests (AI enabled)
     runs-on: ubuntu-latest

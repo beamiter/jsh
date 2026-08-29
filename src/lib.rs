@@ -45,5 +45,6 @@ pub mod suggest;
 mod terminal_text;
 pub mod value;
 pub mod value_builtins;
+pub mod wire_json;
 pub mod workflows;
 pub mod zjump;

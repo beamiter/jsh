@@ -16,7 +16,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use jsh::ai::{AiConfig, AiContext, AiProvider, AiRequest, AiRequestKind, AiResponse, AiWorker};
+use jsh::ai::{
+    AiConfig, AiContext, AiProvider, AiRequest, AiRequestKind, AiResponse, AiTransport, AiWorker,
+};
 
 /// Serve exactly one request, returning the raw body jsh sent.
 fn serve_once(reply_json: &'static str) -> (String, mpsc::Receiver<String>) {
@@ -91,13 +93,21 @@ fn hostile_context() -> AiContext {
 
 fn round_trip(reply_json: &'static str) -> (String, AiResponse) {
     let (base_url, body_rx) = serve_once(reply_json);
-    let worker = AiWorker::new(config(base_url));
-    worker.request(AiRequest {
-        request_id: 37,
-        kind: AiRequestKind::Generate,
-        prompt: "retry the migration".to_string(),
-        context: hostile_context(),
-    });
+    // These guards are about what jsh *says* — the prompt it builds, the bytes
+    // it redacts, the reply it refuses to hand the line buffer — so they need
+    // the reply value in this process. The shipping transport performs the
+    // request in a `jsh --jsh-internal-model-request` child, which this libtest
+    // binary cannot be; the process boundary itself is covered end to end in
+    // `tests/model_transport_tests.rs` against the real `jsh` executable.
+    let worker = AiWorker::with_transport(config(base_url), AiTransport::InProcessForTests);
+    worker
+        .request(AiRequest {
+            request_id: 37,
+            kind: AiRequestKind::Generate,
+            prompt: "retry the migration".to_string(),
+            context: hostile_context(),
+        })
+        .expect("the worker accepted the request");
     let response = worker
         .rx
         .recv_timeout(Duration::from_secs(20))

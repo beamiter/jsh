@@ -252,16 +252,33 @@ described below.
   than the feature being missing — and says so once per helper per process,
   because resolution happens from a prompt callback and a notification thread.
 
-- Model requests are cancellable rather than merely abandonable. A blocking ureq
-  read cannot be interrupted in place, so running it on a worker thread only ever
-  achieved half the job: INT released the foreground, but the request stayed
-  connected and billed — and held the single-flight slot — until the provider's
-  120-second read timeout, refusing every request in that window with "a previous
-  model request is still shutting down". The request now runs in a child process
-  (`--jsh-internal-model-request`, dispatched from `internal_child_entrypoint`
-  before any startup work), and cancelling it kills the process group. The
-  in-flight gate is gone entirely because there is no longer a previous request
-  to wait for. The child is this same binary, so TLS verification, the
+- Model requests are cancellable rather than merely abandonable, on **both** AI
+  lanes. A blocking ureq read cannot be interrupted in place, so running it on a
+  worker thread only ever achieved half the job: INT released the foreground, but
+  the request stayed connected and billed — and held the single-flight slot —
+  until the provider's read timeout, refusing every request in that window with
+  "a previous model request is still shutting down". The request now runs in a
+  child process (`--jsh-internal-model-request`, dispatched from
+  `internal_child_entrypoint` before any startup work), and cancelling it kills
+  the process group. The in-flight gate is gone entirely because there is no
+  longer a previous request to wait for.
+
+  The editor's everyday AI — `#`+Enter, Ctrl-F, Alt-E — goes through the same
+  child. It used to be the counterexample: `AiWorker` ran ureq on the
+  `jsh-ai-worker` thread and `Editor::invalidate_ai_request` only dropped the
+  reply, so Ctrl-C restored the prompt while the request stayed connected for up
+  to 30 s and, with both worker channels holding exactly one item, the next AI
+  keypress could do nothing at all with nothing shown. `AiCancellation` is the
+  editor's half: a shared high-water mark of the last request id the editor gave
+  up on, so cancelling is race-free against a request that is still queued, and
+  the worker polls it as the transport's cancel predicate. A submission the
+  worker refuses now reports *why* — a busy slot and a dead worker read
+  differently — instead of returning a bare `false`. The envelope carries a
+  `lane`, because the two lanes do not share their budgets: the Agent waits
+  minutes for a megabyte, the editor 30 s with response-header caps, and the
+  child answers with the provider's status plus its untouched body so each
+  lane's parent applies its own precedence (the editor reports the provider's
+  own error member; the Agent discards a non-2xx body unseen). The child is this same binary, so TLS verification, the
   zero-redirect policy, the response header caps and the body ceiling are the
   unchanged code in `perform_model_request`; only where it runs moved. The
   ceiling now wraps the transparently decoded body reader (currently gzip) as
@@ -269,6 +286,19 @@ described below.
   an unbounded child String. The
   envelope travels on stdin — never argv — because it carries the API key, and
   it is jsh's own versioned JSON rather than serde on jagent's types.
+- Agent `[i] insert` applies jsh's own exact-review gate before a proposal can
+  reach the prompt. `[y]` re-scans the approved command and demands the literal
+  word RUN; `[e]` re-checks what the user retyped; `[i]` had neither, yet it is
+  the branch whose result lands in the line buffer as ordinary typed input that
+  one Enter executes. jagent's `validate_command` is not that gate: its
+  invisible-character table is deliberately a subset of jsh's, stopping at
+  U+FFF8 and keeping the assigned interlinear annotation anchors U+FFF9..=U+FFFB
+  that a terminal still renders as nothing — so a proposal could be displayed as
+  a visible `\u{fff9}` escape and then executed spelled as nothing at all.
+  `review_proposal` now refuses such a command before the session moves to
+  ManualReview, and `Editor::take_editor_prefill` enforces the same rule at the
+  seam itself, so the invariant belongs to the boundary rather than to its
+  current only producer.
 - `io_guard::bounded_command_session` generalises `bounded_command_output` with a
   stdin payload, a cancellation predicate polled every ≤100 ms, and an opt-in
   `PR_SET_PDEATHSIG`. The payload is written from a helper thread that is always

@@ -813,8 +813,8 @@ fn vb_from_yaml(
             return Err(1);
         }
     };
-    // serde_yaml deserializes into serde_json::Value first (lossy-typed but JSON-compatible).
-    let yval: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|e| {
+    // serde_yaml_ng deserializes into serde_json::Value first (lossy-typed but JSON-compatible).
+    let yval: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&bytes).map_err(|e| {
         eprintln!("from-yaml: {}", e);
         1
     })?;
@@ -838,7 +838,7 @@ fn vb_to_yaml(
     } else {
         Value::List(vs).to_json()
     };
-    let s = serde_yaml::to_string(&jval).map_err(|e| {
+    let s = serde_yaml_ng::to_string(&jval).map_err(|e| {
         eprintln!("to-yaml: {}", e);
         1
     })?;
@@ -1058,8 +1058,8 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn yaml_to_json(y: serde_yaml::Value) -> serde_json::Value {
-    use serde_yaml::Value as Y;
+fn yaml_to_json(y: serde_yaml_ng::Value) -> serde_json::Value {
+    use serde_yaml_ng::Value as Y;
     match y {
         Y::Null => serde_json::Value::Null,
         Y::Bool(b) => serde_json::Value::Bool(b),
@@ -1081,7 +1081,7 @@ fn yaml_to_json(y: serde_yaml::Value) -> serde_json::Value {
             for (k, v) in map {
                 let key = match k {
                     Y::String(s) => s,
-                    other => serde_yaml::to_string(&other)
+                    other => serde_yaml_ng::to_string(&other)
                         .unwrap_or_default()
                         .trim()
                         .to_string(),

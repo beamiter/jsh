@@ -25,10 +25,29 @@ use jagent::provider::MAX_REQUEST_JSON_BYTES;
 
 const FLAG: &str = "--jsh-internal-model-request";
 
+/// An envelope for the Agent lane, which is what most of these cases exercise.
 fn envelope(url: &str) -> String {
+    envelope_for("agent", url)
+}
+
+/// Both AI lanes run through this one child — that is what makes the editor's
+/// `#`/Ctrl-F/Alt-E requests cancellable instead of merely abandonable — and
+/// the lane is what selects its timeouts and response ceiling.
+fn envelope_for(lane: &str, url: &str) -> String {
     format!(
-        r#"{{"v":1,"provider":"ollama","url":"{url}","headers":[["content-type","application/json"]],"body":"{{}}"}}"#
+        r#"{{"v":2,"lane":"{lane}","provider":"ollama","url":"{url}","headers":[["content-type","application/json"]],"body":"{{}}"}}"#
     )
+}
+
+/// Split a successful reply into the provider status and the body behind it.
+fn framed_reply(stdout: &[u8]) -> (u16, &[u8]) {
+    assert_eq!(stdout.first(), Some(&b'+'), "stdout={stdout:?}");
+    assert!(stdout.len() >= 4, "stdout={stdout:?}");
+    let status = std::str::from_utf8(&stdout[1..4])
+        .expect("status digits")
+        .parse()
+        .expect("numeric status");
+    (status, &stdout[4..])
 }
 
 /// A child in its own process group, fed one request envelope on stdin.
@@ -217,7 +236,7 @@ fn duplicate_outer_envelope_members_are_rejected_before_network() {
         |address| {
             let url = format!("http://127.0.0.1:{}", address.port());
             format!(
-                r#"{{"v":1,"provider":"ollama","url":"{url}","url":"{url}","headers":[["content-type","application/json"]],"body":"{{}}"}}"#
+                r#"{{"v":2,"lane":"agent","provider":"ollama","url":"{url}","url":"{url}","headers":[["content-type","application/json"]],"body":"{{}}"}}"#
             )
         },
     );
@@ -270,8 +289,9 @@ fn the_transport_child_performs_the_request_and_frames_its_answer() {
     // belongs to the parent's PreparedAgentRequest, which still carries the
     // request's provider and Text/NativeTools selection; the transport must
     // not erase completion or tool-call metadata first.
-    assert_eq!(stdout.first(), Some(&b'+'), "stdout={stdout:?}");
-    assert_eq!(&stdout[1..], b"nonsense");
+    let (http_status, body) = framed_reply(&stdout);
+    assert_eq!(http_status, 200);
+    assert_eq!(body, b"nonsense");
     assert!(status.success());
 }
 
@@ -335,7 +355,8 @@ fn loopback_http_credentials_bypass_environment_proxies() {
 
     let secret = "Bearer direct-loopback-sentinel";
     let request = serde_json::json!({
-        "v": 1,
+        "v": 2,
+        "lane": "agent",
         "provider": "openai-compatible",
         "url": format!("http://{target_address}/v1/chat/completions"),
         "headers": [
@@ -353,7 +374,9 @@ fn loopback_http_credentials_bypass_environment_proxies() {
     let proxied = proxy_thread.join().expect("fake proxy thread");
 
     assert!(output.status.success(), "stdout={:?}", output.stdout);
-    assert_eq!(output.stdout, b"+{}");
+    let (status, body) = framed_reply(&output.stdout);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"{}");
     let direct =
         String::from_utf8_lossy(direct.as_deref().expect("direct provider was not reached"));
     assert!(direct.contains(secret), "direct request={direct:?}");
@@ -388,7 +411,8 @@ fn a_malformed_envelope_is_reported_without_touching_the_network() {
 fn decoded_public_requests_are_revalidated_before_the_hidden_child_touches_network() {
     let request = |address: std::net::SocketAddr| {
         serde_json::json!({
-            "v": 1,
+            "v": 2,
+            "lane": "agent",
             "provider": "ollama",
             "url": format!("http://127.0.0.1:{}", address.port()),
             "headers": [["content-type", "application/json"]],
@@ -457,7 +481,8 @@ fn unknown_provider_diagnostics_do_not_echo_the_untrusted_name() {
     let output =
         assert_rejected_before_network("unknown provider", "unknown provider", |address| {
             serde_json::json!({
-                "v": 1,
+                "v": 2,
+                "lane": "agent",
                 "provider": secret,
                 "url": format!("http://127.0.0.1:{}", address.port()),
                 "headers": [["content-type", "application/json"]],
@@ -600,5 +625,142 @@ fn killing_the_transport_ends_a_stalled_request_immediately() {
     assert!(
         elapsed < Duration::from_secs(5),
         "killing the transport took {elapsed:?}; it should be immediate"
+    );
+}
+
+/// The editor's `#`/Ctrl-F/Alt-E lane runs in this same child now. Before, it
+/// ran `ureq` directly on the `jsh-ai-worker` thread, where a blocking socket
+/// read cannot be interrupted: Ctrl-C restored the prompt and forgot the
+/// request while it stayed connected and billed for up to 30 s, and because
+/// both worker channels hold exactly one item, the next AI keypress inside that
+/// window did nothing at all.
+#[test]
+fn the_chat_lane_runs_in_the_same_killable_child_as_the_agent_lane() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
+    let address = listener.local_addr().expect("provider address");
+    let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        reached_tx
+            .send(String::from_utf8_lossy(&buffer[..read]).into_owned())
+            .expect("report request");
+        let body = r#"{"message":{"content":"ls -la"}}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = stream.flush();
+    });
+
+    let output = spawn_transport(&envelope_for("chat", &format!("http://{address}")))
+        .wait_with_output()
+        .expect("await chat transport child");
+    let request = reached_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the chat lane never reached the provider");
+    server.join().expect("provider thread");
+
+    assert!(request.starts_with("POST "), "request={request:?}");
+    let (status, body) = framed_reply(&output.stdout);
+    assert_eq!(status, 200);
+    // Untouched bytes: the editor lane's duplicate-member preflight and its
+    // redaction both live in the parent and need the provider's own encoding.
+    assert_eq!(body, br#"{"message":{"content":"ls -la"}}"#);
+    assert!(output.status.success());
+}
+
+/// The editor lane reports the provider's own error text ("insufficient quota")
+/// rather than a bare status code, so a non-2xx response has to cross the
+/// process boundary with its body intact. The Agent lane discards that body in
+/// the parent instead.
+#[test]
+fn a_chat_lane_error_response_keeps_its_status_and_its_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
+    let address = listener.local_addr().expect("provider address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let _ = read_http_head(&mut stream);
+        let body = r#"{"error":{"message":"insufficient quota"}}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = stream.flush();
+    });
+
+    let output = spawn_transport(&envelope_for("chat", &format!("http://{address}")))
+        .wait_with_output()
+        .expect("await chat transport child");
+    server.join().expect("provider thread");
+
+    let (status, body) = framed_reply(&output.stdout);
+    assert_eq!(status, 429);
+    assert_eq!(body, br#"{"error":{"message":"insufficient quota"}}"#);
+}
+
+/// A lane the child does not recognize selects no timeouts and no response
+/// ceiling, so it is refused rather than defaulted to the more permissive one.
+#[test]
+fn an_unknown_lane_is_refused_before_the_network() {
+    assert_raw_envelope_rejected_before_network(
+        "unknown lane",
+        "unknown request lane",
+        |address| envelope_for("editor", &format!("http://127.0.0.1:{}", address.port())),
+    );
+    assert_raw_envelope_rejected_before_network(
+        "stale envelope version",
+        "unsupported request version",
+        |address| {
+            let url = format!("http://127.0.0.1:{}", address.port());
+            format!(
+                r#"{{"v":1,"lane":"agent","provider":"ollama","url":"{url}","headers":[["content-type","application/json"]],"body":"{{}}"}}"#
+            )
+        },
+    );
+}
+
+/// The same kill that ends a stalled Agent request ends a stalled editor one.
+/// This is the property the editor was missing entirely: `invalidate_ai_request`
+/// used to drop the reply and leave the request running.
+#[test]
+fn killing_the_transport_ends_a_stalled_chat_request_immediately() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled provider");
+    let address = listener.local_addr().expect("provider address");
+    let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept request");
+        accepted_tx.send(()).expect("report accepted request");
+        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        drop(stream);
+    });
+
+    let mut child = spawn_transport(&envelope_for("chat", &format!("http://{address}")));
+    accepted_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the chat lane never reached the stalled provider");
+
+    let started = Instant::now();
+    child.kill().expect("kill transport child");
+    let status = child.wait().expect("await killed transport child");
+    let elapsed = started.elapsed();
+
+    let _ = release_tx.send(());
+    server.join().expect("stalled provider thread");
+
+    assert!(!status.success());
+    // The old thread transport would have held on for the full 30 s recv
+    // timeout with nothing the editor could do about it.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "killing the chat transport took {elapsed:?}; it should be immediate"
     );
 }

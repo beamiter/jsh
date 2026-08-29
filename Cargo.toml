@@ -15,6 +15,12 @@ ai = ["dep:ureq", "dep:jagent"]
 [dependencies]
 glob = "0.3"
 regex = "1"
+# preserve_order is what makes a record keep the field order it was read or
+# built with, all the way through `from json`/`to json`, from-yaml/toml/xml and
+# structured.rs. Cargo unifies features across the whole graph, though, so
+# jagent gets it too and its `json!`-built request bodies serialize in
+# insertion instead of sorted order; src/wire_json.rs undoes that on the way
+# out so jsh puts the same bytes on the wire as the rest of the family.
 serde_json = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 indexmap = { version = "2", features = ["serde"] }
@@ -25,8 +31,13 @@ dirs = "6.0.0"
 nix = { version = "0.31.3", features = ["process", "fs", "signal", "term", "user"] }
 ureq = { version = "3", optional = true }
 # Pin the policy engine so a branch move cannot silently change the contract.
-jagent = { git = "https://github.com/beamiter/jagent.git", rev = "a462ec81f3a4c6ad85a455780ced232172f127ea", optional = true }
-serde_yaml = "0.9"
+jagent = { git = "https://github.com/beamiter/jagent.git", rev = "f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf", optional = true }
+# serde_yaml 0.9 is abandoned upstream ("+deprecated", no successor release),
+# so an advisory against it could never be answered by a version bump.
+# serde_yaml_ng is the maintained continuation with the same API, and is what
+# anvil, forge, ember and frost already ship: one YAML parser across the
+# family, one place to patch. deny.toml keeps the old one from coming back.
+serde_yaml_ng = "0.10"
 toml = "1.1"
 quick-xml = { version = "0.41", features = ["serialize"] }
 

@@ -2260,7 +2260,7 @@ fn structured_fields(content: &str, format: &str) -> Option<Vec<(String, String)
             serde_json::from_str(first).ok()?
         }
         "yaml" | "yml" => {
-            let parsed: serde_yaml::Value = serde_yaml::from_str(content).ok()?;
+            let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).ok()?;
             serde_json::to_value(parsed).ok()?
         }
         "toml" => {
@@ -2968,7 +2968,7 @@ fn complete_kube_names(prefix: &str, kind: KubeName, state: &ShellState) -> Vec<
 }
 
 fn parse_kubeconfig_names(content: &str, kind: KubeName, prefix: &str) -> Vec<Completion> {
-    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+    let Ok(document) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content) else {
         return Vec::new();
     };
     let current = document
@@ -3051,7 +3051,7 @@ fn compose_services_from_path(path: &Path, prefix: &str) -> Vec<Completion> {
     else {
         return Vec::new();
     };
-    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+    let Ok(document) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content) else {
         return Vec::new();
     };
     let Some(services) = document

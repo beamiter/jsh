@@ -1,0 +1,36 @@
+# Supply-chain gate for jsh's dependency tree.
+#
+# This exists because of serde_yaml 0.9.34+deprecated: an abandoned crate with
+# no successor release, so Dependabot had nothing to bump it to and no other
+# step in the pipeline looked at advisories at all. jsh could have shipped an
+# unpatchable parser indefinitely without a single red check. Run in CI as
+# `cargo deny check advisories bans sources`.
+#
+# Licenses are deliberately not checked here: that needs a curated allow-list,
+# and adding a half-reviewed one would turn a supply-chain gate into noise.
+
+[advisories]
+# A yanked release is a supply-chain signal in its own right, not a warning.
+yanked = "deny"
+# Every accepted advisory must be listed here with a reason, so "we know about
+# it" is a reviewed decision in the diff rather than a silent default.
+ignore = []
+
+[bans]
+# The family pins one version per crate through its lockfiles, not through this
+# check; duplicate transitive versions are a build-size question, not a
+# supply-chain one, and denying them here would only produce unactionable noise.
+multiple-versions = "allow"
+deny = [
+    # The crate this gate was added for. It is abandoned upstream and can never
+    # be patched, so it must not come back through a transitive dependency
+    # either. anvil, forge, ember and frost all ship serde_yaml_ng.
+    { crate = "serde_yaml", use-instead = "serde_yaml_ng" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# jagent is pinned by revision in Cargo.toml; this is the allow-list that keeps
+# the set of git sources a reviewed one.
+allow-git = ["https://github.com/beamiter/jagent"]
