@@ -77,6 +77,70 @@ fn without_an_override_the_automatic_helper_still_runs() {
 }
 
 #[test]
+fn bash_fallback_receives_the_live_jsh_environment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script = temp.path().join("live-environment.sh");
+    fs::write(
+        &script,
+        format!(
+            "{FORCE_BASH}export JSH_BRIDGE_DERIVED=\"${{JSH_BRIDGE_INPUT}}:${{JSH_BRIDGE_REMOVED-unset}}\"\n"
+        ),
+    )
+    .expect("fixture");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_jsh"));
+    command.args([
+        "--norc",
+        "-c",
+        &format!(
+            "export JSH_BRIDGE_INPUT=state-value; unset JSH_BRIDGE_REMOVED; source {}; printf 'DERIVED=%s\\n' \"$JSH_BRIDGE_DERIVED\"",
+            script.display()
+        ),
+    ]);
+    // These stale host values must not be inherited behind ShellState's back.
+    command.env("JSH_BRIDGE_INPUT", "host-old");
+    command.env("JSH_BRIDGE_REMOVED", "host-old");
+    let output = command.output().expect("run jsh");
+
+    assert!(
+        stdout_of(&output).contains("DERIVED=state-value:unset"),
+        "fallback Bash did not receive live jsh state: stdout={:?} stderr={:?}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn bash_fallback_preserves_the_sourced_files_exit_status() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script = temp.path().join("return-status.sh");
+    fs::write(
+        &script,
+        format!("{FORCE_BASH}export JSH_BEFORE_RETURN=kept\nreturn 42\n"),
+    )
+    .expect("fixture");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
+        .args([
+            "--norc",
+            "-c",
+            &format!(
+                "source {}; printf 'STATUS=%s VALUE=%s\\n' \"$?\" \"$JSH_BEFORE_RETURN\"",
+                script.display()
+            ),
+        ])
+        .output()
+        .expect("run jsh");
+
+    assert!(
+        stdout_of(&output).contains("STATUS=42 VALUE=kept"),
+        "fallback source status was overwritten: stdout={:?} stderr={:?}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn a_trustworthy_override_is_used() {
     let Some(bash) = ["/usr/bin/bash", "/bin/bash"]
         .into_iter()

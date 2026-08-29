@@ -528,6 +528,22 @@ impl ShellState {
         self.env_vars.get(name).map(|s| s.as_str())
     }
 
+    /// Give a helper process the shell's exported environment exactly.
+    ///
+    /// `Command` otherwise inherits the Rust process environment, which can
+    /// lag behind a restored or otherwise directly populated `ShellState` and
+    /// can reintroduce a variable the shell considers unset. Invalid C
+    /// environment entries are ignored instead of reaching `Command::env`,
+    /// whose platform conversion would panic on an interior NUL.
+    pub(crate) fn configure_command_environment(&self, command: &mut std::process::Command) {
+        command.env_clear();
+        for (name, value) in &self.env_vars {
+            if env_name_ok(name) && !value.contains('\0') {
+                command.env(name, value);
+            }
+        }
+    }
+
     fn detect_terminal_width() -> usize {
         // Try COLUMNS environment variable first
         if let Ok(cols_str) = env::var("COLUMNS") {

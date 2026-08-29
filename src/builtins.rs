@@ -922,8 +922,8 @@ fn strip_job_control_notices(stderr: &str) -> String {
         .join("\n")
 }
 
-/// Use bash to source a script file when jsh's parser can't handle it,
-/// then reload environment variables and simple functions back into jsh.
+/// Use bash to source a script file when jsh's parser can't handle it, then
+/// reload its exported environment back into jsh.
 fn source_via_bash(path: &str, source_args: &[String], state: &mut ShellState) -> i32 {
     const MAX_SOURCE_HELPER_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
     const MAX_SOURCE_HELPER_STDERR_BYTES: usize = 1024 * 1024;
@@ -936,16 +936,33 @@ export PS1='$ '
 
 set -a
 source -- "$1" "${@:2}"
-set +a
+builtin set -- "$?"
+builtin set +a
+builtin trap - DEBUG RETURN ERR EXIT
+builtin set +o history
 
-# Output all environment variables in key=value format
-declare -p | grep 'declare -x' | sed 's/declare -x //' | sed "s/='/'=/g"
-
-# Output alias definitions for later parsing if needed
-alias 2>/dev/null || true
-
-# Output function names
-declare -F | awk '{print $3}'
+# Preserve arbitrary exported values without reparsing shell quoting.  NUL is
+# forbidden inside an environment entry, so `NAME=VALUE\0` is unambiguous.
+# Use a fixed system `env` so a sourced PATH or function cannot replace it.
+# Exclude helper-owned values while retaining PS1/HISTFILE if the sourced file
+# deliberately changed their sentinel values. `$1` now holds the source
+# status. Build the env argv in a subshell's positional parameters so no helper
+# variable can collide with an exported value from the sourced file.
+builtin printf '\0JSH_ENVIRONMENT_V1\0'
+(
+    builtin set -- -u SHLVL -u _
+    [[ ${HISTFILE-} == /dev/null ]] && builtin set -- "$@" -u HISTFILE
+    [[ ${PS1-} == '$ ' ]] && builtin set -- "$@" -u PS1
+    if [[ -x /usr/bin/env ]]; then
+        /usr/bin/env "$@" -0
+    elif [[ -x /bin/env ]]; then
+        /bin/env "$@" -0
+    else
+        builtin exit 127
+    fi
+) || builtin exit "$?"
+builtin printf '\0'
+builtin exit "$1"
 "#;
 
     // Execute bash script to capture the environment
@@ -954,6 +971,7 @@ declare -F | awk '{print $3}'
         return 1;
     };
     let mut command = std::process::Command::new(bash);
+    state.configure_command_environment(&mut command);
     command
         .arg("--norc")
         .arg("--noprofile")
@@ -971,7 +989,6 @@ declare -F | awk '{print $3}'
         std::time::Duration::from_secs(300),
     ) {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
 
             // If bash had errors, print them but continue
@@ -983,32 +1000,12 @@ declare -F | awk '{print $3}'
                 );
             }
 
-            // Parse exported variables from bash output
-            for line in stdout.lines() {
-                // Skip function names (no = sign) and aliases
-                if line.contains('=') && !line.starts_with("alias") {
-                    if let Some(eq_pos) = line.find('=') {
-                        let key = &line[..eq_pos];
-                        let value = &line[eq_pos + 1..];
-                        // Remove quotes if present
-                        let value = if (value.starts_with('\'') && value.ends_with('\''))
-                            || (value.starts_with('"') && value.ends_with('"'))
-                        {
-                            &value[1..value.len() - 1]
-                        } else {
-                            value
-                        };
-                        state.export_var(key, value);
-                    }
-                }
+            if crate::config::import_bash_environment_frame(&output.stdout, state).is_none() {
+                eprintln!("jsh: source: bash fallback returned malformed environment framing");
+                return 1;
             }
 
-            // Return success (bash exit code is usually 0 for sourcing)
-            if output.status.success() {
-                0
-            } else {
-                1
-            }
+            output.status.code().unwrap_or(1)
         }
         Err(e) => {
             eprintln!("jsh: source: failed to execute bash fallback: {}", e);

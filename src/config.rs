@@ -17,6 +17,8 @@ const MAX_STARTUP_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONFIG_HELPER_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONFIG_HELPER_STDERR_BYTES: usize = 512 * 1024;
 const CONFIG_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const BASH_ENV_FRAME_MARKER: &[u8] = b"\0JSH_ENVIRONMENT_V1\0";
+const MAX_BASH_ENV_VARS: usize = 4096;
 
 /// Run a startup helper without making an interactive termination request wait
 /// for the helper's (potentially long) timeout.  Startup imports run before the
@@ -137,11 +139,35 @@ export PS1='$ '
 
 set -a
 source -- "$1"
-set +a
+builtin set -- "$?"
+builtin set +a
+builtin trap - DEBUG RETURN ERR EXIT
+builtin set +o history
 
-# Output all environment variables in key=value format
-echo "=== ENV_VARS ==="
-declare -p | grep 'declare -x' | sed 's/declare -x //'
+# Exported values are arbitrary strings: they may contain newlines, quotes,
+# backslashes, or text identical to one of the section markers below.  NUL is
+# the one byte a Unix environment entry cannot contain, so use `env -0`
+# records instead of a loop variable that could overwrite an exported variable
+# with the same name.  Absolute paths keep a sourced PATH/function from
+# replacing this protocol helper. SHLVL and `_` describe the helper process,
+# not jsh. HISTFILE=/dev/null and PS1='$ ' are helper sentinels unless the
+# sourced file changed them. `$1` now holds the source status. Build the env
+# argv in a subshell's positional parameters so no helper variable can collide
+# with an exported value from the sourced file.
+builtin printf '\0JSH_ENVIRONMENT_V1\0'
+(
+    builtin set -- -u SHLVL -u _
+    [[ ${HISTFILE-} == /dev/null ]] && builtin set -- "$@" -u HISTFILE
+    [[ ${PS1-} == '$ ' ]] && builtin set -- "$@" -u PS1
+    if [[ -x /usr/bin/env ]]; then
+        /usr/bin/env "$@" -0
+    elif [[ -x /bin/env ]]; then
+        /bin/env "$@" -0
+    else
+        builtin exit 127
+    fi
+) || builtin exit "$?"
+builtin printf '\0'
 
 # Output aliases
 echo "=== ALIASES ==="
@@ -154,6 +180,7 @@ declare -F 2>/dev/null | awk '{{print $3}}' || true
 # Output shell options (shopt)
 echo "=== SHOPTS ==="
 shopt 2>/dev/null || true
+builtin exit "$1"
 "#;
 
     // Execute bash script to capture the environment, aliases, and functions
@@ -162,6 +189,7 @@ shopt 2>/dev/null || true
         return;
     };
     let mut command = std::process::Command::new(bash);
+    state.configure_command_environment(&mut command);
     command
         // `PS1` is only half of how a startup file asks whether anyone is
         // listening. The other half is `$-`, and the guard every distribution
@@ -188,7 +216,10 @@ shopt 2>/dev/null || true
         .arg(path)
         .env("HISTFILE", "/dev/null");
     match run_startup_helper(&mut command, true) {
-        Ok(output) => parse_bash_output(&String::from_utf8_lossy(&output.stdout), state),
+        Ok(output) if parse_bash_output(&output.stdout, state) => {}
+        Ok(_) => eprintln!(
+            "jsh: bash startup import returned malformed environment framing for {path:?}"
+        ),
         Err(error) if interrupted_by_shell_signal(&error) => {}
         Err(error) => eprintln!("jsh: bash startup import failed for {path:?}: {error}"),
     }
@@ -271,16 +302,76 @@ fn load_conda_hook(state: &mut ShellState) {
     }
 }
 
-/// Parse bash output containing env vars, aliases, functions, and shopt settings
-fn parse_bash_output(output: &str, state: &mut ShellState) {
+/// Import the last complete environment frame in `output` and return the
+/// unconsumed suffix.  Using the last marker means arbitrary output printed by
+/// the sourced file before the helper's frame cannot impersonate it.  The
+/// state is changed only after the whole frame has been validated.
+pub(crate) fn import_bash_environment_frame<'a>(
+    output: &'a [u8],
+    state: &mut ShellState,
+) -> Option<&'a [u8]> {
+    let marker = output
+        .windows(BASH_ENV_FRAME_MARKER.len())
+        .rposition(|window| window == BASH_ENV_FRAME_MARKER)?;
+    let mut cursor = marker.checked_add(BASH_ENV_FRAME_MARKER.len())?;
+    let mut variables = Vec::new();
+
+    loop {
+        let record_end = output[cursor..].iter().position(|byte| *byte == 0)?;
+        let record_end = cursor.checked_add(record_end)?;
+        let record = &output[cursor..record_end];
+        cursor = record_end.checked_add(1)?;
+        if record.is_empty() {
+            break;
+        }
+        if variables.len() >= MAX_BASH_ENV_VARS {
+            return None;
+        }
+
+        let Some(equals) = record.iter().position(|byte| *byte == b'=') else {
+            // Unix can carry environment entries that jsh's NAME=VALUE model
+            // cannot represent. They are not a framing failure and must not
+            // prevent ordinary exported variables from being imported.
+            continue;
+        };
+        let name_bytes = &record[..equals];
+        let value_bytes = &record[equals + 1..];
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+        // Bash encodes exported functions as BASH_FUNC_name%% entries. Their
+        // names (and other implementation-specific environment entries) are
+        // not shell identifiers, so skip them without rejecting the frame.
+        if !crate::environment::is_valid_identifier(name) {
+            continue;
+        }
+        if variables
+            .iter()
+            .any(|(previous, _): &(String, String)| previous == name)
+        {
+            return None;
+        }
+        let value = String::from_utf8_lossy(value_bytes).into_owned();
+        variables.push((name.to_string(), value));
+    }
+
+    for (name, value) in variables {
+        state.export_var(&name, &value);
+    }
+    Some(&output[cursor..])
+}
+
+/// Parse bash output containing a NUL-framed environment followed by aliases,
+/// functions, and shopt settings.
+fn parse_bash_output(output: &[u8], state: &mut ShellState) -> bool {
+    let Some(remainder) = import_bash_environment_frame(output, state) else {
+        return false;
+    };
+    let output = String::from_utf8_lossy(remainder);
     let mut current_section = "";
 
     for line in output.lines() {
         match line {
-            "=== ENV_VARS ===" => {
-                current_section = "ENV_VARS";
-                continue;
-            }
             "=== ALIASES ===" => {
                 current_section = "ALIASES";
                 continue;
@@ -297,24 +388,6 @@ fn parse_bash_output(output: &str, state: &mut ShellState) {
         }
 
         match current_section {
-            "ENV_VARS" => {
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some(eq_pos) = line.find('=') {
-                    let key = &line[..eq_pos];
-                    let value = &line[eq_pos + 1..];
-                    // Remove quotes if present
-                    let value = if (value.starts_with('\'') && value.ends_with('\''))
-                        || (value.starts_with('"') && value.ends_with('"'))
-                    {
-                        &value[1..value.len() - 1]
-                    } else {
-                        value
-                    };
-                    state.export_var(key, value);
-                }
-            }
             "ALIASES" => {
                 if line.is_empty() || !line.starts_with("alias ") {
                     continue;
@@ -359,6 +432,7 @@ fn parse_bash_output(output: &str, state: &mut ShellState) {
             _ => {}
         }
     }
+    true
 }
 
 // ─── Legacy `rsh` → `jsh` data migration ────────────────────────────────────
@@ -643,17 +717,30 @@ mod tests {
     use crate::environment::ShellState;
     use std::os::unix::fs::MetadataExt;
 
+    fn framed_bash_output(variables: &[(&str, &str)], sections: &str) -> Vec<u8> {
+        let mut output = BASH_ENV_FRAME_MARKER.to_vec();
+        for (name, value) in variables {
+            output.extend_from_slice(name.as_bytes());
+            output.push(b'=');
+            output.extend_from_slice(value.as_bytes());
+            output.push(0);
+        }
+        output.push(0);
+        output.extend_from_slice(sections.as_bytes());
+        output
+    }
+
     #[test]
     fn test_parse_bash_output_env_vars() {
-        let output = r#"=== ENV_VARS ===
-TEST_VAR='hello_world'
-MY_PATH='/custom/path'
-=== ALIASES ===
+        let output = framed_bash_output(
+            &[("TEST_VAR", "hello_world"), ("MY_PATH", "/custom/path")],
+            r#"=== ALIASES ===
 === FUNCTIONS ===
-=== SHOPTS ==="#;
+=== SHOPTS ==="#,
+        );
 
         let mut state = ShellState::new(false);
-        parse_bash_output(output, &mut state);
+        assert!(parse_bash_output(&output, &mut state));
 
         assert_eq!(state.get_var("TEST_VAR"), Some("hello_world"));
         assert_eq!(state.get_var("MY_PATH"), Some("/custom/path"));
@@ -661,15 +748,17 @@ MY_PATH='/custom/path'
 
     #[test]
     fn test_parse_bash_output_aliases() {
-        let output = r#"=== ENV_VARS ===
-=== ALIASES ===
+        let output = framed_bash_output(
+            &[],
+            r#"=== ALIASES ===
 alias ll='ls -la'
 alias grep='grep --color=auto'
 === FUNCTIONS ===
-=== SHOPTS ==="#;
+=== SHOPTS ==="#,
+        );
 
         let mut state = ShellState::new(false);
-        parse_bash_output(output, &mut state);
+        assert!(parse_bash_output(&output, &mut state));
 
         assert_eq!(state.aliases.get("ll"), Some(&"ls -la".to_string()));
         assert_eq!(
@@ -680,16 +769,18 @@ alias grep='grep --color=auto'
 
     #[test]
     fn test_parse_bash_output_shopts() {
-        let output = r#"=== ENV_VARS ===
-=== ALIASES ===
+        let output = framed_bash_output(
+            &[],
+            r#"=== ALIASES ===
 === FUNCTIONS ===
 === SHOPTS ===
 extglob         on
 dotglob         off
-globstar        on"#;
+globstar        on"#,
+        );
 
         let mut state = ShellState::new(false);
-        parse_bash_output(output, &mut state);
+        assert!(parse_bash_output(&output, &mut state));
 
         assert!(state.shell_opts.extglob);
         assert!(!state.shell_opts.dotglob);
@@ -698,20 +789,116 @@ globstar        on"#;
 
     #[test]
     fn test_parse_bash_output_mixed() {
-        let output = r#"=== ENV_VARS ===
-APP_NAME='myapp'
-=== ALIASES ===
+        let output = framed_bash_output(
+            &[("APP_NAME", "myapp")],
+            r#"=== ALIASES ===
 alias ll='ls -lah'
 === FUNCTIONS ===
 === SHOPTS ===
-extglob         on"#;
+extglob         on"#,
+        );
 
         let mut state = ShellState::new(false);
-        parse_bash_output(output, &mut state);
+        assert!(parse_bash_output(&output, &mut state));
 
         assert_eq!(state.get_var("APP_NAME"), Some("myapp"));
         assert_eq!(state.aliases.get("ll"), Some(&"ls -lah".to_string()));
         assert!(state.shell_opts.extglob);
+    }
+
+    #[test]
+    fn environment_frame_preserves_arbitrary_values_and_is_atomic_on_errors() {
+        let complex = "line one\nline two 'single' \"double\" \\ === ALIASES ===";
+        let output = framed_bash_output(
+            &[("JSH_FRAMED_COMPLEX", complex), ("JSH_FRAMED_EMPTY", "")],
+            "=== ALIASES ===\n",
+        );
+        let mut state = ShellState::new(false);
+        assert!(parse_bash_output(&output, &mut state));
+        assert_eq!(state.get_var("JSH_FRAMED_COMPLEX"), Some(complex));
+        assert_eq!(state.get_var("JSH_FRAMED_EMPTY"), Some(""));
+
+        let special = framed_bash_output(
+            &[
+                ("BASH_FUNC_exported%%", "() {  :\n}"),
+                ("JSH_AFTER_SPECIAL", "imported"),
+            ],
+            "",
+        );
+        assert!(parse_bash_output(&special, &mut state));
+        assert_eq!(state.get_var("BASH_FUNC_exported%%"), None);
+        assert_eq!(state.get_var("JSH_AFTER_SPECIAL"), Some("imported"));
+
+        let malformed = b"\0JSH_ENVIRONMENT_V1\0JSH_PARTIAL=not-terminated";
+        assert!(import_bash_environment_frame(malformed, &mut state).is_none());
+        assert_eq!(state.get_var("JSH_PARTIAL"), None);
+
+        let duplicate = framed_bash_output(
+            &[("JSH_DUPLICATE", "first"), ("JSH_DUPLICATE", "second")],
+            "",
+        );
+        assert!(import_bash_environment_frame(&duplicate, &mut state).is_none());
+        assert_eq!(state.get_var("JSH_DUPLICATE"), None);
+        state.unset_var("JSH_FRAMED_COMPLEX");
+        state.unset_var("JSH_FRAMED_EMPTY");
+        state.unset_var("JSH_AFTER_SPECIAL");
+    }
+
+    #[test]
+    fn bash_bridge_round_trips_multiline_and_quoted_environment_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("complex-env.bashrc");
+        std::fs::write(
+            &path,
+            r#"export JSH_COMPLEX_BASH_VALUE=$'line one\nline two "double" \'single\' \\ === ALIASES ==='
+export JSH_DERIVED_FROM_STATE="${JSH_STATE_ONLY_INPUT-unset}"
+export __jsh_env_name=original
+jsh_exported_function() { :; }
+export -f jsh_exported_function
+trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0DEBUG_FORGED=bad\0\0"' DEBUG
+trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0RETURN_FORGED=bad\0\0"' RETURN
+trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0FORGED=bad\0\0"' EXIT
+"#,
+        )
+        .expect("write rc file");
+
+        let mut state = ShellState::new(false);
+        // Populate only ShellState, not the Rust process environment: this is
+        // the boundary a restored session and the live `export` builtin both
+        // rely on before the fallback Bash evaluates the sourced file.
+        state.env_vars.insert(
+            "JSH_STATE_ONLY_INPUT".to_string(),
+            "state-value".to_string(),
+        );
+        for (name, value) in [
+            ("HISTFILE", "original-history-path"),
+            ("PS1", "jsh-prompt"),
+            ("SHLVL", "7"),
+            ("_", "jsh"),
+        ] {
+            state.env_vars.insert(name.to_string(), value.to_string());
+        }
+        source_via_bash(&path, &mut state);
+        assert_eq!(
+            state.get_var("JSH_COMPLEX_BASH_VALUE"),
+            Some("line one\nline two \"double\" 'single' \\ === ALIASES ===")
+        );
+        assert_eq!(state.get_var("__jsh_env_name"), Some("original"));
+        assert_eq!(state.get_var("JSH_DERIVED_FROM_STATE"), Some("state-value"));
+        assert_eq!(state.get_var("HISTFILE"), Some("original-history-path"));
+        assert_eq!(state.get_var("PS1"), Some("jsh-prompt"));
+        assert_eq!(state.get_var("SHLVL"), Some("7"));
+        assert_eq!(state.get_var("_"), Some("jsh"));
+        assert_eq!(state.get_var("DEBUG_FORGED"), None);
+        assert_eq!(state.get_var("RETURN_FORGED"), None);
+        assert_eq!(state.get_var("FORGED"), None);
+        state.unset_var("JSH_COMPLEX_BASH_VALUE");
+        state.unset_var("JSH_STATE_ONLY_INPUT");
+        state.unset_var("JSH_DERIVED_FROM_STATE");
+        state.unset_var("__jsh_env_name");
+        for name in ["HISTFILE", "PS1", "SHLVL", "_"] {
+            state.env_vars.remove(name);
+        }
     }
 
     #[test]
