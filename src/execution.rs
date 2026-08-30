@@ -764,7 +764,14 @@ fn ensure_unshared_directory(file: &File, path: &Path) -> io::Result<()> {
 }
 
 fn set_private_open_file_permissions(file: &File) -> io::Result<()> {
-    file.set_permissions(fs::Permissions::from_mode(0o600))
+    // fchmod updates ctime even when the requested mode is already present.
+    // Reads and rejected appends must not manufacture metadata changes on an
+    // already-private journal or lockfile.
+    if file.metadata()?.permissions().mode() & 0o7777 == 0o600 {
+        Ok(())
+    } else {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+    }
 }
 
 pub fn default_journal_path() -> Option<PathBuf> {
@@ -2293,6 +2300,18 @@ mod tests {
         );
         fs::write(journal.path(), original).unwrap();
         fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata_before = fs::metadata(journal.path()).unwrap();
+        let stable_metadata_before = (
+            metadata_before.mode(),
+            metadata_before.uid(),
+            metadata_before.nlink(),
+            metadata_before.mtime(),
+            metadata_before.mtime_nsec(),
+            metadata_before.ctime(),
+            metadata_before.ctime_nsec(),
+        );
+        // Keep a redundant fchmod observably separate from fixture creation.
+        std::thread::sleep(Duration::from_millis(2));
         let finish = || ExecutionEvent::Finish {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: "known".into(),
@@ -2307,6 +2326,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
         assert_eq!(fs::read(journal.path()).unwrap(), original.as_bytes());
+        let metadata_after = fs::metadata(journal.path()).unwrap();
+        assert_eq!(
+            (
+                metadata_after.mode(),
+                metadata_after.uid(),
+                metadata_after.nlink(),
+                metadata_after.mtime(),
+                metadata_after.mtime_nsec(),
+                metadata_after.ctime(),
+                metadata_after.ctime_nsec(),
+            ),
+            stable_metadata_before,
+            "a rejected append must not fchmod an already-private source"
+        );
         let unexpected = fs::read_dir(journal.path().parent().unwrap())
             .unwrap()
             .filter_map(Result::ok)
@@ -2481,6 +2514,94 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn compaction_replacement_is_private_without_touching_coordination_metadata() {
+        let (dir, journal) = journal();
+        journal
+            .record_start("jsh-compaction-metadata", None, 1, "true", "/tmp", 1)
+            .unwrap();
+
+        let lock_path = dir.path().join(JOURNAL_LOCK_FILE_NAME);
+        let journal_before = fs::metadata(journal.path()).unwrap();
+        let parent_before = fs::metadata(dir.path()).unwrap();
+        let lock_before = fs::metadata(&lock_path).unwrap();
+        let stable_parent_before = (
+            parent_before.dev(),
+            parent_before.ino(),
+            parent_before.uid(),
+            parent_before.nlink(),
+            parent_before.mode() & 0o7777,
+        );
+        let stable_lock_before = (
+            lock_before.dev(),
+            lock_before.ino(),
+            lock_before.uid(),
+            lock_before.nlink(),
+            lock_before.mode(),
+            lock_before.mtime(),
+            lock_before.mtime_nsec(),
+            lock_before.ctime(),
+            lock_before.ctime_nsec(),
+        );
+        std::thread::sleep(Duration::from_millis(2));
+
+        {
+            let _lock = journal.lock(FlockArg::LockExclusive).unwrap();
+            compact_unlocked(journal.path()).unwrap();
+        }
+
+        let journal_after = fs::metadata(journal.path()).unwrap();
+        assert_ne!(
+            (journal_after.dev(), journal_after.ino()),
+            (journal_before.dev(), journal_before.ino())
+        );
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        assert_eq!(journal_after.uid(), unsafe { nix::libc::geteuid() });
+        assert_eq!(journal_after.nlink(), 1);
+        assert_eq!(journal_after.mode() & 0o7777, 0o600);
+
+        let parent_after = fs::metadata(dir.path()).unwrap();
+        assert_eq!(
+            (
+                parent_after.dev(),
+                parent_after.ino(),
+                parent_after.uid(),
+                parent_after.nlink(),
+                parent_after.mode() & 0o7777,
+            ),
+            stable_parent_before,
+            "rename may update directory times, not its trust metadata"
+        );
+        let lock_after = fs::metadata(&lock_path).unwrap();
+        assert_eq!(
+            (
+                lock_after.dev(),
+                lock_after.ino(),
+                lock_after.uid(),
+                lock_after.nlink(),
+                lock_after.mode(),
+                lock_after.mtime(),
+                lock_after.mtime_nsec(),
+                lock_after.ctime(),
+                lock_after.ctime_nsec(),
+            ),
+            stable_lock_before,
+            "locking for compaction must not fchmod an already-private sidecar"
+        );
+        let mut entries = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                std::ffi::OsString::from("executions.jsonl"),
+                std::ffi::OsString::from(JOURNAL_LOCK_FILE_NAME),
+            ]
         );
     }
 
