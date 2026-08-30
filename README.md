@@ -411,6 +411,11 @@ inspects at most 524,288 physical event lines, above the number of conforming v1
 events that fit its byte window but finite for malformed short-line streams.
 Compaction accepts the source under that same physical-line budget before it
 can discard ignored future or unknown events and replace the journal.
+It syncs the complete temporary file before rename and the parent directory
+after rename. Pre-rename failures preserve the old inode and remove the
+temporary; a post-rename parent-sync failure leaves the replacement visible,
+reports an unknown commit state, and is safe to compact again without adding
+events.
 Append checks the prospective line budget before any automatic compaction, so
 an exact-limit source is refused byte-for-byte intact instead of being erased
 into apparent compliance. Its incremental peer counter charges an unterminated

@@ -668,6 +668,37 @@ fn append_durability_error(stage: &str, error: io::Error) -> io::Error {
     )
 }
 
+trait CompactionCommitIo {
+    fn sync_temporary(&self, file: &File) -> io::Result<()>;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn sync_directory(&self, directory: &File) -> io::Result<()>;
+}
+
+struct SyncCompactionCommitIo;
+
+impl CompactionCommitIo for SyncCompactionCommitIo {
+    fn sync_temporary(&self, file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn sync_directory(&self, directory: &File) -> io::Result<()> {
+        directory.sync_all()
+    }
+}
+
+fn compaction_commit_unknown(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "execution journal compaction {stage} failed after rename; commit state is unknown: {error}"
+        ),
+    )
+}
+
 fn flock_with_timeout(mut file: File, arg: FlockArg, timeout: Duration) -> io::Result<Flock<File>> {
     let nonblocking = match arg {
         FlockArg::LockShared | FlockArg::LockSharedNonblock => FlockArg::LockSharedNonblock,
@@ -1403,6 +1434,14 @@ fn compact_unlocked(path: &Path) -> io::Result<()> {
 }
 
 fn compact_unlocked_with_line_limit(path: &Path, max_event_lines: usize) -> io::Result<()> {
+    compact_unlocked_with_line_limit_and_commit(path, max_event_lines, &SyncCompactionCommitIo)
+}
+
+fn compact_unlocked_with_line_limit_and_commit(
+    path: &Path,
+    max_event_lines: usize,
+    commit: &impl CompactionCommitIo,
+) -> io::Result<()> {
     // Compaction must first accept the source under the same physical-line
     // budget its output promises to satisfy. Otherwise ignored future events
     // could be erased from an over-budget source and make it appear valid.
@@ -1434,6 +1473,7 @@ fn compact_unlocked_with_line_limit(path: &Path, max_event_lines: usize) -> io::
     }
     let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), counter));
+    let mut renamed = false;
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -1445,12 +1485,16 @@ fn compact_unlocked_with_line_limit(path: &Path, max_event_lines: usize) -> io::
         for encoded in retained.iter().rev() {
             file.write_all(encoded)?;
         }
-        file.sync_all()?;
-        fs::rename(&tmp_path, path)?;
-        let directory = ensure_journal_parent(path, false)?;
-        directory.sync_all()
+        commit.sync_temporary(&file)?;
+        commit.rename(&tmp_path, path)?;
+        renamed = true;
+        let directory = ensure_journal_parent(path, false)
+            .map_err(|error| compaction_commit_unknown("parent reopen", error))?;
+        commit
+            .sync_directory(&directory)
+            .map_err(|error| compaction_commit_unknown("parent sync", error))
     })();
-    if result.is_err() {
+    if result.is_err() && !renamed {
         let _ = fs::remove_file(&tmp_path);
     }
     result
@@ -1570,6 +1614,62 @@ mod tests {
                 Err(io::Error::other("injected directory-sync failure"))
             } else {
                 lock._directory.sync_all()
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompactionFaultStage {
+        TemporarySync,
+        Rename,
+        DirectorySync,
+    }
+
+    struct FaultingCompactionCommitIo {
+        stage: CompactionFaultStage,
+        temporary_sync_calls: std::cell::Cell<usize>,
+        rename_calls: std::cell::Cell<usize>,
+        directory_sync_calls: std::cell::Cell<usize>,
+    }
+
+    impl FaultingCompactionCommitIo {
+        fn new(stage: CompactionFaultStage) -> Self {
+            Self {
+                stage,
+                temporary_sync_calls: std::cell::Cell::new(0),
+                rename_calls: std::cell::Cell::new(0),
+                directory_sync_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl CompactionCommitIo for FaultingCompactionCommitIo {
+        fn sync_temporary(&self, file: &File) -> io::Result<()> {
+            self.temporary_sync_calls
+                .set(self.temporary_sync_calls.get() + 1);
+            if self.stage == CompactionFaultStage::TemporarySync {
+                Err(io::Error::other("injected temporary-sync failure"))
+            } else {
+                file.sync_all()
+            }
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.rename_calls.set(self.rename_calls.get() + 1);
+            if self.stage == CompactionFaultStage::Rename {
+                Err(io::Error::other("injected rename failure"))
+            } else {
+                fs::rename(from, to)
+            }
+        }
+
+        fn sync_directory(&self, directory: &File) -> io::Result<()> {
+            self.directory_sync_calls
+                .set(self.directory_sync_calls.get() + 1);
+            if self.stage == CompactionFaultStage::DirectorySync {
+                Err(io::Error::other("injected directory-sync failure"))
+            } else {
+                directory.sync_all()
             }
         }
     }
@@ -2814,6 +2914,108 @@ mod tests {
                 std::ffi::OsString::from(JOURNAL_LOCK_FILE_NAME),
             ]
         );
+    }
+
+    #[test]
+    fn compaction_commit_failures_preserve_their_visible_commit_stage() {
+        const SOURCE: &str = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"commit-stage\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"future\",\"payload\":true}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"commit-stage\",\"exit_code\":9,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}\n"
+        );
+        let directory_entries = |path: &Path| {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+
+        for stage in [
+            CompactionFaultStage::TemporarySync,
+            CompactionFaultStage::Rename,
+        ] {
+            let (dir, journal) = journal();
+            fs::write(journal.path(), SOURCE).unwrap();
+            fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+            let records_before = journal.records().unwrap();
+            let bytes_before = fs::read(journal.path()).unwrap();
+            let identity_before = fs::metadata(journal.path()).unwrap();
+            let entries_before = directory_entries(dir.path());
+            let fault = FaultingCompactionCommitIo::new(stage);
+
+            let error = compact_unlocked_with_line_limit_and_commit(
+                journal.path(),
+                MAX_JOURNAL_EVENT_LINES,
+                &fault,
+            )
+            .unwrap_err();
+
+            assert!(!error.to_string().contains("commit state is unknown"));
+            assert_eq!(fs::read(journal.path()).unwrap(), bytes_before);
+            let identity_after = fs::metadata(journal.path()).unwrap();
+            assert_eq!(
+                (identity_after.dev(), identity_after.ino()),
+                (identity_before.dev(), identity_before.ino())
+            );
+            assert_eq!(journal.records().unwrap(), records_before);
+            assert_eq!(directory_entries(dir.path()), entries_before);
+            assert_eq!(fault.temporary_sync_calls.get(), 1);
+            match stage {
+                CompactionFaultStage::TemporarySync => {
+                    assert_eq!(fault.rename_calls.get(), 0);
+                }
+                CompactionFaultStage::Rename => {
+                    assert_eq!(fault.rename_calls.get(), 1);
+                }
+                CompactionFaultStage::DirectorySync => unreachable!(),
+            }
+            assert_eq!(fault.directory_sync_calls.get(), 0);
+        }
+
+        let (dir, journal) = journal();
+        fs::write(journal.path(), SOURCE).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let records_before = journal.records().unwrap();
+        let bytes_before = fs::read(journal.path()).unwrap();
+        let identity_before = fs::metadata(journal.path()).unwrap();
+        let entries_before = directory_entries(dir.path());
+        let fault = FaultingCompactionCommitIo::new(CompactionFaultStage::DirectorySync);
+
+        let error = compact_unlocked_with_line_limit_and_commit(
+            journal.path(),
+            MAX_JOURNAL_EVENT_LINES,
+            &fault,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("commit state is unknown"));
+        assert_eq!(fault.temporary_sync_calls.get(), 1);
+        assert_eq!(fault.rename_calls.get(), 1);
+        assert_eq!(fault.directory_sync_calls.get(), 1);
+        let visible_after_error = fs::read(journal.path()).unwrap();
+        assert_ne!(visible_after_error, bytes_before);
+        assert_unique_jsonl(&visible_after_error);
+        assert_eq!(
+            visible_after_error
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .count(),
+            2
+        );
+        let identity_after = fs::metadata(journal.path()).unwrap();
+        assert_ne!(
+            (identity_after.dev(), identity_after.ino()),
+            (identity_before.dev(), identity_before.ino())
+        );
+        assert_eq!(journal.records().unwrap(), records_before);
+        assert_eq!(directory_entries(dir.path()), entries_before);
+
+        compact_unlocked(journal.path()).unwrap();
+        assert_eq!(fs::read(journal.path()).unwrap(), visible_after_error);
+        assert_eq!(journal.records().unwrap(), records_before);
+        assert_eq!(directory_entries(dir.path()), entries_before);
     }
 
     #[test]
