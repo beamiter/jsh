@@ -6,6 +6,7 @@
 
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -66,18 +67,7 @@ pub struct ExecutionRecord {
 #[serde(tag = "event")]
 enum ExecutionEvent {
     #[serde(rename = "start")]
-    Start {
-        #[serde(alias = "rsh_execution_version")]
-        jsh_execution_version: u32,
-        id: String,
-        session_id: Option<String>,
-        seq: u64,
-        command: String,
-        #[serde(default)]
-        command_truncated: bool,
-        cwd: String,
-        started_at_ms: u64,
-    },
+    Start(StartEvent),
     #[serde(rename = "finish")]
     Finish {
         #[serde(alias = "rsh_execution_version")]
@@ -106,6 +96,31 @@ enum ExecutionEvent {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct StartEvent {
+    #[serde(alias = "rsh_execution_version")]
+    jsh_execution_version: u32,
+    id: String,
+    session_id: Option<String>,
+    seq: u64,
+    command: String,
+    #[serde(default)]
+    command_truncated: bool,
+    cwd: String,
+    started_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventIdentity<'a> {
+    #[serde(borrow)]
+    event: Cow<'a, str>,
+    #[serde(alias = "rsh_execution_version")]
+    jsh_execution_version: u32,
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ConflictEvent {
     #[serde(alias = "rsh_execution_version")]
     jsh_execution_version: u32,
@@ -123,11 +138,8 @@ enum ConflictSlot {
 impl ExecutionEvent {
     fn version(&self) -> u32 {
         match self {
-            Self::Start {
-                jsh_execution_version,
-                ..
-            }
-            | Self::Finish {
+            Self::Start(event) => event.jsh_execution_version,
+            Self::Finish {
                 jsh_execution_version,
                 ..
             }
@@ -138,6 +150,16 @@ impl ExecutionEvent {
             Self::Conflict(event) => event.jsh_execution_version,
         }
     }
+}
+
+/// Extract the identity barrier without decoding any other Start metadata.
+/// This keeps malformed replacement fields from leaving stale state active.
+fn recognized_v1_start_id(line: &[u8]) -> Option<Cow<'_, str>> {
+    let identity = serde_json::from_slice::<EventIdentity<'_>>(line).ok()?;
+    (identity.event == "start"
+        && identity.jsh_execution_version == EXECUTION_JOURNAL_VERSION
+        && is_valid_execution_id(&identity.id))
+    .then_some(identity.id)
 }
 
 #[derive(Debug)]
@@ -268,7 +290,7 @@ impl ExecutionJournal {
     ) -> io::Result<()> {
         let (command, command_truncated) = bounded_text(command, MAX_COMMAND_BYTES);
         validate_command_text(&command, MAX_COMMAND_BYTES)?;
-        self.append_event(ExecutionEvent::Start {
+        self.append_event(ExecutionEvent::Start(StartEvent {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
             session_id: match session_id {
@@ -280,7 +302,7 @@ impl ExecutionJournal {
             command_truncated,
             cwd: validate_cwd(cwd)?.to_string(),
             started_at_ms,
-        })
+        }))
     }
 
     pub fn record_finish(
@@ -838,6 +860,18 @@ fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
         if !within_limit {
             continue;
         }
+        // A recognized v1 Start owns this ID even when strict decoding of its
+        // remaining metadata fails. Retire the old lifecycle first so later
+        // Finish/Output events cannot bind back to stale command/session data.
+        if let Some(id) = recognized_v1_start_id(&line) {
+            if let Some(previous) = records.remove(id.as_ref()) {
+                record_order.remove(&(
+                    previous.record.started_at_ms,
+                    previous.record.seq,
+                    previous.record.id,
+                ));
+            }
+        }
         let Ok(event) = serde_json::from_slice::<ExecutionEvent>(&line) else {
             continue;
         };
@@ -845,7 +879,7 @@ fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
             continue;
         }
         match event {
-            ExecutionEvent::Start {
+            ExecutionEvent::Start(StartEvent {
                 id,
                 session_id,
                 seq,
@@ -854,7 +888,7 @@ fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
                 cwd,
                 started_at_ms,
                 ..
-            } => {
+            }) => {
                 if validate_execution_id(&id).is_err()
                     || session_id
                         .as_deref()
@@ -878,13 +912,6 @@ fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
                     ended_at_ms: None,
                     output: None,
                 };
-                if let Some(previous) = records.remove(&id) {
-                    record_order.remove(&(
-                        previous.record.started_at_ms,
-                        previous.record.seq,
-                        previous.record.id.clone(),
-                    ));
-                }
                 record_order.insert((started_at_ms, seq, id.clone()), id.clone());
                 records.insert(id, FoldedExecution::new(record));
                 while records.len() > MAX_RETAINED_EXECUTIONS {
@@ -1041,7 +1068,7 @@ fn encode_compacted_record(folded: &FoldedExecution) -> io::Result<Vec<u8>> {
     let record = &folded.record;
     write_compacted_event(
         &mut encoded,
-        &ExecutionEvent::Start {
+        &ExecutionEvent::Start(StartEvent {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: record.id.clone(),
             session_id: record.session_id.clone(),
@@ -1050,7 +1077,7 @@ fn encode_compacted_record(folded: &FoldedExecution) -> io::Result<Vec<u8>> {
             command_truncated: record.command_truncated,
             cwd: record.cwd.clone(),
             started_at_ms: record.started_at_ms,
-        },
+        }),
     )?;
     if folded.finish_conflicted {
         write_compacted_event(
@@ -1359,6 +1386,189 @@ mod tests {
             reset.output.as_ref().map(|output| output.text.as_str()),
             Some("exact")
         );
+    }
+
+    #[test]
+    fn recognized_start_ids_barrier_invalid_replacement_lifecycles() {
+        let (_dir, journal) = journal();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(journal.path())
+            .unwrap();
+        let valid_start = |id: &str, seq: u64| {
+            serde_json::json!({
+                "jsh_execution_version": 1,
+                "event": "start",
+                "id": id,
+                "session_id": "wanted",
+                "seq": seq,
+                "command": "old",
+                "cwd": "/old",
+                "started_at_ms": seq,
+            })
+        };
+        let finish = |id: &str| {
+            serde_json::json!({
+                "jsh_execution_version": 1,
+                "event": "finish",
+                "id": id,
+                "exit_code": 9,
+                "duration_ms": 1,
+                "cwd_after": "/after",
+                "ended_at_ms": 99,
+            })
+        };
+        let mut replacements = vec![
+            (
+                "bad-session",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "bad-session",
+                    "session_id": "bad session",
+                    "seq": 10,
+                    "command": "new",
+                    "cwd": "/new",
+                    "started_at_ms": 10,
+                }),
+            ),
+            (
+                "bad-command",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "bad-command",
+                    "session_id": "wanted",
+                    "seq": 11,
+                    "command": "hidden\u{202e}command",
+                    "cwd": "/new",
+                    "started_at_ms": 11,
+                }),
+            ),
+            (
+                "bad-cwd",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "bad-cwd",
+                    "session_id": "wanted",
+                    "seq": 12,
+                    "command": "new",
+                    "cwd": "",
+                    "started_at_ms": 12,
+                }),
+            ),
+            (
+                "bad-type",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "bad-type",
+                    "session_id": "wanted",
+                    "seq": "13",
+                    "command": "new",
+                    "cwd": "/new",
+                    "started_at_ms": 13,
+                }),
+            ),
+            (
+                "extra-field",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "extra-field",
+                    "session_id": "wanted",
+                    "seq": 14,
+                    "command": "new",
+                    "cwd": "/new",
+                    "started_at_ms": 14,
+                    "extra": true,
+                }),
+            ),
+            (
+                "legacy-barrier",
+                serde_json::json!({
+                    "rsh_execution_version": 1,
+                    "event": "start",
+                    "id": "legacy-barrier",
+                    "session_id": "wanted",
+                    "seq": 15,
+                    "command": "new",
+                    "cwd": "",
+                    "started_at_ms": 15,
+                }),
+            ),
+        ];
+        replacements.push((
+            "oversized-command",
+            serde_json::json!({
+                "jsh_execution_version": 1,
+                "event": "start",
+                "id": "oversized-command",
+                "session_id": "wanted",
+                "seq": 16,
+                "command": "x".repeat(MAX_COMMAND_BYTES + 1),
+                "cwd": "/new",
+                "started_at_ms": 16,
+            }),
+        ));
+
+        for (index, (id, replacement)) in replacements.iter().enumerate() {
+            writeln!(file, "{}", valid_start(id, index as u64 + 1)).unwrap();
+            writeln!(file, "{replacement}").unwrap();
+            writeln!(file, "{}", finish(id)).unwrap();
+        }
+        writeln!(file, "{}", valid_start("escaped-id", 17)).unwrap();
+        writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"escaped\\u002did\",\"session_id\":\"wanted\",\"seq\":17,\"command\":\"new\",\"cwd\":\"\",\"started_at_ms\":17}}").unwrap();
+        writeln!(file, "{}", finish("escaped-id")).unwrap();
+
+        writeln!(file, "{}", valid_start("survivor", 20)).unwrap();
+        for ignored in [
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"session_id\":\"wanted\",\"seq\":21,\"command\":\"missing id\",\"cwd\":\"/new\",\"started_at_ms\":21}",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":7,\"session_id\":\"wanted\",\"seq\":22,\"command\":\"wrong id type\",\"cwd\":\"/new\",\"started_at_ms\":22}",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"survivor \" ,\"session_id\":\"wanted\",\"seq\":22,\"command\":\"invalid id\",\"cwd\":\"/new\",\"started_at_ms\":22}",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"survivor\"",
+            "{\"jsh_execution_version\":99,\"event\":\"start\",\"id\":\"survivor\",\"session_id\":\"wanted\",\"seq\":23,\"command\":\"future\",\"cwd\":\"/new\",\"started_at_ms\":23}",
+            "{\"jsh_execution_version\":1,\"event\":\"future-start\",\"id\":\"survivor\",\"session_id\":\"wanted\",\"seq\":24,\"command\":\"extension\",\"cwd\":\"/new\",\"started_at_ms\":24}",
+        ] {
+            writeln!(file, "{ignored}").unwrap();
+        }
+        writeln!(file, "{}", finish("survivor")).unwrap();
+        drop(file);
+
+        let before_compaction = journal.records().unwrap();
+        assert_eq!(before_compaction.len(), 1);
+        assert_eq!(before_compaction[0].id, "survivor");
+        assert_eq!(before_compaction[0].exit_code, Some(9));
+
+        compact_unlocked(journal.path()).unwrap();
+        assert_eq!(journal.records().unwrap(), before_compaction);
+        let compacted = fs::read_to_string(journal.path()).unwrap();
+        for (id, _) in &replacements {
+            assert!(
+                !compacted.contains(id),
+                "stale id survived compaction: {id}"
+            );
+        }
+        assert!(!compacted.contains("escaped-id"));
+
+        journal
+            .record_start("bad-cwd", Some("wanted"), 30, "fresh", "/fresh", 30)
+            .unwrap();
+        journal
+            .record_finish("bad-cwd", 0, 1, "/fresh", 31)
+            .unwrap();
+        let revived = journal.records().unwrap();
+        assert_eq!(
+            revived
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["survivor", "bad-cwd"]
+        );
+        assert_eq!(revived[1].command, "fresh");
     }
 
     /// Golden event emitted by `jterm_core::execution_journal`. Keep this
@@ -1808,7 +2018,7 @@ mod tests {
         file.write_all(b"\n").unwrap();
         write_compacted_event(
             &mut file,
-            &ExecutionEvent::Start {
+            &ExecutionEvent::Start(StartEvent {
                 jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                 id: "jsh-after-large-line".into(),
                 session_id: None,
@@ -1817,7 +2027,7 @@ mod tests {
                 command_truncated: false,
                 cwd: "/tmp".into(),
                 started_at_ms: 1,
-            },
+            }),
         )
         .unwrap();
         drop(file);
@@ -1875,7 +2085,7 @@ mod tests {
         for seq in 0..(MAX_RETAINED_EXECUTIONS as u64 + 5) {
             write_compacted_event(
                 &mut file,
-                &ExecutionEvent::Start {
+                &ExecutionEvent::Start(StartEvent {
                     jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                     id: format!("jsh-{seq}"),
                     session_id: Some("tab".into()),
@@ -1884,7 +2094,7 @@ mod tests {
                     command_truncated: false,
                     cwd: "/tmp".into(),
                     started_at_ms: seq,
-                },
+                }),
             )
             .unwrap();
         }
@@ -1915,7 +2125,7 @@ mod tests {
             let id = format!("jsh-large-{seq}");
             write_compacted_event(
                 &mut file,
-                &ExecutionEvent::Start {
+                &ExecutionEvent::Start(StartEvent {
                     jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                     id: id.clone(),
                     session_id: Some("tab".into()),
@@ -1924,7 +2134,7 @@ mod tests {
                     command_truncated: false,
                     cwd: "/tmp".into(),
                     started_at_ms: seq,
-                },
+                }),
             )
             .unwrap();
             write_compacted_event(
@@ -2076,7 +2286,7 @@ mod tests {
         for seq in 0..(MAX_RETAINED_EXECUTIONS as u64 + 5) {
             write_compacted_event(
                 &mut file,
-                &ExecutionEvent::Start {
+                &ExecutionEvent::Start(StartEvent {
                     jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                     id: format!("jsh-bounded-{seq}"),
                     session_id: None,
@@ -2085,7 +2295,7 @@ mod tests {
                     command_truncated: false,
                     cwd: "/tmp".into(),
                     started_at_ms: seq,
-                },
+                }),
             )
             .unwrap();
         }
