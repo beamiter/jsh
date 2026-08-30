@@ -496,9 +496,10 @@ pub fn default_journal_path() -> Option<PathBuf> {
 
 fn select_journal_path(override_path: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match override_path {
+        Some(path) if path.is_empty() => default_journal_path(),
         Some(path) => {
             let path = PathBuf::from(path);
-            (!path.as_os_str().is_empty() && path.is_absolute()).then_some(path)
+            path.is_absolute().then_some(path)
         }
         None => default_journal_path(),
     }
@@ -1313,6 +1314,11 @@ mod tests {
 
     #[test]
     fn journal_path_override_must_be_absolute() {
+        assert_eq!(
+            select_journal_path(Some(std::ffi::OsString::new())),
+            default_journal_path(),
+            "an empty override must match jterm_core's unset/default semantics"
+        );
         assert!(select_journal_path(Some("relative/file.jsonl".into())).is_none());
         assert_eq!(
             select_journal_path(Some("/tmp/jsh-test/executions.jsonl".into())),
