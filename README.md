@@ -418,6 +418,10 @@ tail once; a later LF only terminates it, and a compaction rename forces a safe
 recount on the replacement inode.
 An append after a torn final event charges its recovery newline to the same
 reader byte ceiling and refuses an over-budget write before changing the file.
+Every successful append data-syncs the journal before returning; creation of a
+new journal pathname also syncs its parent directory. A durability-barrier
+error happens after the event bytes may already be visible, so its commit state
+is explicitly unknown and the writer does not retry the event internally.
 Individual metadata and captured-output records also have hard size limits.
 Exact duplicate finish or output delivery is idempotent; conflicting duplicates
 poison only their own lifecycle slot until the next authoritative start.

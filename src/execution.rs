@@ -496,6 +496,21 @@ impl ExecutionJournal {
         max_event_lines: usize,
         compact_after_bytes: u64,
     ) -> io::Result<()> {
+        self.append_event_with_limits_and_durability(
+            event,
+            max_event_lines,
+            compact_after_bytes,
+            &SyncJournalDurability,
+        )
+    }
+
+    fn append_event_with_limits_and_durability(
+        &self,
+        event: ExecutionEvent,
+        max_event_lines: usize,
+        compact_after_bytes: u64,
+        durability: &impl JournalDurability,
+    ) -> io::Result<()> {
         let mut encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
         if encoded.len() > MAX_EVENT_LINE_BYTES {
             return Err(io::Error::new(
@@ -506,7 +521,7 @@ impl ExecutionJournal {
         encoded.push(b'\n');
 
         let _lock = self.lock(FlockArg::LockExclusive)?;
-        let mut file = open_regular_file(&self.path, true, true, true)?;
+        let (mut file, created_pathname) = open_or_create_regular_append_file(&self.path)?;
         set_private_open_file_permissions(&file)?;
         let source_len = file.metadata()?.len();
         let exact_line_count = if source_len < max_event_lines as u64 {
@@ -529,7 +544,10 @@ impl ExecutionJournal {
         if compacted_before_append {
             drop(file);
             compact_unlocked_with_line_limit(&self.path, max_event_lines)?;
-            file = open_regular_file(&self.path, true, true, true)?;
+            // Successful compaction must have installed the replacement. Do
+            // not silently create a second, unsynced pathname if it vanishes
+            // before this reopen.
+            file = open_regular_file(&self.path, true, true, false)?;
             set_private_open_file_permissions(&file)?;
         }
         let current_len = file.metadata()?.len();
@@ -562,9 +580,23 @@ impl ExecutionJournal {
             drop(file);
             compact_unlocked_with_line_limit(&self.path, max_event_lines)?;
             invalidate_append_line_count_cache(&self.path)?;
-        } else if !compacted_before_append {
-            if let Some(line_count) = exact_line_count {
-                cache_completed_append(&self.path, &file, line_count + 1)?;
+        } else {
+            if !compacted_before_append {
+                if let Some(line_count) = exact_line_count {
+                    cache_completed_append(&self.path, &file, line_count + 1)?;
+                }
+            }
+            // A returned barrier error is deliberately not retried: bytes may
+            // already be visible, so the caller must treat commit state as
+            // unknown. The public shell safely omits a dependent Finish in
+            // that case rather than manufacturing a second Start.
+            durability
+                .sync_data(&file)
+                .map_err(|error| append_durability_error("data", error))?;
+            if created_pathname {
+                durability
+                    .sync_directory(&_lock)
+                    .map_err(|error| append_durability_error("directory", error))?;
             }
         }
         Ok(())
@@ -608,6 +640,32 @@ impl ExecutionJournal {
 struct JournalLock {
     _directory: Flock<File>,
     _file: Flock<File>,
+}
+
+trait JournalDurability {
+    fn sync_data(&self, file: &File) -> io::Result<()>;
+    fn sync_directory(&self, lock: &JournalLock) -> io::Result<()>;
+}
+
+struct SyncJournalDurability;
+
+impl JournalDurability for SyncJournalDurability {
+    fn sync_data(&self, file: &File) -> io::Result<()> {
+        file.sync_data()
+    }
+
+    fn sync_directory(&self, lock: &JournalLock) -> io::Result<()> {
+        lock._directory.sync_all()
+    }
+}
+
+fn append_durability_error(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "execution journal {stage} durability barrier failed after writing; commit state is unknown: {error}"
+        ),
+    )
 }
 
 fn flock_with_timeout(mut file: File, arg: FlockArg, timeout: Duration) -> io::Result<Flock<File>> {
@@ -687,6 +745,26 @@ fn open_regular_file(path: &Path, read: bool, append: bool, create: bool) -> io:
         .open(path)?;
     ensure_regular_file(&file, path)?;
     Ok(file)
+}
+
+fn open_or_create_regular_append_file(path: &Path) -> io::Result<(File, bool)> {
+    let created = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create_new(true)
+        .custom_flags(SAFE_FILE_OPEN_FLAGS)
+        .mode(0o600)
+        .open(path);
+    match created {
+        Ok(file) => {
+            ensure_regular_file(&file, path)?;
+            Ok((file, true))
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_regular_file(path, true, true, false).map(|file| (file, false))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn ensure_regular_file(file: &File, path: &Path) -> io::Result<()> {
@@ -1457,6 +1535,44 @@ mod tests {
     use nix::sys::stat::Mode;
     use nix::unistd::mkfifo;
     use std::os::unix::fs::symlink;
+
+    struct FaultingDurability {
+        fail_data: bool,
+        fail_directory: bool,
+        data_calls: std::cell::Cell<usize>,
+        directory_calls: std::cell::Cell<usize>,
+    }
+
+    impl FaultingDurability {
+        fn new(fail_data: bool, fail_directory: bool) -> Self {
+            Self {
+                fail_data,
+                fail_directory,
+                data_calls: std::cell::Cell::new(0),
+                directory_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl JournalDurability for FaultingDurability {
+        fn sync_data(&self, file: &File) -> io::Result<()> {
+            self.data_calls.set(self.data_calls.get() + 1);
+            if self.fail_data {
+                Err(io::Error::other("injected data-sync failure"))
+            } else {
+                file.sync_data()
+            }
+        }
+
+        fn sync_directory(&self, lock: &JournalLock) -> io::Result<()> {
+            self.directory_calls.set(self.directory_calls.get() + 1);
+            if self.fail_directory {
+                Err(io::Error::other("injected directory-sync failure"))
+            } else {
+                lock._directory.sync_all()
+            }
+        }
+    }
 
     fn journal() -> (tempfile::TempDir, ExecutionJournal) {
         let dir = tempfile::tempdir().unwrap();
@@ -2287,6 +2403,101 @@ mod tests {
         let record = journal.get("jsh-recomputed-bound").unwrap().unwrap();
         assert_eq!(record.exit_code, Some(7));
         assert_eq!(record.duration_ms, Some(2));
+    }
+
+    #[test]
+    fn append_durability_errors_report_unknown_visible_state_without_retry() {
+        let start = |id: &str| {
+            ExecutionEvent::Start(StartEvent {
+                jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                id: id.into(),
+                session_id: Some("wanted".into()),
+                seq: 1,
+                command: "true".into(),
+                command_truncated: false,
+                cwd: "/tmp".into(),
+                started_at_ms: 1,
+            })
+        };
+
+        let (_data_dir, data_journal) = journal();
+        let data_fault = FaultingDurability::new(true, false);
+        let error = data_journal
+            .append_event_with_limits_and_durability(
+                start("data-fault"),
+                MAX_JOURNAL_EVENT_LINES,
+                u64::MAX,
+                &data_fault,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("commit state is unknown"));
+        assert_eq!(data_fault.data_calls.get(), 1);
+        assert_eq!(data_fault.directory_calls.get(), 0);
+        assert_eq!(
+            fs::read_to_string(data_journal.path())
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "the writer must not retry after a post-write barrier failure"
+        );
+        assert_eq!(data_journal.records().unwrap()[0].id, "data-fault");
+
+        let (_directory_dir, directory_journal) = journal();
+        let directory_fault = FaultingDurability::new(false, true);
+        let error = directory_journal
+            .append_event_with_limits_and_durability(
+                start("directory-fault"),
+                MAX_JOURNAL_EVENT_LINES,
+                u64::MAX,
+                &directory_fault,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("commit state is unknown"));
+        assert_eq!(directory_fault.data_calls.get(), 1);
+        assert_eq!(directory_fault.directory_calls.get(), 1);
+        assert_eq!(
+            fs::read_to_string(directory_journal.path())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let existing_path = FaultingDurability::new(false, true);
+        directory_journal
+            .append_event_with_limits_and_durability(
+                ExecutionEvent::Finish {
+                    jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                    id: "directory-fault".into(),
+                    exit_code: 7,
+                    duration_ms: 2,
+                    cwd_after: "/tmp".into(),
+                    ended_at_ms: 3,
+                },
+                MAX_JOURNAL_EVENT_LINES,
+                u64::MAX,
+                &existing_path,
+            )
+            .unwrap();
+        assert_eq!(existing_path.data_calls.get(), 1);
+        assert_eq!(
+            existing_path.directory_calls.get(),
+            0,
+            "an existing pathname needs only the data barrier"
+        );
+        let record = directory_journal.get("directory-fault").unwrap().unwrap();
+        assert_eq!(record.exit_code, Some(7));
+        assert_eq!(
+            fs::read_to_string(directory_journal.path())
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "neither barrier path retries an event internally"
+        );
     }
 
     #[test]
