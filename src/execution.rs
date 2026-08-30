@@ -432,16 +432,29 @@ impl ExecutionJournal {
             file = open_regular_file(&self.path, true, true, true)?;
             set_private_open_file_permissions(&file)?;
         }
+        let current_len = file.metadata()?.len();
         // A power loss can leave the prior write without its JSONL newline.
         // Separate that partial record before appending so one torn tail does
-        // not consume the first valid event after recovery.
-        if file.metadata()?.len() != 0 {
+        // not consume the first valid event after recovery. The separator is
+        // part of the prospective write budget: writing it first must never
+        // make the journal unreadable when the event follows.
+        let needs_separator = if current_len != 0 {
             file.seek(SeekFrom::End(-1))?;
             let mut last = [0_u8; 1];
             file.read_exact(&mut last)?;
-            if last[0] != b'\n' {
-                file.write_all(b"\n")?;
-            }
+            last[0] != b'\n'
+        } else {
+            false
+        };
+        let appended_bytes = encoded.len().saturating_add(usize::from(needs_separator));
+        if !journal_append_within_bound(current_len, appended_bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "execution journal append exceeds reader recovery limit",
+            ));
+        }
+        if needs_separator {
+            file.write_all(b"\n")?;
         }
         file.write_all(&encoded)?;
         if file.metadata()?.len() > MAX_JOURNAL_FILE_BYTES {
@@ -840,6 +853,11 @@ fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
     result.push_str(&value[..head_end]);
     result.push_str(&value[tail_start..]);
     (result, true)
+}
+
+fn journal_append_within_bound(current_bytes: u64, appended_bytes: usize) -> bool {
+    current_bytes.saturating_add(u64::try_from(appended_bytes).unwrap_or(u64::MAX))
+        <= MAX_JOURNAL_READ_BYTES
 }
 
 fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
@@ -1243,6 +1261,29 @@ mod tests {
         event.resize(raw_bytes - suffix.len(), b'x');
         event.extend_from_slice(suffix);
         assert_eq!(event.len(), raw_bytes);
+        event
+    }
+
+    fn output_event_with_raw_bytes(id: &str, raw_bytes: usize) -> ExecutionEvent {
+        let empty = ExecutionEvent::Output {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: id.to_string(),
+            text: String::new(),
+            truncated: true,
+            total_bytes: u64::MAX,
+            captured_at_ms: 2,
+        };
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        assert!(raw_bytes >= overhead);
+        let event = ExecutionEvent::Output {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: id.to_string(),
+            text: "x".repeat(raw_bytes - overhead),
+            truncated: true,
+            total_bytes: u64::MAX,
+            captured_at_ms: 2,
+        };
+        assert_eq!(serde_json::to_vec(&event).unwrap().len(), raw_bytes);
         event
     }
 
@@ -1751,6 +1792,77 @@ mod tests {
         let records = journal.records().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "jsh-after-torn");
+    }
+
+    #[test]
+    fn torn_tail_separator_is_counted_before_mutating_the_journal() {
+        let (_dir, journal) = journal();
+        let original_len = MAX_JOURNAL_FILE_BYTES as usize;
+        fs::write(journal.path(), vec![b'x'; original_len]).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let event = output_event_with_raw_bytes("jsh-hard-bound", MAX_EVENT_LINE_BYTES);
+
+        let error = journal.append_event(event).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        let unchanged = fs::read(journal.path()).unwrap();
+        assert_eq!(unchanged.len(), original_len);
+        assert!(unchanged.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn exact_reader_bound_is_accepted_before_post_append_compaction() {
+        let (_dir, journal) = journal();
+        let event = output_event_with_raw_bytes("jsh-exact-bound", MAX_EVENT_LINE_BYTES);
+        let append_bytes = MAX_EVENT_LINE_BYTES as u64 + 1;
+        let original_len = MAX_JOURNAL_READ_BYTES - append_bytes - 1;
+        assert_eq!(original_len, MAX_JOURNAL_FILE_BYTES - 1);
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(journal.path())
+            .unwrap();
+        file.set_len(original_len).unwrap();
+        drop(file);
+
+        journal.append_event(event).unwrap();
+
+        // The append reaches the exact read ceiling, then compaction consumes
+        // it successfully. The oversized orphan output retains no state.
+        assert_eq!(fs::metadata(journal.path()).unwrap().len(), 0);
+        assert!(journal.records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_recomputes_separator_and_budget_after_pre_compaction() {
+        let (_dir, journal) = journal();
+        let start = ExecutionEvent::Start(StartEvent {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: "jsh-recomputed-bound".into(),
+            session_id: None,
+            seq: 1,
+            command: "true".into(),
+            command_truncated: false,
+            cwd: "/tmp".into(),
+            started_at_ms: 1,
+        });
+        let mut source = serde_json::to_vec(&start).unwrap();
+        source.push(b'\n');
+        source.resize(MAX_JOURNAL_FILE_BYTES as usize + 1, b'x');
+        fs::write(journal.path(), source).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        journal
+            .record_finish("jsh-recomputed-bound", 7, 2, "/tmp", 3)
+            .unwrap();
+
+        let compacted = fs::read_to_string(journal.path()).unwrap();
+        assert_eq!(compacted.lines().count(), 2);
+        assert!(!compacted.contains("\n\n"));
+        let record = journal.get("jsh-recomputed-bound").unwrap().unwrap();
+        assert_eq!(record.exit_code, Some(7));
+        assert_eq!(record.duration_ms, Some(2));
     }
 
     #[test]
