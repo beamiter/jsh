@@ -98,6 +98,26 @@ enum ExecutionEvent {
         total_bytes: u64,
         captured_at_ms: u64,
     },
+    /// Durable ambiguity marker written only by compaction. Legacy v1 readers
+    /// reject this additive event and therefore leave the slot unknown too.
+    #[serde(rename = "conflict")]
+    Conflict(ConflictEvent),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictEvent {
+    #[serde(alias = "rsh_execution_version")]
+    jsh_execution_version: u32,
+    id: String,
+    slot: ConflictSlot,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConflictSlot {
+    Finish,
+    Output,
 }
 
 impl ExecutionEvent {
@@ -115,7 +135,73 @@ impl ExecutionEvent {
                 jsh_execution_version,
                 ..
             } => *jsh_execution_version,
+            Self::Conflict(event) => event.jsh_execution_version,
         }
+    }
+}
+
+#[derive(Debug)]
+struct FoldedExecution {
+    record: ExecutionRecord,
+    finish_conflicted: bool,
+    output_conflicted: bool,
+}
+
+impl FoldedExecution {
+    fn new(record: ExecutionRecord) -> Self {
+        Self {
+            record,
+            finish_conflicted: false,
+            output_conflicted: false,
+        }
+    }
+
+    fn apply_finish(
+        &mut self,
+        exit_code: i32,
+        duration_ms: u64,
+        cwd_after: String,
+        ended_at_ms: u64,
+    ) {
+        if self.finish_conflicted {
+            return;
+        }
+        if self.record.exit_code.is_none() {
+            self.record.exit_code = Some(exit_code);
+            self.record.duration_ms = Some(duration_ms);
+            self.record.cwd_after = Some(cwd_after);
+            self.record.ended_at_ms = Some(ended_at_ms);
+        } else if self.record.exit_code != Some(exit_code)
+            || self.record.duration_ms != Some(duration_ms)
+            || self.record.cwd_after.as_deref() != Some(cwd_after.as_str())
+            || self.record.ended_at_ms != Some(ended_at_ms)
+        {
+            self.poison_finish();
+        }
+    }
+
+    fn apply_output(&mut self, output: ExecutionOutput) {
+        if self.output_conflicted {
+            return;
+        }
+        match self.record.output.as_ref() {
+            None => self.record.output = Some(output),
+            Some(existing) if existing == &output => {}
+            Some(_) => self.poison_output(),
+        }
+    }
+
+    fn poison_finish(&mut self) {
+        self.record.exit_code = None;
+        self.record.duration_ms = None;
+        self.record.cwd_after = None;
+        self.record.ended_at_ms = None;
+        self.finish_conflicted = true;
+    }
+
+    fn poison_output(&mut self) {
+        self.record.output = None;
+        self.output_conflicted = true;
     }
 }
 
@@ -267,7 +353,7 @@ impl ExecutionJournal {
         }
         let _lock = self.lock(FlockArg::LockShared)?;
         match read_records(&self.path) {
-            Ok(records) => Ok(records),
+            Ok(records) => Ok(records.into_iter().map(|folded| folded.record).collect()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(error) => Err(error),
         }
@@ -729,7 +815,7 @@ fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
     (result, true)
 }
 
-fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
+fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
     let file = open_regular_file(path, true, false, false)?;
     set_private_open_file_permissions(&file)?;
     if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
@@ -738,7 +824,7 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
             "execution journal exceeds size limit",
         ));
     }
-    let mut records = HashMap::<String, ExecutionRecord>::new();
+    let mut records = HashMap::<String, FoldedExecution>::new();
     // Keep the working set bounded while preserving the newest start-event
     // chronology. A second start for one ID is authoritative and must move to
     // its new position rather than retaining the first event's eviction age.
@@ -794,13 +880,13 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                 };
                 if let Some(previous) = records.remove(&id) {
                     record_order.remove(&(
-                        previous.started_at_ms,
-                        previous.seq,
-                        previous.id.clone(),
+                        previous.record.started_at_ms,
+                        previous.record.seq,
+                        previous.record.id.clone(),
                     ));
                 }
                 record_order.insert((started_at_ms, seq, id.clone()), id.clone());
-                records.insert(id, record);
+                records.insert(id, FoldedExecution::new(record));
                 while records.len() > MAX_RETAINED_EXECUTIONS {
                     let Some((_, oldest_id)) = record_order.pop_first() else {
                         break;
@@ -820,10 +906,7 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
-                    record.exit_code = Some(exit_code);
-                    record.duration_ms = Some(duration_ms);
-                    record.cwd_after = Some(cwd_after);
-                    record.ended_at_ms = Some(ended_at_ms);
+                    record.apply_finish(exit_code, duration_ms, cwd_after, ended_at_ms);
                 }
             }
             ExecutionEvent::Output {
@@ -840,7 +923,7 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                 if let Some(record) = records.get_mut(&id) {
                     let (truncated, total_bytes) =
                         normalize_output_metadata(text.len(), truncated, total_bytes);
-                    record.output = Some(ExecutionOutput {
+                    record.apply_output(ExecutionOutput {
                         total_bytes,
                         text,
                         truncated,
@@ -848,11 +931,26 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                     });
                 }
             }
+            ExecutionEvent::Conflict(event) => {
+                if validate_execution_id(&event.id).is_err() {
+                    continue;
+                }
+                if let Some(record) = records.get_mut(&event.id) {
+                    match event.slot {
+                        ConflictSlot::Finish => record.poison_finish(),
+                        ConflictSlot::Output => record.poison_output(),
+                    }
+                }
+            }
         }
     }
     let mut records = records.into_values().collect::<Vec<_>>();
     records.sort_by(|left, right| {
-        (left.started_at_ms, left.seq, &left.id).cmp(&(right.started_at_ms, right.seq, &right.id))
+        (left.record.started_at_ms, left.record.seq, &left.record.id).cmp(&(
+            right.record.started_at_ms,
+            right.record.seq,
+            &right.record.id,
+        ))
     });
     Ok(records)
 }
@@ -938,8 +1036,9 @@ fn compact_unlocked(path: &Path) -> io::Result<()> {
     result
 }
 
-fn encode_compacted_record(record: &ExecutionRecord) -> io::Result<Vec<u8>> {
+fn encode_compacted_record(folded: &FoldedExecution) -> io::Result<Vec<u8>> {
     let mut encoded = Vec::new();
+    let record = &folded.record;
     write_compacted_event(
         &mut encoded,
         &ExecutionEvent::Start {
@@ -953,7 +1052,16 @@ fn encode_compacted_record(record: &ExecutionRecord) -> io::Result<Vec<u8>> {
             started_at_ms: record.started_at_ms,
         },
     )?;
-    if let (Some(exit_code), Some(duration_ms), Some(cwd_after), Some(ended_at_ms)) = (
+    if folded.finish_conflicted {
+        write_compacted_event(
+            &mut encoded,
+            &ExecutionEvent::Conflict(ConflictEvent {
+                jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                id: record.id.clone(),
+                slot: ConflictSlot::Finish,
+            }),
+        )?;
+    } else if let (Some(exit_code), Some(duration_ms), Some(cwd_after), Some(ended_at_ms)) = (
         record.exit_code,
         record.duration_ms,
         record.cwd_after.clone(),
@@ -971,7 +1079,16 @@ fn encode_compacted_record(record: &ExecutionRecord) -> io::Result<Vec<u8>> {
             },
         )?;
     }
-    if let Some(output) = &record.output {
+    if folded.output_conflicted {
+        write_compacted_event(
+            &mut encoded,
+            &ExecutionEvent::Conflict(ConflictEvent {
+                jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                id: record.id.clone(),
+                slot: ConflictSlot::Output,
+            }),
+        )?;
+    } else if let Some(output) = &record.output {
         write_compacted_event(
             &mut encoded,
             &ExecutionEvent::Output {
@@ -1130,6 +1247,118 @@ mod tests {
         assert_eq!(replacement.cwd, "/new");
         assert_eq!(replacement.exit_code, None);
         assert!(journal.list(Some("old-tab"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflicting_lifecycle_slots_do_not_resolve_last_wins() {
+        let (_dir, journal) = journal();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(journal.path())
+            .unwrap();
+        writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-conflict\",\"session_id\":\"tab-1\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}}").unwrap();
+        for event in [
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-conflict\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-conflict\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-conflict\",\"exit_code\":9,\"duration_ms\":8,\"cwd_after\":\"/other\",\"ended_at_ms\":9}",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-conflict\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-conflict\",\"text\":\"first\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4}",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-conflict\",\"text\":\"first\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4}",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-conflict\",\"text\":\"second\",\"truncated\":false,\"total_bytes\":6,\"captured_at_ms\":10}",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-conflict\",\"text\":\"first\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4}",
+        ] {
+            writeln!(file, "{event}").unwrap();
+        }
+        drop(file);
+
+        let record = journal.get("jsh-conflict").unwrap().unwrap();
+        assert_eq!(record.exit_code, None);
+        assert_eq!(record.duration_ms, None);
+        assert_eq!(record.cwd_after, None);
+        assert_eq!(record.ended_at_ms, None);
+        assert_eq!(record.output, None);
+
+        let before_compaction = journal.records().unwrap();
+        compact_unlocked(journal.path()).unwrap();
+        let after_compaction = journal.records().unwrap();
+        assert_eq!(after_compaction, before_compaction);
+
+        let compacted = fs::read_to_string(journal.path()).unwrap();
+        let compacted_lines = compacted.lines().collect::<Vec<_>>();
+        assert_eq!(compacted_lines.len(), 3);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(compacted_lines[1]).unwrap(),
+            serde_json::json!({
+                "event": "conflict",
+                "jsh_execution_version": 1,
+                "id": "jsh-conflict",
+                "slot": "finish",
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(compacted_lines[2]).unwrap(),
+            serde_json::json!({
+                "event": "conflict",
+                "jsh_execution_version": 1,
+                "id": "jsh-conflict",
+                "slot": "output",
+            })
+        );
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(journal.path())
+            .unwrap();
+        writeln!(file, "{}", compacted_lines[1]).unwrap();
+        writeln!(file, "{}", compacted_lines[2]).unwrap();
+        drop(file);
+        journal
+            .record_finish("jsh-conflict", 0, 2, "/tmp", 3)
+            .unwrap();
+        journal
+            .record_output("jsh-conflict", "first", false, 5, 4)
+            .unwrap();
+        assert_eq!(journal.records().unwrap(), before_compaction);
+
+        journal
+            .record_start("jsh-conflict", Some("tab-1"), 2, "fresh", "/tmp", 20)
+            .unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(journal.path())
+            .unwrap();
+        for malformed in [
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"jsh-conflict\",\"slot\":\"finish\",\"extra\":true}",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"jsh-conflict\",\"slot\":\"unknown\"}",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"jsh-conflict\"}",
+            "{\"jsh_execution_version\":1,\"event\":\"conflicts\",\"id\":\"jsh-conflict\",\"slot\":\"finish\"}",
+            "{\"jsh_execution_version\":99,\"event\":\"conflict\",\"id\":\"jsh-conflict\",\"slot\":\"finish\"}",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"bad id\",\"slot\":\"finish\"}",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"orphan\",\"slot\":\"finish\"}",
+        ] {
+            writeln!(file, "{malformed}").unwrap();
+        }
+        drop(file);
+        journal
+            .record_finish("jsh-conflict", 7, 2, "/after", 22)
+            .unwrap();
+        journal
+            .record_output("jsh-conflict", "exact", false, 5, 23)
+            .unwrap();
+
+        let reset = journal.get("jsh-conflict").unwrap().unwrap();
+        assert_eq!(reset.seq, 2);
+        assert_eq!(reset.command, "fresh");
+        assert_eq!(reset.exit_code, Some(7));
+        assert_eq!(reset.duration_ms, Some(2));
+        assert_eq!(reset.cwd_after.as_deref(), Some("/after"));
+        assert_eq!(reset.ended_at_ms, Some(22));
+        assert_eq!(
+            reset.output.as_ref().map(|output| output.text.as_str()),
+            Some("exact")
+        );
     }
 
     /// Golden event emitted by `jterm_core::execution_journal`. Keep this
