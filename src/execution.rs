@@ -142,12 +142,18 @@ impl ExecutionJournal {
         {
             return None;
         }
-        let path = select_journal_path(std::env::var_os("JSH_EXECUTION_JOURNAL_PATH"))?;
-        Some(Self::with_path(path))
+        let override_path = std::env::var_os("JSH_EXECUTION_JOURNAL_PATH");
+        let harden_existing_parent =
+            journal_parent_hardening_for_override(override_path.as_deref());
+        let path = select_journal_path(override_path)?;
+        Some(Self::with_path_policy(path, harden_existing_parent))
     }
 
     pub fn with_path(path: PathBuf) -> Self {
-        let harden_existing_parent = default_journal_path().as_deref() == Some(path.as_path());
+        Self::with_path_policy(path, false)
+    }
+
+    fn with_path_policy(path: PathBuf, harden_existing_parent: bool) -> Self {
         let lock_path = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -519,6 +525,10 @@ pub fn default_journal_path() -> Option<PathBuf> {
     let state_dir = dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")));
     state_dir.map(|state_dir| state_dir.join("jsh").join("executions.jsonl"))
+}
+
+fn journal_parent_hardening_for_override(override_path: Option<&std::ffi::OsStr>) -> bool {
+    override_path.is_none() || override_path.is_some_and(std::ffi::OsStr::is_empty)
 }
 
 fn select_journal_path(override_path: Option<std::ffi::OsString>) -> Option<PathBuf> {
@@ -1338,6 +1348,21 @@ mod tests {
             fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+
+    #[test]
+    fn an_explicit_default_path_remains_a_custom_namespace() {
+        let default = default_journal_path().expect("state directory");
+        let journal = ExecutionJournal::with_path(default.clone());
+
+        assert!(!journal.harden_existing_parent);
+        assert!(!journal_parent_hardening_for_override(Some(
+            default.as_os_str()
+        )));
+        assert!(journal_parent_hardening_for_override(None));
+        assert!(journal_parent_hardening_for_override(Some(
+            std::ffi::OsStr::new("")
+        )));
     }
 
     #[test]
