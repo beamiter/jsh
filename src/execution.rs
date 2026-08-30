@@ -747,7 +747,12 @@ fn read_bounded_line(
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(buffer.len(), |index| index + 1);
         if !oversized {
-            if line.len() + consumed <= MAX_EVENT_LINE_BYTES + 1 {
+            // The public limit covers the JSON event, not its optional line
+            // delimiter.  Counting `+ 1` unconditionally admitted an
+            // unterminated event with MAX_EVENT_LINE_BYTES + 1 payload bytes.
+            // Discount a newline only when this chunk actually contains one.
+            let payload_bytes = consumed.saturating_sub(usize::from(newline.is_some()));
+            if line.len().saturating_add(payload_bytes) <= MAX_EVENT_LINE_BYTES {
                 line.extend_from_slice(&buffer[..consumed]);
             } else {
                 line.clear();
@@ -1145,6 +1150,41 @@ mod tests {
         let records = journal.records().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "jsh-after-large-line");
+    }
+
+    #[test]
+    fn event_line_limit_counts_only_a_real_newline_as_framing() {
+        for terminated in [false, true] {
+            let mut bytes = vec![b'x'; MAX_EVENT_LINE_BYTES];
+            if terminated {
+                bytes.push(b'\n');
+            }
+            let mut reader = bytes.as_slice();
+            let mut line = Vec::new();
+            let mut bytes_read = 0;
+            assert_eq!(
+                read_bounded_line(&mut reader, &mut line, &mut bytes_read).unwrap(),
+                Some(true),
+                "an event exactly at the payload limit must be retained"
+            );
+            assert_eq!(line, bytes);
+        }
+
+        for terminated in [false, true] {
+            let mut bytes = vec![b'x'; MAX_EVENT_LINE_BYTES + 1];
+            if terminated {
+                bytes.push(b'\n');
+            }
+            let mut reader = bytes.as_slice();
+            let mut line = Vec::new();
+            let mut bytes_read = 0;
+            assert_eq!(
+                read_bounded_line(&mut reader, &mut line, &mut bytes_read).unwrap(),
+                Some(false),
+                "one byte beyond the payload limit must be discarded"
+            );
+            assert!(line.is_empty());
+        }
     }
 
     #[test]
