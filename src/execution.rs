@@ -11,9 +11,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const EXECUTION_JOURNAL_VERSION: u32 = 1;
@@ -43,6 +44,18 @@ const SAFE_FILE_OPEN_FLAGS: i32 =
     nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct AppendLineCountCache {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    scanned_bytes: u64,
+    newline_count: usize,
+    ends_with_newline: bool,
+}
+
+static APPEND_LINE_COUNT_CACHE: Mutex<Option<AppendLineCountCache>> = Mutex::new(None);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ExecutionOutput {
@@ -414,6 +427,15 @@ impl ExecutionJournal {
     }
 
     fn append_event(&self, event: ExecutionEvent) -> io::Result<()> {
+        self.append_event_with_limits(event, MAX_JOURNAL_EVENT_LINES, MAX_JOURNAL_FILE_BYTES)
+    }
+
+    fn append_event_with_limits(
+        &self,
+        event: ExecutionEvent,
+        max_event_lines: usize,
+        compact_after_bytes: u64,
+    ) -> io::Result<()> {
         let mut encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
         if encoded.len() > MAX_EVENT_LINE_BYTES {
             return Err(io::Error::new(
@@ -426,9 +448,27 @@ impl ExecutionJournal {
         let _lock = self.lock(FlockArg::LockExclusive)?;
         let mut file = open_regular_file(&self.path, true, true, true)?;
         set_private_open_file_permissions(&file)?;
-        if file.metadata()?.len() > MAX_JOURNAL_FILE_BYTES {
+        let source_len = file.metadata()?.len();
+        let exact_line_count = if source_len < max_event_lines as u64 {
+            None
+        } else {
+            Some(count_physical_lines_cached(
+                &mut file, &self.path, source_len,
+            )?)
+        };
+        // Check the source before compaction. Otherwise an append could erase
+        // ignored physical events and use the smaller replacement to evade the
+        // event-count budget.
+        if exact_line_count.is_some_and(|line_count| line_count >= max_event_lines) {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "execution journal append exceeds event-count limit",
+            ));
+        }
+        let compacted_before_append = source_len > compact_after_bytes;
+        if compacted_before_append {
             drop(file);
-            compact_unlocked(&self.path)?;
+            compact_unlocked_with_line_limit(&self.path, max_event_lines)?;
             file = open_regular_file(&self.path, true, true, true)?;
             set_private_open_file_permissions(&file)?;
         }
@@ -453,13 +493,19 @@ impl ExecutionJournal {
                 "execution journal append exceeds reader recovery limit",
             ));
         }
+        invalidate_append_line_count_cache(&self.path)?;
         if needs_separator {
             file.write_all(b"\n")?;
         }
         file.write_all(&encoded)?;
-        if file.metadata()?.len() > MAX_JOURNAL_FILE_BYTES {
+        if file.metadata()?.len() > compact_after_bytes {
             drop(file);
-            compact_unlocked(&self.path)?;
+            compact_unlocked_with_line_limit(&self.path, max_event_lines)?;
+            invalidate_append_line_count_cache(&self.path)?;
+        } else if !compacted_before_append {
+            if let Some(line_count) = exact_line_count {
+                cache_completed_append(&self.path, &file, line_count + 1)?;
+            }
         }
         Ok(())
     }
@@ -858,6 +904,97 @@ fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
 fn journal_append_within_bound(current_bytes: u64, appended_bytes: usize) -> bool {
     current_bytes.saturating_add(u64::try_from(appended_bytes).unwrap_or(u64::MAX))
         <= MAX_JOURNAL_READ_BYTES
+}
+
+fn count_physical_lines_cached(
+    journal: &mut File,
+    journal_path: &Path,
+    current_len: u64,
+) -> io::Result<usize> {
+    let metadata = journal.metadata()?;
+    let mut cache = APPEND_LINE_COUNT_CACHE
+        .lock()
+        .map_err(|_| io::Error::other("journal line-count cache is poisoned"))?;
+    let can_resume = cache.as_ref().is_some_and(|cached| {
+        cached.path == journal_path
+            && cached.device == metadata.dev()
+            && cached.inode == metadata.ino()
+            && cached.scanned_bytes <= current_len
+    });
+    let (offset, mut newline_count, mut ends_with_newline) = if can_resume {
+        let cached = cache.as_ref().expect("cache presence checked above");
+        (
+            cached.scanned_bytes,
+            cached.newline_count,
+            cached.ends_with_newline,
+        )
+    } else {
+        (0, 0, false)
+    };
+
+    journal.seek(SeekFrom::Start(offset))?;
+    let mut remaining = current_len.saturating_sub(offset);
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = journal.read(&mut buffer[..requested])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "execution journal changed while counting events",
+            ));
+        }
+        newline_count = newline_count
+            .checked_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count())
+            .ok_or_else(|| io::Error::other("execution journal event count overflowed"))?;
+        ends_with_newline = buffer[read - 1] == b'\n';
+        remaining -= read as u64;
+    }
+
+    *cache = Some(AppendLineCountCache {
+        path: journal_path.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        scanned_bytes: current_len,
+        newline_count,
+        ends_with_newline,
+    });
+    newline_count
+        .checked_add(usize::from(current_len != 0 && !ends_with_newline))
+        .ok_or_else(|| io::Error::other("execution journal event count overflowed"))
+}
+
+fn invalidate_append_line_count_cache(journal_path: &Path) -> io::Result<()> {
+    let mut cache = APPEND_LINE_COUNT_CACHE
+        .lock()
+        .map_err(|_| io::Error::other("journal line-count cache is poisoned"))?;
+    if cache
+        .as_ref()
+        .is_some_and(|cached| cached.path == journal_path)
+    {
+        *cache = None;
+    }
+    Ok(())
+}
+
+fn cache_completed_append(
+    journal_path: &Path,
+    journal: &File,
+    physical_lines: usize,
+) -> io::Result<()> {
+    let metadata = journal.metadata()?;
+    let mut cache = APPEND_LINE_COUNT_CACHE
+        .lock()
+        .map_err(|_| io::Error::other("journal line-count cache is poisoned"))?;
+    *cache = Some(AppendLineCountCache {
+        path: journal_path.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        scanned_bytes: metadata.len(),
+        newline_count: physical_lines,
+        ends_with_newline: true,
+    });
+    Ok(())
 }
 
 fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
@@ -1988,6 +2125,63 @@ mod tests {
         let record = journal.get("jsh-recomputed-bound").unwrap().unwrap();
         assert_eq!(record.exit_code, Some(7));
         assert_eq!(record.duration_ms, Some(2));
+    }
+
+    #[test]
+    fn append_rejects_an_exact_event_budget_before_compaction() {
+        let (_dir, journal) = journal();
+        let original = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"future\",\"payload\":true}\n",
+            "{\"malformed\":\n",
+            "{\"jsh_execution_version\":2,\"event\":\"output\",\"id\":\"known\",\"text\":\"future\",\"truncated\":false,\"total_bytes\":6,\"captured_at_ms\":2}\n"
+        );
+        fs::write(journal.path(), original).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let finish = || ExecutionEvent::Finish {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: "known".into(),
+            exit_code: 7,
+            duration_ms: 2,
+            cwd_after: "/tmp".into(),
+            ended_at_ms: 3,
+        };
+
+        let error = journal
+            .append_event_with_limits(finish(), 4, 1)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(fs::read(journal.path()).unwrap(), original.as_bytes());
+        let unexpected = fs::read_dir(journal.path().parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name != "executions.jsonl" && name != JOURNAL_LOCK_FILE_NAME)
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected.is_empty(),
+            "left compaction artifacts: {unexpected:?}"
+        );
+
+        let reopened = ExecutionJournal::with_path(journal.path().to_owned());
+        assert_eq!(
+            read_records_with_line_limit(reopened.path(), 4)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(fs::read(reopened.path()).unwrap(), original.as_bytes());
+
+        compact_unlocked_with_line_limit(reopened.path(), 4).unwrap();
+        reopened
+            .append_event_with_limits(finish(), 4, u64::MAX)
+            .unwrap();
+        let after_restart = ExecutionJournal::with_path(reopened.path().to_owned())
+            .get("known")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_restart.exit_code, Some(7));
+        assert_eq!(after_restart.duration_ms, Some(2));
     }
 
     #[test]

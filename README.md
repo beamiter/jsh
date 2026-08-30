@@ -411,6 +411,9 @@ inspects at most 524,288 physical event lines, above the number of conforming v1
 events that fit its byte window but finite for malformed short-line streams.
 Compaction accepts the source under that same physical-line budget before it
 can discard ignored future or unknown events and replace the journal.
+Append checks the prospective line budget before any automatic compaction, so
+an exact-limit source is refused byte-for-byte intact instead of being erased
+into apparent compliance.
 An append after a torn final event charges its recovery newline to the same
 reader byte ceiling and refuses an over-budget write before changing the file.
 Individual metadata and captured-output records also have hard size limits.
