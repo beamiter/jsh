@@ -145,6 +145,21 @@ struct EventKindVersion<'a> {
     jsh_execution_version: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct VersionNamePresence {
+    #[serde(default, deserialize_with = "present_json_value")]
+    jsh_execution_version: bool,
+    #[serde(default, deserialize_with = "present_json_value")]
+    rsh_execution_version: bool,
+}
+
+fn present_json_value<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConflictEvent {
@@ -216,6 +231,13 @@ fn known_v1_slot_event_has_extra_fields(line: &[u8]) -> bool {
             _ => unreachable!("slot event kind checked above"),
         }
     })
+}
+
+fn has_version_alias_collision(line: &[u8]) -> bool {
+    let Ok(presence) = serde_json::from_slice::<VersionNamePresence>(line) else {
+        return false;
+    };
+    presence.jsh_execution_version && presence.rsh_execution_version
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1049,7 +1071,7 @@ fn read_records_with_line_limit(
 fn read_records_with_line_limit_policy(
     path: &Path,
     max_event_lines: usize,
-    reject_extra_slot_fields: bool,
+    strict_compaction: bool,
 ) -> io::Result<Vec<FoldedExecution>> {
     let file = open_regular_file(path, true, false, false)?;
     set_private_open_file_permissions(&file)?;
@@ -1093,6 +1115,17 @@ fn read_records_with_line_limit_policy(
         // duplicate unknown members that Serde would otherwise skip while
         // decoding Finish/Output events.
         if jagent::validate_no_duplicate_members(&line).is_err() {
+            // A malformed/torn event remains skippable, but compaction must
+            // not turn structurally valid duplicate-member JSON into one
+            // canonical last-wins interpretation. Value decoding is used only
+            // to distinguish valid-but-ambiguous JSON from syntax damage; the
+            // decoded tree is discarded without touching lifecycle state.
+            if strict_compaction && serde_json::from_slice::<serde_json::Value>(&line).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "execution journal contains ambiguous JSON object members",
+                ));
+            }
             continue;
         }
         // A recognized v1 Start owns this ID even when strict decoding of its
@@ -1108,10 +1141,13 @@ fn read_records_with_line_limit_policy(
         let event = match serde_json::from_slice::<ExecutionEvent>(&line) {
             Ok(event) => event,
             Err(_) => {
-                if reject_extra_slot_fields && known_v1_slot_event_has_extra_fields(&line) {
+                if strict_compaction
+                    && (known_v1_slot_event_has_extra_fields(&line)
+                        || has_version_alias_collision(&line))
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "execution journal finish/output event contains extra fields",
+                        "execution journal event envelope is ambiguous",
                     ));
                 }
                 continue;
@@ -2873,6 +2909,111 @@ mod tests {
         assert_eq!(records[3].id, "duplicate-identity");
         assert_eq!(records[3].command, "four");
         assert_eq!(records[3].exit_code, Some(9));
+
+        let bytes_before = fs::read(journal.path()).unwrap();
+        let identity_before = fs::metadata(journal.path()).unwrap();
+        let mut entries_before = fs::read_dir(journal.path().parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries_before.sort();
+        let error = compact_unlocked(journal.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(journal.path()).unwrap(), bytes_before);
+        let identity_after = fs::metadata(journal.path()).unwrap();
+        assert_eq!(
+            (identity_after.dev(), identity_after.ino()),
+            (identity_before.dev(), identity_before.ino())
+        );
+        let mut entries_after = fs::read_dir(journal.path().parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries_after.sort();
+        assert_eq!(entries_after, entries_before);
+    }
+
+    #[test]
+    fn ambiguous_envelopes_fail_compaction_while_future_known_kinds_stay_skippable() {
+        let (_dir, ambiguous_journal) = journal();
+        let contents = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"stable\",\"exit_code\":9,\"duration_ms\":2,\"cwd_after\":\"/old-after\",\"ended_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"stable\",\"text\":\"old output\",\"truncated\":false,\"total_bytes\":10,\"captured_at_ms\":4}\n",
+            "{\"jsh_execution_version\":2,\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":12,\"command\":\"alias last v1\",\"cwd\":\"/new\",\"started_at_ms\":12}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"\\u0065vent\":\"finish\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":10,\"command\":\"duplicate kind\",\"cwd\":\"/new\",\"started_at_ms\":10}\n",
+            "{\"jsh_execution_version\":1,\"jsh_execution_\\u0076ersion\":1,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":11,\"command\":\"duplicate version\",\"cwd\":\"/new\",\"started_at_ms\":11}\n",
+            "{\"rsh_execution_version\":1,\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":13,\"command\":\"alias first v1\",\"cwd\":\"/new\",\"started_at_ms\":13}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"stable\",\"\\u0069d\":\"other\",\"session_id\":\"wanted\",\"seq\":14,\"command\":\"duplicate id\",\"cwd\":\"/new\",\"started_at_ms\":14}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"\\u0073ession_id\":\"other\",\"seq\":15,\"command\":\"duplicate session\",\"cwd\":\"/new\",\"started_at_ms\":15}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"other\",\"\\u0069d\":\"stable\",\"exit_code\":70,\"duration_ms\":70,\"cwd_after\":\"/wrong\",\"ended_at_ms\":70}\n",
+            "{\"jsh_execution_version\":2,\"rsh_execution_version\":1,\"event\":\"finish\",\"id\":\"stable\",\"exit_code\":71,\"duration_ms\":71,\"cwd_after\":\"/wrong\",\"ended_at_ms\":71}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"other\",\"\\u0069d\":\"stable\",\"text\":\"duplicate id output\",\"truncated\":false,\"total_bytes\":19,\"captured_at_ms\":72}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":20,\"command\":\"future start\",\"cwd\":\"/future\",\"started_at_ms\":20}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"finish\",\"id\":\"stable\",\"exit_code\":72,\"duration_ms\":72,\"cwd_after\":\"/future\",\"ended_at_ms\":72}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"output\",\"id\":\"stable\",\"text\":\"future output\",\"truncated\":false,\"total_bytes\":13,\"captured_at_ms\":73}\n"
+        );
+        fs::write(ambiguous_journal.path(), contents).unwrap();
+        fs::set_permissions(ambiguous_journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let records = ambiguous_journal.records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "stable");
+        assert_eq!(records[0].seq, 1);
+        assert_eq!(records[0].command, "old");
+        assert_eq!(records[0].cwd, "/old");
+        assert_eq!(records[0].exit_code, Some(9));
+        assert_eq!(records[0].duration_ms, Some(2));
+        assert_eq!(records[0].cwd_after.as_deref(), Some("/old-after"));
+        assert_eq!(
+            records[0]
+                .output
+                .as_ref()
+                .map(|output| output.text.as_str()),
+            Some("old output")
+        );
+
+        let directory_entries = |path: &Path| {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        let bytes_before = fs::read(ambiguous_journal.path()).unwrap();
+        let identity_before = fs::metadata(ambiguous_journal.path()).unwrap();
+        let entries_before = directory_entries(ambiguous_journal.path().parent().unwrap());
+        let error = compact_unlocked(ambiguous_journal.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(ambiguous_journal.path()).unwrap(), bytes_before);
+        let identity_after = fs::metadata(ambiguous_journal.path()).unwrap();
+        assert_eq!(
+            (identity_after.dev(), identity_after.ino()),
+            (identity_before.dev(), identity_before.ino())
+        );
+        assert_eq!(
+            directory_entries(ambiguous_journal.path().parent().unwrap()),
+            entries_before
+        );
+
+        let (_future_dir, future_journal) = journal();
+        let future_contents = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"future-safe\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"future-safe\",\"exit_code\":9,\"duration_ms\":2,\"cwd_after\":\"/old-after\",\"ended_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"future-safe\",\"text\":\"old output\",\"truncated\":false,\"total_bytes\":10,\"captured_at_ms\":4}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"future-safe\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"future start\",\"cwd\":\"/future\",\"started_at_ms\":5}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"finish\",\"id\":\"future-safe\",\"exit_code\":70,\"duration_ms\":70,\"cwd_after\":\"/future\",\"ended_at_ms\":70}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"output\",\"id\":\"future-safe\",\"text\":\"future output\",\"truncated\":false,\"total_bytes\":13,\"captured_at_ms\":71}\n"
+        );
+        fs::write(future_journal.path(), future_contents).unwrap();
+        fs::set_permissions(future_journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let future_before = future_journal.records().unwrap();
+        compact_unlocked(future_journal.path()).unwrap();
+        assert_eq!(future_journal.records().unwrap(), future_before);
+        assert!(!fs::read_to_string(future_journal.path())
+            .unwrap()
+            .contains("future start"));
     }
 
     #[test]
