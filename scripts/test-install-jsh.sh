@@ -499,7 +499,7 @@ run_src() {
     env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
         XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
         JSH_INSTALL_BASE_URL="file://${REL}" \
-        sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin" "$@"
+        sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin"
 }
 
 rm -f "${STUB}/target-added" "${SRCLOG}.rustup"

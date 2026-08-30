@@ -7,6 +7,7 @@
 use crate::environment::{ConfigSource, ShellState};
 use crate::executor;
 use crate::parser;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -19,6 +20,28 @@ const MAX_CONFIG_HELPER_STDERR_BYTES: usize = 512 * 1024;
 const CONFIG_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const BASH_ENV_FRAME_MARKER: &[u8] = b"\0JSH_ENVIRONMENT_V1\0";
 const MAX_BASH_ENV_VARS: usize = 4096;
+
+/// Valid identifier names Bash consumes as its own dynamic/read-only state
+/// instead of preserving as exported environment entries. Their absence from
+/// a post-source frame is therefore indistinguishable from a sourced `unset`.
+const BASH_IMPLICITLY_OMITTED_ENV_NAMES: &[&str] = &[
+    "BASHPID",
+    "BASH_ARGV0",
+    "BASH_COMMAND",
+    "BASH_SUBSHELL",
+    "BASH_VERSINFO",
+    "COMP_WORDBREAKS",
+    "HISTCMD",
+    "OLDPWD",
+    "PPID",
+    "RANDOM",
+    "SRANDOM",
+];
+
+fn bash_frame_absence_is_ambiguous(name: &str) -> bool {
+    matches!(name, "SHLVL" | "_" | "PS1" | "HISTFILE")
+        || BASH_IMPLICITLY_OMITTED_ENV_NAMES.contains(&name)
+}
 
 /// Run a startup helper without making an interactive termination request wait
 /// for the helper's (potentially long) timeout.  Startup imports run before the
@@ -189,7 +212,7 @@ builtin exit "$1"
         return;
     };
     let mut command = std::process::Command::new(bash);
-    state.configure_command_environment(&mut command);
+    let prior_environment = state.configure_command_environment(&mut command);
     command
         // `PS1` is only half of how a startup file asks whether anyone is
         // listening. The other half is `$-`, and the guard every distribution
@@ -216,7 +239,7 @@ builtin exit "$1"
         .arg(path)
         .env("HISTFILE", "/dev/null");
     match run_startup_helper(&mut command, true) {
-        Ok(output) if parse_bash_output(&output.stdout, state) => {}
+        Ok(output) if parse_bash_output(&output.stdout, state, &prior_environment) => {}
         Ok(_) => eprintln!(
             "jsh: bash startup import returned malformed environment framing for {path:?}"
         ),
@@ -240,8 +263,8 @@ fn load_conda_hook(state: &mut ShellState) {
     // the user to run `conda init`, in a shell where `conda init` has already
     // been run and cannot help. So each way of failing says so, once, naming
     // the path it failed on.
-    match crate::io_guard::executable_named_by_startup(&conda_cmd) {
-        crate::io_guard::StartupExecutable::Ok => {}
+    let resolved_conda = match crate::io_guard::executable_named_by_startup(&conda_cmd) {
+        crate::io_guard::StartupExecutable::Ok(path) => path,
         crate::io_guard::StartupExecutable::Unusable => {
             eprintln!(
                 "jsh: conda: $CONDA_EXE is not an executable file: {}",
@@ -258,9 +281,12 @@ fn load_conda_hook(state: &mut ShellState) {
             );
             return;
         }
-    }
+    };
 
-    let mut command = std::process::Command::new(&conda_cmd);
+    // Execute the exact canonical path whose ownership was checked. Running
+    // the original symlink would reopen a replacement window between the
+    // validation above and exec.
+    let mut command = std::process::Command::new(&resolved_conda);
     command.args(["shell.posix", "hook"]);
     let output = match run_startup_helper(&mut command, false) {
         Ok(output) if output.status.success() => output,
@@ -303,12 +329,15 @@ fn load_conda_hook(state: &mut ShellState) {
 }
 
 /// Import the last complete environment frame in `output` and return the
-/// unconsumed suffix.  Using the last marker means arbitrary output printed by
-/// the sourced file before the helper's frame cannot impersonate it.  The
-/// state is changed only after the whole frame has been validated.
+/// unconsumed suffix. Using the last marker means arbitrary output printed by
+/// the sourced file before the helper's frame cannot impersonate it.
+/// `prior_environment` is the exact set of names placed into the child; a name
+/// missing from the validated result represents a sourced `unset`. The state
+/// is changed only after the whole frame has been validated.
 pub(crate) fn import_bash_environment_frame<'a>(
     output: &'a [u8],
     state: &mut ShellState,
+    prior_environment: &HashSet<String>,
 ) -> Option<&'a [u8]> {
     let marker = output
         .windows(BASH_ENV_FRAME_MARKER.len())
@@ -355,6 +384,32 @@ pub(crate) fn import_bash_environment_frame<'a>(
         variables.push((name.to_string(), value));
     }
 
+    let imported_names: HashSet<&str> = variables.iter().map(|(name, _)| name.as_str()).collect();
+    // A sourced `unset NAME` is represented by NAME being present in the
+    // exact environment handed to Bash and absent from its validated result.
+    // Do not diff against all of ShellState: invalid C-environment entries
+    // were never sent, while names outside jsh's identifier model (notably
+    // Bash's exported-function records, `BASH_FUNC_name%%`) are intentionally
+    // skipped by the parser. Treating either category as an unset would turn a
+    // helper limitation into unrelated state loss.
+    //
+    // Bash owns SHLVL and `_`, consumes several valid names as dynamic shell
+    // state, and omits PS1/HISTFILE when they retain helper sentinel values.
+    // Absence is ambiguous for all of them. A sourced non-sentinel
+    // PS1/HISTFILE is present in the frame and still updates the shell below.
+    let removed_names: Vec<String> = prior_environment
+        .iter()
+        .filter(|name| {
+            crate::environment::is_valid_identifier(name)
+                && !bash_frame_absence_is_ambiguous(name)
+                && !imported_names.contains(name.as_str())
+        })
+        .cloned()
+        .collect();
+
+    for name in removed_names {
+        state.unset_var(&name);
+    }
     for (name, value) in variables {
         state.export_var(&name, &value);
     }
@@ -363,8 +418,12 @@ pub(crate) fn import_bash_environment_frame<'a>(
 
 /// Parse bash output containing a NUL-framed environment followed by aliases,
 /// functions, and shopt settings.
-fn parse_bash_output(output: &[u8], state: &mut ShellState) -> bool {
-    let Some(remainder) = import_bash_environment_frame(output, state) else {
+fn parse_bash_output(
+    output: &[u8],
+    state: &mut ShellState,
+    prior_environment: &HashSet<String>,
+) -> bool {
+    let Some(remainder) = import_bash_environment_frame(output, state, prior_environment) else {
         return false;
     };
     let output = String::from_utf8_lossy(remainder);
@@ -730,6 +789,10 @@ mod tests {
         output
     }
 
+    fn parse_test_bash_output(output: &[u8], state: &mut ShellState) -> bool {
+        parse_bash_output(output, state, &HashSet::new())
+    }
+
     #[test]
     fn test_parse_bash_output_env_vars() {
         let output = framed_bash_output(
@@ -740,7 +803,7 @@ mod tests {
         );
 
         let mut state = ShellState::new(false);
-        assert!(parse_bash_output(&output, &mut state));
+        assert!(parse_test_bash_output(&output, &mut state));
 
         assert_eq!(state.get_var("TEST_VAR"), Some("hello_world"));
         assert_eq!(state.get_var("MY_PATH"), Some("/custom/path"));
@@ -758,7 +821,7 @@ alias grep='grep --color=auto'
         );
 
         let mut state = ShellState::new(false);
-        assert!(parse_bash_output(&output, &mut state));
+        assert!(parse_test_bash_output(&output, &mut state));
 
         assert_eq!(state.aliases.get("ll"), Some(&"ls -la".to_string()));
         assert_eq!(
@@ -780,7 +843,7 @@ globstar        on"#,
         );
 
         let mut state = ShellState::new(false);
-        assert!(parse_bash_output(&output, &mut state));
+        assert!(parse_test_bash_output(&output, &mut state));
 
         assert!(state.shell_opts.extglob);
         assert!(!state.shell_opts.dotglob);
@@ -799,7 +862,7 @@ extglob         on"#,
         );
 
         let mut state = ShellState::new(false);
-        assert!(parse_bash_output(&output, &mut state));
+        assert!(parse_test_bash_output(&output, &mut state));
 
         assert_eq!(state.get_var("APP_NAME"), Some("myapp"));
         assert_eq!(state.aliases.get("ll"), Some(&"ls -lah".to_string()));
@@ -814,7 +877,7 @@ extglob         on"#,
             "=== ALIASES ===\n",
         );
         let mut state = ShellState::new(false);
-        assert!(parse_bash_output(&output, &mut state));
+        assert!(parse_test_bash_output(&output, &mut state));
         assert_eq!(state.get_var("JSH_FRAMED_COMPLEX"), Some(complex));
         assert_eq!(state.get_var("JSH_FRAMED_EMPTY"), Some(""));
 
@@ -825,23 +888,114 @@ extglob         on"#,
             ],
             "",
         );
-        assert!(parse_bash_output(&special, &mut state));
+        assert!(parse_test_bash_output(&special, &mut state));
         assert_eq!(state.get_var("BASH_FUNC_exported%%"), None);
         assert_eq!(state.get_var("JSH_AFTER_SPECIAL"), Some("imported"));
 
         let malformed = b"\0JSH_ENVIRONMENT_V1\0JSH_PARTIAL=not-terminated";
-        assert!(import_bash_environment_frame(malformed, &mut state).is_none());
+        assert!(import_bash_environment_frame(malformed, &mut state, &HashSet::new()).is_none());
         assert_eq!(state.get_var("JSH_PARTIAL"), None);
 
         let duplicate = framed_bash_output(
             &[("JSH_DUPLICATE", "first"), ("JSH_DUPLICATE", "second")],
             "",
         );
-        assert!(import_bash_environment_frame(&duplicate, &mut state).is_none());
+        assert!(import_bash_environment_frame(&duplicate, &mut state, &HashSet::new()).is_none());
         assert_eq!(state.get_var("JSH_DUPLICATE"), None);
         state.unset_var("JSH_FRAMED_COMPLEX");
         state.unset_var("JSH_FRAMED_EMPTY");
         state.unset_var("JSH_AFTER_SPECIAL");
+    }
+
+    #[test]
+    fn environment_frame_applies_prior_removals_atomically_and_protects_sentinels() {
+        let mut state = ShellState::new(false);
+        for (name, value) in [
+            ("JSH_FRAME_REMOVE", "old"),
+            ("JSH_FRAME_UPDATE", "old"),
+            ("JSH_FRAME_UNSENT", "keep"),
+            ("BASH_FUNC_jsh_frame%%", "() {  :\n}"),
+            ("ODD.NAME", "keep"),
+            ("SHLVL", "7"),
+            ("_", "jsh"),
+            ("PS1", "jsh-prompt"),
+            ("HISTFILE", "jsh-history"),
+        ] {
+            // Populate only this ShellState. In particular, do not rewrite
+            // process-wide SHLVL/PS1/HISTFILE while tests run in parallel.
+            state.env_vars.insert(name.to_string(), value.to_string());
+        }
+        let mut prior_environment: HashSet<String> = [
+            "JSH_FRAME_REMOVE",
+            "JSH_FRAME_UPDATE",
+            "BASH_FUNC_jsh_frame%%",
+            "ODD.NAME",
+            "SHLVL",
+            "_",
+            "PS1",
+            "HISTFILE",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        for name in BASH_IMPLICITLY_OMITTED_ENV_NAMES {
+            state
+                .env_vars
+                .insert((*name).to_string(), "keep".to_string());
+            prior_environment.insert((*name).to_string());
+        }
+
+        let malformed = b"\0JSH_ENVIRONMENT_V1\0JSH_FRAME_UPDATE=new";
+        assert!(import_bash_environment_frame(malformed, &mut state, &prior_environment).is_none());
+        assert_eq!(state.get_var("JSH_FRAME_REMOVE"), Some("old"));
+        assert_eq!(state.get_var("JSH_FRAME_UPDATE"), Some("old"));
+
+        let duplicate = framed_bash_output(
+            &[
+                ("JSH_FRAME_UPDATE", "first"),
+                ("JSH_FRAME_UPDATE", "second"),
+            ],
+            "",
+        );
+        assert!(
+            import_bash_environment_frame(&duplicate, &mut state, &prior_environment).is_none()
+        );
+        assert_eq!(state.get_var("JSH_FRAME_REMOVE"), Some("old"));
+        assert_eq!(state.get_var("JSH_FRAME_UPDATE"), Some("old"));
+
+        let valid = framed_bash_output(&[("JSH_FRAME_UPDATE", "new")], "");
+        assert!(import_bash_environment_frame(&valid, &mut state, &prior_environment).is_some());
+        assert_eq!(state.get_var("JSH_FRAME_REMOVE"), None);
+        assert_eq!(state.get_var("JSH_FRAME_UPDATE"), Some("new"));
+        assert_eq!(state.get_var("JSH_FRAME_UNSENT"), Some("keep"));
+        assert_eq!(state.get_var("BASH_FUNC_jsh_frame%%"), Some("() {  :\n}"));
+        assert_eq!(state.get_var("ODD.NAME"), Some("keep"));
+        assert_eq!(state.get_var("SHLVL"), Some("7"));
+        assert_eq!(state.get_var("_"), Some("jsh"));
+        assert_eq!(state.get_var("PS1"), Some("jsh-prompt"));
+        assert_eq!(state.get_var("HISTFILE"), Some("jsh-history"));
+        for name in BASH_IMPLICITLY_OMITTED_ENV_NAMES {
+            assert_eq!(state.get_var(name), Some("keep"), "{name} was removed");
+        }
+
+        // The importer exported this unique test variable into the process
+        // environment. The protected and unrepresentable fixtures stayed
+        // local to ShellState and can be removed without global side effects.
+        state.unset_var("JSH_FRAME_UPDATE");
+        for name in [
+            "JSH_FRAME_UNSENT",
+            "BASH_FUNC_jsh_frame%%",
+            "ODD.NAME",
+            "SHLVL",
+            "_",
+            "PS1",
+            "HISTFILE",
+        ] {
+            state.env_vars.remove(name);
+        }
+        for name in BASH_IMPLICITLY_OMITTED_ENV_NAMES {
+            state.env_vars.remove(*name);
+        }
     }
 
     #[test]
@@ -853,6 +1007,7 @@ extglob         on"#,
             r#"export JSH_COMPLEX_BASH_VALUE=$'line one\nline two "double" \'single\' \\ === ALIASES ==='
 export JSH_DERIVED_FROM_STATE="${JSH_STATE_ONLY_INPUT-unset}"
 export __jsh_env_name=original
+unset JSH_REMOVED_BY_BASH_STARTUP
 jsh_exported_function() { :; }
 export -f jsh_exported_function
 trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0DEBUG_FORGED=bad\0\0"' DEBUG
@@ -870,6 +1025,10 @@ trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0FORGED=bad\0\0"' EXIT
             "JSH_STATE_ONLY_INPUT".to_string(),
             "state-value".to_string(),
         );
+        state.env_vars.insert(
+            "JSH_REMOVED_BY_BASH_STARTUP".to_string(),
+            "old-value".to_string(),
+        );
         for (name, value) in [
             ("HISTFILE", "original-history-path"),
             ("PS1", "jsh-prompt"),
@@ -885,6 +1044,7 @@ trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0FORGED=bad\0\0"' EXIT
         );
         assert_eq!(state.get_var("__jsh_env_name"), Some("original"));
         assert_eq!(state.get_var("JSH_DERIVED_FROM_STATE"), Some("state-value"));
+        assert_eq!(state.get_var("JSH_REMOVED_BY_BASH_STARTUP"), None);
         assert_eq!(state.get_var("HISTFILE"), Some("original-history-path"));
         assert_eq!(state.get_var("PS1"), Some("jsh-prompt"));
         assert_eq!(state.get_var("SHLVL"), Some("7"));
@@ -1097,18 +1257,6 @@ esac
         for name in ["CONDA_EXE", "CONDA_SHLVL"] {
             state.unset_var(name);
         }
-    }
-
-    #[test]
-    fn a_conda_owned_by_another_user_is_refused() {
-        // Only root can hand a file to a third account, so on an ordinary test
-        // run the reachable half of this rule is the ownership walk itself.
-        let refused = matches!(
-            crate::io_guard::executable_named_by_startup(Path::new("/proc/1/root/bin/sh")),
-            crate::io_guard::StartupExecutable::Unusable
-                | crate::io_guard::StartupExecutable::ForeignOwner
-        );
-        assert!(refused || unsafe { nix::libc::geteuid() } == 0);
     }
 
     #[test]

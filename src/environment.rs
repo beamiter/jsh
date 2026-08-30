@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -535,13 +535,19 @@ impl ShellState {
     /// can reintroduce a variable the shell considers unset. Invalid C
     /// environment entries are ignored instead of reaching `Command::env`,
     /// whose platform conversion would panic on an interior NUL.
-    pub(crate) fn configure_command_environment(&self, command: &mut std::process::Command) {
+    pub(crate) fn configure_command_environment(
+        &self,
+        command: &mut std::process::Command,
+    ) -> HashSet<String> {
         command.env_clear();
+        let mut names = HashSet::new();
         for (name, value) in &self.env_vars {
             if env_name_ok(name) && !value.contains('\0') {
                 command.env(name, value);
+                names.insert(name.clone());
             }
         }
+        names
     }
 
     fn detect_terminal_width() -> usize {

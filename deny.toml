@@ -4,7 +4,7 @@
 # no successor release, so Dependabot had nothing to bump it to and no other
 # step in the pipeline looked at advisories at all. jsh could have shipped an
 # unpatchable parser indefinitely without a single red check. Run in CI as
-# `cargo deny check advisories bans sources`.
+# `cargo deny --locked --all-features check advisories bans sources`.
 #
 # Licenses are deliberately not checked here: that needs a curated allow-list,
 # and adding a half-reviewed one would turn a supply-chain gate into noise.

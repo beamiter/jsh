@@ -339,7 +339,7 @@ FAKE_DOCKER_PATH="/usr/local/bin:/usr/bin:/bin"
 indent "${out}"
 assert "reuses the installed binary" matches "${out}" "using the existing ${CTR_HOME}/bin/jsh"
 assert "did not push" lacks "${out}" 'pushing '
-rm -rf "${CTR_HOME}/bin"
+rm -rf -- "${CTR_HOME:?}/bin"
 
 echo "== a binary that is not jsh is refused =="
 bad_rel="${ROOT}/bad"

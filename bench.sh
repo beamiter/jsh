@@ -71,7 +71,7 @@ run_bench_c "Startup time (true)" "true"
 run_bench_c "Simple echo" "echo hello"
 
 # 3. Variable assignment and expansion
-run_bench_c "Variable expansion" 'FOO=bar; echo $FOO'
+run_bench_c "Variable expansion" "FOO=bar; echo \$FOO"
 
 # 4. Pipeline
 run_bench_c "Simple pipeline" "echo hello | cat | cat | cat"
@@ -104,7 +104,11 @@ SCRIPT
 echo "--- Script file execution ---"
 cmds=()
 for sh in jsh "${SHELLS[@]}"; do
-    shell_bin=$([[ "$sh" == "jsh" ]] && echo "$JSH" || command -v "$sh")
+    if [[ "$sh" == "jsh" ]]; then
+        shell_bin=$JSH
+    else
+        shell_bin=$(command -v "$sh")
+    fi
     cmds+=(-n "$sh" "$shell_bin $TMPSCRIPT")
 done
 hyperfine --warmup 3 --min-runs 50 --shell=none "${cmds[@]}" 2>&1

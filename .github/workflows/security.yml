@@ -1,0 +1,51 @@
+name: Scheduled supply-chain policy
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_DENY_VERSION: "0.20.2"
+
+jobs:
+  policy:
+    name: Advisories, bans, and sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # dtolnay/rust-toolchain stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      # actions/cache v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/cargo-deny-target
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install the pinned cargo-deny version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$HOME/.cache/cargo-deny-target" \
+            cargo install cargo-deny --version "$CARGO_DENY_VERSION" \
+            --locked --force
+          test "$(cargo deny --version)" = "cargo-deny $CARGO_DENY_VERSION"
+
+      - name: Check advisories, banned crates, and sources
+        run: cargo deny --locked --all-features check advisories bans sources

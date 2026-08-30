@@ -83,7 +83,7 @@ fn bash_fallback_receives_the_live_jsh_environment() {
     fs::write(
         &script,
         format!(
-            "{FORCE_BASH}export JSH_BRIDGE_DERIVED=\"${{JSH_BRIDGE_INPUT}}:${{JSH_BRIDGE_REMOVED-unset}}\"\n"
+            "{FORCE_BASH}unset JSH_BRIDGE_UNSET_BY_SOURCE\nexport JSH_BRIDGE_DERIVED=\"${{JSH_BRIDGE_INPUT}}:${{JSH_BRIDGE_REMOVED-unset}}\"\n"
         ),
     )
     .expect("fixture");
@@ -93,7 +93,7 @@ fn bash_fallback_receives_the_live_jsh_environment() {
         "--norc",
         "-c",
         &format!(
-            "export JSH_BRIDGE_INPUT=state-value; unset JSH_BRIDGE_REMOVED; source {}; printf 'DERIVED=%s\\n' \"$JSH_BRIDGE_DERIVED\"",
+            "export JSH_BRIDGE_INPUT=state-value; unset JSH_BRIDGE_REMOVED; export JSH_BRIDGE_UNSET_BY_SOURCE=present; source {}; printf 'DERIVED=%s UNSET=<%s>\\n' \"$JSH_BRIDGE_DERIVED\" \"$JSH_BRIDGE_UNSET_BY_SOURCE\"",
             script.display()
         ),
     ]);
@@ -103,7 +103,7 @@ fn bash_fallback_receives_the_live_jsh_environment() {
     let output = command.output().expect("run jsh");
 
     assert!(
-        stdout_of(&output).contains("DERIVED=state-value:unset"),
+        stdout_of(&output).contains("DERIVED=state-value:unset UNSET=<>"),
         "fallback Bash did not receive live jsh state: stdout={:?} stderr={:?}",
         stdout_of(&output),
         stderr_of(&output)
@@ -177,6 +177,10 @@ fn an_override_that_is_not_trustworthy_disables_the_integration() {
     assert!(
         stderr.contains("not a trusted executable"),
         "stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("/no/such/bash"),
+        "the warning must preserve the configured path: {stderr:?}"
     );
     // Silently starting a *different* bash than the one that was named would be
     // worse than the feature being missing: the operator asked for a specific

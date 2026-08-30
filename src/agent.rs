@@ -3267,7 +3267,37 @@ mod tests {
             report.issue,
             Some(super::AgentChildCwdFrameIssue::InvalidMagic)
         );
-        assert!(writer.write_all(b"continued flood").is_err());
+
+        // Another parallel test can be between fork and exec at this instant.
+        // Such a child briefly inherits the CLOEXEC reader, so one small write
+        // is allowed to succeed even though this process has closed its copy.
+        // A nonblocking flood must still reach EPIPE once that transient copy
+        // closes; it also keeps a broken implementation from hanging the test.
+        let writer_flags = fcntl(&writer, FcntlArg::F_GETFL).expect("writer flags");
+        fcntl(
+            &writer,
+            FcntlArg::F_SETFL(OFlag::from_bits_truncate(writer_flags) | OFlag::O_NONBLOCK),
+        )
+        .expect("nonblocking writer");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let flood = [0_u8; 4096];
+        loop {
+            match writer.write(&flood) {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Ok(_) => {}
+                Err(error) => panic!("unexpected pipe write failure: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an inherited reader remained open after its exec boundary"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]

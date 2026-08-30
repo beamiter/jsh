@@ -78,14 +78,10 @@ fn replaceable(mode: u32, owner: u32, euid: u32) -> bool {
     owner == euid && mode & 0o200 != 0
 }
 
-/// Validate an explicitly configured executable without falling back to PATH.
-pub(crate) fn explicit_absolute_executable(path: &Path) -> bool {
-    trusted_explicit_executable(path)
-}
-
 /// Why [`executable_named_by_startup`] would not run a path.
 pub(crate) enum StartupExecutable {
-    Ok,
+    /// The canonical executable path that was actually validated.
+    Ok(std::path::PathBuf),
     /// Not absolute, missing, not a file, or not executable.
     Unusable,
     /// Some third account owns it or a directory above it.
@@ -110,6 +106,8 @@ pub(crate) enum StartupExecutable {
 /// by some *third* account is a different machine-level claim from a loose mode
 /// on the user's own tree, and nothing in the startup file justifies running
 /// it. That case is reported rather than ignored — see the caller.
+/// A successful result carries the canonical path that was checked, so the
+/// caller never reopens a replaceable symlink name.
 pub(crate) fn executable_named_by_startup(path: &Path) -> StartupExecutable {
     if !path.is_absolute() {
         return StartupExecutable::Unusable;
@@ -124,17 +122,20 @@ pub(crate) fn executable_named_by_startup(path: &Path) -> StartupExecutable {
         return StartupExecutable::Unusable;
     }
     let euid = unsafe { nix::libc::geteuid() };
+    let Some(system_owner) = filesystem_root_owner() else {
+        return StartupExecutable::Unusable;
+    };
     let mut component = Some(resolved.as_path());
     while let Some(current) = component {
         let Ok(metadata) = current.metadata() else {
             return StartupExecutable::Unusable;
         };
-        if metadata.uid() != 0 && metadata.uid() != euid {
+        if !trusted_path_owner(metadata.uid(), euid, system_owner) {
             return StartupExecutable::ForeignOwner;
         }
         component = current.parent();
     }
-    StartupExecutable::Ok
+    StartupExecutable::Ok(resolved)
 }
 
 /// Environment variable that names an explicit absolute path for a helper.
@@ -171,8 +172,8 @@ pub(crate) fn trusted_helper(name: &str) -> Option<std::path::PathBuf> {
     if let Some(configured) = std::env::var_os(helper_path_variable(name)) {
         if !configured.is_empty() {
             let path = std::path::PathBuf::from(configured);
-            if trusted_explicit_executable(&path) {
-                return Some(path);
+            if let Some(resolved) = trusted_explicit_executable(&path) {
+                return Some(resolved);
             }
             warn_once_about_helper(name, &path);
             return None;
@@ -190,7 +191,7 @@ pub(crate) fn trusted_helper_quiet(name: &str) -> Option<std::path::PathBuf> {
     if let Some(configured) = std::env::var_os(helper_path_variable(name)) {
         if !configured.is_empty() {
             let path = std::path::PathBuf::from(configured);
-            return trusted_explicit_executable(&path).then_some(path);
+            return trusted_explicit_executable(&path);
         }
     }
     automatic_system_helper(name).map(Path::to_path_buf)
@@ -229,27 +230,40 @@ fn warn_once_about_helper(name: &str, path: &Path) {
 /// binary in a safe directory under a world-writable parent is not safe: the
 /// parent can be renamed out of the way and replaced wholesale, so validating
 /// only the leaf proves nothing about what will be there at exec time.
-fn trusted_explicit_executable(path: &Path) -> bool {
+///
+/// The canonical path is returned so callers cannot accidentally validate a
+/// symlink and then execute that mutable name. This is also why the namespace
+/// containing the original symlink does not need to remain trustworthy after
+/// this function returns: callers never reopen it.
+fn trusted_explicit_executable(path: &Path) -> Option<std::path::PathBuf> {
     if !path.is_absolute() {
-        return false;
+        return None;
     }
     // canonicalize resolves every symlink, so the chain walked below is the
-    // chain the kernel will walk, rather than the one the caller typed.
+    // target chain the kernel will ultimately reach.
     let Ok(resolved) = path.canonicalize() else {
-        return false;
+        return None;
     };
     let Ok(metadata) = resolved.metadata() else {
-        return false;
+        return None;
     };
-    if !metadata.is_file() || metadata.mode() & 0o111 == 0 || !trusted_path_component(&metadata) {
-        return false;
+    let euid = unsafe { nix::libc::geteuid() };
+    let system_owner = filesystem_root_owner()?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o111 == 0
+        || !trusted_path_component(&metadata, euid, system_owner)
+    {
+        return None;
     }
-    let mut directory = resolved.parent();
+    trusted_directory_chain(resolved.parent(), euid, system_owner).then_some(resolved)
+}
+
+fn trusted_directory_chain(mut directory: Option<&Path>, euid: u32, system_owner: u32) -> bool {
     while let Some(current) = directory {
         let Ok(metadata) = current.metadata() else {
             return false;
         };
-        if !metadata.is_dir() || !trusted_path_component(&metadata) {
+        if !metadata.is_dir() || !trusted_path_component(&metadata, euid, system_owner) {
             return false;
         }
         directory = current.parent();
@@ -257,21 +271,43 @@ fn trusted_explicit_executable(path: &Path) -> bool {
     true
 }
 
-/// Trusted means "only root or this user can change it". World-writable is
+/// Trusted means "only the system owner or this user can change it".
+/// World-writable is
 /// refused outright — that covers the sticky-bit temporary directories, where
 /// anyone can plant a name — and so is ownership by some third user, who could
 /// replace the file between this check and the exec.
 ///
 /// Group-writable is refused only when the group actually contains somebody
 /// else; see [`group_write_reaches_others`].
-fn trusted_path_component(metadata: &fs::Metadata) -> bool {
+fn trusted_path_component(metadata: &fs::Metadata, euid: u32, system_owner: u32) -> bool {
     if metadata.mode() & 0o002 != 0 {
         return false;
     }
     if metadata.mode() & 0o020 != 0 && group_write_reaches_others(metadata.gid(), metadata.uid()) {
         return false;
     }
-    metadata.uid() == 0 || metadata.uid() == unsafe { nix::libc::geteuid() }
+    trusted_path_owner(metadata.uid(), euid, system_owner)
+}
+
+/// The owner of `/` is the namespace's system identity.
+///
+/// On an ordinary host this is uid 0. Rootless and idmapped filesystems can
+/// expose the same system tree through an overflow uid (commonly 65534), so
+/// hard-coding zero rejects `/usr/bin` even though every component has the
+/// same owner as the namespace root. If `/` itself is controlled by an
+/// attacker, path ownership checks inside that namespace are no longer a
+/// meaningful security boundary; using it as the trust anchor adds no new
+/// assumption.
+fn filesystem_root_owner() -> Option<u32> {
+    fs::metadata(Path::new("/"))
+        .ok()
+        .map(|metadata| metadata.uid())
+}
+
+/// Split out so mapped-root and third-owner behavior can be tested without
+/// requiring a particular host uid map.
+fn trusted_path_owner(owner: u32, euid: u32, system_owner: u32) -> bool {
+    owner == euid || owner == system_owner
 }
 
 /// Does the group bit on a path hand write access to anyone beyond its owner?
@@ -1164,7 +1200,7 @@ mod tests {
             assert!(git.is_absolute());
             assert_ne!(git, Path::new("git"));
         }
-        assert!(!explicit_absolute_executable(Path::new("relative-helper")));
+        assert!(trusted_explicit_executable(Path::new("relative-helper")).is_none());
     }
 
     #[test]
@@ -1174,14 +1210,14 @@ mod tests {
             let path = Path::new(candidate);
             if path.exists() {
                 assert!(
-                    explicit_absolute_executable(path),
+                    trusted_explicit_executable(path).is_some(),
                     "{candidate} should be trusted"
                 );
             }
         }
 
-        assert!(!explicit_absolute_executable(Path::new("relative")));
-        assert!(!explicit_absolute_executable(Path::new("/no/such/helper")));
+        assert!(trusted_explicit_executable(Path::new("relative")).is_none());
+        assert!(trusted_explicit_executable(Path::new("/no/such/helper")).is_none());
 
         // The interesting case, and the reason the whole directory chain is
         // walked: the file itself is private and the directory holding it is
@@ -1198,17 +1234,61 @@ mod tests {
             fs::metadata(ancestor).is_ok_and(|metadata| metadata.mode() & 0o022 != 0)
         });
         assert_eq!(
-            explicit_absolute_executable(&configured),
+            trusted_explicit_executable(&configured).is_some(),
             !under_world_writable,
             "chain trust disagreed with the ancestors of {}",
             configured.display()
         );
 
+        // A mutable symlink name is safe only because resolution returns the
+        // canonical target for the caller to execute. Replacing the link after
+        // validation cannot change that returned PathBuf.
+        if let Some(target) = ["/bin/sh", "/usr/bin/env", "/bin/cat"]
+            .into_iter()
+            .find(|candidate| trusted_explicit_executable(Path::new(candidate)).is_some())
+        {
+            let linked = temp.path().join("linked-system-helper");
+            symlink(target, &linked).expect("helper symlink");
+            let resolved = trusted_explicit_executable(&linked).expect("trusted symlink target");
+            assert_eq!(resolved, Path::new(target).canonicalize().expect("target"));
+            fs::remove_file(&linked).expect("remove original link");
+            symlink("/no/such/replacement", &linked).expect("replace helper symlink");
+            assert_eq!(resolved, Path::new(target).canonicalize().expect("target"));
+            assert!(trusted_explicit_executable(&linked).is_none());
+        }
+
         // A regular file with no execute bit is not a helper.
         let data = temp.path().join("not-executable");
         fs::write(&data, "").expect("data fixture");
         fs::set_permissions(&data, fs::Permissions::from_mode(0o600)).expect("data mode");
-        assert!(!explicit_absolute_executable(&data));
+        assert!(trusted_explicit_executable(&data).is_none());
+    }
+
+    #[test]
+    fn a_startup_named_symlink_returns_the_validated_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("conda-target");
+        let replacement = temp.path().join("replacement");
+        for executable in [&target, &replacement] {
+            fs::write(executable, "#!/bin/sh\n").expect("helper fixture");
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o700))
+                .expect("executable mode");
+        }
+        let linked = temp.path().join("conda-link");
+        symlink(&target, &linked).expect("startup helper symlink");
+
+        let StartupExecutable::Ok(resolved) = executable_named_by_startup(&linked) else {
+            panic!("a user-owned executable target should be usable");
+        };
+        assert_eq!(resolved, target.canonicalize().expect("canonical target"));
+
+        fs::remove_file(&linked).expect("remove original link");
+        symlink(&replacement, &linked).expect("replace startup helper symlink");
+        assert_ne!(
+            resolved,
+            linked.canonicalize().expect("canonical replacement"),
+            "the validated result must not retain the mutable symlink name"
+        );
     }
 
     #[test]
@@ -1245,8 +1325,10 @@ mod tests {
         fs::write(&helper, "#!/bin/sh\n").expect("helper fixture");
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o775)).expect("group-writable");
         let metadata = fs::metadata(&helper).expect("helper metadata");
+        let euid = unsafe { nix::libc::geteuid() };
+        let system_owner = filesystem_root_owner().expect("filesystem root metadata");
         assert_eq!(
-            trusted_path_component(&metadata),
+            trusted_path_component(&metadata, euid, system_owner),
             !group_write_reaches_others(metadata.gid(), metadata.uid()),
             "0775 was judged by the bit rather than by who is in the group"
         );
@@ -1254,8 +1336,24 @@ mod tests {
         // World-writable is still refused with no lookup at all.
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o777)).expect("world-writable");
         assert!(!trusted_path_component(
-            &fs::metadata(&helper).expect("helper metadata")
+            &fs::metadata(&helper).expect("helper metadata"),
+            euid,
+            system_owner,
         ));
+    }
+
+    #[test]
+    fn mapped_filesystem_root_is_the_system_owner_not_every_foreign_uid() {
+        // Model a rootless/idmapped mount where the system tree is exposed as
+        // the overflow uid. The mapping's root and this process remain trusted;
+        // an unrelated account (including host uid 0 when it is not the mapped
+        // root) does not silently join that set.
+        let euid = 1_000;
+        let mapped_root = 65_534;
+        assert!(trusted_path_owner(euid, euid, mapped_root));
+        assert!(trusted_path_owner(mapped_root, euid, mapped_root));
+        assert!(!trusted_path_owner(2_000, euid, mapped_root));
+        assert!(!trusted_path_owner(0, euid, mapped_root));
     }
 
     #[test]

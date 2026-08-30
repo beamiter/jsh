@@ -971,7 +971,7 @@ builtin exit "$1"
         return 1;
     };
     let mut command = std::process::Command::new(bash);
-    state.configure_command_environment(&mut command);
+    let prior_environment = state.configure_command_environment(&mut command);
     command
         .arg("--norc")
         .arg("--noprofile")
@@ -1000,7 +1000,13 @@ builtin exit "$1"
                 );
             }
 
-            if crate::config::import_bash_environment_frame(&output.stdout, state).is_none() {
+            if crate::config::import_bash_environment_frame(
+                &output.stdout,
+                state,
+                &prior_environment,
+            )
+            .is_none()
+            {
                 eprintln!("jsh: source: bash fallback returned malformed environment framing");
                 return 1;
             }
