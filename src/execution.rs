@@ -613,12 +613,7 @@ pub fn execution_id(session_id: Option<&str>, seq: u64) -> String {
 }
 
 fn validate_execution_id(id: &str) -> io::Result<&str> {
-    if !id.is_empty()
-        && id.len() <= MAX_EXECUTION_ID_BYTES
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+    if is_valid_execution_id(id) {
         Ok(id)
     } else {
         Err(io::Error::new(
@@ -626,6 +621,15 @@ fn validate_execution_id(id: &str) -> io::Result<&str> {
             "invalid execution ID",
         ))
     }
+}
+
+/// Exact correlation-key grammar shared by OSC lifecycle metadata and JSONL.
+pub(crate) fn is_valid_execution_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_EXECUTION_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn validate_session_id(id: &str) -> io::Result<&str> {
@@ -1460,6 +1464,28 @@ mod tests {
             .record_start("jsh-b", Some(&"x".repeat(129)), 2, "true", "/tmp", 2)
             .is_err());
         assert!(journal.records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn execution_id_validation_matches_the_shared_protocol_grammar() {
+        let generated = execution_id(Some("tab_1"), 7);
+        for valid in [
+            generated,
+            "jsh-a_b.c-1".into(),
+            "x".repeat(MAX_EXECUTION_ID_BYTES),
+        ] {
+            assert!(is_valid_execution_id(&valid), "id={valid:?}");
+        }
+        for invalid in [
+            String::new(),
+            "x".repeat(MAX_EXECUTION_ID_BYTES + 1),
+            "jsh:1".into(),
+            "has space".into(),
+            "line\nbreak".into(),
+            "雪".into(),
+        ] {
+            assert!(!is_valid_execution_id(&invalid), "id={invalid:?}");
+        }
     }
 
     #[test]

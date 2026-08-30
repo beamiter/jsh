@@ -238,8 +238,11 @@ pub fn command_start() {
 
 /// Build OSC 133;C with jsh execution metadata.
 fn command_output_start_packet(execution_id: &str, command: &str, cwd: &str) -> String {
-    let id = percent_encode_metadata(execution_id);
-    let mut packet = format!("\x1b]133;C;id={id}");
+    let mut packet = "\x1b]133;C".to_string();
+    if crate::execution::is_valid_execution_id(execution_id) {
+        packet.push_str(";id=");
+        packet.push_str(&percent_encode_metadata(execution_id));
+    }
     if crate::execution::is_valid_command_text(command, MAX_OSC_COMMAND_BYTES) {
         packet.push_str(";cmdline_url=");
         packet.push_str(&percent_encode_metadata(command));
@@ -267,8 +270,12 @@ fn command_finished_packet(
     duration_ms: u64,
     cwd: &str,
 ) -> String {
-    let id = percent_encode_metadata(execution_id);
-    let mut packet = format!("\x1b]133;D;{exit_code};id={id};duration_ms={duration_ms}");
+    let mut packet = format!("\x1b]133;D;{exit_code}");
+    if crate::execution::is_valid_execution_id(execution_id) {
+        packet.push_str(";id=");
+        packet.push_str(&percent_encode_metadata(execution_id));
+    }
+    packet.push_str(&format!(";duration_ms={duration_ms}"));
     if crate::execution::is_valid_cwd(cwd) {
         packet.push_str(";cwd_url=");
         packet.push_str(&percent_encode_metadata(cwd));
@@ -361,12 +368,11 @@ mod tests {
 
     #[test]
     fn command_start_packet_percent_encodes_exact_metadata() {
-        let packet =
-            command_output_start_packet("jsh:7;\x1b\x07", "printf 'a;b+c'\n雪", "/tmp/a;b%雪");
+        let packet = command_output_start_packet("jsh-7", "printf 'a;b+c'\n雪", "/tmp/a;b%雪");
 
         assert_eq!(
             packet,
-            "\x1b]133;C;id=jsh%3A7%3B%1B%07;cmdline_url=printf%20%27a%3Bb%2Bc%27%0A%E9%9B%AA;cwd_url=%2Ftmp%2Fa%3Bb%25%E9%9B%AA\x07"
+            "\x1b]133;C;id=jsh-7;cmdline_url=printf%20%27a%3Bb%2Bc%27%0A%E9%9B%AA;cwd_url=%2Ftmp%2Fa%3Bb%25%E9%9B%AA\x07"
         );
         assert_eq!(
             packet
@@ -384,6 +390,36 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn execution_id_metadata_is_exact_or_omitted_on_both_lifecycle_marks() {
+        let maximum = "x".repeat(crate::execution::MAX_EXECUTION_ID_BYTES);
+        assert!(command_output_start_packet(&maximum, "true", "/tmp")
+            .contains(&format!(";id={maximum};")));
+        assert!(
+            command_finished_packet(7, &maximum, 9, "/tmp").contains(&format!(";id={maximum};"))
+        );
+
+        for invalid in [
+            String::new(),
+            "x".repeat(crate::execution::MAX_EXECUTION_ID_BYTES + 1),
+            "jsh:7".to_string(),
+            "jsh;7".to_string(),
+            "line\nbreak".to_string(),
+            "雪".to_string(),
+        ] {
+            assert_eq!(
+                command_output_start_packet(&invalid, "true", "/tmp"),
+                "\x1b]133;C;cmdline_url=true;cwd_url=%2Ftmp\x07",
+                "id={invalid:?}"
+            );
+            assert_eq!(
+                command_finished_packet(7, &invalid, 9, "/tmp"),
+                "\x1b]133;D;7;duration_ms=9;cwd_url=%2Ftmp\x07",
+                "id={invalid:?}"
+            );
+        }
     }
 
     #[test]
@@ -621,11 +657,11 @@ mod tests {
 
     #[test]
     fn command_finished_keeps_positional_exit_and_encodes_metadata() {
-        let packet = command_finished_packet(127, "jsh;2", 42, "/tmp/a;b雪");
+        let packet = command_finished_packet(127, "jsh-2", 42, "/tmp/a;b雪");
 
         assert_eq!(
             packet,
-            "\x1b]133;D;127;id=jsh%3B2;duration_ms=42;cwd_url=%2Ftmp%2Fa%3Bb%E9%9B%AA\x07"
+            "\x1b]133;D;127;id=jsh-2;duration_ms=42;cwd_url=%2Ftmp%2Fa%3Bb%E9%9B%AA\x07"
         );
         assert_eq!(
             packet
@@ -645,8 +681,8 @@ mod tests {
         );
 
         assert_eq!(
-            command_finished_packet(127, "jsh;2", 42, "/tmp/\x1b]133;A\x07"),
-            "\x1b]133;D;127;id=jsh%3B2;duration_ms=42\x07"
+            command_finished_packet(127, "jsh-2", 42, "/tmp/\x1b]133;A\x07"),
+            "\x1b]133;D;127;id=jsh-2;duration_ms=42\x07"
         );
     }
 }

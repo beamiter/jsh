@@ -361,7 +361,9 @@ adds percent-encoded, size-bounded metadata to `C` and `D`: an execution ID,
 the exact command when it fits the protocol limit, the working directory, exit
 status, and duration. Oversized commands are explicitly marked as truncated
 rather than being presented as exact. The execution ID correlates terminal
-scrollback with jsh's structured context.
+scrollback with jsh's structured context. It is emitted only when it matches
+the journal's exact 1–192-byte ASCII token grammar; a bad direct API input
+still emits the portable lifecycle mark but cannot claim a durable correlation.
 Commands containing non-structural controls or visually ambiguous formatting
 take the non-exact OSC path and are refused by the journal writer. Newline and
 tab remain valid multiline shell structure, but hidden formatting never enters
