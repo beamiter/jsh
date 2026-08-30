@@ -217,26 +217,27 @@ impl ExecutionJournal {
         total_bytes: u64,
         captured_at_ms: u64,
     ) -> io::Result<()> {
+        let observed_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+        let total_bytes = total_bytes.max(observed_bytes);
         let (mut text, limited) = bounded_text(text, MAX_OUTPUT_BYTES);
         let mut event = ExecutionEvent::Output {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
             text: text.clone(),
             truncated: truncated || limited,
-            total_bytes: total_bytes.max(text.len() as u64),
+            total_bytes,
             captured_at_ms,
         };
         // JSON escaping can expand control-heavy text beyond the line limit.
         // Shrink once more rather than writing an unreadable oversized event.
         if serde_json::to_vec(&event).map_err(io::Error::other)?.len() > MAX_EVENT_LINE_BYTES {
             (text, _) = bounded_text(&text, MAX_OUTPUT_BYTES / 2);
-            let retained_bytes = text.len() as u64;
             event = ExecutionEvent::Output {
                 jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                 id: id.to_string(),
                 text,
                 truncated: true,
-                total_bytes: total_bytes.max(retained_bytes),
+                total_bytes,
                 captured_at_ms,
             };
         }
@@ -1079,13 +1080,17 @@ mod tests {
             .record_start("jsh-bounded", None, 1, &command, "/tmp", 1)
             .unwrap();
         journal
-            .record_output("jsh-bounded", &output, false, output.len() as u64, 2)
+            .record_output("jsh-bounded", &output, false, 0, 2)
             .unwrap();
         let record = journal.get("jsh-bounded").unwrap().unwrap();
         assert_eq!(record.command.len(), MAX_COMMAND_BYTES);
         assert!(record.command_truncated);
         assert_eq!(record.output.as_ref().unwrap().text.len(), MAX_OUTPUT_BYTES);
         assert!(record.output.as_ref().unwrap().truncated);
+        assert_eq!(
+            record.output.as_ref().unwrap().total_bytes,
+            output.len() as u64
+        );
         assert_eq!(
             fs::metadata(journal.path()).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1098,6 +1103,25 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn json_escape_shrinking_preserves_the_observed_output_size() {
+        let (_dir, journal) = journal();
+        journal
+            .record_start("jsh-control-output", None, 1, "printf data", "/tmp", 1)
+            .unwrap();
+        let output = "\0".repeat(MAX_OUTPUT_BYTES);
+
+        journal
+            .record_output("jsh-control-output", &output, false, 0, 2)
+            .unwrap();
+
+        let record = journal.get("jsh-control-output").unwrap().unwrap();
+        let captured = record.output.unwrap();
+        assert!(captured.text.len() <= MAX_OUTPUT_BYTES / 2);
+        assert!(captured.truncated);
+        assert_eq!(captured.total_bytes, output.len() as u64);
     }
 
     #[test]
