@@ -167,7 +167,7 @@ fn recognized_v1_start_id(line: &[u8]) -> Option<Cow<'_, str>> {
     .then_some(identity.id)
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct FoldedExecution {
     record: ExecutionRecord,
     finish_conflicted: bool,
@@ -1082,7 +1082,10 @@ fn compact_unlocked(path: &Path) -> io::Result<()> {
 }
 
 fn compact_unlocked_with_line_limit(path: &Path, max_event_lines: usize) -> io::Result<()> {
-    let records = read_records(path)?;
+    // Compaction must first accept the source under the same physical-line
+    // budget its output promises to satisfy. Otherwise ignored future events
+    // could be erased from an over-budget source and make it appear valid.
+    let records = read_records_with_line_limit(path, max_event_lines)?;
     let mut retained = Vec::<Vec<u8>>::new();
     let mut retained_bytes = 0usize;
     let mut retained_event_lines = 0usize;
@@ -2391,45 +2394,45 @@ mod tests {
     }
 
     #[test]
-    fn reader_rejects_excess_event_lines_before_parsing_them() {
+    fn reader_charges_unknown_events_to_the_physical_line_limit() {
         let (_dir, journal) = journal();
         let accepted = concat!(
             "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"future\",\"cwd\":\"/future\",\"started_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"future\",\"id\":\"bounded\",\"payload\":true}\n",
             "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"bounded\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}\n"
         );
         fs::write(journal.path(), accepted).unwrap();
         fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
-        let records = read_records_with_line_limit(journal.path(), 2).unwrap();
+        let records = read_records_with_line_limit(journal.path(), 4).unwrap();
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.command, "true");
         assert_eq!(records[0].record.exit_code, Some(0));
 
         let over_limit = format!(
-            "{accepted}{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"unexpected\":true}}\n"
+            "{accepted}{{\"jsh_execution_version\":2,\"event\":\"future\",\"id\":\"orphan\"}}\n"
         );
         fs::write(journal.path(), over_limit).unwrap();
-        let error = read_records_with_line_limit(journal.path(), 2).unwrap_err();
+        let error = read_records_with_line_limit(journal.path(), 4).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("event-count limit"));
     }
 
     #[test]
-    fn compaction_refuses_to_emit_more_events_than_readers_accept() {
+    fn compaction_cannot_wash_away_over_limit_unknown_events() {
         let (_dir, journal) = journal();
-        let source = concat!(
+        let accepted = concat!(
             "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"future\",\"cwd\":\"/future\",\"started_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"future\",\"id\":\"bounded\",\"payload\":true}\n",
             "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"bounded\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}\n",
-            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"bounded\",\"text\":\"ok\",\"truncated\":false,\"total_bytes\":2,\"captured_at_ms\":3}\n"
         );
-        fs::write(journal.path(), source).unwrap();
+        fs::write(journal.path(), accepted).unwrap();
         fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let before_compaction = read_records_with_line_limit(journal.path(), 4).unwrap();
 
-        let error = compact_unlocked_with_line_limit(journal.path(), 2).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("event-count limit"));
-        assert_eq!(fs::read_to_string(journal.path()).unwrap(), source);
-
-        compact_unlocked(journal.path()).unwrap();
+        compact_unlocked_with_line_limit(journal.path(), 4).unwrap();
         let compacted = fs::read(journal.path()).unwrap();
         assert_unique_jsonl(&compacted);
         assert_eq!(
@@ -2437,9 +2440,22 @@ mod tests {
                 .split(|byte| *byte == b'\n')
                 .filter(|line| !line.is_empty())
                 .count(),
-            3
+            2
         );
-        assert_eq!(journal.records().unwrap().len(), 1);
+        assert_eq!(
+            read_records_with_line_limit(journal.path(), 4).unwrap(),
+            before_compaction
+        );
+
+        let over_limit = format!(
+            "{accepted}{{\"jsh_execution_version\":2,\"event\":\"future\",\"id\":\"orphan\"}}\n"
+        );
+        fs::write(journal.path(), over_limit.as_bytes()).unwrap();
+        let original = fs::read(journal.path()).unwrap();
+        let error = compact_unlocked_with_line_limit(journal.path(), 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("event-count limit"));
+        assert_eq!(fs::read(journal.path()).unwrap(), original);
     }
 
     #[test]
