@@ -2185,6 +2185,117 @@ mod tests {
     }
 
     #[test]
+    fn peer_tail_growth_and_compaction_keep_line_cache_exact() {
+        let (_dir, journal) = journal();
+        let start = b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n";
+        fs::write(journal.path(), start).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut observer = open_regular_file(journal.path(), true, true, false).unwrap();
+        let mut observed_len = observer.metadata().unwrap().len();
+        assert_eq!(
+            count_physical_lines_cached(&mut observer, journal.path(), observed_len).unwrap(),
+            1
+        );
+
+        let mut peer = OpenOptions::new()
+            .append(true)
+            .open(journal.path())
+            .unwrap();
+        peer.write_all(b"{\"jsh_execution_version\":1,\"event\":\"future\",\"payload\":true}\n")
+            .unwrap();
+        observed_len = observer.metadata().unwrap().len();
+        assert_eq!(
+            count_physical_lines_cached(&mut observer, journal.path(), observed_len).unwrap(),
+            2
+        );
+        assert_eq!(
+            read_records_with_line_limit(journal.path(), 2)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        peer.write_all(b"{\"malformed\":").unwrap();
+        observed_len = observer.metadata().unwrap().len();
+        assert_eq!(
+            count_physical_lines_cached(&mut observer, journal.path(), observed_len).unwrap(),
+            3
+        );
+        assert_eq!(
+            read_records_with_line_limit(journal.path(), 3)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        peer.write_all(b"\n").unwrap();
+        drop(peer);
+        observed_len = observer.metadata().unwrap().len();
+        assert_eq!(
+            count_physical_lines_cached(&mut observer, journal.path(), observed_len).unwrap(),
+            3,
+            "a later LF terminates the cached tail instead of adding a line"
+        );
+        drop(observer);
+
+        let output = || ExecutionEvent::Output {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: "known".into(),
+            text: "new".into(),
+            truncated: false,
+            total_bytes: 3,
+            captured_at_ms: 2,
+        };
+        let unchanged = fs::read(journal.path()).unwrap();
+        let error = journal
+            .append_event_with_limits(output(), 3, u64::MAX)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(fs::read(journal.path()).unwrap(), unchanged);
+
+        journal
+            .append_event_with_limits(output(), 4, u64::MAX)
+            .unwrap();
+        assert_eq!(
+            journal.get("known").unwrap().unwrap().output.unwrap().text,
+            "new"
+        );
+
+        let identity_before_compaction = fs::metadata(journal.path()).unwrap();
+        compact_unlocked_with_line_limit(journal.path(), 4).unwrap();
+        let identity_after_compaction = fs::metadata(journal.path()).unwrap();
+        assert_ne!(
+            (
+                identity_before_compaction.dev(),
+                identity_before_compaction.ino()
+            ),
+            (
+                identity_after_compaction.dev(),
+                identity_after_compaction.ino()
+            ),
+            "atomic compaction must replace the cached journal inode"
+        );
+        let finish = ExecutionEvent::Finish {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: "known".into(),
+            exit_code: 7,
+            duration_ms: 2,
+            cwd_after: "/tmp".into(),
+            ended_at_ms: 3,
+        };
+        journal
+            .append_event_with_limits(finish, 3, u64::MAX)
+            .unwrap();
+        let reopened = ExecutionJournal::with_path(journal.path().to_owned())
+            .get("known")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.exit_code, Some(7));
+        assert_eq!(reopened.output.unwrap().text, "new");
+    }
+
+    #[test]
     fn output_and_commands_are_hard_bounded_and_files_private() {
         let (dir, journal) = journal();
         let command = "x".repeat(MAX_COMMAND_BYTES + 100);

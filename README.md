@@ -413,7 +413,9 @@ Compaction accepts the source under that same physical-line budget before it
 can discard ignored future or unknown events and replace the journal.
 Append checks the prospective line budget before any automatic compaction, so
 an exact-limit source is refused byte-for-byte intact instead of being erased
-into apparent compliance.
+into apparent compliance. Its incremental peer counter charges an unterminated
+tail once; a later LF only terminates it, and a compaction rename forces a safe
+recount on the replacement inode.
 An append after a torn final event charges its recovery newline to the same
 reader byte ceiling and refuses an over-budget write before changing the file.
 Individual metadata and captured-output records also have hard size limits.
