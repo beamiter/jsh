@@ -418,6 +418,7 @@ fn ensure_journal_parent(path: &Path, harden_existing: bool) -> io::Result<File>
     if !existed || harden_existing {
         directory.set_permissions(fs::Permissions::from_mode(0o700))?;
     }
+    ensure_unshared_directory(&directory, parent)?;
     Ok(directory)
 }
 
@@ -460,10 +461,6 @@ fn ensure_regular_file(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The directory has to be the user's; it does not have to be private. See the
-/// same function in `history.rs` for why the mode bits are not consulted — the
-/// journal's own descriptor carries the same `O_NOFOLLOW`, one-link,
-/// owned-by-this-user, 0600 guarantees.
 fn ensure_owned_directory(file: &File, path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -479,6 +476,24 @@ fn ensure_owned_directory(file: &File, path: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{path:?} is not owned by the current user"),
+        ));
+    }
+    Ok(())
+}
+
+/// Shared runtime/doctor rule for a journal namespace that no peer can replace.
+pub(crate) fn journal_parent_mode_is_safe(mode: u32) -> bool {
+    mode & 0o022 == 0
+}
+
+fn ensure_unshared_directory(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mode = file.metadata()?.mode();
+    if !journal_parent_mode_is_safe(mode) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} is writable by another user or group"),
         ));
     }
     Ok(())
@@ -1248,24 +1263,37 @@ mod tests {
         );
     }
 
-    /// A shared parent directory says where the user keeps their state, not
-    /// who owns the journal in it. The journal is still this user's and still
-    /// 0600, established on its own descriptor.
     #[test]
-    fn group_writable_custom_parent_is_accepted() {
+    fn shared_writable_custom_parents_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let parent = dir.path().join("shared");
+        for (name, mode) in [("group", 0o770), ("sticky", 0o1777)] {
+            let parent = dir.path().join(name);
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).unwrap();
+            let journal = ExecutionJournal::with_path(parent.join("custom.jsonl"));
+
+            assert!(
+                journal
+                    .record_start("jsh-custom", None, 1, "true", "/tmp", 1)
+                    .is_err(),
+                "mode={mode:o}"
+            );
+            assert!(!journal.path().exists(), "mode={mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_default_parent_is_hardened_before_the_mode_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("default-state");
         fs::create_dir(&parent).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o770)).unwrap();
-        let journal = ExecutionJournal::with_path(parent.join("custom.jsonl"));
 
-        journal
-            .record_start("jsh-custom", None, 1, "true", "/tmp", 1)
-            .expect("a shared parent is not a private file");
-
+        let held = ensure_journal_parent(&parent.join("executions.jsonl"), true).unwrap();
+        drop(held);
         assert_eq!(
-            fs::metadata(journal.path()).unwrap().permissions().mode() & 0o7777,
-            0o600
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 

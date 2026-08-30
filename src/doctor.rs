@@ -319,22 +319,34 @@ fn startup_and_persistence_checks(checks: &mut Vec<Check>, rcfile: Option<&Path>
         "persistence.home",
         &home,
         "history, bookmarks, completions, frecency, and sessions",
+        false,
     );
     check_writable_namespace(
         checks,
         "persistence.sessions",
         &home.join(".jsh/sessions"),
         "session snapshots",
+        false,
     );
 
     let state_dir = dirs::state_dir().unwrap_or_else(|| home.join(".local/state"));
     let journal = configured_journal_path(checks, &state_dir);
-    if let Some(path) = journal.as_deref() {
+    if let Some((path, custom)) = journal.as_ref() {
         if let Some(parent) = path.parent() {
-            check_writable_namespace(checks, "persistence.journal", parent, "execution context");
+            check_writable_namespace(
+                checks,
+                "persistence.journal",
+                parent,
+                "execution context",
+                *custom,
+            );
         }
     }
-    persistence_integrity_checks(checks, &home, journal.as_deref());
+    persistence_integrity_checks(
+        checks,
+        &home,
+        journal.as_ref().map(|(path, _)| path.as_path()),
+    );
 }
 
 fn inspect_startup_file(checks: &mut Vec<Check>, path: &Path, required: bool) {
@@ -406,7 +418,7 @@ fn inspect_startup_file(checks: &mut Vec<Check>, path: &Path, required: bool) {
     }
 }
 
-fn configured_journal_path(checks: &mut Vec<Check>, state_dir: &Path) -> Option<PathBuf> {
+fn configured_journal_path(checks: &mut Vec<Check>, state_dir: &Path) -> Option<(PathBuf, bool)> {
     if std::env::var("JSH_EXECUTION_JOURNAL")
         .ok()
         .is_some_and(|value| falsey(&value))
@@ -428,9 +440,9 @@ fn journal_path_for_override(
     checks: &mut Vec<Check>,
     state_dir: &Path,
     override_path: Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
+) -> Option<(PathBuf, bool)> {
     match override_path {
-        Some(raw) if raw.is_empty() => Some(state_dir.join("jsh/executions.jsonl")),
+        Some(raw) if raw.is_empty() => Some((state_dir.join("jsh/executions.jsonl"), false)),
         Some(raw) => {
             let path = PathBuf::from(raw);
             if !path.is_absolute() {
@@ -441,10 +453,10 @@ fn journal_path_for_override(
                 ));
                 None
             } else {
-                Some(path)
+                Some((path, true))
             }
         }
-        None => Some(state_dir.join("jsh/executions.jsonl")),
+        None => Some((state_dir.join("jsh/executions.jsonl"), false)),
     }
 }
 
@@ -515,6 +527,7 @@ fn check_writable_namespace(
     name: &'static str,
     intended: &Path,
     purpose: &str,
+    require_unshared: bool,
 ) {
     let Some(existing) = nearest_existing_ancestor(intended) else {
         checks.push(warn(
@@ -528,6 +541,7 @@ fn check_writable_namespace(
         metadata.is_dir()
             && !metadata.file_type().is_symlink()
             && metadata.uid() == unsafe { nix::libc::geteuid() }
+            && (!require_unshared || crate::execution::journal_parent_mode_is_safe(metadata.mode()))
     });
     if owned && path_accessible_for_creation(&existing) {
         checks.push(pass(
@@ -919,8 +933,36 @@ mod tests {
         let path =
             journal_path_for_override(&mut checks, state_dir, Some(std::ffi::OsString::new()));
 
-        assert_eq!(path, Some(state_dir.join("jsh/executions.jsonl")));
+        assert_eq!(path, Some((state_dir.join("jsh/executions.jsonl"), false)));
         assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn custom_journal_diagnostics_reject_a_shared_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        let mut checks = Vec::new();
+        check_writable_namespace(
+            &mut checks,
+            "persistence.journal",
+            dir.path(),
+            "execution context",
+            true,
+        );
+        assert_eq!(checks[0].level, Level::Warn);
+
+        checks.clear();
+        check_writable_namespace(
+            &mut checks,
+            "persistence.journal",
+            dir.path(),
+            "execution context",
+            false,
+        );
+        assert_eq!(checks[0].level, Level::Pass);
     }
 
     #[test]

@@ -415,7 +415,9 @@ The journal can contain sensitive commands, paths, and terminal output. Set
 integration for the terminal UI. Set `JSH_EXECUTION_JOURNAL_PATH` to override
 the location; an empty value behaves like an unset override. A non-empty value
 must be an absolute path whose parent is owned by the current user and is not
-group/world-writable. Relative or unsafe locations are rejected.
+group/world-writable. Shared namespaces such as `/tmp` are not valid overrides
+because the journal and its fixed `executions.lock` sidecar share one trust
+boundary. Relative or unsafe locations are rejected.
 
 ## AI, explicitly opt-in
 
