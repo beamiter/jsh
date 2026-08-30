@@ -15,7 +15,7 @@ use std::env;
 use std::io::IsTerminal;
 
 const MAX_OSC_COMMAND_BYTES: usize = 16 * 1024;
-const MAX_OSC_CWD_BYTES: usize = 4 * 1024;
+const MAX_OSC_CWD_BYTES: usize = crate::execution::MAX_CWD_BYTES;
 /// Titles are display-only and terminals truncate them anyway, so keep the
 /// packet small: a pathological $PWD or command line must not flood the tty.
 const MAX_OSC_TITLE_BYTES: usize = 1024;
@@ -148,14 +148,21 @@ fn bounded_prefix(value: &str, max_bytes: usize) -> &str {
 /// Supported by: iTerm2, WezTerm, Kitty, foot, GNOME Terminal, Windows Terminal.
 pub fn report_cwd(hostname: &str) {
     if let Ok(cwd) = env::current_dir() {
-        emit(&cwd_packet(hostname, &cwd.to_string_lossy()));
+        if let Some(path) = cwd.to_str() {
+            if let Some(packet) = cwd_packet(hostname, path) {
+                emit(&packet);
+            }
+        }
     }
 }
 
-fn cwd_packet(hostname: &str, path: &str) -> String {
+fn cwd_packet(hostname: &str, path: &str) -> Option<String> {
+    if !crate::execution::is_valid_cwd(path) {
+        return None;
+    }
     let host = percent_encode_metadata(hostname);
-    let encoded = percent_encode_path(bounded_prefix(path, MAX_OSC_CWD_BYTES));
-    format!("\x1b]7;file://{host}{encoded}\x1b\\")
+    let encoded = percent_encode_path(path);
+    Some(format!("\x1b]7;file://{host}{encoded}\x1b\\"))
 }
 
 // ── OSC 1337: iTerm2 CurrentDir ───────────────────────────────
@@ -164,8 +171,10 @@ fn cwd_packet(hostname: &str, path: &str) -> String {
 /// Format: `\x1b]1337;CurrentDir=path\x07`
 pub fn report_cwd_iterm2() {
     if let Ok(cwd) = env::current_dir() {
-        if let Some(packet) = cwd_iterm2_packet(&cwd.to_string_lossy()) {
-            emit(&packet);
+        if let Some(path) = cwd.to_str() {
+            if let Some(packet) = cwd_iterm2_packet(path) {
+                emit(&packet);
+            }
         }
     }
 }
@@ -177,11 +186,8 @@ pub fn report_cwd_iterm2() {
 /// report a different directory, so omit this redundant compatibility frame;
 /// [`report_cwd`] remains the canonical, encoded cwd signal.
 fn cwd_iterm2_packet(path: &str) -> Option<String> {
-    (path.len() <= MAX_OSC_CWD_BYTES
-        && !path
-            .chars()
-            .any(|ch| crate::terminal_text::is_terminal_ambiguous(ch) || ch == ';'))
-    .then(|| format!("\x1b]1337;CurrentDir={path}\x07"))
+    (crate::execution::is_valid_cwd(path) && !path.contains(';'))
+        .then(|| format!("\x1b]1337;CurrentDir={path}\x07"))
 }
 
 // ── OSC 0/2: Window Title ─────────────────────────────────────
@@ -233,7 +239,6 @@ pub fn command_start() {
 /// Build OSC 133;C with jsh execution metadata.
 fn command_output_start_packet(execution_id: &str, command: &str, cwd: &str) -> String {
     let id = percent_encode_metadata(execution_id);
-    let cwd = percent_encode_metadata(bounded_prefix(cwd, MAX_OSC_CWD_BYTES));
     let mut packet = format!("\x1b]133;C;id={id}");
     if command.len() <= MAX_OSC_COMMAND_BYTES {
         packet.push_str(";cmdline_url=");
@@ -241,8 +246,10 @@ fn command_output_start_packet(execution_id: &str, command: &str, cwd: &str) -> 
     } else {
         packet.push_str(";cmd_truncated=1");
     }
-    packet.push_str(";cwd_url=");
-    packet.push_str(&cwd);
+    if crate::execution::is_valid_cwd(cwd) {
+        packet.push_str(";cwd_url=");
+        packet.push_str(&percent_encode_metadata(cwd));
+    }
     packet.push('\x07');
     packet
 }
@@ -261,8 +268,13 @@ fn command_finished_packet(
     cwd: &str,
 ) -> String {
     let id = percent_encode_metadata(execution_id);
-    let cwd = percent_encode_metadata(bounded_prefix(cwd, MAX_OSC_CWD_BYTES));
-    format!("\x1b]133;D;{exit_code};id={id};duration_ms={duration_ms};cwd_url={cwd}\x07")
+    let mut packet = format!("\x1b]133;D;{exit_code};id={id};duration_ms={duration_ms}");
+    if crate::execution::is_valid_cwd(cwd) {
+        packet.push_str(";cwd_url=");
+        packet.push_str(&percent_encode_metadata(cwd));
+    }
+    packet.push('\x07');
+    packet
 }
 
 /// Emit OSC 133;D — Command finished marker with exit code and metadata.
@@ -391,14 +403,26 @@ mod tests {
     }
 
     #[test]
-    fn packets_bound_cwd_on_a_utf8_boundary() {
-        let cwd = format!("{}雪", "x".repeat(MAX_OSC_CWD_BYTES - 1));
-        let packet = command_output_start_packet("jsh-1", "true", &cwd);
-
+    fn cwd_metadata_is_exact_or_omitted_on_a_utf8_boundary() {
+        let at_limit = format!("{}雪", "x".repeat(MAX_OSC_CWD_BYTES - 3));
+        assert_eq!(at_limit.len(), MAX_OSC_CWD_BYTES);
+        let packet = command_output_start_packet("jsh-1", "true", &at_limit);
         assert!(packet.ends_with(&format!(
-            ";cwd_url={}\x07",
-            "x".repeat(MAX_OSC_CWD_BYTES - 1)
+            ";cwd_url={}{}\x07",
+            "x".repeat(MAX_OSC_CWD_BYTES - 3),
+            "%E9%9B%AA"
         )));
+
+        let oversized = format!("{}雪", "x".repeat(MAX_OSC_CWD_BYTES - 2));
+        assert_eq!(oversized.len(), MAX_OSC_CWD_BYTES + 1);
+        assert_eq!(
+            command_output_start_packet("jsh-1", "true", &oversized),
+            "\x1b]133;C;id=jsh-1;cmdline_url=true\x07"
+        );
+        assert_eq!(
+            command_finished_packet(0, "jsh-1", 7, &oversized),
+            "\x1b]133;D;0;id=jsh-1;duration_ms=7\x07"
+        );
     }
 
     /// Reject a packet that carries more than its own framing bytes: one ESC to
@@ -506,12 +530,9 @@ mod tests {
 
     #[test]
     fn cwd_packet_encodes_host_and_path() {
-        let packet = cwd_packet("host", "/tmp/evil\x1b]52;c;x\x07");
+        let packet = cwd_packet("host", "/tmp/a b;c雪").expect("safe exact cwd");
 
-        assert_eq!(
-            packet,
-            "\x1b]7;file://host/tmp/evil%1B%5D52%3Bc%3Bx%07\x1b\\"
-        );
+        assert_eq!(packet, "\x1b]7;file://host/tmp/a%20b%3Bc%E9%9B%AA\x1b\\");
         // OSC 7 is ST-terminated, so its framing is ESC ] ... ESC \ — two ESC
         // bytes and no BEL of its own.
         assert_eq!(
@@ -520,6 +541,10 @@ mod tests {
             "{packet:?}"
         );
         assert!(packet.ends_with("\x1b\\"));
+
+        assert_eq!(cwd_packet("host", "/tmp/evil\x1b]52;c;x\x07"), None);
+        assert_eq!(cwd_packet("host", ""), None);
+        assert_eq!(cwd_packet("host", &"x".repeat(MAX_OSC_CWD_BYTES + 1)), None);
     }
 
     #[test]
@@ -588,11 +613,11 @@ mod tests {
 
     #[test]
     fn command_finished_keeps_positional_exit_and_encodes_metadata() {
-        let packet = command_finished_packet(127, "jsh;2", 42, "/tmp/\x1b]133;A\x07");
+        let packet = command_finished_packet(127, "jsh;2", 42, "/tmp/a;b雪");
 
         assert_eq!(
             packet,
-            "\x1b]133;D;127;id=jsh%3B2;duration_ms=42;cwd_url=%2Ftmp%2F%1B%5D133%3BA%07\x07"
+            "\x1b]133;D;127;id=jsh%3B2;duration_ms=42;cwd_url=%2Ftmp%2Fa%3Bb%E9%9B%AA\x07"
         );
         assert_eq!(
             packet
@@ -609,6 +634,11 @@ mod tests {
                 .filter(|&&byte| byte == 0x07)
                 .count(),
             1
+        );
+
+        assert_eq!(
+            command_finished_packet(127, "jsh;2", 42, "/tmp/\x1b]133;A\x07"),
+            "\x1b]133;D;127;id=jsh%3B2;duration_ms=42\x07"
         );
     }
 }

@@ -579,8 +579,12 @@ impl Shell {
                     }
                     let execution_id =
                         execution::execution_id(self.session_id.as_deref(), self.execution_seq);
+                    // Cwd metadata is an identity, not display text. An
+                    // unrepresentable path must omit correlation rather than
+                    // replacing bytes with U+FFFD and naming another path.
                     let cwd_before = std::env::current_dir()
-                        .map(|path| path.to_string_lossy().into_owned())
+                        .ok()
+                        .and_then(|path| path.into_os_string().into_string().ok())
                         .unwrap_or_default();
                     let started_at_ms = execution::unix_time_ms();
                     let journal = execution::ExecutionJournal::configured();
@@ -633,7 +637,8 @@ impl Shell {
                     }
 
                     let cwd_after = std::env::current_dir()
-                        .map(|path| path.to_string_lossy().into_owned())
+                        .ok()
+                        .and_then(|path| path.into_os_string().into_string().ok())
                         .unwrap_or_default();
                     let ended_at_ms = execution::unix_time_ms();
 

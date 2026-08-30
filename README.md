@@ -372,7 +372,9 @@ ordinary Unicode readable but render controls, non-ASCII spacing, bidi
 controls, zero-width text, and other default-ignorables as explicit
 percent-encoded bytes. The redundant iTerm2 `CurrentDir` frame is emitted only
 when the exact raw path is bounded and unambiguous; OSC 7 remains the canonical
-encoded cwd signal.
+encoded cwd signal. Cwd identity is never lossy-decoded or truncated: an
+unrepresentable, oversized, or visually ambiguous value simply omits the
+optional cwd metadata.
 
 Query that context either inside an interactive jsh or from another process:
 
@@ -397,6 +399,9 @@ the journal and its `executions.lock` sidecar are mode `0600` and coordinated
 with `flock`. At 32 MiB the journal is compacted to the newest records, with a
 post-compaction limit of 24 MiB and 2,000 executions. Individual metadata and
 captured-output records also have hard size limits.
+Working directories have no truncation bit in journal v1, so start/finish
+events require the exact bounded, unambiguous value instead of recording a
+prefix or a lossy UTF-8 replacement as though it were another real directory.
 If a damaged or externally produced journal repeats an execution ID, the later
 start event replaces the whole earlier lifecycle and takes its new chronological
 position; stale status, output, and eviction age cannot attach to the new run.

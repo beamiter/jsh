@@ -172,7 +172,6 @@ impl ExecutionJournal {
         started_at_ms: u64,
     ) -> io::Result<()> {
         let (command, command_truncated) = bounded_text(command, MAX_COMMAND_BYTES);
-        let (cwd, _) = bounded_text(cwd, MAX_CWD_BYTES);
         self.append_event(ExecutionEvent::Start {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
@@ -183,7 +182,7 @@ impl ExecutionJournal {
             seq,
             command,
             command_truncated,
-            cwd,
+            cwd: validate_cwd(cwd)?.to_string(),
             started_at_ms,
         })
     }
@@ -196,13 +195,12 @@ impl ExecutionJournal {
         cwd_after: &str,
         ended_at_ms: u64,
     ) -> io::Result<()> {
-        let (cwd_after, _) = bounded_text(cwd_after, MAX_CWD_BYTES);
         self.append_event(ExecutionEvent::Finish {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
             exit_code,
             duration_ms,
-            cwd_after,
+            cwd_after: validate_cwd(cwd_after)?.to_string(),
             ended_at_ms,
         })
     }
@@ -571,6 +569,27 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// Whether a cwd can be shared exactly with terminal and journal consumers.
+///
+/// A cwd has no truncation marker in schema v1. Silently shortening it would
+/// identify a different directory, while controls or invisible formatting
+/// could disguise terminal chrome. Callers therefore omit the optional OSC
+/// field or reject the journal event unless the exact value passes.
+pub(crate) fn is_valid_cwd(cwd: &str) -> bool {
+    !cwd.is_empty()
+        && cwd.len() <= MAX_CWD_BYTES
+        && !cwd.chars().any(crate::terminal_text::is_terminal_ambiguous)
+}
+
+fn validate_cwd(cwd: &str) -> io::Result<&str> {
+    is_valid_cwd(cwd).then_some(cwd).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cwd must be exact, bounded, and visually unambiguous",
+        )
+    })
+}
+
 fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
     if value.len() <= max_bytes {
         return (value.to_string(), false);
@@ -636,7 +655,7 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                         .as_deref()
                         .is_some_and(|id| validate_session_id(id).is_err())
                     || command.len() > MAX_COMMAND_BYTES
-                    || cwd.len() > MAX_CWD_BYTES
+                    || validate_cwd(&cwd).is_err()
                 {
                     continue;
                 }
@@ -678,7 +697,7 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                 ended_at_ms,
                 ..
             } => {
-                if validate_execution_id(&id).is_err() || cwd_after.len() > MAX_CWD_BYTES {
+                if validate_execution_id(&id).is_err() || validate_cwd(&cwd_after).is_err() {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
@@ -1051,6 +1070,37 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn cwd_values_are_exact_or_the_journal_event_is_rejected() {
+        let (_dir, journal) = journal();
+        let at_limit = "x".repeat(MAX_CWD_BYTES);
+        journal
+            .record_start("jsh-exact-cwd", None, 1, "true", &at_limit, 1)
+            .unwrap();
+        journal
+            .record_finish("jsh-exact-cwd", 0, 1, "/after", 2)
+            .unwrap();
+
+        for invalid in [
+            String::new(),
+            "x".repeat(MAX_CWD_BYTES + 1),
+            "/tmp/line\nbreak".to_string(),
+            "/tmp/left\u{202e}right".to_string(),
+        ] {
+            assert!(journal
+                .record_start("jsh-invalid-cwd", None, 2, "true", &invalid, 3)
+                .is_err());
+            assert!(journal
+                .record_finish("jsh-exact-cwd", 0, 1, &invalid, 3)
+                .is_err());
+        }
+
+        let records = journal.records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cwd, at_limit);
+        assert_eq!(records[0].cwd_after.as_deref(), Some("/after"));
     }
 
     #[test]
