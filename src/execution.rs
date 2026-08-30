@@ -860,6 +860,12 @@ fn journal_append_within_bound(current_bytes: u64, appended_bytes: usize) -> boo
         <= MAX_JOURNAL_READ_BYTES
 }
 
+#[derive(Clone, Copy)]
+enum FoldedRecordOrder {
+    Presentation,
+    PhysicalStart,
+}
+
 fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
     read_records_with_line_limit(path, MAX_JOURNAL_EVENT_LINES)
 }
@@ -867,6 +873,14 @@ fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
 fn read_records_with_line_limit(
     path: &Path,
     max_event_lines: usize,
+) -> io::Result<Vec<FoldedExecution>> {
+    read_records_with_line_limit_and_order(path, max_event_lines, FoldedRecordOrder::Presentation)
+}
+
+fn read_records_with_line_limit_and_order(
+    path: &Path,
+    max_event_lines: usize,
+    order: FoldedRecordOrder,
 ) -> io::Result<Vec<FoldedExecution>> {
     let file = open_regular_file(path, true, false, false)?;
     set_private_open_file_permissions(&file)?;
@@ -880,9 +894,11 @@ fn read_records_with_line_limit(
     // Keep the working set bounded while preserving the newest start-event
     // chronology. A second start for one ID is authoritative and must move to
     // its new position rather than retaining the first event's eviction age.
-    // The ordered index keeps both replacement and eviction logarithmic under
-    // a hostile stream of tiny duplicate or unique records.
-    let mut record_order = BTreeMap::<(u64, u64, String), String>::new();
+    // Retention authority follows physical Start order, never untrusted or
+    // reset-prone event timestamps and sequence numbers. The two indexes keep
+    // replacement and eviction logarithmic under a hostile event stream.
+    let mut record_order = BTreeMap::<usize, String>::new();
+    let mut record_positions = HashMap::<String, usize>::new();
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut bytes_read = 0_u64;
@@ -914,12 +930,10 @@ fn read_records_with_line_limit(
         // remaining metadata fails. Retire the old lifecycle first so later
         // Finish/Output events cannot bind back to stale command/session data.
         if let Some(id) = recognized_v1_start_id(&line) {
-            if let Some(previous) = records.remove(id.as_ref()) {
-                record_order.remove(&(
-                    previous.record.started_at_ms,
-                    previous.record.seq,
-                    previous.record.id,
-                ));
+            if records.remove(id.as_ref()).is_some() {
+                if let Some(position) = record_positions.remove(id.as_ref()) {
+                    record_order.remove(&position);
+                }
             }
         }
         let Ok(event) = serde_json::from_slice::<ExecutionEvent>(&line) else {
@@ -962,12 +976,14 @@ fn read_records_with_line_limit(
                     ended_at_ms: None,
                     output: None,
                 };
-                record_order.insert((started_at_ms, seq, id.clone()), id.clone());
+                record_order.insert(event_lines, id.clone());
+                record_positions.insert(id.clone(), event_lines);
                 records.insert(id, FoldedExecution::new(record));
                 while records.len() > MAX_RETAINED_EXECUTIONS {
                     let Some((_, oldest_id)) = record_order.pop_first() else {
                         break;
                     };
+                    record_positions.remove(&oldest_id);
                     records.remove(&oldest_id);
                 }
             }
@@ -1021,15 +1037,35 @@ fn read_records_with_line_limit(
             }
         }
     }
-    let mut records = records.into_values().collect::<Vec<_>>();
-    records.sort_by(|left, right| {
-        (left.record.started_at_ms, left.record.seq, &left.record.id).cmp(&(
-            right.record.started_at_ms,
-            right.record.seq,
-            &right.record.id,
-        ))
-    });
-    Ok(records)
+    let mut ordered_records = Vec::with_capacity(records.len());
+    for record in records.into_values() {
+        let Some(position) = record_positions.remove(&record.record.id) else {
+            return Err(io::Error::other(
+                "execution journal retention index became inconsistent",
+            ));
+        };
+        ordered_records.push((position, record));
+    }
+    match order {
+        FoldedRecordOrder::Presentation => ordered_records.sort_by(|left, right| {
+            (
+                left.1.record.started_at_ms,
+                left.1.record.seq,
+                &left.1.record.id,
+            )
+                .cmp(&(
+                    right.1.record.started_at_ms,
+                    right.1.record.seq,
+                    &right.1.record.id,
+                ))
+        }),
+        FoldedRecordOrder::PhysicalStart => ordered_records
+            .sort_by(|left, right| (left.0, &left.1.record.id).cmp(&(right.0, &right.1.record.id))),
+    }
+    Ok(ordered_records
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect())
 }
 
 /// Read and, when necessary, discard one JSONL record without allocating more
@@ -1085,7 +1121,11 @@ fn compact_unlocked_with_line_limit(path: &Path, max_event_lines: usize) -> io::
     // Compaction must first accept the source under the same physical-line
     // budget its output promises to satisfy. Otherwise ignored future events
     // could be erased from an over-budget source and make it appear valid.
-    let records = read_records_with_line_limit(path, max_event_lines)?;
+    let records = read_records_with_line_limit_and_order(
+        path,
+        max_event_lines,
+        FoldedRecordOrder::PhysicalStart,
+    )?;
     let mut retained = Vec::<Vec<u8>>::new();
     let mut retained_bytes = 0usize;
     let mut retained_event_lines = 0usize;
@@ -2796,5 +2836,106 @@ mod tests {
             records.last().unwrap().seq,
             MAX_RETAINED_EXECUTIONS as u64 + 4
         );
+    }
+
+    #[test]
+    fn compaction_preserves_physical_retention_order_across_restart() {
+        let (_dir, journal) = journal();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(journal.path())
+            .unwrap();
+        write_compacted_event(
+            &mut file,
+            &ExecutionEvent::Start(StartEvent {
+                jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                id: "restarted".into(),
+                session_id: Some("wanted".into()),
+                seq: u64::MAX,
+                command: "old".into(),
+                command_truncated: false,
+                cwd: "/tmp".into(),
+                started_at_ms: u64::MAX,
+            }),
+        )
+        .unwrap();
+        for ordinal in 1..MAX_RETAINED_EXECUTIONS {
+            write_compacted_event(
+                &mut file,
+                &ExecutionEvent::Start(StartEvent {
+                    jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                    id: format!("other-{ordinal}"),
+                    session_id: Some("wanted".into()),
+                    seq: ordinal as u64,
+                    command: "other".into(),
+                    command_truncated: false,
+                    cwd: "/tmp".into(),
+                    started_at_ms: ordinal as u64,
+                }),
+            )
+            .unwrap();
+        }
+        for (id, command) in [("restarted", "new"), ("zz-newest", "newest")] {
+            write_compacted_event(
+                &mut file,
+                &ExecutionEvent::Start(StartEvent {
+                    jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+                    id: id.into(),
+                    session_id: Some("wanted".into()),
+                    seq: 0,
+                    command: command.into(),
+                    command_truncated: false,
+                    cwd: "/tmp".into(),
+                    started_at_ms: 0,
+                }),
+            )
+            .unwrap();
+        }
+        drop(file);
+
+        let before = read_records(journal.path()).unwrap();
+        assert_eq!(before.len(), MAX_RETAINED_EXECUTIONS);
+        assert!(before.iter().any(|record| {
+            record.record.id == "restarted"
+                && record.record.seq == 0
+                && record.record.command == "new"
+        }));
+        assert!(before.iter().any(|record| record.record.id == "zz-newest"));
+        assert!(!before.iter().any(|record| record.record.id == "other-1"));
+        assert!(before.iter().any(|record| record.record.id == "other-2"));
+
+        compact_unlocked(journal.path()).unwrap();
+        assert_eq!(read_records(journal.path()).unwrap(), before);
+        let compacted = fs::read(journal.path()).unwrap();
+        assert_unique_jsonl(&compacted);
+        let lines = compacted
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), MAX_RETAINED_EXECUTIONS);
+        let id_at = |index: usize| {
+            serde_json::from_slice::<serde_json::Value>(lines[index]).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(id_at(0), "other-2");
+        assert_eq!(id_at(lines.len() - 2), "restarted");
+        assert_eq!(id_at(lines.len() - 1), "zz-newest");
+
+        journal
+            .record_start("post-compact", Some("wanted"), 0, "post", "/tmp", 0)
+            .unwrap();
+        let after_append = journal.records().unwrap();
+        assert_eq!(after_append.len(), MAX_RETAINED_EXECUTIONS);
+        assert!(after_append.iter().any(|record| record.id == "restarted"));
+        assert!(after_append.iter().any(|record| record.id == "zz-newest"));
+        assert!(after_append
+            .iter()
+            .any(|record| record.id == "post-compact"));
+        assert!(!after_append.iter().any(|record| record.id == "other-2"));
+        assert!(after_append.iter().any(|record| record.id == "other-3"));
     }
 }

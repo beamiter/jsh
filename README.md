@@ -432,6 +432,10 @@ prefix or a lossy UTF-8 replacement as though it were another real directory.
 If a damaged or externally produced journal repeats an execution ID, the later
 start event replaces the whole earlier lifecycle and takes its new chronological
 position; stale status, output, and eviction age cannot attach to the new run.
+Bounded retention uses physical Start order rather than untrusted timestamps or
+sequence numbers. Compaction emits that same physical order so a later append
+cannot resurrect a retired eviction age; presentation remains sorted by event
+metadata with an id tie-break.
 
 The journal can contain sensitive commands, paths, and terminal output. Set
 `JSH_EXECUTION_JOURNAL=0` to disable disk journaling while retaining OSC
