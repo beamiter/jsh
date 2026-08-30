@@ -82,7 +82,7 @@ pub struct ExecutionRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "event")]
+#[serde(tag = "event", deny_unknown_fields)]
 enum ExecutionEvent {
     #[serde(rename = "start")]
     Start(StartEvent),
@@ -137,6 +137,14 @@ struct EventIdentity<'a> {
     id: Cow<'a, str>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EventKindVersion<'a> {
+    #[serde(borrow)]
+    event: Cow<'a, str>,
+    #[serde(alias = "rsh_execution_version")]
+    jsh_execution_version: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConflictEvent {
@@ -178,6 +186,36 @@ fn recognized_v1_start_id(line: &[u8]) -> Option<Cow<'_, str>> {
         && identity.jsh_execution_version == EXECUTION_JOURNAL_VERSION
         && is_valid_execution_id(&identity.id))
     .then_some(identity.id)
+}
+
+fn known_v1_slot_event_has_extra_fields(line: &[u8]) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<EventKindVersion<'_>>(line) else {
+        return false;
+    };
+    if envelope.jsh_execution_version != EXECUTION_JOURNAL_VERSION
+        || !matches!(envelope.event.as_ref(), "finish" | "output")
+    {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(line) else {
+        return false;
+    };
+    object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "event" | "jsh_execution_version" | "rsh_execution_version" | "id"
+        ) && !match envelope.event.as_ref() {
+            "finish" => matches!(
+                key.as_str(),
+                "exit_code" | "duration_ms" | "cwd_after" | "ended_at_ms"
+            ),
+            "output" => matches!(
+                key.as_str(),
+                "text" | "truncated" | "total_bytes" | "captured_at_ms"
+            ),
+            _ => unreachable!("slot event kind checked above"),
+        }
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1005,6 +1043,14 @@ fn read_records_with_line_limit(
     path: &Path,
     max_event_lines: usize,
 ) -> io::Result<Vec<FoldedExecution>> {
+    read_records_with_line_limit_policy(path, max_event_lines, false)
+}
+
+fn read_records_with_line_limit_policy(
+    path: &Path,
+    max_event_lines: usize,
+    reject_extra_slot_fields: bool,
+) -> io::Result<Vec<FoldedExecution>> {
     let file = open_regular_file(path, true, false, false)?;
     set_private_open_file_permissions(&file)?;
     if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
@@ -1059,8 +1105,17 @@ fn read_records_with_line_limit(
                 }
             }
         }
-        let Ok(event) = serde_json::from_slice::<ExecutionEvent>(&line) else {
-            continue;
+        let event = match serde_json::from_slice::<ExecutionEvent>(&line) {
+            Ok(event) => event,
+            Err(_) => {
+                if reject_extra_slot_fields && known_v1_slot_event_has_extra_fields(&line) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "execution journal finish/output event contains extra fields",
+                    ));
+                }
+                continue;
+            }
         };
         if event.version() != EXECUTION_JOURNAL_VERSION {
             continue;
@@ -1230,7 +1285,7 @@ fn compact_unlocked_with_line_limit(path: &Path, max_event_lines: usize) -> io::
     // Compaction must first accept the source under the same physical-line
     // budget its output promises to satisfy. Otherwise ignored future events
     // could be erased from an over-budget source and make it appear valid.
-    let records = read_records_with_line_limit(path, max_event_lines)?;
+    let records = read_records_with_line_limit_policy(path, max_event_lines, true)?;
     let mut retained = Vec::<Vec<u8>>::new();
     let mut retained_bytes = 0usize;
     let mut retained_event_lines = 0usize;
@@ -1727,6 +1782,70 @@ mod tests {
             reset.output.as_ref().map(|output| output.text.as_str()),
             Some("exact")
         );
+    }
+
+    #[test]
+    fn known_extra_fields_block_compaction_but_unknown_events_remain_skippable() {
+        let (_dir, strict_journal) = journal();
+        fs::write(
+            strict_journal.path(),
+            concat!(
+                "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"strict-known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"strict-known\",\"session_id\":\"other\",\"exit_code\":91,\"duration_ms\":91,\"cwd_after\":\"/wrong\",\"ended_at_ms\":91}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"strict-known\",\"execution_id\":\"other\",\"text\":\"wrong\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":92}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"strict-known\",\"exit_code\":7,\"duration_ms\":2,\"cwd_after\":\"/after\",\"ended_at_ms\":3}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"strict-known\",\"text\":\"exact\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(strict_journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let record = strict_journal.get("strict-known").unwrap().unwrap();
+        assert_eq!(record.exit_code, Some(7));
+        assert_eq!(
+            record.output.as_ref().map(|output| output.text.as_str()),
+            Some("exact")
+        );
+        let directory_entries = |path: &Path| {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        let bytes_before = fs::read(strict_journal.path()).unwrap();
+        let identity_before = fs::metadata(strict_journal.path()).unwrap();
+        let entries_before = directory_entries(strict_journal.path().parent().unwrap());
+        let error = compact_unlocked(strict_journal.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(strict_journal.path()).unwrap(), bytes_before);
+        let identity_after = fs::metadata(strict_journal.path()).unwrap();
+        assert_eq!(
+            (identity_after.dev(), identity_after.ino()),
+            (identity_before.dev(), identity_before.ino())
+        );
+        let entries_after = directory_entries(strict_journal.path().parent().unwrap());
+        assert_eq!(entries_after, entries_before);
+
+        let (_vendor_dir, vendor_journal) = journal();
+        fs::write(
+            vendor_journal.path(),
+            concat!(
+                "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"vendor-safe\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":5}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"vendor_extension\",\"id\":\"vendor-safe\",\"session_id\":\"other\",\"execution_id\":\"other\",\"exit_code\":90,\"text\":\"ignored\"}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"vendor-safe\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/after\",\"ended_at_ms\":7}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"vendor-safe\",\"text\":\"kept\",\"truncated\":false,\"total_bytes\":4,\"captured_at_ms\":8}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(vendor_journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let vendor_before = vendor_journal.records().unwrap();
+        compact_unlocked(vendor_journal.path()).unwrap();
+        assert_eq!(vendor_journal.records().unwrap(), vendor_before);
+        assert!(!fs::read_to_string(vendor_journal.path())
+            .unwrap()
+            .contains("vendor_extension"));
     }
 
     #[test]
