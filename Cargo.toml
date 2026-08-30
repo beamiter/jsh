@@ -10,7 +10,7 @@ categories = ["command-line-utilities"]
 
 [features]
 default = ["ai"]
-ai = ["dep:ureq", "dep:jagent"]
+ai = ["dep:ureq"]
 
 [dependencies]
 glob = "0.3"
@@ -30,8 +30,10 @@ crossterm = "0.29.0"
 dirs = "6.0.0"
 nix = { version = "0.31.3", features = ["process", "fs", "signal", "term", "user"] }
 ureq = { version = "3", optional = true }
-# Pin the policy engine so a branch move cannot silently change the contract.
-jagent = { git = "https://github.com/beamiter/jagent.git", rev = "ab7552d2bf287e330f67f7b75ab766b73aa6268e", optional = true }
+# Pin the shared policy/wire validator so a branch move cannot silently change
+# journal uniqueness semantics. This remains baseline even without AI; its
+# normal dependencies (regex, serde, serde_json) are already always present.
+jagent = { git = "https://github.com/beamiter/jagent.git", rev = "ab7552d2bf287e330f67f7b75ab766b73aa6268e" }
 # serde_yaml 0.9 is abandoned upstream ("+deprecated", no successor release),
 # so an advisory against it could never be answered by a version bump.
 # serde_yaml_ng is the maintained continuation with the same API, and is what
