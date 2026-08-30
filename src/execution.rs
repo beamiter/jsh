@@ -1538,6 +1538,73 @@ mod tests {
     }
 
     #[test]
+    fn compaction_preserves_restart_reset_generation() {
+        let (_dir, journal) = journal();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(journal.path())
+            .unwrap();
+        file.write_all(
+            concat!(
+                "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-restarted\",\"session_id\":\"wanted\",\"seq\":90,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":900}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-restarted\",\"exit_code\":9,\"duration_ms\":8,\"cwd_after\":\"/old-after\",\"ended_at_ms\":908}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-restarted\",\"text\":\"old output\",\"truncated\":false,\"total_bytes\":10,\"captured_at_ms\":909}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"jsh-restarted\",\"slot\":\"finish\"}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"jsh-restarted\",\"slot\":\"output\"}\n",
+                "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"jsh-restarted\",\"session_id\":\"wanted\",\"seq\":0,\"command\":\"future\",\"cwd\":\"/future\",\"started_at_ms\":0}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"future\",\"id\":\"jsh-restarted\",\"payload\":true}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-restarted\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"new\",\"cwd\":\"/new\",\"started_at_ms\":10}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+
+        let before = read_records(journal.path()).unwrap();
+        assert_eq!(before.len(), 1);
+        let restarted = &before[0];
+        assert_eq!(restarted.record.seq, 1);
+        assert_eq!(restarted.record.started_at_ms, 10);
+        assert_eq!(restarted.record.command, "new");
+        assert_eq!(restarted.record.cwd, "/new");
+        assert_eq!(restarted.record.exit_code, None);
+        assert_eq!(restarted.record.output, None);
+        assert!(!restarted.finish_conflicted);
+        assert!(!restarted.output_conflicted);
+
+        compact_unlocked(journal.path()).unwrap();
+        let compacted = fs::read(journal.path()).unwrap();
+        assert_unique_jsonl(&compacted);
+        assert_eq!(compacted.split(|byte| *byte == b'\n').count(), 2);
+        let compacted_text = String::from_utf8(compacted).unwrap();
+        assert!(!compacted_text.contains("old output"));
+        assert!(!compacted_text.contains("/old"));
+        assert!(!compacted_text.contains("\"event\":\"conflict\""));
+        assert!(!compacted_text.contains("\"event\":\"future\""));
+        assert!(!compacted_text.contains("\"jsh_execution_version\":2"));
+        assert_eq!(read_records(journal.path()).unwrap(), before);
+
+        journal
+            .record_finish("jsh-restarted", 7, 2, "/new-after", 20)
+            .unwrap();
+        journal
+            .record_output("jsh-restarted", "new output", false, 10, 21)
+            .unwrap();
+        let rebound = journal.get("jsh-restarted").unwrap().unwrap();
+        assert_eq!(rebound.command, "new");
+        assert_eq!(rebound.exit_code, Some(7));
+        assert_eq!(rebound.duration_ms, Some(2));
+        assert_eq!(rebound.cwd_after.as_deref(), Some("/new-after"));
+        assert_eq!(rebound.ended_at_ms, Some(20));
+        assert_eq!(
+            rebound.output.as_ref().map(|output| output.text.as_str()),
+            Some("new output")
+        );
+    }
+
+    #[test]
     fn recognized_start_ids_barrier_invalid_replacement_lifecycles() {
         let (_dir, journal) = journal();
         let mut file = OpenOptions::new()

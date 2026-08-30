@@ -417,12 +417,15 @@ Individual metadata and captured-output records also have hard size limits.
 Exact duplicate finish or output delivery is idempotent; conflicting duplicates
 poison only their own lifecycle slot until the next authoritative start.
 Compaction keeps that safe unknown state as an additive `conflict` tombstone
-that older v1 readers ignore. Recursive duplicate-member validation runs before
-any event can mutate lifecycle state, including an invalid start barrier. A
-recognized v1 start with a valid execution id retires that id's prior lifecycle
-before all remaining fields are decoded strictly, so an invalid replacement
-cannot redirect later finish/output events back to stale command or session
-data; malformed, future-version, and unknown events remain non-barriers.
+that older v1 readers ignore. Start authority follows physical event order, so
+a restart still clears both prior slots when its sequence or wall clock moves
+backwards, and compaction cannot rebind those slots to the new generation.
+Recursive duplicate-member validation runs before any event can mutate
+lifecycle state, including an invalid start barrier. A recognized v1 start with
+a valid execution id retires that id's prior lifecycle before all remaining
+fields are decoded strictly, so an invalid replacement cannot redirect later
+finish/output events back to stale command or session data; malformed,
+future-version, and unknown events remain non-barriers.
 Working directories have no truncation bit in journal v1, so start/finish
 events require the exact bounded, unambiguous value instead of recording a
 prefix or a lossy UTF-8 replacement as though it were another real directory.
