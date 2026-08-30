@@ -98,12 +98,12 @@ fn percent_encode_metadata(value: &str) -> String {
 /// only the bytes that can break *out* of the packet are escaped, using the
 /// same `%XX` scheme as the rest of this file:
 ///
-/// * Every C0 control — BEL (0x07) and ESC (0x1B) above all — plus DEL and
-///   every C1 control, which includes 8-bit ST (U+009C). These terminate the
-///   packet early and leave the remainder to be read as a *fresh* sequence: a
-///   directory named `evil\x07\x1b]52;c;<base64>\x07` was enough to make this
-///   family's terminals perform an OSC 52 clipboard write straight out of a
-///   cloned repo.
+/// * Every terminal-ambiguous character: C0 controls — BEL (0x07) and ESC
+///   (0x1B) above all — DEL/C1 controls, non-ASCII spacing, bidi controls,
+///   zero-width characters, and other default-ignorables. Protocol controls
+///   can terminate the packet and start a fresh sequence; invisible formatting
+///   can instead make a command, path, or notification say something different
+///   in trusted-looking terminal chrome.
 /// * `;` when the value sits in a field-delimited packet (`escape_delimiter`),
 ///   so it cannot forge an extra field. Values that occupy the packet's final
 ///   field pass `false`, since a `;` there stays inside that field and dropping
@@ -114,7 +114,7 @@ fn escape_osc_text(value: &str, max_bytes: usize, escape_delimiter: bool) -> Str
     let bounded = bounded_prefix(value, max_bytes);
     let mut escaped = String::with_capacity(bounded.len());
     for ch in bounded.chars() {
-        if ch.is_control() || (escape_delimiter && ch == ';') {
+        if crate::terminal_text::is_terminal_ambiguous(ch) || (escape_delimiter && ch == ';') {
             let mut buf = [0u8; 4];
             for byte in ch.encode_utf8(&mut buf).as_bytes() {
                 escaped.push('%');
@@ -164,19 +164,24 @@ fn cwd_packet(hostname: &str, path: &str) -> String {
 /// Format: `\x1b]1337;CurrentDir=path\x07`
 pub fn report_cwd_iterm2() {
     if let Ok(cwd) = env::current_dir() {
-        emit(&cwd_iterm2_packet(&cwd.to_string_lossy()));
+        if let Some(packet) = cwd_iterm2_packet(&cwd.to_string_lossy()) {
+            emit(&packet);
+        }
     }
 }
 
-/// Build OSC 1337 CurrentDir. iTerm2 wants the raw path (no URI encoding), so
-/// only the packet-breaking bytes and the `;` field delimiter are escaped: a
-/// directory whose name carries an ESC would otherwise end the packet and hand
-/// the rest of its name to the terminal as a new sequence.
-fn cwd_iterm2_packet(path: &str) -> String {
-    format!(
-        "\x1b]1337;CurrentDir={}\x07",
-        escape_osc_text(path, MAX_OSC_CWD_BYTES, true)
-    )
+/// Build OSC 1337 CurrentDir only when the exact path is safe to send raw.
+///
+/// Unlike OSC 7's file URI, iTerm2's `CurrentDir` field has no documented
+/// escaping. Percent-encoding or truncating a hostile/oversized path would
+/// report a different directory, so omit this redundant compatibility frame;
+/// [`report_cwd`] remains the canonical, encoded cwd signal.
+fn cwd_iterm2_packet(path: &str) -> Option<String> {
+    (path.len() <= MAX_OSC_CWD_BYTES
+        && !path
+            .chars()
+            .any(|ch| crate::terminal_text::is_terminal_ambiguous(ch) || ch == ';'))
+    .then(|| format!("\x1b]1337;CurrentDir={path}\x07"))
 }
 
 // ── OSC 0/2: Window Title ─────────────────────────────────────
@@ -442,6 +447,25 @@ mod tests {
     }
 
     #[test]
+    fn display_packets_expose_invisible_and_bidirectional_unicode() {
+        let hostile = "left\u{202e}right\u{00a0}tail\u{200b}";
+        let visible = "left%E2%80%AEright%C2%A0tail%E2%80%8B";
+
+        let title = set_title_packet(hostile);
+        assert_eq!(title, format!("\x1b]2;{visible}\x07"));
+        assert_single_framing(&title);
+
+        assert_eq!(cwd_iterm2_packet(&format!("/tmp/{hostile}")), None);
+
+        let notification = notify_osc777_packet(hostile, hostile);
+        assert_eq!(
+            notification,
+            format!("\x1b]777;notify;{visible};{visible}\x07")
+        );
+        assert_single_framing(&notification);
+    }
+
+    #[test]
     fn set_title_packet_keeps_ordinary_titles_readable() {
         // Titles are display values: escaping them wholesale the way the OSC 133
         // metadata fields are escaped would show `jsh%3A%20~%2Fdev` in the tab.
@@ -464,20 +488,18 @@ mod tests {
     }
 
     #[test]
-    fn cwd_iterm2_packet_neutralizes_hostile_paths_and_field_delimiters() {
-        let packet = cwd_iterm2_packet("/tmp/evil\x07\x1b]52;c;aGFjaw==\x07/x;RemoteHost=y");
-
+    fn cwd_iterm2_packet_omits_inexact_or_hostile_paths() {
         assert_eq!(
-            packet,
-            "\x1b]1337;CurrentDir=/tmp/evil%07%1B]52%3Bc%3BaGFjaw==%07/x%3BRemoteHost=y\x07"
+            cwd_iterm2_packet("/tmp/evil\x07\x1b]52;c;aGFjaw==\x07/x;RemoteHost=y"),
+            None
         );
-        assert_single_framing(&packet);
+        assert_eq!(cwd_iterm2_packet(&"x".repeat(MAX_OSC_CWD_BYTES + 1)), None);
     }
 
     #[test]
     fn cwd_iterm2_packet_keeps_ordinary_paths_raw() {
         // iTerm2 expects the literal path here, not a URI-encoded one.
-        let packet = cwd_iterm2_packet("/home/u/dev/my project");
+        let packet = cwd_iterm2_packet("/home/u/dev/my project").expect("safe exact path");
 
         assert_eq!(packet, "\x1b]1337;CurrentDir=/home/u/dev/my project\x07");
     }

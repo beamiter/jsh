@@ -367,6 +367,13 @@ multiline command has the same identity in OSC metadata and the JSONL execution
 journal. Repeated semantic metadata aliases are treated as ambiguous by the
 shared terminal parser rather than resolved last-wins.
 
+Display-only OSC values such as command titles and job notifications keep
+ordinary Unicode readable but render controls, non-ASCII spacing, bidi
+controls, zero-width text, and other default-ignorables as explicit
+percent-encoded bytes. The redundant iTerm2 `CurrentDir` frame is emitted only
+when the exact raw path is bounded and unambiguous; OSC 7 remains the canonical
+encoded cwd signal.
+
 Query that context either inside an interactive jsh or from another process:
 
 ```sh
