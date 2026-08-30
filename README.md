@@ -400,9 +400,11 @@ Execution context is separate from `~/.jsh_history`. Its append-only JSONL
 journal defaults to `$XDG_STATE_HOME/jsh/executions.jsonl`, falling back to
 `~/.local/state/jsh/executions.jsonl`. The jsh state directory is mode `0700`;
 the journal and its `executions.lock` sidecar are mode `0600` and coordinated
-with `flock`. At 32 MiB the journal is compacted to the newest records, with a
-post-compaction limit of 24 MiB and 2,000 executions. Individual metadata and
-captured-output records also have hard size limits.
+with `flock`. Existing journal or lock files that are group/world-writable are
+rejected rather than repaired in place; extra read bits on an owner-only file
+are tightened back to `0600`. At 32 MiB the journal is compacted to the newest
+records, with a post-compaction limit of 24 MiB and 2,000 executions. Individual
+metadata and captured-output records also have hard size limits.
 Working directories have no truncation bit in journal v1, so start/finish
 events require the exact bounded, unambiguous value instead of recording a
 prefix or a lossy UTF-8 replacement as though it were another real directory.

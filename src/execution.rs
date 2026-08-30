@@ -458,6 +458,16 @@ fn ensure_regular_file(file: &File, path: &Path) -> io::Result<()> {
             format!("{path:?} is not owned by the current user"),
         ));
     }
+    // Do not "repair" a file another account can already have open for
+    // writing: chmod cannot revoke that existing descriptor. Owner-only files
+    // with extra read bits are tightened to 0600 by the caller after this
+    // integrity gate.
+    if metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path:?} is writable by another user or group"),
+        ));
+    }
     Ok(())
 }
 
@@ -950,6 +960,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(journal.path())
             .unwrap();
         writeln!(file, "{{\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"rsh-a\",\"session_id\":\"tab-1\",\"seq\":3,\"command\":\"make\",\"cwd\":\"/p\",\"started_at_ms\":10}}").unwrap();
@@ -1015,6 +1026,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(reader_journal.path())
             .unwrap();
         writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-reader\",\"session_id\":null,\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}}").unwrap();
@@ -1170,6 +1182,49 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn shared_writable_journal_and_lock_files_are_rejected_without_repair() {
+        for target in ["journal", "lock"] {
+            let (dir, journal) = journal();
+            let path = if target == "journal" {
+                journal.path().to_path_buf()
+            } else {
+                dir.path().join("executions.lock")
+            };
+            fs::write(&path, b"").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o622)).unwrap();
+
+            assert!(
+                journal
+                    .record_start("jsh-shared-file", None, 1, "true", "/tmp", 1)
+                    .is_err(),
+                "target={target}"
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o622,
+                "target={target}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_readable_journal_is_tightened_after_validation() {
+        let (_dir, journal) = journal();
+        fs::write(
+            journal.path(),
+            b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-readable\",\"session_id\":null,\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+        )
+        .unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(journal.records().unwrap().len(), 1);
+        assert_eq!(
+            fs::metadata(journal.path()).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
