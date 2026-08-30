@@ -480,6 +480,12 @@ fn persistence_integrity_checks(checks: &mut Vec<Check>, home: &Path, journal: O
     ];
     if let Some(journal) = journal {
         candidates.push(journal.to_path_buf());
+        if let Some(parent) = journal.parent() {
+            let lock = parent.join("executions.lock");
+            if lock != journal {
+                candidates.push(lock);
+            }
+        }
     }
     let euid = unsafe { nix::libc::geteuid() };
     let mut present = 0usize;
@@ -995,6 +1001,31 @@ mod tests {
             false,
         );
         assert_eq!(checks[0].level, Level::Pass);
+    }
+
+    #[test]
+    fn persistence_integrity_includes_the_fixed_journal_lock_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = dir.path().join("events.jsonl");
+        let lock = dir.path().join("executions.lock");
+        std::fs::write(&journal, b"").unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o622)).unwrap();
+
+        let mut checks = Vec::new();
+        persistence_integrity_checks(
+            &mut checks,
+            Path::new("/definitely/missing/jsh-doctor-home"),
+            Some(&journal),
+        );
+
+        assert!(checks.iter().any(|check| {
+            check.level == Level::Warn && check.message.contains("executions.lock")
+        }));
     }
 
     #[test]

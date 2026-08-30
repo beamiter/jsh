@@ -155,7 +155,8 @@ Important options:
 - `--help` and `--version` report the binary's interface and version.
 - `doctor [--json] [--strict] [--rcfile FILE]` performs a read-only environment
   check. JSON reports carry `schema_version` and `healthy`; strict mode exits 1
-  on warnings. Reports describe credential presence, never values, and report
+  on warnings. Persistence checks include the execution journal's fixed lock
+  sidecar. Reports describe credential presence, never values, and report
   malformed or unsupported Agent capability negotiation without echoing the
   supplied capability token.
 
