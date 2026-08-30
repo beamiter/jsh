@@ -47,9 +47,9 @@ fn execute_text(source: &str, state: &mut ShellState) -> i32 {
     }
 }
 
-fn execution_journal_start_warning(error: &io::Error) -> String {
+fn execution_journal_warning(event: &'static str, error: &io::Error) -> String {
     format!(
-        "jsh: execution journal Start was not confirmed ({:?})",
+        "jsh: execution journal {event} was not confirmed ({:?})",
         error.kind()
     )
 }
@@ -595,7 +595,7 @@ impl Shell {
                         .unwrap_or_default();
                     let started_at_ms = execution::unix_time_ms();
                     let journal = execution::ExecutionJournal::configured();
-                    let journal_started = match journal.as_ref() {
+                    let journal_lifecycle = match journal.as_ref() {
                         Some(journal) => match journal.record_start_reconciled(
                             &execution_id,
                             self.session_id.as_deref(),
@@ -604,15 +604,15 @@ impl Shell {
                             &cwd_before,
                             started_at_ms,
                         ) {
-                            Ok(()) => true,
+                            Ok(lifecycle) => Some(lifecycle),
                             Err(error) => {
                                 // Do not print the command: this warning can
                                 // share a terminal with sensitive input.
-                                eprintln!("{}", execution_journal_start_warning(&error));
-                                false
+                                eprintln!("{}", execution_journal_warning("Start", &error));
+                                None
                             }
                         },
-                        None => false,
+                        None => None,
                     };
 
                     // OSC 133;C — command output start
@@ -665,15 +665,19 @@ impl Shell {
                         duration_ms,
                         &cwd_after,
                     );
-                    if journal_started {
-                        if let Some(journal) = journal.as_ref() {
-                            let _ = journal.record_finish(
-                                &execution_id,
-                                self.state.last_exit_code,
-                                duration_ms,
-                                &cwd_after,
-                                ended_at_ms,
-                            );
+                    if let (Some(journal), Some(lifecycle)) =
+                        (journal.as_ref(), journal_lifecycle.as_ref())
+                    {
+                        if let Err(error) = journal.record_finish_reconciled(
+                            lifecycle,
+                            self.state.last_exit_code,
+                            duration_ms,
+                            &cwd_after,
+                            ended_at_ms,
+                        ) {
+                            // The lower layer may describe journal contents;
+                            // expose only the stable error category.
+                            eprintln!("{}", execution_journal_warning("Finish", &error));
                         }
                     }
 
@@ -815,11 +819,15 @@ mod tests {
     #[test]
     fn execution_journal_warning_never_includes_error_payload_or_command_text() {
         let error = io::Error::other("secret command embedded by a lower layer");
-        let warning = execution_journal_start_warning(&error);
+        let start_warning = execution_journal_warning("Start", &error);
+        let finish_warning = execution_journal_warning("Finish", &error);
 
-        assert!(warning.contains("execution journal Start was not confirmed"));
-        assert!(warning.contains("Other"));
-        assert!(!warning.contains("secret command"));
-        assert!(!warning.contains("lower layer"));
+        for warning in [start_warning, finish_warning] {
+            assert!(warning.contains("execution journal"));
+            assert!(warning.contains("was not confirmed"));
+            assert!(warning.contains("Other"));
+            assert!(!warning.contains("secret command"));
+            assert!(!warning.contains("lower layer"));
+        }
     }
 }

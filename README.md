@@ -432,9 +432,13 @@ write stays visible as a recoverable torn tail and is also commit-unknown.
 Before executing an interactive command, jsh reconciles an unknown Start only
 when a fresh read finds that exact complete Start as the sole matching identity
 and final physical record, then retries only its data and parent barriers. It
-writes the Finish for that same lifecycle without rewriting the Start or
-re-executing the command. Torn, duplicated, or followed Start records remain
-unbound and produce a command-redacted warning.
+returns an internal token containing the complete session/id/sequence Start
+identity, so the later Finish cannot be correlated by execution ID alone. An
+unknown Finish is likewise never appended twice: jsh retries only its durability
+barriers when that token's unique Start and exact sole Finish remain intact and
+the Finish is still the final physical record. Torn, duplicated, conflicted,
+reset, or followed terminal records remain unbound and produce a
+command-redacted, error-kind-only warning.
 Individual metadata and captured-output records also have hard size limits.
 Exact duplicate finish or output delivery is idempotent; conflicting duplicates
 poison only their own lifecycle slot until the next authoritative start.

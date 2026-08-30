@@ -81,7 +81,7 @@ pub struct ExecutionRecord {
     pub output: Option<ExecutionOutput>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", deny_unknown_fields)]
 enum ExecutionEvent {
     #[serde(rename = "start")]
@@ -160,7 +160,7 @@ where
     serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConflictEvent {
     #[serde(alias = "rsh_execution_version")]
@@ -169,7 +169,7 @@ struct ConflictEvent {
     slot: ConflictSlot,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ConflictSlot {
     Finish,
@@ -312,6 +312,12 @@ pub struct ExecutionJournal {
     harden_existing_parent: bool,
 }
 
+/// Proof that the interactive executor established this exact Start
+/// lifecycle. Keeping the full Start private prevents a later Finish from
+/// being correlated by execution ID alone.
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedExecutionStart(StartEvent);
+
 #[derive(Debug)]
 struct CommitStateUnknown(String);
 
@@ -406,7 +412,7 @@ impl ExecutionJournal {
         command: &str,
         cwd: &str,
         started_at_ms: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<RecordedExecutionStart> {
         self.record_start_reconciled_with_io(
             id,
             session_id,
@@ -428,7 +434,7 @@ impl ExecutionJournal {
         cwd: &str,
         started_at_ms: u64,
         append_io: &impl JournalAppendIo,
-    ) -> io::Result<()> {
+    ) -> io::Result<RecordedExecutionStart> {
         let event = validated_start_event(id, session_id, seq, command, cwd, started_at_ms)?;
         match self.append_event_with_limits_and_io(
             ExecutionEvent::Start(event.clone()),
@@ -436,10 +442,10 @@ impl ExecutionJournal {
             MAX_JOURNAL_FILE_BYTES,
             append_io,
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(RecordedExecutionStart(event)),
             Err(error) if is_commit_state_unknown(&error) => {
                 match self.has_exact_terminal_start(&event) {
-                    Ok(true) => Ok(()),
+                    Ok(true) => Ok(RecordedExecutionStart(event)),
                     Ok(false) => Err(error),
                     Err(recovery_error) => Err(commit_state_unknown(
                         recovery_error.kind(),
@@ -476,14 +482,95 @@ impl ExecutionJournal {
         cwd_after: &str,
         ended_at_ms: u64,
     ) -> io::Result<()> {
-        self.append_event(ExecutionEvent::Finish {
-            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
-            id: validate_execution_id(id)?.to_string(),
+        self.append_event(validated_finish_event(
+            id,
             exit_code,
             duration_ms,
-            cwd_after: validate_cwd(cwd_after)?.to_string(),
+            cwd_after,
             ended_at_ms,
-        })
+        )?)
+    }
+
+    /// Record the Finish for an exact interactive Start, recovering only when
+    /// the complete Finish is the sole terminal status for that lifecycle and
+    /// remains the final physical journal record.
+    ///
+    /// An indeterminate append is never repeated. A torn or followed record,
+    /// a reset Start, or a conflicting/duplicate Finish leaves the original
+    /// commit-unknown error visible to the caller.
+    pub(crate) fn record_finish_reconciled(
+        &self,
+        lifecycle: &RecordedExecutionStart,
+        exit_code: i32,
+        duration_ms: u64,
+        cwd_after: &str,
+        ended_at_ms: u64,
+    ) -> io::Result<()> {
+        self.record_finish_reconciled_with_io(
+            lifecycle,
+            exit_code,
+            duration_ms,
+            cwd_after,
+            ended_at_ms,
+            &SyncJournalAppendIo,
+        )
+    }
+
+    fn record_finish_reconciled_with_io(
+        &self,
+        lifecycle: &RecordedExecutionStart,
+        exit_code: i32,
+        duration_ms: u64,
+        cwd_after: &str,
+        ended_at_ms: u64,
+        append_io: &impl JournalAppendIo,
+    ) -> io::Result<()> {
+        let event = validated_finish_event(
+            &lifecycle.0.id,
+            exit_code,
+            duration_ms,
+            cwd_after,
+            ended_at_ms,
+        )?;
+        match self.append_event_with_limits_and_io(
+            event.clone(),
+            MAX_JOURNAL_EVENT_LINES,
+            MAX_JOURNAL_FILE_BYTES,
+            append_io,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) if is_commit_state_unknown(&error) => {
+                match self.has_exact_terminal_finish(&lifecycle.0, &event) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(error),
+                    Err(recovery_error) => Err(commit_state_unknown(
+                        recovery_error.kind(),
+                        format!(
+                            "execution journal Finish recovery failed after an unknown append result: {recovery_error}; original error: {error}"
+                        ),
+                    )),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn has_exact_terminal_finish(
+        &self,
+        expected_start: &StartEvent,
+        expected_finish: &ExecutionEvent,
+    ) -> io::Result<bool> {
+        self.ensure_valid_path()?;
+        let lock = self.lock(FlockArg::LockShared)?;
+        if !exact_terminal_finish(&self.path, expected_start, expected_finish)? {
+            return Ok(false);
+        }
+        // The event is already visible. Retry only the durability barriers;
+        // never rewrite a terminal status whose append result was unknown.
+        let file = open_regular_file(&self.path, true, false, false)?;
+        file.sync_data()?;
+        lock._directory.sync_all()?;
+        Ok(true)
     }
 
     /// Append terminal-rendered output. This is used by terminal integrations;
@@ -1183,6 +1270,23 @@ fn validated_start_event(
     })
 }
 
+fn validated_finish_event(
+    id: &str,
+    exit_code: i32,
+    duration_ms: u64,
+    cwd_after: &str,
+    ended_at_ms: u64,
+) -> io::Result<ExecutionEvent> {
+    Ok(ExecutionEvent::Finish {
+        jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+        id: validate_execution_id(id)?.to_string(),
+        exit_code,
+        duration_ms,
+        cwd_after: validate_cwd(cwd_after)?.to_string(),
+        ended_at_ms,
+    })
+}
+
 fn validate_execution_id(id: &str) -> io::Result<&str> {
     if is_valid_execution_id(id) {
         Ok(id)
@@ -1446,6 +1550,98 @@ fn exact_terminal_start(path: &Path, expected: &StartEvent) -> io::Result<bool> 
     }
 
     Ok(terminal_match && matching_identities == 1)
+}
+
+fn exact_terminal_finish(
+    path: &Path,
+    expected_start: &StartEvent,
+    expected_finish: &ExecutionEvent,
+) -> io::Result<bool> {
+    let expected_finish_id = match expected_finish {
+        ExecutionEvent::Finish { id, .. } if id == &expected_start.id => id,
+        _ => return Ok(false),
+    };
+    let file = open_regular_file(path, true, false, false)?;
+    set_private_open_file_permissions(&file)?;
+    if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
+        return Ok(false);
+    }
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut bytes_read = 0_u64;
+    let mut event_lines = 0usize;
+    let mut exact_starts = 0usize;
+    let mut active_expected_start = false;
+    let mut matching_finishes = 0usize;
+    let mut finish_seen_or_conflicted = false;
+    let mut terminal_match = false;
+
+    while let Some(within_limit) = read_bounded_line(&mut reader, &mut line, &mut bytes_read)? {
+        event_lines = event_lines.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution journal event count overflowed during Finish recovery",
+            )
+        })?;
+        if event_lines > MAX_JOURNAL_EVENT_LINES {
+            return Ok(false);
+        }
+        // Recovery is authorized only by the final physical record. A blank,
+        // malformed, oversized, or torn successor therefore clears the match.
+        terminal_match = false;
+        if !within_limit || !line.ends_with(b"\n") {
+            continue;
+        }
+        if jagent::validate_no_duplicate_members(&line).is_err() {
+            if serde_json::from_slice::<serde_json::Value>(&line).is_ok() {
+                return Ok(false);
+            }
+            continue;
+        }
+
+        let recognized_start = recognized_v1_start_id(&line);
+        let decoded = serde_json::from_slice::<ExecutionEvent>(&line).ok();
+        if recognized_start.as_deref() == Some(expected_start.id.as_str()) {
+            // Every recognized same-ID Start is a lifecycle barrier, including
+            // one whose remaining metadata is malformed.
+            active_expected_start = false;
+            finish_seen_or_conflicted = false;
+            if matches!(decoded, Some(ExecutionEvent::Start(ref event)) if event == expected_start)
+            {
+                exact_starts = exact_starts.saturating_add(1);
+                active_expected_start = true;
+            }
+            continue;
+        }
+        if !active_expected_start
+            || serde_json::from_slice::<EventIdentity<'_>>(&line)
+                .ok()
+                .is_none_or(|identity| identity.id != expected_finish_id.as_str())
+        {
+            continue;
+        }
+
+        match decoded {
+            Some(event @ ExecutionEvent::Finish { .. }) => {
+                if !finish_seen_or_conflicted && &event == expected_finish {
+                    matching_finishes = matching_finishes.saturating_add(1);
+                    finish_seen_or_conflicted = true;
+                    terminal_match = true;
+                } else {
+                    // A duplicate exact Finish is folded idempotently, but it
+                    // cannot prove that this unknown append was not retried.
+                    finish_seen_or_conflicted = true;
+                }
+            }
+            Some(ExecutionEvent::Conflict(ConflictEvent {
+                slot: ConflictSlot::Finish,
+                ..
+            })) => finish_seen_or_conflicted = true,
+            _ => {}
+        }
+    }
+
+    Ok(terminal_match && exact_starts == 1 && matching_finishes == 1 && finish_seen_or_conflicted)
 }
 
 fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
@@ -3076,6 +3272,177 @@ mod tests {
             slot: ConflictSlot::Finish,
         })));
         check("successor conflict", &conflict_tail, false);
+    }
+
+    #[test]
+    fn reconciled_finish_distinguishes_complete_and_torn_terminal_records() {
+        let (_pre_write_directory, pre_write_journal) = journal();
+        let pre_write_lifecycle = pre_write_journal
+            .record_start_reconciled("pre-write-finish", Some("wanted"), 10, "true", "/tmp", 40)
+            .unwrap();
+        let bytes_before = fs::read(pre_write_journal.path()).unwrap();
+        let pre_write = FaultingAppendIo::new(AppendFaultStage::WriteAfter(0));
+        let error = pre_write_journal
+            .record_finish_reconciled_with_io(&pre_write_lifecycle, 7, 2, "/after", 42, &pre_write)
+            .unwrap_err();
+        assert!(!is_commit_state_unknown(&error));
+        assert_eq!(fs::read(pre_write_journal.path()).unwrap(), bytes_before);
+        assert_eq!(pre_write.written.get(), 0);
+        assert_eq!(pre_write.data_calls.get(), 0);
+
+        let (_data_directory, recovered) = journal();
+        let recovered_lifecycle = recovered
+            .record_start_reconciled(
+                "data-recovered-finish",
+                Some("wanted"),
+                11,
+                "secret command",
+                "/tmp",
+                50,
+            )
+            .unwrap();
+        let data_fault = FaultingAppendIo::new(AppendFaultStage::DataSync);
+        recovered
+            .record_finish_reconciled_with_io(&recovered_lifecycle, 9, 3, "/after", 53, &data_fault)
+            .unwrap();
+        assert_eq!(data_fault.data_calls.get(), 1);
+        assert_eq!(data_fault.directory_calls.get(), 0);
+        assert_eq!(
+            fs::read_to_string(recovered.path())
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        let record = ExecutionJournal::with_path(recovered.path().to_owned())
+            .get("data-recovered-finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.session_id.as_deref(), Some("wanted"));
+        assert_eq!(record.seq, 11);
+        assert_eq!(record.command, "secret command");
+        assert_eq!(record.exit_code, Some(9));
+
+        let (_torn_directory, torn) = journal();
+        let torn_lifecycle = torn
+            .record_start_reconciled(
+                "torn-finish",
+                Some("wanted"),
+                12,
+                "must remain bound only to this Start",
+                "/tmp",
+                60,
+            )
+            .unwrap();
+        let partial = FaultingAppendIo::new(AppendFaultStage::WriteAfter(18));
+        let error = torn
+            .record_finish_reconciled_with_io(&torn_lifecycle, 5, 4, "/after", 64, &partial)
+            .unwrap_err();
+        assert!(is_commit_state_unknown(&error));
+        assert_eq!(partial.written.get(), 18);
+        assert_eq!(partial.data_calls.get(), 0);
+        assert!(!fs::read(torn.path()).unwrap().ends_with(b"\n"));
+        let record = ExecutionJournal::with_path(torn.path().to_owned())
+            .get("torn-finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.session_id.as_deref(), Some("wanted"));
+        assert_eq!(record.seq, 12);
+        assert_eq!(record.exit_code, None);
+    }
+
+    #[test]
+    fn finish_recovery_requires_the_exact_lifecycle_and_physical_tail() {
+        let expected_start = validated_start_event(
+            "strict-finish-recovery",
+            Some("wanted"),
+            13,
+            "expected command",
+            "/tmp",
+            70,
+        )
+        .unwrap();
+        let expected_finish =
+            validated_finish_event(&expected_start.id, 7, 5, "/after", 75).unwrap();
+        let encode = |event: &ExecutionEvent| {
+            let mut line = serde_json::to_vec(event).unwrap();
+            line.push(b'\n');
+            line
+        };
+        let start = encode(&ExecutionEvent::Start(expected_start.clone()));
+        let finish = encode(&expected_finish);
+        let check = |label: &str, bytes: &[u8], accepted: bool| {
+            let (_directory, journal) = journal();
+            fs::write(journal.path(), bytes).unwrap();
+            fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                journal
+                    .has_exact_terminal_finish(&expected_start, &expected_finish)
+                    .unwrap(),
+                accepted,
+                "fixture {label}"
+            );
+        };
+
+        let mut exact = start.clone();
+        exact.extend_from_slice(&finish);
+        check("exact Start and terminal Finish", &exact, true);
+
+        let output = ExecutionEvent::Output {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: expected_start.id.clone(),
+            text: "captured".into(),
+            truncated: false,
+            total_bytes: 8,
+            captured_at_ms: 74,
+        };
+        let mut output_before_finish = start.clone();
+        output_before_finish.extend_from_slice(&encode(&output));
+        output_before_finish.extend_from_slice(&finish);
+        check(
+            "independent Output slot before terminal Finish",
+            &output_before_finish,
+            true,
+        );
+
+        let mut duplicate_finish = exact.clone();
+        duplicate_finish.extend_from_slice(&finish);
+        check("duplicate exact Finish", &duplicate_finish, false);
+
+        let different_finish =
+            validated_finish_event(&expected_start.id, 9, 5, "/after", 75).unwrap();
+        let mut conflicting_finish = start.clone();
+        conflicting_finish.extend_from_slice(&encode(&different_finish));
+        conflicting_finish.extend_from_slice(&finish);
+        check(
+            "conflicting Finish before expected",
+            &conflicting_finish,
+            false,
+        );
+
+        let mut duplicate_start = start.clone();
+        duplicate_start.extend_from_slice(&start);
+        duplicate_start.extend_from_slice(&finish);
+        check("duplicate exact Start generation", &duplicate_start, false);
+
+        let mut malformed_barrier = start.clone();
+        malformed_barrier.extend_from_slice(
+            b"{\"event\":\"start\",\"jsh_execution_version\":1,\"id\":\"strict-finish-recovery\",\"extra\":true}\n",
+        );
+        malformed_barrier.extend_from_slice(&finish);
+        check(
+            "later malformed same-ID Start barrier",
+            &malformed_barrier,
+            false,
+        );
+
+        let mut output_successor = exact.clone();
+        output_successor.extend_from_slice(&encode(&output));
+        check("complete Output successor", &output_successor, false);
+
+        let mut torn_output_successor = exact;
+        torn_output_successor.extend_from_slice(b"{\"event\":\"output\",\"id\":");
+        check("torn Output successor", &torn_output_successor, false);
     }
 
     #[test]
