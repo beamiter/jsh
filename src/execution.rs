@@ -744,9 +744,9 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                 }
                 if let Some(record) = records.get_mut(&id) {
                     record.output = Some(ExecutionOutput {
+                        total_bytes: total_bytes.max(text.len() as u64),
                         text,
                         truncated,
-                        total_bytes,
                         captured_at_ms,
                     });
                 }
@@ -1014,12 +1014,16 @@ mod tests {
             .append(true)
             .open(journal.path())
             .unwrap();
-        writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-core-fixture\",\"text\":\"one\\ntwo\",\"truncated\":false,\"total_bytes\":7,\"captured_at_ms\":12}}").unwrap();
+        writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-core-fixture\",\"text\":\"one\\ntwo\",\"truncated\":false,\"total_bytes\":1,\"captured_at_ms\":12}}").unwrap();
         drop(file);
 
         let record = journal.get("jsh-core-fixture").unwrap().unwrap();
         assert_eq!(record.command, "printf one\nprintf two");
-        assert_eq!(record.output.unwrap().text, "one\ntwo");
+        let output = record.output.unwrap();
+        assert_eq!(output.text, "one\ntwo");
+        // Match jterm_core: a producer cannot claim fewer source bytes than
+        // the exact UTF-8 payload retained in the event.
+        assert_eq!(output.total_bytes, 7);
     }
 
     #[test]
