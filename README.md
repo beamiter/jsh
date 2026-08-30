@@ -420,10 +420,12 @@ the location; an empty value behaves like an unset override. A non-empty value
 must be an absolute, terminal-visible file path no longer than 16 KiB whose
 parent is owned by the current user and is not group/world-writable. Shared
 namespaces such as `/tmp` are not valid overrides because the journal and its
-fixed `executions.lock` sidecar share one trust boundary. A non-empty override
-remains custom even when it spells the default path; jsh never repairs that
-explicit namespace in place. Relative paths and locations containing controls,
-terminal-invisible text, or other unsafe bytes are rejected.
+fixed `executions.lock` sidecar share one trust boundary. The journal file
+itself cannot use that reserved sidecar name, including case aliases on
+case-insensitive filesystems. A non-empty override remains custom even when it
+spells the default path; jsh never repairs that explicit namespace in place.
+Relative paths and locations containing controls, terminal-invisible text, or
+other unsafe bytes are rejected.
 
 ## AI, explicitly opt-in
 

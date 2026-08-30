@@ -24,6 +24,7 @@ pub const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub const COMPACTED_JOURNAL_TARGET_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_RETAINED_EXECUTIONS: usize = 2_000;
 pub(crate) const MAX_JOURNAL_PATH_BYTES: usize = 16 * 1024;
+pub(crate) const JOURNAL_LOCK_FILE_NAME: &str = "executions.lock";
 /// Maximum bytes in the execution identifier shared with terminal OSC 133
 /// metadata and terminal-produced output events.
 pub const MAX_EXECUTION_ID_BYTES: usize = 192;
@@ -157,7 +158,7 @@ impl ExecutionJournal {
         let lock_path = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join("executions.lock");
+            .join(JOURNAL_LOCK_FILE_NAME);
         Self {
             path,
             lock_path,
@@ -257,6 +258,7 @@ impl ExecutionJournal {
     /// Fold the append-only event stream into one record per execution.
     /// Malformed, oversized, unknown-version, and orphan events are ignored.
     pub fn records(&self) -> io::Result<Vec<ExecutionRecord>> {
+        self.ensure_valid_path()?;
         if matches!(
             fs::symlink_metadata(&self.path),
             Err(error) if error.kind() == io::ErrorKind::NotFound
@@ -337,6 +339,7 @@ impl ExecutionJournal {
     }
 
     fn lock(&self, arg: FlockArg) -> io::Result<JournalLock> {
+        self.ensure_valid_path()?;
         let directory = ensure_journal_parent(&self.path, self.harden_existing_parent)?;
         // Updated peers lock the directory before opening the sidecar, so one
         // cannot rename it and acquire a different lock inode mid-operation.
@@ -356,6 +359,17 @@ impl ExecutionJournal {
             _directory: directory,
             _file: file,
         })
+    }
+
+    fn ensure_valid_path(&self) -> io::Result<()> {
+        if is_valid_journal_path(&self.path) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "execution journal path is invalid or collides with its lock sidecar",
+            ))
+        }
     }
 }
 
@@ -550,7 +564,13 @@ fn select_journal_path(override_path: Option<std::ffi::OsString>) -> Option<Path
 /// terminal-visible file-name boundary. Non-UTF-8 Unix names remain valid as
 /// long as their raw bytes contain no ASCII controls.
 pub(crate) fn is_valid_journal_path(path: &Path) -> bool {
-    if path.file_name().is_none() {
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    if file_name
+        .to_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(JOURNAL_LOCK_FILE_NAME))
+    {
         return false;
     }
     let bytes = path.as_os_str().as_bytes();
@@ -1460,6 +1480,10 @@ mod tests {
     fn journal_path_override_matches_the_terminal_path_boundary() {
         use std::os::unix::ffi::OsStringExt;
 
+        assert_eq!(
+            select_journal_path(Some("/tmp/executions.locked".into())),
+            Some(PathBuf::from("/tmp/executions.locked"))
+        );
         let maximum = format!("/{}", "x".repeat(MAX_JOURNAL_PATH_BYTES - 1));
         assert_eq!(
             select_journal_path(Some(maximum.clone().into())),
@@ -1476,6 +1500,9 @@ mod tests {
             "/tmp/bad\u{0080}name.jsonl",
             "/tmp/bad\u{202e}name.jsonl",
             "/tmp/bad\u{fff9}name.jsonl",
+            "/tmp/executions.lock",
+            "/tmp/./executions.lock",
+            "/tmp/EXECUTIONS.LOCK",
         ] {
             assert!(
                 select_journal_path(Some(unsafe_path.into())).is_none(),
@@ -1488,6 +1515,27 @@ mod tests {
             select_journal_path(Some(non_utf8.clone())),
             Some(PathBuf::from(non_utf8))
         );
+    }
+
+    #[test]
+    fn direct_journal_paths_cannot_alias_the_fixed_lock_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        for name in ["executions.lock", "EXECUTIONS.LOCK"] {
+            let path = dir.path().join(name);
+            let journal = ExecutionJournal::with_path(path.clone());
+            let error = journal
+                .records()
+                .expect_err("reserved lock sidecar alias was readable");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "name={name}");
+            let error = journal
+                .record_start("jsh-reserved", None, 1, "true", "/tmp", 1)
+                .expect_err("reserved lock sidecar alias accepted");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "name={name}");
+            assert!(!path.exists(), "created reserved alias {name:?}");
+        }
     }
 
     #[test]

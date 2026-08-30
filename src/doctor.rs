@@ -461,10 +461,11 @@ fn journal_path_for_override(
         checks.push(warn(
             "persistence.journal",
             format!(
-                "execution journal path must name a terminal-visible file within {} bytes",
-                crate::execution::MAX_JOURNAL_PATH_BYTES
+                "execution journal path must name a terminal-visible file within {} bytes and must not use the reserved {} sidecar name",
+                crate::execution::MAX_JOURNAL_PATH_BYTES,
+                crate::execution::JOURNAL_LOCK_FILE_NAME
             ),
-            "remove control or invisible formatting and choose a shorter file path",
+            "remove control or invisible formatting, shorten the path, or choose a different file name",
         ));
         return None;
     }
@@ -481,7 +482,7 @@ fn persistence_integrity_checks(checks: &mut Vec<Check>, home: &Path, journal: O
     if let Some(journal) = journal {
         candidates.push(journal.to_path_buf());
         if let Some(parent) = journal.parent() {
-            let lock = parent.join("executions.lock");
+            let lock = parent.join(crate::execution::JOURNAL_LOCK_FILE_NAME);
             if lock != journal {
                 candidates.push(lock);
             }
@@ -963,6 +964,8 @@ mod tests {
             "/tmp/bad\u{0080}name.jsonl",
             "/tmp/bad\u{202e}name.jsonl",
             "/tmp/bad\u{fff9}name.jsonl",
+            "/tmp/executions.lock",
+            "/tmp/EXECUTIONS.LOCK",
         ] {
             let mut checks = Vec::new();
             assert!(
