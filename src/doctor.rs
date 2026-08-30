@@ -417,13 +417,26 @@ fn configured_journal_path(checks: &mut Vec<Check>, state_dir: &Path) -> Option<
         ));
         return None;
     }
-    match std::env::var_os("JSH_EXECUTION_JOURNAL_PATH") {
+    journal_path_for_override(
+        checks,
+        state_dir,
+        std::env::var_os("JSH_EXECUTION_JOURNAL_PATH"),
+    )
+}
+
+fn journal_path_for_override(
+    checks: &mut Vec<Check>,
+    state_dir: &Path,
+    override_path: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    match override_path {
+        Some(raw) if raw.is_empty() => Some(state_dir.join("jsh/executions.jsonl")),
         Some(raw) => {
             let path = PathBuf::from(raw);
-            if path.as_os_str().is_empty() || !path.is_absolute() {
+            if !path.is_absolute() {
                 checks.push(warn(
                     "persistence.journal",
-                    "JSH_EXECUTION_JOURNAL_PATH must be a non-empty absolute path",
+                    "JSH_EXECUTION_JOURNAL_PATH must be an absolute path",
                     "set an absolute file path or unset the override",
                 ));
                 None
@@ -896,6 +909,18 @@ mod tests {
         assert!(!output.contains('\x1b'));
         assert!(!output.contains('\x07'));
         assert!(output.contains("\\x1b]0;bad\\x07"));
+    }
+
+    #[test]
+    fn empty_journal_path_override_uses_the_runtime_default() {
+        let state_dir = Path::new("/tmp/jsh-doctor-state");
+        let mut checks = Vec::new();
+
+        let path =
+            journal_path_for_override(&mut checks, state_dir, Some(std::ffi::OsString::new()));
+
+        assert_eq!(path, Some(state_dir.join("jsh/executions.jsonl")));
+        assert!(checks.is_empty());
     }
 
     #[test]

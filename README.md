@@ -413,9 +413,9 @@ position; stale status, output, and eviction age cannot attach to the new run.
 The journal can contain sensitive commands, paths, and terminal output. Set
 `JSH_EXECUTION_JOURNAL=0` to disable disk journaling while retaining OSC
 integration for the terminal UI. Set `JSH_EXECUTION_JOURNAL_PATH` to override
-the location; the value must be an absolute path whose parent is owned by the
-current user and is not group/world-writable. Relative or unsafe locations are
-rejected.
+the location; an empty value behaves like an unset override. A non-empty value
+must be an absolute path whose parent is owned by the current user and is not
+group/world-writable. Relative or unsafe locations are rejected.
 
 ## AI, explicitly opt-in
 
