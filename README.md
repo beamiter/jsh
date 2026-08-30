@@ -439,6 +439,11 @@ barriers when that token's unique Start and exact sole Finish remain intact and
 the Finish is still the final physical record. Torn, duplicated, conflicted,
 reset, or followed terminal records remain unbound and produce a
 command-redacted, error-kind-only warning.
+The OSC 133 `C` mark carries the same exact `session_id`, `id`, `seq`, and
+`started_at_ms` generation fields so a terminal's asynchronous Output writer
+can prove which Start it observed instead of persisting by ID alone. Invalid or
+missing session identifiers omit that binding field and therefore cannot form
+a durable Output capability.
 Individual metadata and captured-output records also have hard size limits.
 Exact duplicate finish or output delivery is idempotent; conflicting duplicates
 poison only their own lifecycle slot until the next authoritative start.

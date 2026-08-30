@@ -616,7 +616,14 @@ impl Shell {
                     };
 
                     // OSC 133;C — command output start
-                    osc::command_output_start(&execution_id, &line, &cwd_before);
+                    osc::command_output_start(
+                        &execution_id,
+                        self.session_id.as_deref(),
+                        self.execution_seq,
+                        started_at_ms,
+                        &line,
+                        &cwd_before,
+                    );
 
                     // Parse and execute
                     let cmd_start = std::time::Instant::now();

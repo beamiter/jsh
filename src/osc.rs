@@ -237,12 +237,25 @@ pub fn command_start() {
 }
 
 /// Build OSC 133;C with jsh execution metadata.
-fn command_output_start_packet(execution_id: &str, command: &str, cwd: &str) -> String {
+#[allow(clippy::too_many_arguments)]
+fn command_output_start_packet(
+    execution_id: &str,
+    session_id: Option<&str>,
+    seq: u64,
+    started_at_ms: u64,
+    command: &str,
+    cwd: &str,
+) -> String {
     let mut packet = "\x1b]133;C".to_string();
     if crate::execution::is_valid_execution_id(execution_id) {
         packet.push_str(";id=");
         packet.push_str(&percent_encode_metadata(execution_id));
     }
+    if let Some(session_id) = session_id.filter(|id| crate::execution::is_valid_session_id(id)) {
+        packet.push_str(";session_id=");
+        packet.push_str(&percent_encode_metadata(session_id));
+    }
+    packet.push_str(&format!(";seq={seq};started_at_ms={started_at_ms}"));
     if crate::execution::is_valid_command_text(command, MAX_OSC_COMMAND_BYTES) {
         packet.push_str(";cmdline_url=");
         packet.push_str(&percent_encode_metadata(command));
@@ -259,8 +272,23 @@ fn command_output_start_packet(execution_id: &str, command: &str, cwd: &str) -> 
 
 /// Emit OSC 133;C — Command output start marker with correlation metadata.
 /// Call this just before the command's output begins.
-pub fn command_output_start(execution_id: &str, command: &str, cwd: &str) {
-    emit(&command_output_start_packet(execution_id, command, cwd));
+#[allow(clippy::too_many_arguments)]
+pub fn command_output_start(
+    execution_id: &str,
+    session_id: Option<&str>,
+    seq: u64,
+    started_at_ms: u64,
+    command: &str,
+    cwd: &str,
+) {
+    emit(&command_output_start_packet(
+        execution_id,
+        session_id,
+        seq,
+        started_at_ms,
+        command,
+        cwd,
+    ));
 }
 
 /// Build OSC 133;D with the standard positional exit code and jsh metadata.
@@ -366,13 +394,17 @@ fn notify_osc777_packet(summary: &str, body: &str) -> String {
 mod tests {
     use super::*;
 
+    fn start_packet(execution_id: &str, command: &str, cwd: &str) -> String {
+        command_output_start_packet(execution_id, Some("session-1"), 7, 11, command, cwd)
+    }
+
     #[test]
     fn command_start_packet_percent_encodes_exact_metadata() {
-        let packet = command_output_start_packet("jsh-7", "printf 'a;b+c'\n雪", "/tmp/a;b%雪");
+        let packet = start_packet("jsh-7", "printf 'a;b+c'\n雪", "/tmp/a;b%雪");
 
         assert_eq!(
             packet,
-            "\x1b]133;C;id=jsh-7;cmdline_url=printf%20%27a%3Bb%2Bc%27%0A%E9%9B%AA;cwd_url=%2Ftmp%2Fa%3Bb%25%E9%9B%AA\x07"
+            "\x1b]133;C;id=jsh-7;session_id=session-1;seq=7;started_at_ms=11;cmdline_url=printf%20%27a%3Bb%2Bc%27%0A%E9%9B%AA;cwd_url=%2Ftmp%2Fa%3Bb%25%E9%9B%AA\x07"
         );
         assert_eq!(
             packet
@@ -395,8 +427,7 @@ mod tests {
     #[test]
     fn execution_id_metadata_is_exact_or_omitted_on_both_lifecycle_marks() {
         let maximum = "x".repeat(crate::execution::MAX_EXECUTION_ID_BYTES);
-        assert!(command_output_start_packet(&maximum, "true", "/tmp")
-            .contains(&format!(";id={maximum};")));
+        assert!(start_packet(&maximum, "true", "/tmp").contains(&format!(";id={maximum};")));
         assert!(
             command_finished_packet(7, &maximum, 9, "/tmp").contains(&format!(";id={maximum};"))
         );
@@ -410,8 +441,8 @@ mod tests {
             "雪".to_string(),
         ] {
             assert_eq!(
-                command_output_start_packet(&invalid, "true", "/tmp"),
-                "\x1b]133;C;cmdline_url=true;cwd_url=%2Ftmp\x07",
+                start_packet(&invalid, "true", "/tmp"),
+                "\x1b]133;C;session_id=session-1;seq=7;started_at_ms=11;cmdline_url=true;cwd_url=%2Ftmp\x07",
                 "id={invalid:?}"
             );
             assert_eq!(
@@ -423,24 +454,64 @@ mod tests {
     }
 
     #[test]
+    fn command_start_lifecycle_evidence_is_complete_or_session_unbound() {
+        let maximum = "s".repeat(crate::execution::MAX_SESSION_ID_BYTES);
+        let packet = command_output_start_packet(
+            "jsh-1",
+            Some(&maximum),
+            u64::MAX,
+            u64::MAX,
+            "true",
+            "/tmp",
+        );
+        assert_eq!(
+            packet,
+            format!(
+                "\x1b]133;C;id=jsh-1;session_id={maximum};seq={};started_at_ms={};cmdline_url=true;cwd_url=%2Ftmp\x07",
+                u64::MAX,
+                u64::MAX
+            )
+        );
+
+        for invalid in [
+            None,
+            Some(""),
+            Some("bad/session"),
+            Some("bad session"),
+            Some("雪"),
+        ] {
+            assert_eq!(
+                command_output_start_packet("jsh-1", invalid, 7, 11, "true", "/tmp"),
+                "\x1b]133;C;id=jsh-1;seq=7;started_at_ms=11;cmdline_url=true;cwd_url=%2Ftmp\x07",
+                "session={invalid:?}"
+            );
+        }
+        let over_limit = "s".repeat(crate::execution::MAX_SESSION_ID_BYTES + 1);
+        assert!(
+            !command_output_start_packet("jsh-1", Some(&over_limit), 7, 11, "true", "/tmp")
+                .contains("session_id=")
+        );
+    }
+
+    #[test]
     fn command_start_packet_omits_oversized_command() {
         let at_limit = "x".repeat(MAX_OSC_COMMAND_BYTES);
-        let included = command_output_start_packet("jsh-1", &at_limit, "/tmp");
+        let included = start_packet("jsh-1", &at_limit, "/tmp");
         assert!(included.contains(";cmdline_url="));
         assert!(!included.contains("cmd_truncated"));
 
         let over_limit = "x".repeat(MAX_OSC_COMMAND_BYTES + 1);
-        let omitted = command_output_start_packet("jsh-1", &over_limit, "/tmp");
+        let omitted = start_packet("jsh-1", &over_limit, "/tmp");
         assert_eq!(
             omitted,
-            "\x1b]133;C;id=jsh-1;cmd_truncated=1;cwd_url=%2Ftmp\x07"
+            "\x1b]133;C;id=jsh-1;session_id=session-1;seq=7;started_at_ms=11;cmd_truncated=1;cwd_url=%2Ftmp\x07"
         );
         assert!(!omitted.contains(&over_limit));
 
         for ambiguous in ["", "echo\rhidden", "echo\x1b[2J", "left\u{202e}right"] {
             assert_eq!(
-                command_output_start_packet("jsh-1", ambiguous, "/tmp"),
-                "\x1b]133;C;id=jsh-1;cmd_truncated=1;cwd_url=%2Ftmp\x07",
+                start_packet("jsh-1", ambiguous, "/tmp"),
+                "\x1b]133;C;id=jsh-1;session_id=session-1;seq=7;started_at_ms=11;cmd_truncated=1;cwd_url=%2Ftmp\x07",
                 "command={ambiguous:?}"
             );
         }
@@ -450,7 +521,7 @@ mod tests {
     fn cwd_metadata_is_exact_or_omitted_on_a_utf8_boundary() {
         let at_limit = format!("{}雪", "x".repeat(MAX_OSC_CWD_BYTES - 3));
         assert_eq!(at_limit.len(), MAX_OSC_CWD_BYTES);
-        let packet = command_output_start_packet("jsh-1", "true", &at_limit);
+        let packet = start_packet("jsh-1", "true", &at_limit);
         assert!(packet.ends_with(&format!(
             ";cwd_url={}{}\x07",
             "x".repeat(MAX_OSC_CWD_BYTES - 3),
@@ -460,8 +531,8 @@ mod tests {
         let oversized = format!("{}雪", "x".repeat(MAX_OSC_CWD_BYTES - 2));
         assert_eq!(oversized.len(), MAX_OSC_CWD_BYTES + 1);
         assert_eq!(
-            command_output_start_packet("jsh-1", "true", &oversized),
-            "\x1b]133;C;id=jsh-1;cmdline_url=true\x07"
+            start_packet("jsh-1", "true", &oversized),
+            "\x1b]133;C;id=jsh-1;session_id=session-1;seq=7;started_at_ms=11;cmdline_url=true\x07"
         );
         assert_eq!(
             command_finished_packet(0, "jsh-1", 7, &oversized),
