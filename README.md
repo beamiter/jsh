@@ -361,6 +361,10 @@ the exact command when it fits the protocol limit, the working directory, exit
 status, and duration. Oversized commands are explicitly marked as truncated
 rather than being presented as exact. The execution ID correlates terminal
 scrollback with jsh's structured context.
+Commands containing non-structural controls or visually ambiguous formatting
+take the non-exact OSC path and are refused by the journal writer. Newline and
+tab remain valid multiline shell structure, but hidden formatting never enters
+exact OSC or journal metadata.
 
 Percent-encoded newline and tab bytes remain structural command text, so a
 multiline command has the same identity in OSC metadata and the JSONL execution

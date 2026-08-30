@@ -240,7 +240,7 @@ pub fn command_start() {
 fn command_output_start_packet(execution_id: &str, command: &str, cwd: &str) -> String {
     let id = percent_encode_metadata(execution_id);
     let mut packet = format!("\x1b]133;C;id={id}");
-    if command.len() <= MAX_OSC_COMMAND_BYTES {
+    if crate::execution::is_valid_command_text(command, MAX_OSC_COMMAND_BYTES) {
         packet.push_str(";cmdline_url=");
         packet.push_str(&percent_encode_metadata(command));
     } else {
@@ -400,6 +400,14 @@ mod tests {
             "\x1b]133;C;id=jsh-1;cmd_truncated=1;cwd_url=%2Ftmp\x07"
         );
         assert!(!omitted.contains(&over_limit));
+
+        for ambiguous in ["", "echo\rhidden", "echo\x1b[2J", "left\u{202e}right"] {
+            assert_eq!(
+                command_output_start_packet("jsh-1", ambiguous, "/tmp"),
+                "\x1b]133;C;id=jsh-1;cmd_truncated=1;cwd_url=%2Ftmp\x07",
+                "command={ambiguous:?}"
+            );
+        }
     }
 
     #[test]

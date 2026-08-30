@@ -172,6 +172,7 @@ impl ExecutionJournal {
         started_at_ms: u64,
     ) -> io::Result<()> {
         let (command, command_truncated) = bounded_text(command, MAX_COMMAND_BYTES);
+        validate_command_text(&command, MAX_COMMAND_BYTES)?;
         self.append_event(ExecutionEvent::Start {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
@@ -590,6 +591,29 @@ fn validate_cwd(cwd: &str) -> io::Result<&str> {
     })
 }
 
+/// Whether command text is exact, bounded, and safe to carry as reviewed
+/// metadata. Newline and tab remain structural shell syntax; other controls
+/// and invisible formatting cannot enter a terminal or journal display path.
+pub(crate) fn is_valid_command_text(command: &str, max_bytes: usize) -> bool {
+    !command.is_empty()
+        && command.len() <= max_bytes
+        && !command.chars().any(|ch| {
+            (ch.is_control() && !matches!(ch, '\n' | '\t'))
+                || (!ch.is_control() && crate::terminal_text::is_terminal_ambiguous(ch))
+        })
+}
+
+fn validate_command_text(command: &str, max_bytes: usize) -> io::Result<&str> {
+    is_valid_command_text(command, max_bytes)
+        .then_some(command)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command text must be exact, bounded, and visually unambiguous",
+            )
+        })
+}
+
 fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
     if value.len() <= max_bytes {
         return (value.to_string(), false);
@@ -654,7 +678,7 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                     || session_id
                         .as_deref()
                         .is_some_and(|id| validate_session_id(id).is_err())
-                    || command.len() > MAX_COMMAND_BYTES
+                    || !is_valid_command_text(&command, MAX_COMMAND_BYTES)
                     || validate_cwd(&cwd).is_err()
                 {
                     continue;
@@ -1101,6 +1125,31 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].cwd, at_limit);
         assert_eq!(records[0].cwd_after.as_deref(), Some("/after"));
+    }
+
+    #[test]
+    fn command_values_preserve_structure_but_reject_display_ambiguity() {
+        let (_dir, journal) = journal();
+        journal
+            .record_start(
+                "jsh-structured-command",
+                None,
+                1,
+                "printf one\nprintf '\t%s' two",
+                "/tmp",
+                1,
+            )
+            .unwrap();
+
+        for invalid in ["", "echo\rhidden", "echo\x1b[2J", "left\u{202e}right"] {
+            assert!(journal
+                .record_start("jsh-invalid-command", None, 2, invalid, "/tmp", 2)
+                .is_err());
+        }
+
+        let records = journal.records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].command, "printf one\nprintf '\t%s' two");
     }
 
     #[test]
