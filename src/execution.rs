@@ -1194,6 +1194,38 @@ mod tests {
         (dir, journal)
     }
 
+    fn start_event_with_raw_bytes(id: &str, raw_bytes: usize) -> Vec<u8> {
+        let prefix = format!(
+            "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"{id}\",\"session_id\":\"wanted\",\"seq\":9,\"command\":\""
+        );
+        let suffix = b"\",\"cwd\":\"/new\",\"started_at_ms\":9}";
+        assert!(raw_bytes >= prefix.len() + suffix.len());
+        let mut event = prefix.into_bytes();
+        event.resize(raw_bytes - suffix.len(), b'x');
+        event.extend_from_slice(suffix);
+        assert_eq!(event.len(), raw_bytes);
+        assert!(serde_json::from_slice::<serde_json::Value>(&event).is_ok());
+        event
+    }
+
+    fn escaped_multibyte_output_event(id: &str, decoded_bytes: usize) -> Vec<u8> {
+        let mut event = format!(
+            "{{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"{id}\",\"text\":\""
+        )
+        .into_bytes();
+        for _ in 0..decoded_bytes / "界".len() {
+            event.extend_from_slice(br"\u754c");
+        }
+        event.resize(event.len() + decoded_bytes % "界".len(), b'x');
+        event.extend_from_slice(
+            format!(
+                "\",\"truncated\":false,\"total_bytes\":{decoded_bytes},\"captured_at_ms\":2}}"
+            )
+            .as_bytes(),
+        );
+        event
+    }
+
     /// A journal written before the 0.2.0 rename tags every event with
     /// `rsh_execution_version`. Without the serde alias those events fail to
     /// deserialize and a migrated journal reads as empty, so `context
@@ -1786,6 +1818,10 @@ mod tests {
         assert!(captured.text.len() <= MAX_OUTPUT_BYTES / 2);
         assert!(captured.truncated);
         assert_eq!(captured.total_bytes, output.len() as u64);
+        assert!(fs::read_to_string(journal.path())
+            .unwrap()
+            .lines()
+            .all(|line| line.len() <= MAX_EVENT_LINE_BYTES));
     }
 
     #[test]
@@ -2080,6 +2116,79 @@ mod tests {
         let records = journal.records().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "jsh-after-large-line");
+    }
+
+    #[test]
+    fn raw_line_budget_precedes_start_barrier_semantics() {
+        let (_dir, journal) = journal();
+        let mut contents = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"raw-exact\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"raw-exact\",\"exit_code\":9,\"duration_ms\":1,\"cwd_after\":\"/old\",\"ended_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"raw-over\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"raw-over\",\"exit_code\":9,\"duration_ms\":1,\"cwd_after\":\"/old\",\"ended_at_ms\":3}\n"
+        )
+        .as_bytes()
+        .to_vec();
+        contents.extend_from_slice(&start_event_with_raw_bytes(
+            "raw-exact",
+            MAX_EVENT_LINE_BYTES,
+        ));
+        contents.push(b'\n');
+        contents.extend_from_slice(&start_event_with_raw_bytes(
+            "raw-over",
+            MAX_EVENT_LINE_BYTES + 1,
+        ));
+        contents.push(b'\n');
+        fs::write(journal.path(), contents).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let records = journal.records().unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "raw-over");
+        assert_eq!(records[0].command, "old");
+        assert_eq!(records[0].exit_code, Some(9));
+    }
+
+    #[test]
+    fn decoded_utf8_budget_is_charged_after_json_unescaping() {
+        let (_dir, journal) = journal();
+        let mut contents = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"decoded-exact\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"decoded-over\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":2}\n"
+        )
+        .as_bytes()
+        .to_vec();
+        contents.extend_from_slice(&escaped_multibyte_output_event(
+            "decoded-exact",
+            MAX_OUTPUT_BYTES,
+        ));
+        contents.push(b'\n');
+        contents.extend_from_slice(&escaped_multibyte_output_event(
+            "decoded-over",
+            MAX_OUTPUT_BYTES + 1,
+        ));
+        contents.push(b'\n');
+        fs::write(journal.path(), contents).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let records = journal.records().unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id, "decoded-exact");
+        assert_eq!(
+            records[0].output.as_ref().unwrap().text.len(),
+            MAX_OUTPUT_BYTES
+        );
+        assert_eq!(records[1].id, "decoded-over");
+        assert_eq!(records[1].output, None);
+
+        compact_unlocked(journal.path()).unwrap();
+        let compacted = fs::read_to_string(journal.path()).unwrap();
+        assert!(compacted
+            .lines()
+            .all(|line| line.len() <= MAX_EVENT_LINE_BYTES));
+        assert_eq!(journal.records().unwrap(), records);
     }
 
     #[test]
