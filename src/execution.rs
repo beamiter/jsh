@@ -220,11 +220,13 @@ impl ExecutionJournal {
         let observed_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
         let total_bytes = total_bytes.max(observed_bytes);
         let (mut text, limited) = bounded_text(text, MAX_OUTPUT_BYTES);
+        let (truncated, total_bytes) =
+            normalize_output_metadata(text.len(), truncated || limited, total_bytes);
         let mut event = ExecutionEvent::Output {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             id: validate_execution_id(id)?.to_string(),
             text: text.clone(),
-            truncated: truncated || limited,
+            truncated,
             total_bytes,
             captured_at_ms,
         };
@@ -615,6 +617,16 @@ fn validate_command_text(command: &str, max_bytes: usize) -> io::Result<&str> {
         })
 }
 
+fn normalize_output_metadata(
+    retained_bytes: usize,
+    truncated: bool,
+    total_bytes: u64,
+) -> (bool, u64) {
+    let retained_bytes = u64::try_from(retained_bytes).unwrap_or(u64::MAX);
+    let total_bytes = total_bytes.max(retained_bytes);
+    (truncated || total_bytes > retained_bytes, total_bytes)
+}
+
 fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
     if value.len() <= max_bytes {
         return (value.to_string(), false);
@@ -744,8 +756,10 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
+                    let (truncated, total_bytes) =
+                        normalize_output_metadata(text.len(), truncated, total_bytes);
                     record.output = Some(ExecutionOutput {
-                        total_bytes: total_bytes.max(text.len() as u64),
+                        total_bytes,
                         text,
                         truncated,
                         captured_at_ms,
@@ -960,6 +974,45 @@ mod tests {
         assert_eq!(journal.show("jsh-a").unwrap().unwrap().seq, 7);
         assert_eq!(journal.list(Some("tab-1"), 1).unwrap().len(), 1);
         assert!(journal.list(Some("another-tab"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_byte_evidence_cannot_deny_truncation() {
+        let (_writer_dir, writer_journal) = journal();
+        writer_journal
+            .record_start("jsh-writer", None, 1, "true", "/tmp", 1)
+            .unwrap();
+        writer_journal
+            .record_output("jsh-writer", "hi", false, 3, 2)
+            .unwrap();
+
+        let writer_output = writer_journal
+            .get("jsh-writer")
+            .unwrap()
+            .unwrap()
+            .output
+            .unwrap();
+        assert!(writer_output.truncated);
+        assert_eq!(writer_output.total_bytes, 3);
+
+        let (_reader_dir, reader_journal) = journal();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(reader_journal.path())
+            .unwrap();
+        writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-reader\",\"session_id\":null,\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}}").unwrap();
+        writeln!(file, "{{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"jsh-reader\",\"text\":\"hi\",\"truncated\":false,\"total_bytes\":3,\"captured_at_ms\":2}}").unwrap();
+        drop(file);
+
+        let reader_output = reader_journal
+            .get("jsh-reader")
+            .unwrap()
+            .unwrap()
+            .output
+            .unwrap();
+        assert!(reader_output.truncated);
+        assert_eq!(reader_output.total_bytes, 3);
     }
 
     #[test]
