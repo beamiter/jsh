@@ -397,6 +397,9 @@ the journal and its `executions.lock` sidecar are mode `0600` and coordinated
 with `flock`. At 32 MiB the journal is compacted to the newest records, with a
 post-compaction limit of 24 MiB and 2,000 executions. Individual metadata and
 captured-output records also have hard size limits.
+If a damaged or externally produced journal repeats an execution ID, the later
+start event replaces the whole earlier lifecycle and takes its new chronological
+position; stale status, output, and eviction age cannot attach to the new run.
 
 The journal can contain sensitive commands, paths, and terminal output. Set
 `JSH_EXECUTION_JOURNAL=0` to disable disk journaling while retaining OSC

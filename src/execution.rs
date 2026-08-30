@@ -6,7 +6,7 @@
 
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -600,12 +600,13 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
             "execution journal exceeds size limit",
         ));
     }
-    let mut records = VecDeque::<ExecutionRecord>::new();
-    // Logical indices never shift when the front is evicted; this keeps a
-    // hostile stream of tiny unique start events linear rather than O(n^2).
-    let mut indices = HashMap::<String, u64>::new();
-    let mut base_index = 0_u64;
-    let mut next_index = 0_u64;
+    let mut records = HashMap::<String, ExecutionRecord>::new();
+    // Keep the working set bounded while preserving the newest start-event
+    // chronology. A second start for one ID is authoritative and must move to
+    // its new position rather than retaining the first event's eviction age.
+    // The ordered index keeps both replacement and eviction logarithmic under
+    // a hostile stream of tiny duplicate or unique records.
+    let mut record_order = BTreeMap::<(u64, u64, String), String>::new();
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut bytes_read = 0_u64;
@@ -653,26 +654,20 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                     ended_at_ms: None,
                     output: None,
                 };
-                if let Some(index) = indices.get(&id).copied() {
-                    if let Some(existing) = index
-                        .checked_sub(base_index)
-                        .and_then(|offset| usize::try_from(offset).ok())
-                        .and_then(|offset| records.get_mut(offset))
-                    {
-                        *existing = record;
-                    }
-                } else {
-                    if records.len() == MAX_RETAINED_EXECUTIONS {
-                        if let Some(evicted) = records.pop_front() {
-                            if indices.get(&evicted.id) == Some(&base_index) {
-                                indices.remove(&evicted.id);
-                            }
-                            base_index = base_index.saturating_add(1);
-                        }
-                    }
-                    indices.insert(id, next_index);
-                    records.push_back(record);
-                    next_index = next_index.saturating_add(1);
+                if let Some(previous) = records.remove(&id) {
+                    record_order.remove(&(
+                        previous.started_at_ms,
+                        previous.seq,
+                        previous.id.clone(),
+                    ));
+                }
+                record_order.insert((started_at_ms, seq, id.clone()), id.clone());
+                records.insert(id, record);
+                while records.len() > MAX_RETAINED_EXECUTIONS {
+                    let Some((_, oldest_id)) = record_order.pop_first() else {
+                        break;
+                    };
+                    records.remove(&oldest_id);
                 }
             }
             ExecutionEvent::Finish {
@@ -686,12 +681,7 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                 if validate_execution_id(&id).is_err() || cwd_after.len() > MAX_CWD_BYTES {
                     continue;
                 }
-                if let Some(record) = indices
-                    .get(&id)
-                    .and_then(|index| index.checked_sub(base_index))
-                    .and_then(|offset| usize::try_from(offset).ok())
-                    .and_then(|offset| records.get_mut(offset))
-                {
+                if let Some(record) = records.get_mut(&id) {
                     record.exit_code = Some(exit_code);
                     record.duration_ms = Some(duration_ms);
                     record.cwd_after = Some(cwd_after);
@@ -709,12 +699,7 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
                 if validate_execution_id(&id).is_err() || text.len() > MAX_OUTPUT_BYTES {
                     continue;
                 }
-                if let Some(record) = indices
-                    .get(&id)
-                    .and_then(|index| index.checked_sub(base_index))
-                    .and_then(|offset| usize::try_from(offset).ok())
-                    .and_then(|offset| records.get_mut(offset))
-                {
+                if let Some(record) = records.get_mut(&id) {
                     record.output = Some(ExecutionOutput {
                         text,
                         truncated,
@@ -725,7 +710,11 @@ fn read_records(path: &Path) -> io::Result<Vec<ExecutionRecord>> {
             }
         }
     }
-    Ok(records.into())
+    let mut records = records.into_values().collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        (left.started_at_ms, left.seq, &left.id).cmp(&(right.started_at_ms, right.seq, &right.id))
+    });
+    Ok(records)
 }
 
 /// Read and, when necessary, discard one JSONL record without allocating more
@@ -927,6 +916,39 @@ mod tests {
         assert_eq!(journal.show("jsh-a").unwrap().unwrap().seq, 7);
         assert_eq!(journal.list(Some("tab-1"), 1).unwrap().len(), 1);
         assert!(journal.list(Some("another-tab"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_later_duplicate_start_replaces_lifecycle_and_chronology() {
+        let (_dir, journal) = journal();
+        journal
+            .record_start("jsh-reused", Some("old-tab"), 1, "old", "/old", 10)
+            .unwrap();
+        journal
+            .record_finish("jsh-reused", 9, 5, "/old-after", 15)
+            .unwrap();
+        journal
+            .record_start("jsh-middle", None, 2, "middle", "/middle", 20)
+            .unwrap();
+        journal
+            .record_start("jsh-reused", Some("new-tab"), 3, "new", "/new", 30)
+            .unwrap();
+
+        let records = journal.records().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["jsh-middle", "jsh-reused"]
+        );
+        let replacement = &records[1];
+        assert_eq!(replacement.seq, 3);
+        assert_eq!(replacement.session_id.as_deref(), Some("new-tab"));
+        assert_eq!(replacement.command, "new");
+        assert_eq!(replacement.cwd, "/new");
+        assert_eq!(replacement.exit_code, None);
+        assert!(journal.list(Some("old-tab"), 10).unwrap().is_empty());
     }
 
     /// Golden event emitted by `jterm_core::execution_journal`. Keep this
