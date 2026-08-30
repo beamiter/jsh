@@ -406,8 +406,10 @@ the journal and its `executions.lock` sidecar are mode `0600` and coordinated
 with `flock`. Existing journal or lock files that are group/world-writable are
 rejected rather than repaired in place; extra read bits on an owner-only file
 are tightened back to `0600`. At 32 MiB the journal is compacted to the newest
-records, with a post-compaction limit of 24 MiB and 2,000 executions. Individual
-metadata and captured-output records also have hard size limits. Exact duplicate
+records, with a post-compaction limit of 24 MiB and 2,000 executions. A read
+inspects at most 524,288 physical event lines, above the number of conforming v1
+events that fit its byte window but finite for malformed short-line streams.
+Individual metadata and captured-output records also have hard size limits. Exact duplicate
 finish or output delivery is idempotent; conflicting duplicates poison only
 their own lifecycle slot until the next authoritative start. Compaction keeps
 that safe unknown state as an additive `conflict` tombstone that older v1

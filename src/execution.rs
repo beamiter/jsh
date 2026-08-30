@@ -22,6 +22,11 @@ pub const MAX_CWD_BYTES: usize = 4 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum physical JSONL records inspected during one journal read.
+///
+/// This exceeds the number of shortest recognized v1 events that fit in the
+/// byte window, while bounding CPU spent rejecting malformed short lines.
+pub const MAX_JOURNAL_EVENT_LINES: usize = 512 * 1024;
 pub const COMPACTED_JOURNAL_TARGET_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_RETAINED_EXECUTIONS: usize = 2_000;
 pub(crate) const MAX_JOURNAL_PATH_BYTES: usize = 16 * 1024;
@@ -838,6 +843,13 @@ fn bounded_text(value: &str, max_bytes: usize) -> (String, bool) {
 }
 
 fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
+    read_records_with_line_limit(path, MAX_JOURNAL_EVENT_LINES)
+}
+
+fn read_records_with_line_limit(
+    path: &Path,
+    max_event_lines: usize,
+) -> io::Result<Vec<FoldedExecution>> {
     let file = open_regular_file(path, true, false, false)?;
     set_private_open_file_permissions(&file)?;
     if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
@@ -856,7 +868,20 @@ fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut bytes_read = 0_u64;
+    let mut event_lines = 0usize;
     while let Some(within_limit) = read_bounded_line(&mut reader, &mut line, &mut bytes_read)? {
+        event_lines = event_lines.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution journal event count overflowed",
+            )
+        })?;
+        if event_lines > max_event_lines {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution journal exceeds event-count limit",
+            ));
+        }
         if !within_limit {
             continue;
         }
@@ -1028,13 +1053,32 @@ fn read_bounded_line(
 }
 
 fn compact_unlocked(path: &Path) -> io::Result<()> {
+    compact_unlocked_with_line_limit(path, MAX_JOURNAL_EVENT_LINES)
+}
+
+fn compact_unlocked_with_line_limit(path: &Path, max_event_lines: usize) -> io::Result<()> {
     let records = read_records(path)?;
     let mut retained = Vec::<Vec<u8>>::new();
     let mut retained_bytes = 0usize;
+    let mut retained_event_lines = 0usize;
     for record in records.iter().rev().take(MAX_RETAINED_EXECUTIONS) {
         let encoded = encode_compacted_record(record)?;
         if retained_bytes + encoded.len() > COMPACTED_JOURNAL_TARGET_BYTES {
             break;
+        }
+        retained_event_lines = retained_event_lines
+            .checked_add(encoded.iter().filter(|byte| **byte == b'\n').count())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compacted execution journal event count overflowed",
+                )
+            })?;
+        if retained_event_lines > max_event_lines {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compacted execution journal exceeds event-count limit",
+            ));
         }
         retained_bytes += encoded.len();
         retained.push(encoded);
@@ -1613,6 +1657,7 @@ mod tests {
         assert_eq!(MAX_CWD_BYTES, 4 * 1024);
         assert_eq!(MAX_OUTPUT_BYTES, 256 * 1024);
         assert_eq!(MAX_JOURNAL_FILE_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAX_JOURNAL_EVENT_LINES, 512 * 1024);
         assert_eq!(MAX_RETAINED_EXECUTIONS, 2_000);
     }
 
@@ -2035,6 +2080,53 @@ mod tests {
         let records = journal.records().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "jsh-after-large-line");
+    }
+
+    #[test]
+    fn reader_rejects_excess_event_lines_before_parsing_them() {
+        let (_dir, journal) = journal();
+        let accepted = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"bounded\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}\n"
+        );
+        fs::write(journal.path(), accepted).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let records = read_records_with_line_limit(journal.path(), 2).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.exit_code, Some(0));
+
+        let over_limit = format!(
+            "{accepted}{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"unexpected\":true}}\n"
+        );
+        fs::write(journal.path(), over_limit).unwrap();
+        let error = read_records_with_line_limit(journal.path(), 2).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("event-count limit"));
+    }
+
+    #[test]
+    fn compaction_refuses_to_emit_more_events_than_readers_accept() {
+        let (_dir, journal) = journal();
+        let source = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"bounded\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"bounded\",\"text\":\"ok\",\"truncated\":false,\"total_bytes\":2,\"captured_at_ms\":3}\n"
+        );
+        fs::write(journal.path(), source).unwrap();
+        fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = compact_unlocked_with_line_limit(journal.path(), 2).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("event-count limit"));
+        assert_eq!(fs::read_to_string(journal.path()).unwrap(), source);
+
+        compact_unlocked(journal.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(journal.path()).unwrap().lines().count(),
+            3
+        );
+        assert_eq!(journal.records().unwrap().len(), 1);
     }
 
     #[test]
