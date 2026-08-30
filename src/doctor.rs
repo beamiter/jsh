@@ -441,8 +441,8 @@ fn journal_path_for_override(
     state_dir: &Path,
     override_path: Option<std::ffi::OsString>,
 ) -> Option<(PathBuf, bool)> {
-    match override_path {
-        Some(raw) if raw.is_empty() => Some((state_dir.join("jsh/executions.jsonl"), false)),
+    let (path, custom) = match override_path {
+        Some(raw) if raw.is_empty() => (state_dir.join("jsh/executions.jsonl"), false),
         Some(raw) => {
             let path = PathBuf::from(raw);
             if !path.is_absolute() {
@@ -451,13 +451,24 @@ fn journal_path_for_override(
                     "JSH_EXECUTION_JOURNAL_PATH must be an absolute path",
                     "set an absolute file path or unset the override",
                 ));
-                None
-            } else {
-                Some((path, true))
+                return None;
             }
+            (path, true)
         }
-        None => Some((state_dir.join("jsh/executions.jsonl"), false)),
+        None => (state_dir.join("jsh/executions.jsonl"), false),
+    };
+    if !crate::execution::is_valid_journal_path(&path) {
+        checks.push(warn(
+            "persistence.journal",
+            format!(
+                "execution journal path must name a terminal-visible file within {} bytes",
+                crate::execution::MAX_JOURNAL_PATH_BYTES
+            ),
+            "remove control or invisible formatting and choose a shorter file path",
+        ));
+        return None;
     }
+    Some((path, custom))
 }
 
 fn persistence_integrity_checks(checks: &mut Vec<Check>, home: &Path, journal: Option<&Path>) {
@@ -935,6 +946,27 @@ mod tests {
 
         assert_eq!(path, Some((state_dir.join("jsh/executions.jsonl"), false)));
         assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn journal_path_diagnostics_match_the_runtime_safety_boundary() {
+        let state_dir = Path::new("/tmp/jsh-doctor-state");
+        for unsafe_path in [
+            "/",
+            "/tmp/bad\nname.jsonl",
+            "/tmp/bad\u{0080}name.jsonl",
+            "/tmp/bad\u{202e}name.jsonl",
+            "/tmp/bad\u{fff9}name.jsonl",
+        ] {
+            let mut checks = Vec::new();
+            assert!(
+                journal_path_for_override(&mut checks, state_dir, Some(unsafe_path.into()))
+                    .is_none(),
+                "accepted {unsafe_path:?}"
+            );
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].level, Level::Warn);
+        }
     }
 
     #[test]

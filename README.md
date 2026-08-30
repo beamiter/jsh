@@ -416,10 +416,12 @@ The journal can contain sensitive commands, paths, and terminal output. Set
 `JSH_EXECUTION_JOURNAL=0` to disable disk journaling while retaining OSC
 integration for the terminal UI. Set `JSH_EXECUTION_JOURNAL_PATH` to override
 the location; an empty value behaves like an unset override. A non-empty value
-must be an absolute path whose parent is owned by the current user and is not
-group/world-writable. Shared namespaces such as `/tmp` are not valid overrides
-because the journal and its fixed `executions.lock` sidecar share one trust
-boundary. Relative or unsafe locations are rejected.
+must be an absolute, terminal-visible file path no longer than 16 KiB whose
+parent is owned by the current user and is not group/world-writable. Shared
+namespaces such as `/tmp` are not valid overrides because the journal and its
+fixed `executions.lock` sidecar share one trust boundary. Relative paths and
+locations containing controls, terminal-invisible text, or other unsafe bytes
+are rejected.
 
 ## AI, explicitly opt-in
 

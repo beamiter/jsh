@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +23,7 @@ pub const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub const COMPACTED_JOURNAL_TARGET_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_RETAINED_EXECUTIONS: usize = 2_000;
+pub(crate) const MAX_JOURNAL_PATH_BYTES: usize = 16 * 1024;
 /// Maximum bytes in the execution identifier shared with terminal OSC 133
 /// metadata and terminal-produced output events.
 pub const MAX_EXECUTION_ID_BYTES: usize = 192;
@@ -520,14 +522,34 @@ pub fn default_journal_path() -> Option<PathBuf> {
 }
 
 fn select_journal_path(override_path: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    match override_path {
-        Some(path) if path.is_empty() => default_journal_path(),
+    let path = match override_path {
+        Some(path) if path.is_empty() => default_journal_path()?,
         Some(path) => {
             let path = PathBuf::from(path);
-            path.is_absolute().then_some(path)
+            if !path.is_absolute() {
+                return None;
+            }
+            path
         }
-        None => default_journal_path(),
+        None => default_journal_path()?,
+    };
+    is_valid_journal_path(&path).then_some(path)
+}
+
+/// Whether a selected execution-journal path matches jterm_core's bounded,
+/// terminal-visible file-name boundary. Non-UTF-8 Unix names remain valid as
+/// long as their raw bytes contain no ASCII controls.
+pub(crate) fn is_valid_journal_path(path: &Path) -> bool {
+    if path.file_name().is_none() {
+        return false;
     }
+    let bytes = path.as_os_str().as_bytes();
+    bytes.len() <= MAX_JOURNAL_PATH_BYTES
+        && !bytes.iter().any(|byte| matches!(*byte, 0..=0x1f | 0x7f))
+        && !path.to_str().is_some_and(|text| {
+            text.chars()
+                .any(crate::terminal_text::is_terminal_ambiguous)
+        })
 }
 
 fn env_value_is_false(value: &str) -> bool {
@@ -1406,6 +1428,40 @@ mod tests {
         assert_eq!(
             select_journal_path(Some("/tmp/jsh-test/executions.jsonl".into())),
             Some(PathBuf::from("/tmp/jsh-test/executions.jsonl"))
+        );
+    }
+
+    #[test]
+    fn journal_path_override_matches_the_terminal_path_boundary() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let maximum = format!("/{}", "x".repeat(MAX_JOURNAL_PATH_BYTES - 1));
+        assert_eq!(
+            select_journal_path(Some(maximum.clone().into())),
+            Some(PathBuf::from(maximum))
+        );
+        assert!(select_journal_path(Some(
+            format!("/{}", "x".repeat(MAX_JOURNAL_PATH_BYTES)).into()
+        ))
+        .is_none());
+
+        for unsafe_path in [
+            "/",
+            "/tmp/bad\nname.jsonl",
+            "/tmp/bad\u{0080}name.jsonl",
+            "/tmp/bad\u{202e}name.jsonl",
+            "/tmp/bad\u{fff9}name.jsonl",
+        ] {
+            assert!(
+                select_journal_path(Some(unsafe_path.into())).is_none(),
+                "accepted {unsafe_path:?}"
+            );
+        }
+
+        let non_utf8 = std::ffi::OsString::from_vec(b"/tmp/jsh-\xff.jsonl".to_vec());
+        assert_eq!(
+            select_journal_path(Some(non_utf8.clone())),
+            Some(PathBuf::from(non_utf8))
         );
     }
 
