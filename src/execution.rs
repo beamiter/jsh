@@ -860,12 +860,6 @@ fn journal_append_within_bound(current_bytes: u64, appended_bytes: usize) -> boo
         <= MAX_JOURNAL_READ_BYTES
 }
 
-#[derive(Clone, Copy)]
-enum FoldedRecordOrder {
-    Presentation,
-    PhysicalStart,
-}
-
 fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
     read_records_with_line_limit(path, MAX_JOURNAL_EVENT_LINES)
 }
@@ -873,14 +867,6 @@ fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
 fn read_records_with_line_limit(
     path: &Path,
     max_event_lines: usize,
-) -> io::Result<Vec<FoldedExecution>> {
-    read_records_with_line_limit_and_order(path, max_event_lines, FoldedRecordOrder::Presentation)
-}
-
-fn read_records_with_line_limit_and_order(
-    path: &Path,
-    max_event_lines: usize,
-    order: FoldedRecordOrder,
 ) -> io::Result<Vec<FoldedExecution>> {
     let file = open_regular_file(path, true, false, false)?;
     set_private_open_file_permissions(&file)?;
@@ -1046,22 +1032,8 @@ fn read_records_with_line_limit_and_order(
         };
         ordered_records.push((position, record));
     }
-    match order {
-        FoldedRecordOrder::Presentation => ordered_records.sort_by(|left, right| {
-            (
-                left.1.record.started_at_ms,
-                left.1.record.seq,
-                &left.1.record.id,
-            )
-                .cmp(&(
-                    right.1.record.started_at_ms,
-                    right.1.record.seq,
-                    &right.1.record.id,
-                ))
-        }),
-        FoldedRecordOrder::PhysicalStart => ordered_records
-            .sort_by(|left, right| (left.0, &left.1.record.id).cmp(&(right.0, &right.1.record.id))),
-    }
+    ordered_records
+        .sort_by(|left, right| (left.0, &left.1.record.id).cmp(&(right.0, &right.1.record.id)));
     Ok(ordered_records
         .into_iter()
         .map(|(_, record)| record)
@@ -1121,11 +1093,7 @@ fn compact_unlocked_with_line_limit(path: &Path, max_event_lines: usize) -> io::
     // Compaction must first accept the source under the same physical-line
     // budget its output promises to satisfy. Otherwise ignored future events
     // could be erased from an over-budget source and make it appear valid.
-    let records = read_records_with_line_limit_and_order(
-        path,
-        max_event_lines,
-        FoldedRecordOrder::PhysicalStart,
-    )?;
+    let records = read_records_with_line_limit(path, max_event_lines)?;
     let mut retained = Vec::<Vec<u8>>::new();
     let mut retained_bytes = 0usize;
     let mut retained_event_lines = 0usize;
@@ -1390,6 +1358,53 @@ mod tests {
         assert_eq!(journal.show("jsh-a").unwrap().unwrap().seq, 7);
         assert_eq!(journal.list(Some("tab-1"), 1).unwrap().len(), 1);
         assert!(journal.list(Some("another-tab"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chronological_apis_use_physical_order_across_clock_reset_and_ties() {
+        let (_dir, journal) = journal();
+        for (id, seq, started_at_ms, exit_code) in [
+            ("old-high", 99, 999, 9),
+            ("z-tie", 1, 1, 7),
+            ("a-tie", 1, 1, 0),
+        ] {
+            journal
+                .record_start(id, Some("wanted"), seq, id, "/tmp", started_at_ms)
+                .unwrap();
+            journal
+                .record_finish(id, exit_code, 1, "/tmp", started_at_ms + 1)
+                .unwrap();
+        }
+
+        let assert_chronology = || {
+            assert_eq!(
+                journal
+                    .records()
+                    .unwrap()
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["old-high", "z-tie", "a-tie"]
+            );
+            assert_eq!(
+                journal
+                    .list(Some("wanted"), 2)
+                    .unwrap()
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["z-tie", "a-tie"]
+            );
+            assert_eq!(
+                journal.last_failed().unwrap().unwrap().id,
+                "z-tie",
+                "the physically latest failure wins, not the largest timestamp"
+            );
+        };
+
+        assert_chronology();
+        compact_unlocked(journal.path()).unwrap();
+        assert_chronology();
     }
 
     #[test]
