@@ -112,7 +112,7 @@ enum ExecutionEvent {
     Conflict(ConflictEvent),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StartEvent {
     #[serde(alias = "rsh_execution_version")]
@@ -312,6 +312,27 @@ pub struct ExecutionJournal {
     harden_existing_parent: bool,
 }
 
+#[derive(Debug)]
+struct CommitStateUnknown(String);
+
+impl std::fmt::Display for CommitStateUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CommitStateUnknown {}
+
+fn commit_state_unknown(kind: io::ErrorKind, message: String) -> io::Error {
+    io::Error::new(kind, CommitStateUnknown(message))
+}
+
+fn is_commit_state_unknown(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<CommitStateUnknown>().is_some())
+}
+
 impl ExecutionJournal {
     /// Return the configured journal. `JSH_EXECUTION_JOURNAL` is only an
     /// enable/disable switch; a custom location uses
@@ -366,21 +387,85 @@ impl ExecutionJournal {
         cwd: &str,
         started_at_ms: u64,
     ) -> io::Result<()> {
-        let (command, command_truncated) = bounded_text(command, MAX_COMMAND_BYTES);
-        validate_command_text(&command, MAX_COMMAND_BYTES)?;
-        self.append_event(ExecutionEvent::Start(StartEvent {
-            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
-            id: validate_execution_id(id)?.to_string(),
-            session_id: match session_id {
-                Some(id) => Some(validate_session_id(id)?.to_string()),
-                None => None,
-            },
+        let event = validated_start_event(id, session_id, seq, command, cwd, started_at_ms)?;
+        self.append_event(ExecutionEvent::Start(event))
+    }
+
+    /// Record a Start for the interactive executor, recovering only an exact,
+    /// complete terminal record after an indeterminate append result.
+    ///
+    /// This never appends the Start a second time. A partial tail, duplicate
+    /// lifecycle identity, or any later physical event keeps the original
+    /// commit-unknown error so the caller cannot attach a Finish to stale data.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_start_reconciled(
+        &self,
+        id: &str,
+        session_id: Option<&str>,
+        seq: u64,
+        command: &str,
+        cwd: &str,
+        started_at_ms: u64,
+    ) -> io::Result<()> {
+        self.record_start_reconciled_with_io(
+            id,
+            session_id,
             seq,
             command,
-            command_truncated,
-            cwd: validate_cwd(cwd)?.to_string(),
+            cwd,
             started_at_ms,
-        }))
+            &SyncJournalAppendIo,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_start_reconciled_with_io(
+        &self,
+        id: &str,
+        session_id: Option<&str>,
+        seq: u64,
+        command: &str,
+        cwd: &str,
+        started_at_ms: u64,
+        append_io: &impl JournalAppendIo,
+    ) -> io::Result<()> {
+        let event = validated_start_event(id, session_id, seq, command, cwd, started_at_ms)?;
+        match self.append_event_with_limits_and_io(
+            ExecutionEvent::Start(event.clone()),
+            MAX_JOURNAL_EVENT_LINES,
+            MAX_JOURNAL_FILE_BYTES,
+            append_io,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) if is_commit_state_unknown(&error) => {
+                match self.has_exact_terminal_start(&event) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(error),
+                    Err(recovery_error) => Err(commit_state_unknown(
+                        recovery_error.kind(),
+                        format!(
+                            "execution journal Start recovery failed after an unknown append result: {recovery_error}; original error: {error}"
+                        ),
+                    )),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn has_exact_terminal_start(&self, expected: &StartEvent) -> io::Result<bool> {
+        self.ensure_valid_path()?;
+        let lock = self.lock(FlockArg::LockShared)?;
+        if !exact_terminal_start(&self.path, expected)? {
+            return Ok(false);
+        }
+        // Retry only the durability barriers after proving the exact event is
+        // already present. This makes a positive recovery restart-safe without
+        // ever rewriting the Start or risking a duplicate lifecycle.
+        let file = open_regular_file(&self.path, true, false, false)?;
+        file.sync_data()?;
+        lock._directory.sync_all()?;
+        Ok(true)
     }
 
     pub fn record_finish(
@@ -496,20 +581,20 @@ impl ExecutionJournal {
         max_event_lines: usize,
         compact_after_bytes: u64,
     ) -> io::Result<()> {
-        self.append_event_with_limits_and_durability(
+        self.append_event_with_limits_and_io(
             event,
             max_event_lines,
             compact_after_bytes,
-            &SyncJournalDurability,
+            &SyncJournalAppendIo,
         )
     }
 
-    fn append_event_with_limits_and_durability(
+    fn append_event_with_limits_and_io(
         &self,
         event: ExecutionEvent,
         max_event_lines: usize,
         compact_after_bytes: u64,
-        durability: &impl JournalDurability,
+        append_io: &impl JournalAppendIo,
     ) -> io::Result<()> {
         let mut encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
         if encoded.len() > MAX_EVENT_LINE_BYTES {
@@ -572,29 +657,47 @@ impl ExecutionJournal {
             ));
         }
         invalidate_append_line_count_cache(&self.path)?;
+        let mut written = 0;
         if needs_separator {
-            file.write_all(b"\n")?;
+            if let Err(error) = write_all_counted(append_io, &mut file, b"\n", &mut written) {
+                return finish_failed_append_write(
+                    &self.path,
+                    file,
+                    created_pathname,
+                    written,
+                    error,
+                );
+            }
         }
-        file.write_all(&encoded)?;
-        if file.metadata()?.len() > compact_after_bytes {
+        if let Err(error) = write_all_counted(append_io, &mut file, &encoded, &mut written) {
+            return finish_failed_append_write(&self.path, file, created_pathname, written, error);
+        }
+        let post_append_len = file
+            .metadata()
+            .map_err(|error| append_post_write_error("size check", error))?
+            .len();
+        if post_append_len > compact_after_bytes {
             drop(file);
-            compact_unlocked_with_line_limit(&self.path, max_event_lines)?;
-            invalidate_append_line_count_cache(&self.path)?;
+            compact_unlocked_with_line_limit(&self.path, max_event_lines)
+                .map_err(|error| append_post_write_error("post-append compaction", error))?;
+            invalidate_append_line_count_cache(&self.path)
+                .map_err(|error| append_post_write_error("cache invalidation", error))?;
         } else {
             if !compacted_before_append {
                 if let Some(line_count) = exact_line_count {
-                    cache_completed_append(&self.path, &file, line_count + 1)?;
+                    cache_completed_append(&self.path, &file, line_count + 1).map_err(|error| {
+                        append_post_write_error("line-count bookkeeping", error)
+                    })?;
                 }
             }
-            // A returned barrier error is deliberately not retried: bytes may
-            // already be visible, so the caller must treat commit state as
-            // unknown. The public shell safely omits a dependent Finish in
-            // that case rather than manufacturing a second Start.
-            durability
+            // A returned post-write error is deliberately not retried. The
+            // interactive facade may only continue this lifecycle after a
+            // strict terminal-record recovery proves the exact Start visible.
+            append_io
                 .sync_data(&file)
                 .map_err(|error| append_durability_error("data", error))?;
             if created_pathname {
-                durability
+                append_io
                     .sync_directory(&_lock)
                     .map_err(|error| append_durability_error("directory", error))?;
             }
@@ -642,14 +745,19 @@ struct JournalLock {
     _file: Flock<File>,
 }
 
-trait JournalDurability {
+trait JournalAppendIo {
+    fn write(&self, file: &mut File, bytes: &[u8]) -> io::Result<usize>;
     fn sync_data(&self, file: &File) -> io::Result<()>;
     fn sync_directory(&self, lock: &JournalLock) -> io::Result<()>;
 }
 
-struct SyncJournalDurability;
+struct SyncJournalAppendIo;
 
-impl JournalDurability for SyncJournalDurability {
+impl JournalAppendIo for SyncJournalAppendIo {
+    fn write(&self, file: &mut File, bytes: &[u8]) -> io::Result<usize> {
+        file.write(bytes)
+    }
+
     fn sync_data(&self, file: &File) -> io::Result<()> {
         file.sync_data()
     }
@@ -659,13 +767,103 @@ impl JournalDurability for SyncJournalDurability {
     }
 }
 
+fn write_all_counted(
+    append_io: &impl JournalAppendIo,
+    file: &mut File,
+    mut bytes: &[u8],
+    written: &mut usize,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match append_io.write(file, bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write the complete execution journal event",
+                ));
+            }
+            Ok(count) if count <= bytes.len() => {
+                *written = written.saturating_add(count);
+                bytes = &bytes[count..];
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "execution journal writer reported an invalid byte count",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn append_write_error(error: io::Error, written: usize) -> io::Error {
+    if written == 0 {
+        io::Error::new(
+            error.kind(),
+            format!("execution journal append failed before writing any bytes: {error}"),
+        )
+    } else {
+        commit_state_unknown(
+            error.kind(),
+            format!(
+                "execution journal append failed after writing a visible prefix; commit state is unknown: {error}"
+            ),
+        )
+    }
+}
+
 fn append_durability_error(stage: &str, error: io::Error) -> io::Error {
-    io::Error::new(
+    commit_state_unknown(
         error.kind(),
         format!(
             "execution journal {stage} durability barrier failed after writing; commit state is unknown: {error}"
         ),
     )
+}
+
+fn append_post_write_error(stage: &str, error: io::Error) -> io::Error {
+    commit_state_unknown(
+        error.kind(),
+        format!("execution journal {stage} failed after writing; commit state is unknown: {error}"),
+    )
+}
+
+fn finish_failed_append_write(
+    journal_path: &Path,
+    file: File,
+    created_pathname: bool,
+    written: usize,
+    error: io::Error,
+) -> io::Result<()> {
+    if created_pathname && written == 0 {
+        remove_created_empty_journal(journal_path, &file).map_err(|cleanup_error| {
+            io::Error::new(
+                cleanup_error.kind(),
+                format!(
+                    "execution journal append failed before writing and its empty pathname could not be removed: {error}; cleanup failed: {cleanup_error}"
+                ),
+            )
+        })?;
+    }
+    drop(file);
+    Err(append_write_error(error, written))
+}
+
+fn remove_created_empty_journal(journal_path: &Path, file: &File) -> io::Result<()> {
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(journal_path)?;
+    if opened.len() != 0
+        || !named.is_file()
+        || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "new execution journal pathname no longer names the empty opened file",
+        ));
+    }
+    fs::remove_file(journal_path)
 }
 
 trait CompactionCommitIo {
@@ -691,7 +889,7 @@ impl CompactionCommitIo for SyncCompactionCommitIo {
 }
 
 fn compaction_commit_unknown(stage: &str, error: io::Error) -> io::Error {
-    io::Error::new(
+    commit_state_unknown(
         error.kind(),
         format!(
             "execution journal compaction {stage} failed after rename; commit state is unknown: {error}"
@@ -960,6 +1158,31 @@ pub fn execution_id(session_id: Option<&str>, seq: u64) -> String {
     )
 }
 
+fn validated_start_event(
+    id: &str,
+    session_id: Option<&str>,
+    seq: u64,
+    command: &str,
+    cwd: &str,
+    started_at_ms: u64,
+) -> io::Result<StartEvent> {
+    let (command, command_truncated) = bounded_text(command, MAX_COMMAND_BYTES);
+    validate_command_text(&command, MAX_COMMAND_BYTES)?;
+    Ok(StartEvent {
+        jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+        id: validate_execution_id(id)?.to_string(),
+        session_id: match session_id {
+            Some(id) => Some(validate_session_id(id)?.to_string()),
+            None => None,
+        },
+        seq,
+        command,
+        command_truncated,
+        cwd: validate_cwd(cwd)?.to_string(),
+        started_at_ms,
+    })
+}
+
 fn validate_execution_id(id: &str) -> io::Result<&str> {
     if is_valid_execution_id(id) {
         Ok(id)
@@ -1171,6 +1394,58 @@ fn cache_completed_append(
         ends_with_newline: true,
     });
     Ok(())
+}
+
+fn exact_terminal_start(path: &Path, expected: &StartEvent) -> io::Result<bool> {
+    let file = open_regular_file(path, true, false, false)?;
+    set_private_open_file_permissions(&file)?;
+    if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
+        return Ok(false);
+    }
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut bytes_read = 0_u64;
+    let mut event_lines = 0usize;
+    let mut matching_identities = 0usize;
+    let mut terminal_match = false;
+
+    while let Some(within_limit) = read_bounded_line(&mut reader, &mut line, &mut bytes_read)? {
+        event_lines = event_lines.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution journal event count overflowed during Start recovery",
+            )
+        })?;
+        if event_lines > MAX_JOURNAL_EVENT_LINES {
+            return Ok(false);
+        }
+        // Only this physical terminal record can authorize the Finish. Any
+        // later blank, malformed, conflict, or torn record resets the match.
+        terminal_match = false;
+        if !within_limit || !line.ends_with(b"\n") {
+            continue;
+        }
+        if jagent::validate_no_duplicate_members(&line).is_err() {
+            // Preserve recovery past an older torn line, while failing closed
+            // for structurally valid JSON whose identity is ambiguous.
+            if serde_json::from_slice::<serde_json::Value>(&line).is_ok() {
+                return Ok(false);
+            }
+            continue;
+        }
+        if serde_json::from_slice::<EventIdentity<'_>>(&line)
+            .ok()
+            .is_some_and(|identity| identity.id == expected.id)
+        {
+            matching_identities = matching_identities.saturating_add(1);
+        }
+        terminal_match = matches!(
+            serde_json::from_slice::<ExecutionEvent>(&line),
+            Ok(ExecutionEvent::Start(ref event)) if event == expected
+        );
+    }
+
+    Ok(terminal_match && matching_identities == 1)
 }
 
 fn read_records(path: &Path) -> io::Result<Vec<FoldedExecution>> {
@@ -1580,28 +1855,54 @@ mod tests {
     use nix::unistd::mkfifo;
     use std::os::unix::fs::symlink;
 
-    struct FaultingDurability {
-        fail_data: bool,
-        fail_directory: bool,
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AppendFaultStage {
+        WriteAfter(usize),
+        DataSync,
+        DirectorySync,
+    }
+
+    struct FaultingAppendIo {
+        stage: AppendFaultStage,
+        write_calls: std::cell::Cell<usize>,
+        written: std::cell::Cell<usize>,
         data_calls: std::cell::Cell<usize>,
         directory_calls: std::cell::Cell<usize>,
     }
 
-    impl FaultingDurability {
-        fn new(fail_data: bool, fail_directory: bool) -> Self {
+    impl FaultingAppendIo {
+        fn new(stage: AppendFaultStage) -> Self {
             Self {
-                fail_data,
-                fail_directory,
+                stage,
+                write_calls: std::cell::Cell::new(0),
+                written: std::cell::Cell::new(0),
                 data_calls: std::cell::Cell::new(0),
                 directory_calls: std::cell::Cell::new(0),
             }
         }
     }
 
-    impl JournalDurability for FaultingDurability {
+    impl JournalAppendIo for FaultingAppendIo {
+        fn write(&self, file: &mut File, bytes: &[u8]) -> io::Result<usize> {
+            self.write_calls.set(self.write_calls.get() + 1);
+            let requested = match self.stage {
+                AppendFaultStage::WriteAfter(limit) => {
+                    let remaining = limit.saturating_sub(self.written.get());
+                    if remaining == 0 {
+                        return Err(io::Error::other("injected append-write failure"));
+                    }
+                    remaining.min(bytes.len())
+                }
+                AppendFaultStage::DataSync | AppendFaultStage::DirectorySync => bytes.len(),
+            };
+            let count = file.write(&bytes[..requested])?;
+            self.written.set(self.written.get() + count);
+            Ok(count)
+        }
+
         fn sync_data(&self, file: &File) -> io::Result<()> {
             self.data_calls.set(self.data_calls.get() + 1);
-            if self.fail_data {
+            if self.stage == AppendFaultStage::DataSync {
                 Err(io::Error::other("injected data-sync failure"))
             } else {
                 file.sync_data()
@@ -1610,7 +1911,7 @@ mod tests {
 
         fn sync_directory(&self, lock: &JournalLock) -> io::Result<()> {
             self.directory_calls.set(self.directory_calls.get() + 1);
-            if self.fail_directory {
+            if self.stage == AppendFaultStage::DirectorySync {
                 Err(io::Error::other("injected directory-sync failure"))
             } else {
                 lock._directory.sync_all()
@@ -2521,9 +2822,9 @@ mod tests {
         };
 
         let (_data_dir, data_journal) = journal();
-        let data_fault = FaultingDurability::new(true, false);
+        let data_fault = FaultingAppendIo::new(AppendFaultStage::DataSync);
         let error = data_journal
-            .append_event_with_limits_and_durability(
+            .append_event_with_limits_and_io(
                 start("data-fault"),
                 MAX_JOURNAL_EVENT_LINES,
                 u64::MAX,
@@ -2545,9 +2846,9 @@ mod tests {
         assert_eq!(data_journal.records().unwrap()[0].id, "data-fault");
 
         let (_directory_dir, directory_journal) = journal();
-        let directory_fault = FaultingDurability::new(false, true);
+        let directory_fault = FaultingAppendIo::new(AppendFaultStage::DirectorySync);
         let error = directory_journal
-            .append_event_with_limits_and_durability(
+            .append_event_with_limits_and_io(
                 start("directory-fault"),
                 MAX_JOURNAL_EVENT_LINES,
                 u64::MAX,
@@ -2566,9 +2867,9 @@ mod tests {
             1
         );
 
-        let existing_path = FaultingDurability::new(false, true);
+        let existing_path = FaultingAppendIo::new(AppendFaultStage::DirectorySync);
         directory_journal
-            .append_event_with_limits_and_durability(
+            .append_event_with_limits_and_io(
                 ExecutionEvent::Finish {
                     jsh_execution_version: EXECUTION_JOURNAL_VERSION,
                     id: "directory-fault".into(),
@@ -2598,6 +2899,183 @@ mod tests {
             2,
             "neither barrier path retries an event internally"
         );
+    }
+
+    #[test]
+    fn reconciled_start_distinguishes_a_complete_tail_from_a_torn_tail() {
+        let (_pre_write_directory, pre_write_journal) = journal();
+        let pre_write = FaultingAppendIo::new(AppendFaultStage::WriteAfter(0));
+        let error = pre_write_journal
+            .record_start_reconciled_with_io(
+                "pre-write-start",
+                Some("wanted"),
+                6,
+                "never written",
+                "/tmp",
+                9,
+                &pre_write,
+            )
+            .unwrap_err();
+        assert!(!is_commit_state_unknown(&error));
+        assert!(!pre_write_journal.path().exists());
+        assert_eq!(pre_write.written.get(), 0);
+        assert_eq!(pre_write.data_calls.get(), 0);
+        assert_eq!(pre_write.directory_calls.get(), 0);
+
+        let (_data_directory, data_journal) = journal();
+        let data_fault = FaultingAppendIo::new(AppendFaultStage::DataSync);
+        data_journal
+            .record_start_reconciled_with_io(
+                "data-recovered-start",
+                Some("wanted"),
+                6,
+                "data recovery",
+                "/tmp",
+                9,
+                &data_fault,
+            )
+            .unwrap();
+        assert_eq!(data_fault.data_calls.get(), 1);
+        assert_eq!(data_fault.directory_calls.get(), 0);
+        assert_eq!(data_journal.records().unwrap().len(), 1);
+
+        let (_directory, recovered_journal) = journal();
+        let directory_fault = FaultingAppendIo::new(AppendFaultStage::DirectorySync);
+
+        recovered_journal
+            .record_start_reconciled_with_io(
+                "recovered-start",
+                Some("wanted"),
+                7,
+                "secret command",
+                "/tmp",
+                10,
+                &directory_fault,
+            )
+            .unwrap();
+
+        assert_eq!(directory_fault.data_calls.get(), 1);
+        assert_eq!(directory_fault.directory_calls.get(), 1);
+        assert_eq!(
+            fs::read_to_string(recovered_journal.path())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let reopened = ExecutionJournal::with_path(recovered_journal.path().to_owned());
+        reopened
+            .record_finish("recovered-start", 7, 2, "/after", 12)
+            .unwrap();
+        let record = reopened.get("recovered-start").unwrap().unwrap();
+        assert_eq!(record.command, "secret command");
+        assert_eq!(record.exit_code, Some(7));
+        assert_eq!(
+            fs::read_to_string(recovered_journal.path())
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+
+        let (_torn_directory, torn) = journal();
+        let partial = FaultingAppendIo::new(AppendFaultStage::WriteAfter(12));
+        let error = torn
+            .record_start_reconciled_with_io(
+                "torn-start",
+                Some("wanted"),
+                8,
+                "must not be rebound",
+                "/tmp",
+                20,
+                &partial,
+            )
+            .unwrap_err();
+        assert!(is_commit_state_unknown(&error));
+        assert_eq!(partial.written.get(), 12);
+        assert_eq!(partial.data_calls.get(), 0);
+        assert_eq!(partial.directory_calls.get(), 0);
+        assert!(!fs::read(torn.path()).unwrap().ends_with(b"\n"));
+        let reopened = ExecutionJournal::with_path(torn.path().to_owned());
+        assert!(reopened.records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn start_recovery_requires_one_exact_complete_terminal_identity() {
+        let expected = validated_start_event(
+            "strict-recovery",
+            Some("wanted"),
+            9,
+            "expected command",
+            "/tmp",
+            30,
+        )
+        .unwrap();
+        let encode = |event: ExecutionEvent| {
+            let mut line = serde_json::to_vec(&event).unwrap();
+            line.push(b'\n');
+            line
+        };
+        let exact = encode(ExecutionEvent::Start(expected.clone()));
+        let check = |label: &str, bytes: &[u8], accepted: bool| {
+            let (_directory, journal) = journal();
+            fs::write(journal.path(), bytes).unwrap();
+            fs::set_permissions(journal.path(), fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                journal.has_exact_terminal_start(&expected).unwrap(),
+                accepted,
+                "fixture {label}"
+            );
+        };
+
+        check("exact", &exact, true);
+
+        let mut prior_torn = b"{\"torn\":".to_vec();
+        prior_torn.push(b'\n');
+        prior_torn.extend_from_slice(&exact);
+        check("prior torn record then exact", &prior_torn, true);
+
+        let mut torn = exact.clone();
+        torn.pop();
+        check("unterminated exact start", &torn, false);
+
+        let mut duplicate = exact.clone();
+        duplicate.extend_from_slice(&exact);
+        check("duplicate identity", &duplicate, false);
+
+        let duplicate_member = b"{\"event\":\"start\",\"jsh_execution_version\":1,\"id\":\"strict-recovery\",\"\\u0069d\":\"strict-recovery\",\"session_id\":\"wanted\",\"seq\":9,\"command\":\"expected command\",\"command_truncated\":false,\"cwd\":\"/tmp\",\"started_at_ms\":30}\n";
+        check("decoded duplicate id member", duplicate_member, false);
+
+        let mut different = expected.clone();
+        different.command = "different payload".into();
+        check(
+            "same identity and sequence with different payload",
+            &encode(ExecutionEvent::Start(different)),
+            false,
+        );
+
+        let mut garbage_tail = exact.clone();
+        garbage_tail.extend_from_slice(b"trailing garbage");
+        check("valid start followed by garbage", &garbage_tail, false);
+
+        let mut finish_tail = exact.clone();
+        finish_tail.extend_from_slice(&encode(ExecutionEvent::Finish {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: expected.id.clone(),
+            exit_code: 0,
+            duration_ms: 1,
+            cwd_after: "/tmp".into(),
+            ended_at_ms: 31,
+        }));
+        check("successor finish", &finish_tail, false);
+
+        let mut conflict_tail = exact;
+        conflict_tail.extend_from_slice(&encode(ExecutionEvent::Conflict(ConflictEvent {
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            id: expected.id.clone(),
+            slot: ConflictSlot::Finish,
+        })));
+        check("successor conflict", &conflict_tail, false);
     }
 
     #[test]

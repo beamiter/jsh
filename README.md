@@ -426,7 +426,15 @@ reader byte ceiling and refuses an over-budget write before changing the file.
 Every successful append data-syncs the journal before returning; creation of a
 new journal pathname also syncs its parent directory. A durability-barrier
 error happens after the event bytes may already be visible, so its commit state
-is explicitly unknown and the writer does not retry the event internally.
+is explicitly unknown and the writer does not retry the event internally. A
+first-byte write failure removes a newly created empty pathname; a partial
+write stays visible as a recoverable torn tail and is also commit-unknown.
+Before executing an interactive command, jsh reconciles an unknown Start only
+when a fresh read finds that exact complete Start as the sole matching identity
+and final physical record, then retries only its data and parent barriers. It
+writes the Finish for that same lifecycle without rewriting the Start or
+re-executing the command. Torn, duplicated, or followed Start records remain
+unbound and produce a command-redacted warning.
 Individual metadata and captured-output records also have hard size limits.
 Exact duplicate finish or output delivery is idempotent; conflicting duplicates
 poison only their own lifecycle slot until the next authoritative start.

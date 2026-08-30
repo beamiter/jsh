@@ -47,6 +47,13 @@ fn execute_text(source: &str, state: &mut ShellState) -> i32 {
     }
 }
 
+fn execution_journal_start_warning(error: &io::Error) -> String {
+    format!(
+        "jsh: execution journal Start was not confirmed ({:?})",
+        error.kind()
+    )
+}
+
 fn finish_noninteractive(mut state: ShellState, status: i32) -> i32 {
     state.last_exit_code = status;
     run_exit_trap(&mut state)
@@ -588,18 +595,25 @@ impl Shell {
                         .unwrap_or_default();
                     let started_at_ms = execution::unix_time_ms();
                     let journal = execution::ExecutionJournal::configured();
-                    let journal_started = journal.as_ref().is_some_and(|journal| {
-                        journal
-                            .record_start(
-                                &execution_id,
-                                self.session_id.as_deref(),
-                                self.execution_seq,
-                                &line,
-                                &cwd_before,
-                                started_at_ms,
-                            )
-                            .is_ok()
-                    });
+                    let journal_started = match journal.as_ref() {
+                        Some(journal) => match journal.record_start_reconciled(
+                            &execution_id,
+                            self.session_id.as_deref(),
+                            self.execution_seq,
+                            &line,
+                            &cwd_before,
+                            started_at_ms,
+                        ) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                // Do not print the command: this warning can
+                                // share a terminal with sensitive input.
+                                eprintln!("{}", execution_journal_start_warning(&error));
+                                false
+                            }
+                        },
+                        None => false,
+                    };
 
                     // OSC 133;C — command output start
                     osc::command_output_start(&execution_id, &line, &cwd_before);
@@ -796,5 +810,16 @@ mod tests {
     fn complete_program_reads_are_bounded_before_parsing() {
         let error = read_program_interruptibly_with_limit(&b"12345"[..], 4).unwrap_err();
         assert!(matches!(error, ProgramReadError::Io(_)));
+    }
+
+    #[test]
+    fn execution_journal_warning_never_includes_error_payload_or_command_text() {
+        let error = io::Error::other("secret command embedded by a lower layer");
+        let warning = execution_journal_start_warning(&error);
+
+        assert!(warning.contains("execution journal Start was not confirmed"));
+        assert!(warning.contains("Other"));
+        assert!(!warning.contains("secret command"));
+        assert!(!warning.contains("lower layer"));
     }
 }
