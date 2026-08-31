@@ -41,7 +41,7 @@ jagent = { git = "https://github.com/beamiter/jagent.git", rev = "ab7552d2bf287e
 # family, one place to patch. deny.toml keeps the old one from coming back.
 serde_yaml_ng = "0.10"
 toml = "1.1"
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
