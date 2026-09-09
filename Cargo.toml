@@ -33,7 +33,7 @@ ureq = { version = "3", optional = true }
 # Pin the shared policy/wire validator so a branch move cannot silently change
 # journal uniqueness semantics. This remains baseline even without AI; its
 # normal dependencies (regex, serde, serde_json) are already always present.
-jagent = { git = "https://github.com/beamiter/jagent.git", rev = "ab7552d2bf287e330f67f7b75ab766b73aa6268e" }
+jagent = { git = "https://github.com/beamiter/jagent.git", rev = "6ed0b9f037eff9359d62ed448e0d117327fabe26" }
 # serde_yaml 0.9 is abandoned upstream ("+deprecated", no successor release),
 # so an advisory against it could never be answered by a version bump.
 # serde_yaml_ng is the maintained continuation with the same API, and is what
