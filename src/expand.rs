@@ -1520,15 +1520,12 @@ fn expand_process_sub(cmd: &str, kind: &ProcessSubKind, state: &mut ShellState) 
                 }
             }
             crate::signal::reset_child_signals();
-            state.interactive = false;
+            // Same inheritance as command substitution: clear errexit unless
+            // inherit_errexit, drop ERR trap unless errtrace, then run as a
+            // complete non-interactive program (exit/errexit gates).
+            prepare_command_substitution_child(state);
             match crate::parser::parse(cmd) {
-                Ok(cmds) => {
-                    let mut code = 0;
-                    for c in &cmds {
-                        code = crate::executor::execute_complete_command(c, state);
-                    }
-                    std::process::exit(code);
-                }
+                Ok(cmds) => std::process::exit(crate::executor::execute_program(&cmds, state)),
                 Err(_) => std::process::exit(2),
             }
         }

@@ -88,6 +88,7 @@ fn hostile_context() -> AiContext {
             "auth failed: Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123".to_string(),
             1,
         )),
+        execution_digest: None,
     }
 }
 

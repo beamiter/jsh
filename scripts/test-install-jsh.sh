@@ -13,6 +13,14 @@ INSTALLER="${SCRIPT_DIR}/install-jsh.sh"
     exit 1
 }
 
+have() { command -v "$1" > /dev/null 2>&1; }
+have minisign || {
+    echo "need minisign on PATH to run installer acceptance tests" >&2
+    echo "(Debian/Ubuntu: sudo apt install minisign)" >&2
+    exit 1
+}
+MINISIGN_DIR="$(cd -- "$(dirname -- "$(command -v minisign)")" && pwd)"
+
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/test-install-jsh.XXXXXX")"
 trap 'rm -rf "${ROOT}"' EXIT
 
@@ -21,6 +29,17 @@ FAKE_HOME="${ROOT}/home"
 BIN="${FAKE_HOME}/.local/bin"
 TARGET="x86_64-unknown-linux-gnu"
 mkdir -p "${FAKE_HOME}"
+
+# Ephemeral signing key for fixtures. The installer honours JSH_MINISIGN_PUBKEY
+# only because every harness run also sets JSH_INSTALL_BASE_URL.
+MINI_DIR="${ROOT}/minisign"
+mkdir -p "${MINI_DIR}"
+printf '\n\n' | minisign -G -p "${MINI_DIR}/test.pub" -s "${MINI_DIR}/test.secret" > /dev/null 2>&1
+TEST_MINISIGN_PUBKEY="$(awk '/^R/{print; exit}' "${MINI_DIR}/test.pub")"
+[ -n "${TEST_MINISIGN_PUBKEY}" ] || {
+    echo "failed to generate ephemeral minisign pubkey" >&2
+    exit 1
+}
 
 pass=0
 fail=0
@@ -48,6 +67,44 @@ version_is() { [ "$("$1" --version)" = "$2" ]; }
 
 indent() { printf '    %s\n' "${1//$'\n'/$'\n'    }"; }
 
+sign_manifest() {
+    # sign_manifest PATH — writes PATH.minisig using the ephemeral secret.
+    printf '\n' | minisign -Sm "$1" -s "${MINI_DIR}/test.secret" > /dev/null 2>&1
+}
+
+# publish_manifest <version> [sha256-override]
+# Writes signed manifests under latest/download and download/v$version.
+# Default digest is the current sidecar for TARGET; override replaces it.
+publish_manifest() {
+    local v="$1" sha="${2:-}"
+    local archive="jsh-${v}-${TARGET}.tar.gz"
+    local dir="${REL}/download/v${v}"
+    if [ -z "${sha}" ]; then
+        sha="$(cut -d' ' -f1 < "${dir}/${archive}.sha256" | head -1 | tr -d '\r')"
+    fi
+    mkdir -p "${REL}/latest/download" "${dir}"
+    cat > "${REL}/latest/download/manifest.json" <<EOF
+{
+  "schema": 1,
+  "name": "jsh",
+  "version": "${v}",
+  "tag": "v${v}",
+  "repository": "beamiter/jsh",
+  "artifacts": [
+    {
+      "target": "${TARGET}",
+      "file": "${archive}",
+      "sha256": "${sha}",
+      "url": "file://${dir}/${archive}"
+    }
+  ]
+}
+EOF
+    cp "${REL}/latest/download/manifest.json" "${dir}/manifest.json"
+    sign_manifest "${REL}/latest/download/manifest.json"
+    cp "${REL}/latest/download/manifest.json.minisig" "${dir}/manifest.json.minisig"
+}
+
 # make_release <version> [corrupt-checksum]
 make_release() {
     local v="$1" corrupt="${2:-}"
@@ -71,23 +128,16 @@ EOF
         printf '%064d  %s\n' 0 "jsh-${v}-${TARGET}.tar.gz" \
             > "${REL}/download/v${v}/jsh-${v}-${TARGET}.tar.gz.sha256"
     fi
-    cat > "${REL}/latest/download/manifest.json" <<EOF
-{
-  "schema": 1,
-  "name": "jsh",
-  "version": "${v}",
-  "tag": "v${v}",
-  "repository": "beamiter/jsh",
-  "artifacts": [
-    {
-      "target": "${TARGET}",
-      "file": "jsh-${v}-${TARGET}.tar.gz",
-      "sha256": "$(cut -d' ' -f1 < "${REL}/download/v${v}/jsh-${v}-${TARGET}.tar.gz.sha256")",
-      "url": "file://${REL}/download/v${v}/jsh-${v}-${TARGET}.tar.gz"
-    }
-  ]
+    publish_manifest "${v}"
 }
-EOF
+
+# Re-checksum an already-written archive and refresh the signed manifest so
+# hostile-member tests still reach the archive checks rather than dying on a
+# digest mismatch first.
+refresh_release_digests() {
+    local v="$1"
+    (cd "${REL}/download/v${v}" && sha256sum "jsh-${v}-${TARGET}.tar.gz" > "jsh-${v}-${TARGET}.tar.gz.sha256")
+    publish_manifest "${v}"
 }
 
 # A pristine environment every time: no inherited PATH, cache, or state.
@@ -97,10 +147,11 @@ run() {
     env -i HOME="${FAKE_HOME}" PATH="${PATH_FOR_RUN}" \
         XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
         JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${TARGET}" \
+        JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
         sh "${INSTALLER}" --channel release "$@"
 }
 
-PATH_FOR_RUN="/usr/local/bin:/usr/bin:/bin"
+PATH_FOR_RUN="${MINISIGN_DIR}:/usr/local/bin:/usr/bin:/bin"
 
 echo "== check with nothing installed =="
 make_release 0.3.0
@@ -122,7 +173,7 @@ assert "installed binary runs" version_is "${BIN}/jsh" "jsh 0.3.0 (fake)"
 assert "reports PATH resolution" matches "${out}" 'not on PATH|not this shell|not the copy just installed'
 
 echo "== rerun is a no-op, --force reinstalls =="
-PATH_FOR_RUN="${BIN}:/usr/local/bin:/usr/bin:/bin"
+PATH_FOR_RUN="${BIN}:${MINISIGN_DIR}:/usr/local/bin:/usr/bin:/bin"
 out="$(run 2>&1)"
 indent "${out}"
 assert "no-op when current" matches "${out}" 'already installed'
@@ -176,7 +227,7 @@ EOF
 chmod +x "${MV_STUB}/mv"
 
 rm -f "${MV_COUNT}" "${MV_LOG}" "${MV_FAIL_ROLLBACK}"
-PATH_FOR_RUN="${MV_STUB}:${BIN}:/usr/local/bin:/usr/bin:/bin"
+PATH_FOR_RUN="${MV_STUB}:${BIN}:${MINISIGN_DIR}:/usr/local/bin:/usr/bin:/bin"
 out="$(run 2>&1)"
 rc=$?
 indent "${out}"
@@ -209,7 +260,7 @@ assert "failed rollback leaves no restoring temporary" \
 cp "${rollback}" "${BIN}/jsh"
 chmod 0755 "${BIN}/jsh"
 rm -f "${MV_FAIL_ROLLBACK}" "${MV_COUNT}" "${MV_LOG}"
-PATH_FOR_RUN="${BIN}:/usr/local/bin:/usr/bin:/bin"
+PATH_FOR_RUN="${BIN}:${MINISIGN_DIR}:/usr/local/bin:/usr/bin:/bin"
 assert "fixture recovery restores the previous binary" \
     version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
 
@@ -245,6 +296,7 @@ make_release 0.3.1
 out="$(run --check --json --max-age 0 2> /dev/null)" # refresh the cache after the probes above
 assert "cache written" [ -f "${FAKE_HOME}/.cache/jsh/update-check.json" ]
 mv "${REL}/latest/download/manifest.json" "${REL}/manifest.hidden"
+mv "${REL}/latest/download/manifest.json.minisig" "${REL}/manifest.minisig.hidden"
 out="$(run --check --json --max-age 3600 2> /dev/null)"
 assert "fresh cache answers without network" matches "${out}" '"latest":"0\.3\.1"'
 out="$(run --check --json 2> /dev/null)"
@@ -253,6 +305,7 @@ indent "${out}"
 assert "unreachable manifest exits nonzero" [ ${rc} -ne 0 ]
 assert "unreachable manifest reported, not guessed" matches "${out}" '"error":"cannot reach'
 mv "${REL}/manifest.hidden" "${REL}/latest/download/manifest.json"
+mv "${REL}/manifest.minisig.hidden" "${REL}/latest/download/manifest.json.minisig"
 
 echo "== a clamped PATH still finds the user's jsh via JSH_LOOKUP_PATH =="
 # A terminal runs --check with PATH clamped to system directories so the tools
@@ -266,9 +319,10 @@ CARGO_BIN="${CARGO_HOME_DIR}/.cargo/bin"
 mkdir -p "${CARGO_BIN}"
 cp "${BIN}/jsh" "${CARGO_BIN}/jsh"
 clamped_run() {
-    env -i HOME="${CARGO_HOME_DIR}" PATH="/usr/local/bin:/usr/bin:/bin" \
+    env -i HOME="${CARGO_HOME_DIR}" PATH="/usr/local/bin:/usr/bin:/bin:${MINISIGN_DIR}" \
         XDG_CACHE_HOME="${CARGO_HOME_DIR}/.cache" XDG_STATE_HOME="${CARGO_HOME_DIR}/.local/state" \
         JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${TARGET}" \
+        JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
         "$@" sh "${INSTALLER}" --check --json
 }
 out="$(clamped_run 2> /dev/null)"
@@ -309,13 +363,53 @@ indent "${out}"
 assert "nonzero exit" [ ${rc} -ne 0 ]
 assert "malformed digest rejected" matches "${out}" 'is not a SHA-256 digest'
 
+echo "== missing or bad manifest signature aborts =="
+make_release 0.3.27
+rm -f "${REL}/latest/download/manifest.json.minisig" \
+    "${REL}/download/v0.3.27/manifest.json.minisig"
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "missing minisig exits nonzero" [ ${rc} -ne 0 ]
+assert "refuses unsigned metadata" matches "${out}" 'refusing to trust unsigned metadata'
+assert "old binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+
+make_release 0.3.28
+# Detached sig for different bytes / wrong key must not verify.
+printf '{"tampered":true}\n' > "${ROOT}/tamper-manifest.json"
+printf '\n' | minisign -Sm "${ROOT}/tamper-manifest.json" -s "${MINI_DIR}/test.secret" > /dev/null 2>&1
+cp "${ROOT}/tamper-manifest.json.minisig" "${REL}/latest/download/manifest.json.minisig"
+cp "${ROOT}/tamper-manifest.json.minisig" "${REL}/download/v0.3.28/manifest.json.minisig"
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "bad signature exits nonzero" [ ${rc} -ne 0 ]
+assert "signature verification failed" matches "${out}" 'signature verification failed'
+assert "old binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+
+echo "== sidecar matching archive but not signed manifest aborts =="
+make_release 0.3.29
+real_sha="$(cut -d' ' -f1 < "${REL}/download/v0.3.29/jsh-0.3.29-${TARGET}.tar.gz.sha256")"
+# Signed manifest lies; sidecar still matches the archive.
+publish_manifest 0.3.29 "$(printf '%064d' 0)"
+# Restore a correct sidecar so archive == sidecar != manifest.
+printf '%s  jsh-0.3.29-%s.tar.gz\n' "${real_sha}" "${TARGET}" \
+    > "${REL}/download/v0.3.29/jsh-0.3.29-${TARGET}.tar.gz.sha256"
+out="$(run 2>&1)"
+rc=$?
+indent "${out}"
+assert "nonzero exit" [ ${rc} -ne 0 ]
+assert "sidecar/manifest disagreement refused" \
+    matches "${out}" 'does not match the signed manifest digest'
+assert "old binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+
 echo "== hostile archive members are rejected before extraction =="
 make_release 0.3.23
 rm -rf "${ROOT}/hostile"
 mkdir -p "${ROOT}/hostile/jsh-0.3.23-${TARGET}"
 ln -s /etc/passwd "${ROOT}/hostile/jsh-0.3.23-${TARGET}/jsh"
 (cd "${ROOT}/hostile" && tar -czf "${REL}/download/v0.3.23/jsh-0.3.23-${TARGET}.tar.gz" "jsh-0.3.23-${TARGET}")
-(cd "${REL}/download/v0.3.23" && sha256sum "jsh-0.3.23-${TARGET}.tar.gz" > "jsh-0.3.23-${TARGET}.tar.gz.sha256")
+refresh_release_digests 0.3.23
 out="$(run 2>&1)"
 rc=$?
 indent "${out}"
@@ -329,7 +423,7 @@ printf '#!/bin/sh\necho "jsh 0.3.24 (fake)"\n' > "${ROOT}/hostile/jsh-0.3.24-${T
 chmod +x "${ROOT}/hostile/jsh-0.3.24-${TARGET}/jsh"
 printf 'payload\n' > "${ROOT}/hostile/jsh-0.3.24-${TARGET}/extra"
 (cd "${ROOT}/hostile" && tar -czf "${REL}/download/v0.3.24/jsh-0.3.24-${TARGET}.tar.gz" "jsh-0.3.24-${TARGET}")
-(cd "${REL}/download/v0.3.24" && sha256sum "jsh-0.3.24-${TARGET}.tar.gz" > "jsh-0.3.24-${TARGET}.tar.gz.sha256")
+refresh_release_digests 0.3.24
 out="$(run 2>&1)"
 rc=$?
 indent "${out}"
@@ -345,7 +439,7 @@ printf 'owned\n' > "${ROOT}/hostile/escape"
 (cd "${ROOT}/hostile/jsh-0.3.25-${TARGET}" \
     && tar -cPzf "${REL}/download/v0.3.25/jsh-0.3.25-${TARGET}.tar.gz" \
         -C "${ROOT}/hostile" "jsh-0.3.25-${TARGET}" "../hostile/escape" 2> /dev/null)
-(cd "${REL}/download/v0.3.25" && sha256sum "jsh-0.3.25-${TARGET}.tar.gz" > "jsh-0.3.25-${TARGET}.tar.gz.sha256")
+refresh_release_digests 0.3.25
 out="$(run 2>&1)"
 rc=$?
 indent "${out}"
@@ -361,13 +455,17 @@ assert "traversal version rejected" [ ${rc} -ne 0 ]
 assert "traversal version message" matches "${out}" 'not a valid version'
 out="$(env -i HOME="${FAKE_HOME}" PATH="${PATH_FOR_RUN}" \
     JSH_INSTALL_BASE_URL="http://example.invalid/releases" \
-    JSH_INSTALL_TARGET="${TARGET}" sh "${INSTALLER}" --check 2>&1)"
+    JSH_INSTALL_TARGET="${TARGET}" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
+    sh "${INSTALLER}" --check 2>&1)"
 rc=$?
 assert "plain-HTTP base URL rejected" [ ${rc} -ne 0 ]
 assert "plain-HTTP message" matches "${out}" 'JSH_INSTALL_BASE_URL'
 out="$(env -i HOME="${FAKE_HOME}" PATH="${PATH_FOR_RUN}" \
     JSH_INSTALL_BASE_URL="file://${REL}" \
-    JSH_INSTALL_TARGET="../../etc" sh "${INSTALLER}" --check 2>&1)"
+    JSH_INSTALL_TARGET="../../etc" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
+    sh "${INSTALLER}" --check 2>&1)"
 rc=$?
 assert "traversal target rejected" [ ${rc} -ne 0 ]
 assert "traversal target message" matches "${out}" 'not a valid target triple'
@@ -393,7 +491,7 @@ mkdir -p "${stage}"
 printf '#!/bin/sh\necho "jsh 9.9.9"\n' > "${stage}/jsh"
 chmod +x "${stage}/jsh"
 tar -C "${ROOT}/stage2" -czf "${REL}/download/v0.3.3/jsh-0.3.3-${TARGET}.tar.gz" "jsh-0.3.3-${TARGET}"
-(cd "${REL}/download/v0.3.3" && sha256sum "jsh-0.3.3-${TARGET}.tar.gz" > "jsh-0.3.3-${TARGET}.tar.gz.sha256")
+refresh_release_digests 0.3.3
 out="$(run 2>&1)"
 rc=$?
 indent "${out}"
@@ -406,7 +504,7 @@ mkdir -p "${BSD}"
 printf '#!/bin/sh\necho "jsh: unknown option -- version" >&2\nexit 1\n' > "${BSD}/jsh"
 chmod +x "${BSD}/jsh"
 make_release 0.3.4
-PATH_FOR_RUN="${BSD}:${BIN}:/usr/local/bin:/usr/bin:/bin"
+PATH_FOR_RUN="${BSD}:${BIN}:${MINISIGN_DIR}:/usr/local/bin:/usr/bin:/bin"
 out="$(run 2>&1)"
 indent "${out}"
 assert "foreign jsh reported" matches "${out}" 'which is not this shell'
@@ -419,7 +517,7 @@ ALT="${ROOT}/cargo-bin"
 mkdir -p "${ALT}"
 printf '#!/bin/sh\necho "jsh 0.1.0"\n' > "${ALT}/jsh"
 chmod +x "${ALT}/jsh"
-PATH_FOR_RUN="${ALT}:/usr/local/bin:/usr/bin:/bin"
+PATH_FOR_RUN="${ALT}:${MINISIGN_DIR}:/usr/local/bin:/usr/bin:/bin"
 out="$(run 2>&1)"
 indent "${out}"
 assert "no second copy is created" matches "${out}" "updated jsh 0\.1\.0 -> 0\.3\.4 at ${ALT}/jsh"
@@ -499,6 +597,7 @@ run_src() {
     env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
         XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
         JSH_INSTALL_BASE_URL="file://${REL}" \
+        JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
         sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin"
 }
 
@@ -523,6 +622,7 @@ ln -sf "${STUB}/rustup" "${THINSTUB}/rustup"
 out="$(env -i HOME="${FAKE_HOME}" PATH="${THINSTUB}:${THIN}" \
     XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
     JSH_INSTALL_BASE_URL="file://${REL}" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
     sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin" --force 2>&1)"
 rc=$?
 indent "$(grep -E 'musl-tools|lend itself|glibc' <<< "${out}")"
@@ -538,6 +638,7 @@ rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
 out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
     XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
     JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${SRC_ARCH}-unknown-linux-gnu" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
     sh "${INSTALLER}" --channel source --bin-dir "${ROOT}/src-bin" --force 2>&1)"
 assert "exit 0" [ $? -eq 0 ]
 assert "cargo builds the gnu target" \
@@ -553,6 +654,7 @@ rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
 out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
     XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
     JSH_INSTALL_BASE_URL="file://${REL}" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
     sh "${INSTALLER}" --bin-dir "${ROOT}/src-bin" 2>&1)"
 rc=$?
 indent "$(grep -E 'building' <<< "${out}")"
@@ -571,6 +673,7 @@ rm -rf "${ROOT}/src-bin"; rm -f "${SRCLOG}"
 out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
     XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
     JSH_INSTALL_BASE_URL="file://${EMPTY_REL}" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
     sh "${INSTALLER}" --channel release --bin-dir "${ROOT}/src-bin" 2>&1)"
 rc=$?
 indent "$(grep -E 'falling back|manifest' <<< "${out}")"
@@ -587,6 +690,7 @@ rm -f "${SRCLOG}"
 out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
     XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
     JSH_INSTALL_BASE_URL="file://${REL}" JSH_INSTALL_TARGET="${TARGET}" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
     sh "${INSTALLER}" --channel release --bin-dir "${ROOT}/src-bin" --force 2>&1)"
 rc=$?
 assert "exit nonzero" [ ${rc} -ne 0 ]
@@ -600,6 +704,7 @@ rm -f "${SRCLOG}"
 out="$(env -i HOME="${FAKE_HOME}" PATH="${STUB}:${PATH_FOR_RUN}" \
     XDG_CACHE_HOME="${FAKE_HOME}/.cache" XDG_STATE_HOME="${FAKE_HOME}/.local/state" \
     JSH_INSTALL_BASE_URL="file://${EMPTY_REL}" JSH_INSTALL_TARGET="${TARGET}" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
     sh "${INSTALLER}" --stage-dir "${ROOT}/stage-out" 2>&1)"
 rc=$?
 assert "exit nonzero" [ ${rc} -ne 0 ]

@@ -38,6 +38,15 @@ MAX_ARCHIVE_BYTES=104857600
 MAX_METADATA_BYTES=65536
 # Seconds allowed for one `--version` probe of an untrusted binary.
 PROBE_TIMEOUT=5
+# Minisign public key for the release manifest. Production curl|sh installs
+# always use this pin. An override is accepted only for local fixtures that
+# already set JSH_INSTALL_BASE_URL (the acceptance harness).
+JSH_MINISIGN_PUBKEY_PINNED='RWSpGU55xq8DicaNjDw4p9J0p1Qjg7zUnHcwdKGNIRw59d3wykIuAH0b'
+if [ -n "${JSH_INSTALL_BASE_URL:-}" ] && [ -n "${JSH_MINISIGN_PUBKEY:-}" ]; then
+    JSH_MINISIGN_PUBKEY_EFFECTIVE="${JSH_MINISIGN_PUBKEY}"
+else
+    JSH_MINISIGN_PUBKEY_EFFECTIVE="${JSH_MINISIGN_PUBKEY_PINNED}"
+fi
 
 # Defaulted after the arguments are parsed: source for an install, release for
 # --stage-dir. Empty means "nothing explicit was asked for".
@@ -89,10 +98,12 @@ Default install directory: the directory of the jsh already on PATH when it is
 writable, otherwise ~/.local/bin.
 
 Environment:
-  JSH_INSTALL_BASE_URL  Release base URL (mirrors, local testing)
-  JSH_INSTALL_TARGET    Force a target triple instead of detecting one
-  XDG_CACHE_HOME        Update-check cache base (default ~/.cache)
-  XDG_STATE_HOME        Rollback copy base (default ~/.local/state)
+  JSH_INSTALL_BASE_URL   Release base URL (mirrors, local testing)
+  JSH_INSTALL_TARGET     Force a target triple instead of detecting one
+  JSH_MINISIGN_PUBKEY    Override the pinned manifest pubkey (only honoured
+                         when JSH_INSTALL_BASE_URL is also set; for fixtures)
+  XDG_CACHE_HOME         Update-check cache base (default ~/.cache)
+  XDG_STATE_HOME         Rollback copy base (default ~/.local/state)
 USAGE
 }
 
@@ -560,18 +571,96 @@ cache_put() {
     return 0
 }
 
-latest_version() {
-    # Reads the manifest published at a stable "latest" URL, so no API token
-    # and no rate limit are involved. The version it names is untrusted input:
-    # it becomes part of a URL and a path, so it must satisfy the same grammar
-    # as a version typed on the command line.
+require_minisign() {
+    have minisign || die "need minisign to verify the release manifest (Debian/Ubuntu: sudo apt install minisign)"
+}
+
+# verify_manifest_signature MANIFEST_PATH SIG_PATH
+#
+# Fail closed: a missing tool, a missing signature, or a bad signature aborts
+# the install. The pubkey is the pin above (or a fixture override).
+verify_manifest_signature() {
+    require_minisign
+    [ -f "$1" ] || die "release manifest is missing"
+    [ -f "$2" ] || die "no signature for the release manifest at $2; refusing to trust unsigned metadata"
+    if ! minisign -Vm "$1" -x "$2" -P "${JSH_MINISIGN_PUBKEY_EFFECTIVE}" > /dev/null 2>&1; then
+        die "release manifest signature verification failed"
+    fi
+    return 0
+}
+
+# SHA-256 for TARGET from a verified manifest's artifacts[] list.
+manifest_artifact_sha256() {
+    # manifest_artifact_sha256 MANIFEST TARGET
+    awk -v want="$2" '
+        /"target"[[:space:]]*:/ {
+            if (match($0, /"target"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
+                s = substr($0, RSTART, RLENGTH)
+                sub(/^"target"[[:space:]]*:[[:space:]]*"/, "", s)
+                sub(/"$/, "", s)
+                target = s
+            }
+        }
+        /"sha256"[[:space:]]*:/ {
+            if (match($0, /"sha256"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]{64}"/)) {
+                s = substr($0, RSTART, RLENGTH)
+                sub(/^"sha256"[[:space:]]*:[[:space:]]*"/, "", s)
+                sub(/"$/, "", s)
+                sha = s
+            }
+        }
+        /}/ {
+            if (target == want && length(sha) == 64) {
+                print sha
+                exit
+            }
+            target = ""
+            sha = ""
+        }
+    ' "$1"
+}
+
+# Fetch and verify a release manifest. Dies on a present-but-unsigned or
+# bad-signature response; returns 1 only when the manifest cannot be fetched
+# (no release published yet), so callers can fall back to source.
+fetch_verified_manifest() {
+    # fetch_verified_manifest URL_PREFIX DEST_PATH
+    # URL_PREFIX is e.g. ${BASE_URL}/latest/download or .../download/v1.2.3
     make_tmp
-    manifest="${tmp_dir}/manifest.json"
-    fetch "${BASE_URL}/latest/download/manifest.json" "${manifest}" "${MAX_METADATA_BYTES}" \
-        2> /dev/null || return 1
-    version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${manifest}" | head -1)"
-    valid_version "${version}" || return 1
-    printf '%s\n' "${version}"
+    if ! fetch "$1/manifest.json" "$2" "${MAX_METADATA_BYTES}" 2> /dev/null; then
+        return 1
+    fi
+    if ! fetch "$1/manifest.json.minisig" "$2.minisig" "${MAX_METADATA_BYTES}" 2> /dev/null; then
+        die "no signature for the release manifest at $1/manifest.json.minisig; refusing to trust unsigned metadata"
+    fi
+    verify_manifest_signature "$2" "$2.minisig"
+    return 0
+}
+
+# Resolve the latest published version into the global `resolved_latest`.
+# Returns 0 on success, 1 when no manifest is reachable (caller may fall back).
+# Signature failures call die in *this* shell — never invoke via $(...).
+resolve_latest_version() {
+    make_tmp
+    _manifest="${tmp_dir}/manifest.json"
+    if ! fetch_verified_manifest "${BASE_URL}/latest/download" "${_manifest}"; then
+        resolved_latest=""
+        return 1
+    fi
+    resolved_latest="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${_manifest}" | head -1)"
+    valid_version "${resolved_latest}" || {
+        resolved_latest=""
+        return 1
+    }
+    return 0
+}
+
+latest_version() {
+    # Convenience for callers that only need stdout and can tolerate a
+    # subshell: prefer resolve_latest_version at top level when a signature
+    # failure must kill the install.
+    resolve_latest_version || return 1
+    printf '%s\n' "${resolved_latest}"
 }
 
 # --- install directory -------------------------------------------------------
@@ -651,7 +740,8 @@ if [ "${mode}" = "check" ]; then
         latest="${want_version}"
     elif latest="$(cache_get latest)"; then
         :
-    elif latest="$(latest_version)"; then
+    elif resolve_latest_version; then
+        latest="${resolved_latest}"
         cache_put "${latest}" "${target}"
     else
         latest=""
@@ -692,20 +782,22 @@ fi
 
 version="${want_version}"
 if [ "${channel}" = "release" ] && [ -z "${version}" ]; then
-    if ! version="$(latest_version)"; then
+    if ! resolve_latest_version; then
         # No manifest means no release to install — the state every repository
         # is in before its first tag. Staging has no source fallback (the
         # artifact is for another machine); an install has one, and taking it
         # automatically is what lets a bare `install-jsh.sh` work against a
         # repository that has never released. This is a not-found fallback
-        # only: a manifest that resolves but names artifacts that fail their
-        # checksum still dies, because "build something else instead" is not
-        # an answer to failed verification.
+        # only: a manifest that resolves but fails its signature, or names
+        # artifacts that fail their checksum, still dies, because "build
+        # something else instead" is not an answer to failed verification.
         [ "${mode}" != "stage" ] || die "cannot read the release manifest from ${BASE_URL}"
         version=""
         warn "cannot read the release manifest from ${BASE_URL} (no release published yet?)"
         warn "falling back to --channel source: cargo builds from the repository, which takes a few minutes"
         channel="source"
+    else
+        version="${resolved_latest}"
     fi
 fi
 
@@ -768,21 +860,38 @@ if [ "${channel}" = "release" ]; then
     # traversal, or shell metacharacter.
     valid_version "${version}" || die "not a valid version: ${version}"
     valid_target "${target}" || die "not a valid target triple: ${target}"
+
+    # Trust chain: signed manifest (pinned pubkey) names the artifact digest;
+    # the same-origin .sha256 sidecar must agree; then the archive bytes must
+    # match. Archive-member checks and the --version probe stay below.
+    make_tmp
+    release_manifest="${tmp_dir}/release-manifest.json"
+    fetch_verified_manifest "${BASE_URL}/download/v${version}" "${release_manifest}" \
+        || die "cannot read the signed release manifest for v${version} from ${BASE_URL}"
+    manifest_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${release_manifest}" | head -1)"
+    [ "${manifest_version}" = "${version}" ] \
+        || die "signed manifest version is ${manifest_version:-unknown}, expected ${version}"
+    expected="$(manifest_artifact_sha256 "${release_manifest}" "${target}")"
+    valid_sha256 "${expected}" \
+        || die "signed manifest has no SHA-256 for target ${target}"
+    expected="$(printf '%s' "${expected}" | tr 'A-F' 'a-f')"
+
     archive="jsh-${version}-${target}.tar.gz"
     url="${BASE_URL}/download/v${version}/${archive}"
     say "downloading ${archive}"
     fetch "${url}" "${tmp_dir}/${archive}" "${MAX_ARCHIVE_BYTES}" || die "download failed: ${url}"
 
-    # The published checksum is mandatory. It is same-origin, so it proves only
-    # that the bytes are the ones the release published — but without it a
-    # mirror can serve anything at all, and "continue without verification" is
-    # exactly the path an attacker would arrange to take.
+    # The published checksum is mandatory and must equal the signed-manifest
+    # digest. Same-origin alone is not enough; disagreeing with the signed
+    # manifest is treated as a verification failure, not a fallback.
     fetch "${url}.sha256" "${tmp_dir}/${archive}.sha256" "${MAX_METADATA_BYTES}" 2> /dev/null \
         || die "no published checksum at ${url}.sha256; refusing to install unverified bytes"
-    expected="$(cut -d' ' -f1 < "${tmp_dir}/${archive}.sha256" | head -1 | tr -d '\r')"
-    valid_sha256 "${expected}" || die "published checksum for ${archive} is not a SHA-256 digest"
+    sidecar="$(cut -d' ' -f1 < "${tmp_dir}/${archive}.sha256" | head -1 | tr -d '\r')"
+    valid_sha256 "${sidecar}" || die "published checksum for ${archive} is not a SHA-256 digest"
+    sidecar="$(printf '%s' "${sidecar}" | tr 'A-F' 'a-f')"
+    [ "${sidecar}" = "${expected}" ] \
+        || die "checksum sidecar for ${archive} does not match the signed manifest digest"
     actual="$(sha256_of "${tmp_dir}/${archive}")"
-    expected="$(printf '%s' "${expected}" | tr 'A-F' 'a-f')"
     actual="$(printf '%s' "${actual}" | tr 'A-F' 'a-f')"
     [ "${expected}" = "${actual}" ] \
         || die "checksum mismatch for ${archive} (expected ${expected}, got ${actual})"

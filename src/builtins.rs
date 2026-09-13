@@ -161,42 +161,44 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             state.jobs.print_jobs();
             0
         }
-        "fg" => {
-            let id = args
-                .first()
-                .and_then(|s| s.trim_start_matches('%').parse().ok());
-            match id {
+        "fg" => match args.first() {
+            Some(spec) => match state.jobs.resolve_spec(spec) {
                 Some(id) => state.jobs.continue_fg(id),
-                None => match state.jobs.get_last() {
-                    Some(job) => {
-                        let id = job.id;
-                        state.jobs.continue_fg(id)
-                    }
-                    None => {
-                        eprintln!("jsh: fg: no current job");
-                        1
-                    }
-                },
-            }
-        }
-        "bg" => {
-            let id = args
-                .first()
-                .and_then(|s| s.trim_start_matches('%').parse().ok());
-            match id {
+                None => {
+                    eprintln!("jsh: fg: {}: no such job", spec);
+                    1
+                }
+            },
+            None => match state.jobs.get_last() {
+                Some(job) => {
+                    let id = job.id;
+                    state.jobs.continue_fg(id)
+                }
+                None => {
+                    eprintln!("jsh: fg: no current job");
+                    1
+                }
+            },
+        },
+        "bg" => match args.first() {
+            Some(spec) => match state.jobs.resolve_spec(spec) {
                 Some(id) => state.jobs.continue_bg(id),
-                None => match state.jobs.get_last_stopped() {
-                    Some(job) => {
-                        let id = job.id;
-                        state.jobs.continue_bg(id)
-                    }
-                    None => {
-                        eprintln!("jsh: bg: no current job");
-                        1
-                    }
-                },
-            }
-        }
+                None => {
+                    eprintln!("jsh: bg: {}: no such job", spec);
+                    1
+                }
+            },
+            None => match state.jobs.get_last_stopped() {
+                Some(job) => {
+                    let id = job.id;
+                    state.jobs.continue_bg(id)
+                }
+                None => {
+                    eprintln!("jsh: bg: no current job");
+                    1
+                }
+            },
+        },
         "[[" => builtin_double_bracket(args, state),
         "command" => {
             // Strip the option prefix: -v/-V describe the command instead of
@@ -2517,7 +2519,8 @@ fn builtin_trap(args: &[String], state: &mut ShellState) -> i32 {
     }
 
     if args.len() == 1 && args[0] == "-l" {
-        println!("EXIT HUP INT QUIT ABRT ALRM TERM USR1 USR2");
+        // DEBUG and RETURN are listed for Bash compatibility but are not fired.
+        println!("EXIT HUP INT QUIT ABRT ALRM TERM USR1 USR2 ERR DEBUG RETURN");
         return 0;
     }
 
@@ -2531,7 +2534,8 @@ fn builtin_trap(args: &[String], state: &mut ShellState) -> i32 {
     if args.len() >= 2 {
         let action = &args[0];
         for sig in &args[1..] {
-            // Validate signal name
+            // Validate signal name. DEBUG and RETURN are accepted for Bash
+            // compatibility but are never executed (no DEBUG/RETURN trap fire).
             let sig_lower = sig.to_uppercase();
             let valid_signals = vec![
                 "EXIT", "HUP", "INT", "QUIT", "ABRT", "ALRM", "TERM", "USR1", "USR2", "PIPE",
@@ -3398,7 +3402,7 @@ fn builtin_disown(args: &[String], state: &mut ShellState) -> i32 {
         return 0;
     }
 
-    let id: Option<usize> = args[0].trim_start_matches('%').parse().ok();
+    let id = state.jobs.resolve_spec(&args[0]);
     match id {
         Some(id) => {
             state.jobs.jobs.retain(|j| j.id != id);
@@ -3427,9 +3431,15 @@ fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
     let mut last_status = 0;
     for arg in args {
         let pid_raw = if arg.starts_with('%') {
-            let id: Option<usize> = arg.trim_start_matches('%').parse().ok();
-            match id.and_then(|id| state.jobs.get_by_id(id)) {
-                Some(job) => job.pid.as_raw(),
+            match state.jobs.resolve_spec(arg) {
+                Some(id) => match state.jobs.get_by_id(id) {
+                    Some(job) => job.pid.as_raw(),
+                    None => {
+                        eprintln!("jsh: wait: {}: no such job", arg);
+                        last_status = 127;
+                        continue;
+                    }
+                },
                 None => {
                     eprintln!("jsh: wait: {}: no such job", arg);
                     last_status = 127;

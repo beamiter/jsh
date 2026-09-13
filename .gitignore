@@ -1,1 +1,5 @@
 /target
+
+# Minisign secret keys (public keys under keys/ are committed)
+/keys/*.secret
+/keys/**/*.secret

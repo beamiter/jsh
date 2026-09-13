@@ -348,20 +348,25 @@ described below.
   and cannot run here, so the identity check moves to the destination.
 
 - `scripts/install-jsh.sh` requires a published, format-checked SHA-256 and
-  refuses to install unverified bytes; bounds every download by size and keeps
-  redirects on HTTPS; validates the version, target, and base-URL grammars
-  before they reach a URL or a path, including the version read from the release
-  manifest; lists an archive and refuses links, special files, traversal,
-  absolute paths, and extra members before extracting only the expected binary;
-  makes the update-check cache, the staged binary, and the rollback restore use
-  unpredictable, private, atomically replaced names; and bounds the `--version`
-  probe with a deadline plus a file instead of a pipe, so a descendant that
-  inherits the probe's stdout cannot hang the installer.
+  refuses to install unverified bytes; verifies a detached minisign signature
+  over `manifest.json` against a pubkey pinned in the installer before trusting
+  any digest or version from that manifest; still requires the same-origin
+  `.tar.gz.sha256` sidecar and demands it equal the signed-manifest digest;
+  bounds every download by size and keeps redirects on HTTPS; validates the
+  version, target, and base-URL grammars before they reach a URL or a path,
+  including the version read from the release manifest; lists an archive and
+  refuses links, special files, traversal, absolute paths, and extra members
+  before extracting only the expected binary; makes the update-check cache, the
+  staged binary, and the rollback restore use unpredictable, private,
+  atomically replaced names; and bounds the `--version` probe with a deadline
+  plus a file instead of a pipe, so a descendant that inherits the probe's
+  stdout cannot hang the installer.
   `scripts/test-install-jsh.sh` covers the absent and malformed checksum, the
-  symlink, extra-member and traversal archives, the rejected grammars, and the
-  cache's permissions and symlink safety. It also injects a failed installed-
-  binary self-check to verify both atomic rollback and the truthful fallback
-  when the rollback rename itself fails.
+  missing/bad manifest signature, a sidecar that disagrees with the signed
+  manifest, the symlink, extra-member and traversal archives, the rejected
+  grammars, and the cache's permissions and symlink safety. It also injects a
+  failed installed-binary self-check to verify both atomic rollback and the
+  truthful fallback when the rollback rename itself fails.
 - `post_chat_response` enforces explicit response-header count and
   cumulative-byte limits before reading a body. The body cap is applied both
   below ureq's content decoder and to the decoded reader, so compressed input
@@ -369,14 +374,6 @@ described below.
   retained before either body limit applies.
 
 ## Remaining boundaries
-
-### Add a signed release manifest
-
-The installer's mandatory SHA-256 is same-origin: it proves the bytes match what
-the release published, not who published them. A detached signature over the
-manifest, verified against a key pinned in the installer, is the missing half.
-That needs a release-side signing decision, so it is deliberately not
-approximated here.
 
 After changing either canonical script, synchronize and test every vendored
 jterm copy. `jterm_core/scripts/install-jsh.sh` carries `install-jsh.sh`, and

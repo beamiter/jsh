@@ -174,6 +174,34 @@ fn command_substitution_honors_exit_and_its_own_errexit() {
 }
 
 #[test]
+fn process_substitution_body_uses_program_gates() {
+    // Align with cmdsub: `exit` in a process-sub body must stop the body.
+    let output = run_c("cat <(exit 7; printf SHOULD_NOT); printf done");
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "done");
+}
+
+#[test]
+fn lastpipe_runs_final_stage_in_current_shell() {
+    let output = run_c(
+        "set +m; shopt -s lastpipe; \
+         echo hello | read x; \
+         echo \"$x\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "hello");
+
+    // Without lastpipe, `read` runs in a subshell so `$x` stays empty.
+    let output = run_c(
+        "set +m; shopt -u lastpipe; \
+         echo hello | read x; \
+         echo \"<$x>\"",
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "<>");
+}
+
+#[test]
 fn command_substitution_err_trap_inheritance_is_opt_in() {
     let output = run_c(
         "trap 'printf OUTER' ERR; out=$(false); \

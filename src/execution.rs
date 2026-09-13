@@ -312,6 +312,19 @@ pub struct ExecutionJournal {
     harden_existing_parent: bool,
 }
 
+/// Filters for [`ExecutionJournal::query`].
+///
+/// Chronological records are filtered first, then the newest `limit` are kept.
+/// A zero limit returns no records. An empty `cwd` filter is rejected by callers
+/// at the parse layer; exact string equality is used against [`ExecutionRecord::cwd`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionQuery {
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    pub failed_only: bool,
+    pub limit: usize,
+}
+
 /// Proof that the interactive executor established this exact Start
 /// lifecycle. Keeping the full Start private prevents a later Finish from
 /// being correlated by execution ID alone.
@@ -631,15 +644,31 @@ impl ExecutionJournal {
         }
     }
 
+    /// Filter records in chronological order, then keep the latest `limit`.
+    pub fn query(&self, query: &ExecutionQuery) -> io::Result<Vec<ExecutionRecord>> {
+        let mut records = self.records()?;
+        if let Some(session_id) = query.session_id.as_deref() {
+            records.retain(|record| record.session_id.as_deref() == Some(session_id));
+        }
+        if let Some(cwd) = query.cwd.as_deref() {
+            records.retain(|record| record.cwd == cwd);
+        }
+        if query.failed_only {
+            records.retain(|record| record.exit_code.is_some_and(|code| code != 0));
+        }
+        let keep_from = records.len().saturating_sub(query.limit);
+        Ok(records.split_off(keep_from))
+    }
+
     /// Return records in chronological order, optionally scoped to one
     /// terminal session. A zero limit returns no records.
     pub fn list(&self, session_id: Option<&str>, limit: usize) -> io::Result<Vec<ExecutionRecord>> {
-        let mut records = self.records()?;
-        if let Some(session_id) = session_id {
-            records.retain(|record| record.session_id.as_deref() == Some(session_id));
-        }
-        let keep_from = records.len().saturating_sub(limit);
-        Ok(records.split_off(keep_from))
+        self.query(&ExecutionQuery {
+            session_id: session_id.map(str::to_string),
+            cwd: None,
+            failed_only: false,
+            limit,
+        })
     }
 
     pub fn show(&self, id: &str) -> io::Result<Option<ExecutionRecord>> {
@@ -650,12 +679,23 @@ impl ExecutionJournal {
         Ok(self.records()?.into_iter().find(|record| record.id == id))
     }
 
+    /// Most recent failed execution, optionally scoped by session and/or cwd.
+    pub fn last_failed_matching(
+        &self,
+        session_id: Option<&str>,
+        cwd: Option<&str>,
+    ) -> io::Result<Option<ExecutionRecord>> {
+        let mut records = self.query(&ExecutionQuery {
+            session_id: session_id.map(str::to_string),
+            cwd: cwd.map(str::to_string),
+            failed_only: true,
+            limit: 1,
+        })?;
+        Ok(records.pop())
+    }
+
     pub fn last_failed(&self) -> io::Result<Option<ExecutionRecord>> {
-        Ok(self
-            .records()?
-            .into_iter()
-            .rev()
-            .find(|record| record.exit_code.is_some_and(|code| code != 0)))
+        self.last_failed_matching(None, None)
     }
 
     fn append_event(&self, event: ExecutionEvent) -> io::Result<()> {

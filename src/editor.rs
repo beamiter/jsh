@@ -1610,6 +1610,13 @@ impl Editor {
         } else {
             None
         };
+        let execution_digest = if self.ai_include_extended_context {
+            crate::execution::ExecutionJournal::configured().and_then(|journal| {
+                crate::execution_context::agent_digest(&journal, 8, None, Some(cwd.as_str())).ok()
+            })
+        } else {
+            None
+        };
         AiContext {
             cwd,
             os,
@@ -1625,6 +1632,7 @@ impl Editor {
                     record.output.map(|output| output.text)
                 },
             ),
+            execution_digest,
         }
     }
 

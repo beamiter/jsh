@@ -214,6 +214,31 @@ jobs:
           rm artifacts.jsonl
           cat manifest.json
 
+      - name: Sign manifest.json
+        working-directory: dist
+        env:
+          JSH_MINISIGN_SECRET_KEY: ${{ secrets.JSH_MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JSH_MINISIGN_SECRET_KEY}" ]; then
+            echo "::error::JSH_MINISIGN_SECRET_KEY is empty; refusing to publish an unsigned manifest"
+            exit 1
+          fi
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          secret="$(mktemp)"
+          trap 'rm -f "${secret}"' EXIT
+          # Secret must be the full minisign secret-key file contents.
+          printf '%s' "${JSH_MINISIGN_SECRET_KEY}" > "${secret}"
+          if [ -n "$(tail -c1 "${secret}" 2>/dev/null || true)" ]; then
+            printf '\n' >> "${secret}"
+          fi
+          chmod 0600 "${secret}"
+          # Key is generated with an empty password for non-interactive CI.
+          printf '\n' | minisign -Sm manifest.json -s "${secret}"
+          test -s manifest.json.minisig
+          ls -l manifest.json manifest.json.minisig
+
       - name: Stage the installer
         run: cp scripts/install-jsh.sh dist/install-jsh.sh
 

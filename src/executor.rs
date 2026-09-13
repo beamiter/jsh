@@ -592,6 +592,18 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
     0
 }
 
+/// Job control is active when the shell is interactive and `monitor` (`-m`) is
+/// on. Absent `monitor` tracks the interactive default (on for interactive).
+fn job_control_active(state: &ShellState) -> bool {
+    state.interactive
+        && state
+            .shell_opts
+            .tracked_opts
+            .get("monitor")
+            .copied()
+            .unwrap_or(state.interactive)
+}
+
 fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
     let cmds = &pipeline.commands;
 
@@ -627,9 +639,14 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
         };
     }
 
+    // Bash `shopt -s lastpipe`: run the last stage in the current shell when
+    // job control is not active (so side effects like `read` persist).
+    let use_lastpipe = state.shell_opts.lastpipe && !job_control_active(state);
+
     let mut prev_read_fd: Option<RawFd> = None;
     let mut child_pids: Vec<Pid> = Vec::new();
     let mut pgid = Pid::from_raw(0);
+    let mut last_in_shell: Option<i32> = None;
 
     for (i, cmd) in cmds.iter().enumerate() {
         let is_last = i == cmds.len() - 1;
@@ -649,6 +666,22 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
             (None, None)
         };
 
+        if use_lastpipe && is_last {
+            // Parent keeps prev_read_fd as the last stage's stdin.
+            let saved_stdin = prev_read_fd
+                .and_then(|_| unsafe { nix::unistd::dup(BorrowedFd::borrow_raw(0)) }.ok());
+            if let Some(fd) = prev_read_fd.take() {
+                dup2_raw(fd, 0).ok();
+                close(fd).ok();
+            }
+            let code = execute_command(cmd, state);
+            if let Some(sfd) = saved_stdin {
+                dup2_raw(sfd.as_raw_fd(), 0).ok();
+            }
+            last_in_shell = Some(code);
+            break;
+        }
+
         state
             .fork_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -656,9 +689,11 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
             Ok(ForkResult::Child) => {
                 signal::reset_child_signals();
                 state.interactive = false;
-                let my_pid = nix::unistd::getpid();
-                let target_pgid = if pgid.as_raw() == 0 { my_pid } else { pgid };
-                setpgid(my_pid, target_pgid).ok();
+                if !use_lastpipe {
+                    let my_pid = nix::unistd::getpid();
+                    let target_pgid = if pgid.as_raw() == 0 { my_pid } else { pgid };
+                    setpgid(my_pid, target_pgid).ok();
+                }
 
                 if let Some(fd) = prev_read_fd {
                     dup2_raw(fd, 0).ok();
@@ -676,13 +711,15 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
                 child_exit(code);
             }
             Ok(ForkResult::Parent { child }) => {
-                let first_child = pgid.as_raw() == 0;
-                if first_child {
-                    pgid = child;
-                }
-                setpgid(child, pgid).ok();
-                if first_child {
-                    signal::set_foreground_pgid(Some(pgid.as_raw()));
+                if !use_lastpipe {
+                    let first_child = pgid.as_raw() == 0;
+                    if first_child {
+                        pgid = child;
+                    }
+                    setpgid(child, pgid).ok();
+                    if first_child {
+                        signal::set_foreground_pgid(Some(pgid.as_raw()));
+                    }
                 }
                 child_pids.push(child);
                 if let Some(fd) = write_fd {
@@ -694,7 +731,9 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
                 prev_read_fd = read_fd;
             }
             Err(e) => {
-                signal::set_foreground_pgid(None);
+                if !use_lastpipe {
+                    signal::set_foreground_pgid(None);
+                }
                 eprintln!("jsh: fork failed: {}", e);
                 return 1;
             }
@@ -702,7 +741,8 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
     }
 
     let shell_pgid = nix::unistd::getpgrp();
-    if state.interactive && pgid.as_raw() != 0 {
+    let give_terminal = !use_lastpipe && state.interactive && pgid.as_raw() != 0;
+    if give_terminal {
         tcsetpgrp(std::io::stdin(), pgid).ok();
     }
 
@@ -725,9 +765,15 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
             }
         }
     }
-    signal::set_foreground_pgid(None);
+    if let Some(code) = last_in_shell {
+        pipestatus.push(code);
+        last_status = code;
+    }
+    if !use_lastpipe {
+        signal::set_foreground_pgid(None);
+    }
 
-    if state.interactive {
+    if give_terminal {
         tcsetpgrp(std::io::stdin(), shell_pgid).ok();
     }
     if state.shell_opts.pipefail {

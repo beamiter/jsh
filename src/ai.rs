@@ -216,6 +216,9 @@ pub struct AiContext {
     pub recent_history: Vec<String>,
     pub git_status: Option<String>,
     pub last_error: Option<(String, String, i32)>, // (command, stderr, exit_code)
+    /// Bounded recent/failed execution summaries from the journal when extended
+    /// context sharing is enabled. Never includes captured output bodies.
+    pub execution_digest: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for AiContext {
@@ -234,6 +237,15 @@ impl std::fmt::Debug for AiContext {
                     .last_error
                     .as_ref()
                     .map(|(command, output, code)| (command.len(), output.len(), code)),
+            )
+            .field(
+                "execution_digest",
+                &self.execution_digest.as_ref().map(|value| {
+                    (
+                        value.get("recent_count").cloned(),
+                        value.get("failed_count").cloned(),
+                    )
+                }),
             )
             .finish()
     }
@@ -837,12 +849,14 @@ fn shell_context_json(ctx: &AiContext) -> Option<serde_json::Value> {
         .take(MAX_HISTORY_LINES)
         .map(|line| bound_bytes(line, MAX_HISTORY_LINE_BYTES))
         .collect();
-    if git_status.is_none() && recent.is_empty() {
+    let digest = ctx.execution_digest.clone();
+    if git_status.is_none() && recent.is_empty() && digest.is_none() {
         return None;
     }
     Some(serde_json::json!({
         "git_status": git_status,
         "recent_commands_newest_first": recent,
+        "execution_digest": digest,
     }))
 }
 
@@ -1377,6 +1391,7 @@ mod tests {
                 recent_history: vec![secret.to_string()],
                 git_status: Some(secret.to_string()),
                 last_error: Some((secret.to_string(), secret.to_string(), 1)),
+                execution_digest: None,
             },
         };
         let debug = format!("{request:?}");
@@ -1589,6 +1604,7 @@ mod tests {
                     "e".repeat(MAX_AI_ERROR_OUTPUT_BYTES + 1),
                     1,
                 )),
+                execution_digest: None,
             },
         });
 
@@ -1658,6 +1674,7 @@ mod tests {
                 recent_history: Vec::new(),
                 git_status: None,
                 last_error: None,
+                execution_digest: None,
             },
         };
 
@@ -1684,6 +1701,7 @@ mod ai_tests {
             recent_history: Vec::new(),
             git_status: None,
             last_error: None,
+            execution_digest: None,
         }
     }
 

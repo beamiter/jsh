@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Agent delivery negotiation now prefers `complete` and falls back to
+  `streaming` when a peer is streaming-only. `JSH_AGENT_DELIVERY` can narrow
+  the preference; streaming bodies still fold through jagent into a complete
+  response before the review-first approval prompt, so partial stream tool-call
+  events never become executable proposals. Doctor reports the negotiated
+  delivery.
+- Release installs verify a detached minisign signature over `manifest.json`
+  against a pubkey pinned in the installer, then take the archive digest from
+  that signed manifest and cross-check the published `.sha256` sidecar. See
+  `docs/release-signing.md`.
+- `context list` accepts `--cwd` and `--failed`; `last-failed` accepts session
+  and cwd filters; `context summary` and `agent_digest` return a bounded
+  recent/failed JSON digest without output bodies. Extended AI context can
+  include that digest when context sharing is enabled.
+- `shopt -s lastpipe` runs the final pipeline stage in-shell when job control is
+  inactive. Process substitutions reuse command-substitution inheritance and
+  `execute_program`. `fg`/`bg`/`wait`/`disown` accept `%%`/`%+`/`%-`/`%N`.
+  `DEBUG`/`RETURN` traps remain accepted but unfired.
+
 - The jagent revision is exact-pinned at `a462ec8`. Ordinary editor AI replies
   now remain bounded raw bytes until jagent's canonical response decoder, so a
   recursive duplicate member cannot be erased by `serde_json::Value` and turn

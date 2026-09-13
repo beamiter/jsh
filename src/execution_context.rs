@@ -3,13 +3,14 @@
 //! Both `jsh context ...` and the interactive `context` builtin use this
 //! module, so parsing, status codes, filtering, and JSON schemas stay aligned.
 
-use crate::execution::{ExecutionJournal, ExecutionRecord};
+use crate::execution::{ExecutionJournal, ExecutionQuery, ExecutionRecord};
 use serde::Serialize;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
 pub const DEFAULT_LIST_LIMIT: usize = 20;
 pub const MAX_LIST_LIMIT: usize = 2_000;
+pub const MAX_CWD_FILTER_BYTES: usize = 4_096;
 
 pub const STATUS_OK: i32 = 0;
 pub const STATUS_NOT_FOUND: i32 = 1;
@@ -19,16 +20,20 @@ pub const STATUS_DISABLED: i32 = 78;
 
 pub const HELP: &str = concat!(
     "Usage:\n",
-    "  context list [-n N] [--session ID] [--json]\n",
+    "  context list [-n N] [--session ID] [--cwd PATH] [--failed] [--json]\n",
     "  context show ID [--json]\n",
-    "  context last-failed [--json]\n\n",
+    "  context last-failed [--session ID] [--cwd PATH] [--json]\n",
+    "  context summary [-n N] [--session ID] [--cwd PATH] [--json]\n\n",
     "Commands:\n",
     "  list         List execution summaries in chronological order\n",
     "  show         Show one execution, including captured output\n",
-    "  last-failed  Show the most recent failed execution and its output\n\n",
+    "  last-failed  Show the most recent failed execution and its output\n",
+    "  summary      Show a bounded recent/failed digest for agents\n\n",
     "Options:\n",
     "  -n N          Return the latest N summaries (default 20, max 2000)\n",
-    "  --session ID  Restrict list to one terminal session\n",
+    "  --session ID  Restrict results to one terminal session\n",
+    "  --cwd PATH    Restrict results to one working directory\n",
+    "  --failed      Restrict list to failed executions\n",
     "  --json        Emit an agent-friendly JSON envelope\n\n",
     "Exit status: 0 success, 1 no match, 2 usage, 74 I/O error,\n",
     "             78 journal disabled/unavailable.\n",
@@ -40,6 +45,8 @@ pub enum ContextRequest {
     List {
         limit: usize,
         session_id: Option<String>,
+        cwd: Option<String>,
+        failed_only: bool,
         json: bool,
     },
     Show {
@@ -47,6 +54,14 @@ pub enum ContextRequest {
         json: bool,
     },
     LastFailed {
+        session_id: Option<String>,
+        cwd: Option<String>,
+        json: bool,
+    },
+    Summary {
+        limit: usize,
+        session_id: Option<String>,
+        cwd: Option<String>,
         json: bool,
     },
 }
@@ -55,7 +70,10 @@ impl ContextRequest {
     fn json(&self) -> bool {
         match self {
             Self::Help => false,
-            Self::List { json, .. } | Self::Show { json, .. } | Self::LastFailed { json } => *json,
+            Self::List { json, .. }
+            | Self::Show { json, .. }
+            | Self::LastFailed { json, .. }
+            | Self::Summary { json, .. } => *json,
         }
     }
 }
@@ -134,7 +152,7 @@ impl std::error::Error for ContextError {}
 pub fn parse_args(args: &[String]) -> Result<ContextRequest, ContextError> {
     let Some(command) = args.first().map(String::as_str) else {
         return Err(ContextError::usage(
-            "missing context command (expected list, show, or last-failed)",
+            "missing context command (expected list, show, last-failed, or summary)",
         ));
     };
 
@@ -143,8 +161,9 @@ pub fn parse_args(args: &[String]) -> Result<ContextRequest, ContextError> {
         "list" => parse_list_args(&args[1..]),
         "show" => parse_show_args(&args[1..]),
         "last-failed" => parse_last_failed_args(&args[1..]),
+        "summary" => parse_summary_args(&args[1..]),
         other => Err(ContextError::usage(format!(
-            "unknown context command '{other}' (expected list, show, or last-failed)"
+            "unknown context command '{other}' (expected list, show, last-failed, or summary)"
         ))),
     }
 }
@@ -153,6 +172,8 @@ fn parse_list_args(args: &[String]) -> Result<ContextRequest, ContextError> {
     let mut limit = DEFAULT_LIST_LIMIT;
     let mut saw_limit = false;
     let mut session_id = None;
+    let mut cwd = None;
+    let mut failed_only = false;
     let mut json = false;
     let mut index = 0;
     while index < args.len() {
@@ -188,6 +209,26 @@ fn parse_list_args(args: &[String]) -> Result<ContextRequest, ContextError> {
                 session_id = Some(id.clone());
                 index += 2;
             }
+            "--cwd" => {
+                if cwd.is_some() {
+                    return Err(ContextError::usage("option '--cwd' may only be used once"));
+                }
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| ContextError::usage("option '--cwd' requires a path"))?;
+                validate_cwd_path(path)?;
+                cwd = Some(path.clone());
+                index += 2;
+            }
+            "--failed" => {
+                if failed_only {
+                    return Err(ContextError::usage(
+                        "option '--failed' may only be used once",
+                    ));
+                }
+                failed_only = true;
+                index += 1;
+            }
             "--json" => {
                 if json {
                     return Err(ContextError::usage("option '--json' may only be used once"));
@@ -205,6 +246,8 @@ fn parse_list_args(args: &[String]) -> Result<ContextRequest, ContextError> {
     Ok(ContextRequest::List {
         limit,
         session_id,
+        cwd,
+        failed_only,
         json,
     })
 }
@@ -241,12 +284,42 @@ fn parse_show_args(args: &[String]) -> Result<ContextRequest, ContextError> {
 }
 
 fn parse_last_failed_args(args: &[String]) -> Result<ContextRequest, ContextError> {
+    let mut session_id = None;
+    let mut cwd = None;
     let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" if !json => json = true,
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session" => {
+                if session_id.is_some() {
+                    return Err(ContextError::usage(
+                        "option '--session' may only be used once",
+                    ));
+                }
+                let id = args
+                    .get(index + 1)
+                    .ok_or_else(|| ContextError::usage("option '--session' requires an ID"))?;
+                validate_session_id(id)?;
+                session_id = Some(id.clone());
+                index += 2;
+            }
+            "--cwd" => {
+                if cwd.is_some() {
+                    return Err(ContextError::usage("option '--cwd' may only be used once"));
+                }
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| ContextError::usage("option '--cwd' requires a path"))?;
+                validate_cwd_path(path)?;
+                cwd = Some(path.clone());
+                index += 2;
+            }
             "--json" => {
-                return Err(ContextError::usage("option '--json' may only be used once"));
+                if json {
+                    return Err(ContextError::usage("option '--json' may only be used once"));
+                }
+                json = true;
+                index += 1;
             }
             other => {
                 return Err(ContextError::usage(format!(
@@ -255,7 +328,84 @@ fn parse_last_failed_args(args: &[String]) -> Result<ContextRequest, ContextErro
             }
         }
     }
-    Ok(ContextRequest::LastFailed { json })
+    Ok(ContextRequest::LastFailed {
+        session_id,
+        cwd,
+        json,
+    })
+}
+
+fn parse_summary_args(args: &[String]) -> Result<ContextRequest, ContextError> {
+    let mut limit = DEFAULT_LIST_LIMIT;
+    let mut saw_limit = false;
+    let mut session_id = None;
+    let mut cwd = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-n" => {
+                if saw_limit {
+                    return Err(ContextError::usage("option '-n' may only be used once"));
+                }
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(|| ContextError::usage("option '-n' requires a positive number"))?;
+                limit = raw
+                    .parse::<usize>()
+                    .map_err(|_| ContextError::usage("option '-n' requires a positive integer"))?;
+                if !(1..=MAX_LIST_LIMIT).contains(&limit) {
+                    return Err(ContextError::usage(format!(
+                        "option '-n' must be between 1 and {MAX_LIST_LIMIT}"
+                    )));
+                }
+                saw_limit = true;
+                index += 2;
+            }
+            "--session" => {
+                if session_id.is_some() {
+                    return Err(ContextError::usage(
+                        "option '--session' may only be used once",
+                    ));
+                }
+                let id = args
+                    .get(index + 1)
+                    .ok_or_else(|| ContextError::usage("option '--session' requires an ID"))?;
+                validate_session_id(id)?;
+                session_id = Some(id.clone());
+                index += 2;
+            }
+            "--cwd" => {
+                if cwd.is_some() {
+                    return Err(ContextError::usage("option '--cwd' may only be used once"));
+                }
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| ContextError::usage("option '--cwd' requires a path"))?;
+                validate_cwd_path(path)?;
+                cwd = Some(path.clone());
+                index += 2;
+            }
+            "--json" => {
+                if json {
+                    return Err(ContextError::usage("option '--json' may only be used once"));
+                }
+                json = true;
+                index += 1;
+            }
+            option => {
+                return Err(ContextError::usage(format!(
+                    "unknown option or argument '{option}' for 'context summary'"
+                )));
+            }
+        }
+    }
+    Ok(ContextRequest::Summary {
+        limit,
+        session_id,
+        cwd,
+        json,
+    })
 }
 
 fn validate_execution_id(id: &str) -> Result<(), ContextError> {
@@ -288,11 +438,34 @@ fn validate_session_id(id: &str) -> Result<(), ContextError> {
     }
 }
 
+fn validate_cwd_path(cwd: &str) -> Result<(), ContextError> {
+    if cwd.is_empty() {
+        return Err(ContextError::usage(
+            "cwd path must be non-empty, at most 4096 bytes, and must not contain NUL",
+        ));
+    }
+    if cwd.len() > MAX_CWD_FILTER_BYTES {
+        return Err(ContextError::usage(
+            "cwd path must be non-empty, at most 4096 bytes, and must not contain NUL",
+        ));
+    }
+    if cwd.bytes().any(|byte| byte == 0) {
+        return Err(ContextError::usage(
+            "cwd path must be non-empty, at most 4096 bytes, and must not contain NUL",
+        ));
+    }
+    Ok(())
+}
+
 enum QueryResult {
     Help,
     List(Vec<ExecutionRecord>),
     Show(ExecutionRecord),
     LastFailed(ExecutionRecord),
+    Summary {
+        recent: Vec<ExecutionRecord>,
+        failed: Vec<ExecutionRecord>,
+    },
 }
 
 fn query(
@@ -306,17 +479,26 @@ fn query(
     match request {
         ContextRequest::Help => Ok(QueryResult::Help),
         ContextRequest::List {
-            limit, session_id, ..
+            limit,
+            session_id,
+            cwd,
+            failed_only,
+            ..
         } => {
             let records = journal
-                .list(session_id.as_deref(), *limit)
+                .query(&ExecutionQuery {
+                    session_id: session_id.clone(),
+                    cwd: cwd.clone(),
+                    failed_only: *failed_only,
+                    limit: *limit,
+                })
                 .map_err(|error| ContextError::io(error, journal))?;
             if records.is_empty() {
-                let message = session_id.as_deref().map_or_else(
-                    || "no execution records found".to_string(),
-                    |id| format!("no execution records found for session '{id}'"),
-                );
-                Err(ContextError::not_found(message))
+                Err(ContextError::not_found(list_not_found_message(
+                    session_id.as_deref(),
+                    cwd.as_deref(),
+                    *failed_only,
+                )))
             } else {
                 Ok(QueryResult::List(records))
             }
@@ -326,12 +508,110 @@ fn query(
             .map_err(|error| ContextError::io(error, journal))?
             .map(QueryResult::Show)
             .ok_or_else(|| ContextError::not_found(format!("execution '{id}' was not found"))),
-        ContextRequest::LastFailed { .. } => journal
-            .last_failed()
+        ContextRequest::LastFailed {
+            session_id, cwd, ..
+        } => journal
+            .last_failed_matching(session_id.as_deref(), cwd.as_deref())
             .map_err(|error| ContextError::io(error, journal))?
             .map(QueryResult::LastFailed)
-            .ok_or_else(|| ContextError::not_found("no failed execution record was found")),
+            .ok_or_else(|| {
+                ContextError::not_found(last_failed_not_found_message(
+                    session_id.as_deref(),
+                    cwd.as_deref(),
+                ))
+            }),
+        ContextRequest::Summary {
+            limit,
+            session_id,
+            cwd,
+            ..
+        } => {
+            let (recent, failed) =
+                summary_records(journal, *limit, session_id.as_deref(), cwd.as_deref())
+                    .map_err(|error| ContextError::io(error, journal))?;
+            if recent.is_empty() && failed.is_empty() {
+                Err(ContextError::not_found(list_not_found_message(
+                    session_id.as_deref(),
+                    cwd.as_deref(),
+                    false,
+                )))
+            } else {
+                Ok(QueryResult::Summary { recent, failed })
+            }
+        }
     }
+}
+
+fn list_not_found_message(
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+    failed_only: bool,
+) -> String {
+    let subject = if failed_only {
+        "no failed execution records found"
+    } else {
+        "no execution records found"
+    };
+    match (session_id, cwd) {
+        (None, None) => subject.to_string(),
+        (Some(id), None) => format!("{subject} for session '{id}'"),
+        (None, Some(path)) => format!("{subject} for cwd '{path}'"),
+        (Some(id), Some(path)) => format!("{subject} for session '{id}' and cwd '{path}'"),
+    }
+}
+
+fn last_failed_not_found_message(session_id: Option<&str>, cwd: Option<&str>) -> String {
+    match (session_id, cwd) {
+        (None, None) => "no failed execution record was found".to_string(),
+        (Some(id), None) => format!("no failed execution record was found for session '{id}'"),
+        (None, Some(path)) => format!("no failed execution record was found for cwd '{path}'"),
+        (Some(id), Some(path)) => {
+            format!("no failed execution record was found for session '{id}' and cwd '{path}'")
+        }
+    }
+}
+
+fn summary_records(
+    journal: &ExecutionJournal,
+    limit: usize,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> io::Result<(Vec<ExecutionRecord>, Vec<ExecutionRecord>)> {
+    let base = ExecutionQuery {
+        session_id: session_id.map(str::to_string),
+        cwd: cwd.map(str::to_string),
+        failed_only: false,
+        limit,
+    };
+    let recent = journal.query(&base)?;
+    let failed = journal.query(&ExecutionQuery {
+        failed_only: true,
+        ..base
+    })?;
+    Ok((recent, failed))
+}
+
+fn summary_json_value(recent: &[ExecutionRecord], failed: &[ExecutionRecord]) -> serde_json::Value {
+    let recent: Vec<_> = recent.iter().map(ExecutionSummary::from_record).collect();
+    let failed: Vec<_> = failed.iter().map(ExecutionSummary::from_record).collect();
+    serde_json::json!({
+        "kind": "summary",
+        "recent": recent,
+        "failed": failed,
+        "recent_count": recent.len(),
+        "failed_count": failed.len(),
+    })
+}
+
+/// Bounded Agent-friendly digest of recent and failed executions.
+pub fn agent_digest(
+    journal: &ExecutionJournal,
+    limit: usize,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> io::Result<serde_json::Value> {
+    let (recent, failed) = summary_records(journal, limit, session_id, cwd)?;
+    Ok(summary_json_value(&recent, &failed))
 }
 
 #[derive(Serialize)]
@@ -433,6 +713,27 @@ fn append_human_safe(output: &mut String, value: &str) {
     }
 }
 
+fn render_summary_line(output: &mut String, record: &ExecutionRecord) {
+    let summary = ExecutionSummary::from_record(record);
+    let exit = summary
+        .exit_code
+        .map_or_else(|| "-".to_string(), |code| code.to_string());
+    let duration = summary
+        .duration_ms
+        .map_or_else(|| "-".to_string(), |duration| format!("{duration}ms"));
+    let session = summary.session_id.as_deref().unwrap_or("-");
+    let _ = writeln!(
+        output,
+        "{}  {}  exit={}  duration={}  session={}  {}",
+        summary.id,
+        summary.state,
+        exit,
+        duration,
+        single_line_preview(session, 80).0,
+        summary.command_preview
+    );
+}
+
 fn render(result: QueryResult, json: bool) -> Result<String, serde_json::Error> {
     if json {
         let value = match result {
@@ -461,6 +762,7 @@ fn render(result: QueryResult, json: bool) -> Result<String, serde_json::Error> 
                 "kind": "last_failed",
                 "execution": record,
             }),
+            QueryResult::Summary { recent, failed } => summary_json_value(&recent, &failed),
         };
         let mut output = serde_json::to_string(&value)?;
         output.push('\n');
@@ -472,28 +774,21 @@ fn render(result: QueryResult, json: bool) -> Result<String, serde_json::Error> 
         QueryResult::Help => output.push_str(HELP),
         QueryResult::List(records) => {
             for record in &records {
-                let summary = ExecutionSummary::from_record(record);
-                let exit = summary
-                    .exit_code
-                    .map_or_else(|| "-".to_string(), |code| code.to_string());
-                let duration = summary
-                    .duration_ms
-                    .map_or_else(|| "-".to_string(), |duration| format!("{duration}ms"));
-                let session = summary.session_id.as_deref().unwrap_or("-");
-                let _ = writeln!(
-                    output,
-                    "{}  {}  exit={}  duration={}  session={}  {}",
-                    summary.id,
-                    summary.state,
-                    exit,
-                    duration,
-                    single_line_preview(session, 80).0,
-                    summary.command_preview
-                );
+                render_summary_line(&mut output, record);
             }
         }
         QueryResult::Show(record) | QueryResult::LastFailed(record) => {
             render_record_human(&mut output, &record);
+        }
+        QueryResult::Summary { recent, failed } => {
+            let _ = writeln!(output, "Recent: {}", recent.len());
+            for record in &recent {
+                render_summary_line(&mut output, record);
+            }
+            let _ = writeln!(output, "Failed: {}", failed.len());
+            for record in &failed {
+                render_summary_line(&mut output, record);
+            }
         }
     }
     Ok(output)
@@ -655,6 +950,7 @@ fn run_with_writers(
 mod tests {
     use super::*;
     use crate::execution::{ExecutionOutput, ExecutionRecord};
+    use std::os::unix::fs::PermissionsExt;
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -697,6 +993,8 @@ mod tests {
             ContextRequest::List {
                 limit: 7,
                 session_id: Some("tab-1".to_string()),
+                cwd: None,
+                failed_only: false,
                 json: true,
             }
         );
@@ -709,11 +1007,82 @@ mod tests {
         );
         assert_eq!(
             parse_args(&strings(&["last-failed", "--json"])).unwrap(),
-            ContextRequest::LastFailed { json: true }
+            ContextRequest::LastFailed {
+                session_id: None,
+                cwd: None,
+                json: true,
+            }
         );
         assert_eq!(
             parse_args(&strings(&["--help"])).unwrap(),
             ContextRequest::Help
+        );
+    }
+
+    #[test]
+    fn parses_cwd_failed_and_summary_options() {
+        assert_eq!(
+            parse_args(&strings(&[
+                "list",
+                "--cwd",
+                "/tmp/project",
+                "--failed",
+                "-n",
+                "3",
+                "--json"
+            ]))
+            .unwrap(),
+            ContextRequest::List {
+                limit: 3,
+                session_id: None,
+                cwd: Some("/tmp/project".to_string()),
+                failed_only: true,
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&[
+                "last-failed",
+                "--session",
+                "tab-1",
+                "--cwd",
+                "relative/path",
+                "--json"
+            ]))
+            .unwrap(),
+            ContextRequest::LastFailed {
+                session_id: Some("tab-1".to_string()),
+                cwd: Some("relative/path".to_string()),
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&[
+                "summary",
+                "-n",
+                "5",
+                "--session",
+                "tab-2",
+                "--cwd",
+                "/work",
+                "--json"
+            ]))
+            .unwrap(),
+            ContextRequest::Summary {
+                limit: 5,
+                session_id: Some("tab-2".to_string()),
+                cwd: Some("/work".to_string()),
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&strings(&["summary"])).unwrap(),
+            ContextRequest::Summary {
+                limit: DEFAULT_LIST_LIMIT,
+                session_id: None,
+                cwd: None,
+                json: false,
+            }
         );
     }
 
@@ -726,14 +1095,27 @@ mod tests {
             strings(&["list", "-n", "2001"]),
             strings(&["list", "--session", "../bad"]),
             strings(&["list", "--json", "--json"]),
+            strings(&["list", "--cwd", "/a", "--cwd", "/b"]),
+            strings(&["list", "--cwd", ""]),
+            strings(&["list", "--failed", "--failed"]),
+            strings(&["list", "--cwd", &"x".repeat(MAX_CWD_FILTER_BYTES + 1)]),
+            strings(&["list", "--cwd"]),
             strings(&["show"]),
             strings(&["show", "bad/id"]),
             strings(&["show", "one", "two"]),
             strings(&["last-failed", "extra"]),
+            strings(&["last-failed", "--session", "tab-1", "--session", "tab-2"]),
+            strings(&["last-failed", "--cwd", "/a", "--cwd", "/b"]),
+            strings(&["summary", "--json", "--json"]),
+            strings(&["summary", "--cwd", "/a", "--cwd", "/b"]),
+            strings(&["summary", "-n", "0"]),
         ] {
             let error = parse_args(&args).expect_err("arguments must be rejected");
             assert_eq!(error.status(), STATUS_USAGE, "args: {args:?}");
         }
+
+        let unknown = parse_args(&strings(&["unknown"])).unwrap_err();
+        assert!(unknown.message.contains("summary"));
     }
 
     #[test]
@@ -796,6 +1178,8 @@ mod tests {
             ContextRequest::List {
                 limit: 20,
                 session_id: None,
+                cwd: None,
+                failed_only: false,
                 json: true,
             },
             None,
@@ -811,7 +1195,11 @@ mod tests {
         stdout.clear();
         stderr.clear();
         let status = run_with_writers(
-            ContextRequest::LastFailed { json: false },
+            ContextRequest::LastFailed {
+                session_id: None,
+                cwd: None,
+                json: false,
+            },
             Some(&journal),
             &mut stdout,
             &mut stderr,
@@ -834,6 +1222,8 @@ mod tests {
             ContextRequest::List {
                 limit: 20,
                 session_id: None,
+                cwd: None,
+                failed_only: false,
                 json: false,
             },
             Some(&journal),
@@ -844,5 +1234,48 @@ mod tests {
         assert!(String::from_utf8(stderr)
             .unwrap()
             .contains("cannot read execution journal"));
+    }
+
+    #[test]
+    fn summary_json_and_agent_digest_share_envelope() {
+        let recent = record(Some(0), None);
+        let mut failed = record(Some(3), Some("boom"));
+        failed.id = "jsh-test-2".to_string();
+        let rendered = render(
+            QueryResult::Summary {
+                recent: vec![recent.clone()],
+                failed: vec![failed.clone()],
+            },
+            true,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["kind"], "summary");
+        assert_eq!(parsed["recent_count"], 1);
+        assert_eq!(parsed["failed_count"], 1);
+        assert!(parsed["recent"][0].get("output").is_none());
+        assert!(!rendered.contains("boom"));
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = ExecutionJournal::with_path(temp.path().join("digest.jsonl"));
+        journal
+            .record_start("jsh-ok", Some("tab-1"), 1, "true", "/tmp/project", 1)
+            .unwrap();
+        journal
+            .record_finish("jsh-ok", 0, 2, "/tmp/project", 3)
+            .unwrap();
+        journal
+            .record_start("jsh-bad", Some("tab-1"), 2, "false", "/tmp/project", 4)
+            .unwrap();
+        journal
+            .record_finish("jsh-bad", 1, 2, "/tmp/project", 6)
+            .unwrap();
+        let digest = agent_digest(&journal, 20, Some("tab-1"), Some("/tmp/project")).unwrap();
+        assert_eq!(digest["kind"], "summary");
+        assert_eq!(digest["recent_count"], 2);
+        assert_eq!(digest["failed_count"], 1);
+        assert_eq!(digest["failed"][0]["id"], "jsh-bad");
+        assert_eq!(digest.get("ok"), None);
     }
 }

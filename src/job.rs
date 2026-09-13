@@ -81,6 +81,31 @@ impl JobTable {
             .find(|j| j.status == JobStatus::Running || j.status == JobStatus::Stopped)
     }
 
+    /// Resolve Bash-like job specs: `%N`, `%%`, `%+`, `%-` (and bare `N`).
+    /// `%+` and `%%` are the current job (last stopped, else last).
+    /// `%-` is the previous job if available, else current.
+    pub fn resolve_spec(&mut self, spec: &str) -> Option<usize> {
+        let s = spec.strip_prefix('%').unwrap_or(spec);
+        match s {
+            "" | "+" | "%" => self
+                .get_last_stopped()
+                .map(|j| j.id)
+                .or_else(|| self.get_last().map(|j| j.id)),
+            "-" => {
+                if self.jobs.len() >= 2 {
+                    Some(self.jobs[self.jobs.len() - 2].id)
+                } else {
+                    self.jobs.last().map(|j| j.id)
+                }
+            }
+            digits if digits.chars().all(|c| c.is_ascii_digit()) && !digits.is_empty() => {
+                let id: usize = digits.parse().ok()?;
+                self.get_by_id(id).map(|j| j.id)
+            }
+            _ => None,
+        }
+    }
+
     pub fn remove_done(&mut self) {
         self.jobs
             .retain(|j| !matches!(j.status, JobStatus::Done(_)));
@@ -355,5 +380,39 @@ mod tests {
                 "cargo build (1.5s)".to_string()
             )
         );
+    }
+
+    #[test]
+    fn resolve_spec_handles_bash_job_specs() {
+        let mut table = JobTable::new();
+        let id1 = table.add(Pid::from_raw(1001), "sleep 1".into());
+        let id2 = table.add(Pid::from_raw(1002), "sleep 2".into());
+        let id3 = table.add(Pid::from_raw(1003), "sleep 3".into());
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+
+        // Current job: last stopped, else last running/stopped.
+        assert_eq!(table.resolve_spec("%%"), Some(3));
+        assert_eq!(table.resolve_spec("%+"), Some(3));
+        assert_eq!(table.resolve_spec("%"), Some(3));
+        assert_eq!(table.resolve_spec("+"), Some(3));
+
+        // Previous: second-to-last in the table, else last.
+        assert_eq!(table.resolve_spec("%-"), Some(2));
+        assert_eq!(table.resolve_spec("-"), Some(2));
+
+        // Numeric (with or without %).
+        assert_eq!(table.resolve_spec("%1"), Some(1));
+        assert_eq!(table.resolve_spec("2"), Some(2));
+        assert_eq!(table.resolve_spec("%99"), None);
+        assert_eq!(table.resolve_spec("%foo"), None);
+
+        // Prefer last stopped for current.
+        if let Some(job) = table.get_by_id(2) {
+            job.status = JobStatus::Stopped;
+        }
+        assert_eq!(table.resolve_spec("%%"), Some(2));
+        assert_eq!(table.resolve_spec("%+"), Some(2));
     }
 }

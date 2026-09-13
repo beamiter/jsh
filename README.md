@@ -34,11 +34,13 @@ Install or update the released binary:
 curl -fsSL https://github.com/beamiter/jsh/releases/latest/download/install-jsh.sh | sh
 ```
 
-The installer downloads the build for the current platform, verifies its
-checksum, and replaces the binary with `rename(2)`, so shells that are already
-running keep the version they started with. It installs next to an existing
-`jsh` when it finds one on `PATH`, and falls back to `~/.local/bin` otherwise.
-Re-running it is how you update. Useful options:
+The installer downloads the build for the current platform, verifies a detached
+minisign signature over the release `manifest.json` against a pubkey pinned in
+the script, checks the archive SHA-256 from that signed manifest (and the
+same-origin `.sha256` sidecar), and replaces the binary with `rename(2)`, so
+shells that are already running keep the version they started with. It installs
+next to an existing `jsh` when it finds one on `PATH`, and falls back to
+`~/.local/bin` otherwise. Re-running it is how you update. Useful options:
 
 ```sh
 ./scripts/install-jsh.sh --check          # compare installed against latest
@@ -386,18 +388,23 @@ optional cwd metadata.
 Query that context either inside an interactive jsh or from another process:
 
 ```sh
-context list [-n N] [--session ID] [--json]
+context list [-n N] [--session ID] [--cwd PATH] [--failed] [--json]
 context show EXECUTION_ID [--json]
-context last-failed [--json]
+context last-failed [--session ID] [--cwd PATH] [--json]
+context summary [-n N] [--session ID] [--cwd PATH] [--json]
 
-jsh context list [-n N] [--session ID] [--json]
+jsh context list [-n N] [--session ID] [--cwd PATH] [--failed] [--json]
 jsh context show EXECUTION_ID [--json]
-jsh context last-failed [--json]
+jsh context last-failed [--session ID] [--cwd PATH] [--json]
+jsh context summary [-n N] [--session ID] [--cwd PATH] [--json]
 ```
 
 `list` defaults to the newest 20 records and accepts a limit from 1 to 2,000.
-It reports only output availability, truncation, and byte-count metadata;
-`show` and `last-failed` include the captured output itself when available.
+`--cwd` matches the recorded start directory exactly; `--failed` keeps only
+nonzero exits. `summary` returns a bounded Agent-friendly digest of recent and
+failed executions without shipping captured output bodies. `list` reports only
+output availability, truncation, and byte-count metadata; `show` and
+`last-failed` include the captured output itself when available.
 
 Execution context is separate from `~/.jsh_history`. Its append-only JSONL
 journal defaults to `$XDG_STATE_HOME/jsh/executions.jsonl`, falling back to
@@ -577,25 +584,32 @@ other peer can advertise its protocol/delivery support through the canonical,
 at-most-256-byte `JSH_AGENT_PEER_CAPABILITIES` token, for example:
 
 ```sh
-export JSH_AGENT_PEER_CAPABILITIES='jagent-agent/1;protocols=text,native-tools;delivery=complete'
+export JSH_AGENT_PEER_CAPABILITIES='jagent-agent/1;protocols=text,native-tools;delivery=complete,streaming'
 export JSH_AGENT_PROTOCOL=native-tools
+# optional: force streaming when the peer advertises it
+# export JSH_AGENT_DELIVERY=streaming
 ```
 
 If the peer variable is absent, jsh assumes only the legacy `text+complete`
 path; discovery never silently opts an existing integration into native tools.
 An explicit `JSH_AGENT_PROTOCOL` remains authoritative, but jsh rejects it
-unless both the selected provider and peer advertise that protocol with
-`complete` delivery. The current transport does not negotiate streaming.
-Malformed, non-canonical, future-version, whitespace-bearing, duplicate, or
-oversized peer tokens are rejected without being printed. All three built-in
-providers support native `run`/`say`/`done` calls. Tool calls remain proposals
-and pass through exactly the same review prompt—selecting the native wire
-format never grants execution permission. Run `jsh doctor` to inspect the
-effective negotiation without contacting the provider or exposing credentials.
-Capability-token v2, which can express exact protocol/delivery pairs rather
-than a Cartesian product, remains an explicit peer-aware opt-in; default
-emission is v1 for rolling-upgrade safety. jsh exact-pins the revision that
-supports both and replies in the decoded peer's schema version.
+unless both the selected provider and peer advertise that protocol for a
+negotiable delivery. Negotiation prefers `complete` when both sides support it
+and falls back to `streaming` for streaming-only peers. Set
+`JSH_AGENT_DELIVERY=complete|streaming` to narrow that preference (fail closed
+when the chosen delivery is unavailable). Streaming responses still decode to a
+complete `AgentResponse` before review; partial stream tool-call events never
+become executable proposals. Malformed, non-canonical, future-version,
+whitespace-bearing, duplicate, or oversized peer tokens are rejected without
+being printed. All three built-in providers support native `run`/`say`/`done`
+calls. Tool calls remain proposals and pass through exactly the same review
+prompt—selecting the native wire format never grants execution permission. Run
+`jsh doctor` to inspect the effective negotiation without contacting the
+provider or exposing credentials. Capability-token v2, which can express exact
+protocol/delivery pairs rather than a Cartesian product, remains an explicit
+peer-aware opt-in; default emission is v1 for rolling-upgrade safety. jsh
+exact-pins the revision that supports both and replies in the decoded peer's
+schema version.
 
 Before either the ordinary AI client or the independently invokable hidden
 Agent transport child touches DNS or an HTTP socket, it revalidates the decoded
@@ -752,6 +766,11 @@ Benchmarks are available through `cargo bench` and the comparison scripts
 - Some advanced Bash options and edge cases remain incomplete. Prefer an
   explicit Bash shebang for production scripts that depend on exact Bash
   parsing or `set -e` corner cases.
+- `shopt -s lastpipe` runs the final pipeline stage in the current shell when
+  job control (`monitor`) is off. Interactive shells keep `monitor` on by
+  default, matching Bash.
+- `fg`/`bg`/`wait`/`disown` accept Bash job specs `%N`, `%%`, `%+`, and `%-`.
+- `DEBUG` and `RETURN` traps are accepted for compatibility but are not fired.
 - Structured pipeline commands are jsh extensions and are not portable to Bash.
 - HTTP and AI features are available only in builds with the `ai` Cargo feature.
 

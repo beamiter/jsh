@@ -696,7 +696,7 @@ fn ai_check(checks: &mut Vec<Check>) {
 fn agent_protocol_check(checks: &mut Vec<Check>, config: &AiConfig) {
     let provider = config.chat_config(1, None).provider;
     match crate::agent::configured_agent_protocol_from_env(provider) {
-        Ok(protocol) => {
+        Ok(wire) => {
             let peer = if std::env::var_os("JSH_AGENT_PEER_CAPABILITIES").is_some() {
                 "advertised peer"
             } else {
@@ -705,21 +705,23 @@ fn agent_protocol_check(checks: &mut Vec<Check>, config: &AiConfig) {
             checks.push(pass(
                 "ai.agent_protocol",
                 format!(
-                    "Agent protocol '{}' is supported for complete delivery with the {peer}",
-                    protocol.as_wire_name()
+                    "Agent protocol '{}' is supported for {} delivery with the {peer}",
+                    wire.protocol.as_wire_name(),
+                    wire.delivery.as_wire_name(),
                 ),
             ));
         }
         Err(error) => {
             let category = match error {
-                AgentProtocolConfigError::InvalidProtocol => "invalid",
+                AgentProtocolConfigError::InvalidProtocol
+                | AgentProtocolConfigError::InvalidDelivery => "invalid",
                 AgentProtocolConfigError::InvalidPeer(_) => "malformed or unsupported",
                 AgentProtocolConfigError::UnsupportedSelection(_) => "unsupported",
             };
             checks.push(warn(
                 "ai.agent_protocol",
                 format!("Agent protocol negotiation is {category}: {error}"),
-                "use a canonical bounded JSH_AGENT_PEER_CAPABILITIES token and select text or native-tools; omit both variables for legacy text compatibility",
+                "use a canonical bounded JSH_AGENT_PEER_CAPABILITIES token and select text or native-tools; omit both variables for legacy text compatibility; set JSH_AGENT_DELIVERY=streaming only when the peer advertises streaming",
             ));
         }
     }

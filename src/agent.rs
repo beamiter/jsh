@@ -11,6 +11,8 @@
 //! - `JSH_AGENT_MAX_TURNS` — model-turn budget (default 16)
 //! - `JSH_AGENT_PROTOCOL` — explicit `text`/`native-tools` request protocol
 //! - `JSH_AGENT_PEER_CAPABILITIES` — strict bounded jagent capability token
+//! - `JSH_AGENT_DELIVERY` — optional `complete`/`streaming` preference that
+//!   narrows negotiation; omit to prefer complete then fall back to streaming
 //! - `JSH_AGENT_AUTO_APPROVE_READONLY` — retired compatibility switch; when
 //!   set, jsh warns and continues to require explicit approval
 
@@ -21,7 +23,7 @@ use jagent::{
     agent_capabilities_for_peer, prepare_agent_request, AgentCapabilities, AgentDelivery,
     AgentProtocol, AgentRequestSpec, AgentResponse, AgentSession, AgentState, ApprovedCommand,
     CapabilityError, CommandExecutionFailure, CommandExecutionOutcome, EnvironmentMeta, GitMeta,
-    ModelOutcome, Role, SessionError,
+    ModelOutcome, Role, SessionError, StreamEvent,
 };
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Write};
@@ -51,9 +53,17 @@ const MAX_CONSECUTIVE_PROTOCOL_RETRIES: u32 = 2;
 const MAX_AGENT_SESSION_TURNS: u32 = 1_000;
 const AGENT_PROTOCOL_ENV: &str = "JSH_AGENT_PROTOCOL";
 const AGENT_PEER_CAPABILITIES_ENV: &str = "JSH_AGENT_PEER_CAPABILITIES";
+const AGENT_DELIVERY_ENV: &str = "JSH_AGENT_DELIVERY";
 /// A peer that predates capability discovery can only be assumed to understand
 /// the historical JSON-in-text, complete-response path.
 const LEGACY_AGENT_PEER_CAPABILITIES: &str = "jagent-agent/1;protocols=text;delivery=complete";
+
+/// Negotiated Agent wire choice after intersecting provider and peer capabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AgentWireChoice {
+    pub protocol: AgentProtocol,
+    pub delivery: AgentDelivery,
+}
 const INTERNAL_AGENT_CHILD_FLAG: &str = "--jsh-internal-agent-child";
 const AGENT_CHILD_SESSION_ID: &str = "agent-child";
 const AGENT_CHILD_STATE_DIR_ENV: &str = "JSH_AGENT_CHILD_STATE_DIR";
@@ -858,8 +868,8 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
     };
     let chat = chat_config(&ai_config);
     let share_context = ai_config.allows_extended_context();
-    let protocol = match configured_agent_protocol_from_env(chat.provider) {
-        Ok(protocol) => protocol,
+    let wire = match configured_agent_protocol_from_env(chat.provider) {
+        Ok(wire) => wire,
         Err(error) => {
             eprintln!("agent: {error}");
             return 1;
@@ -903,30 +913,29 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                     session.turns_used() + 1,
                     session.max_turns()
                 ));
-                let reply =
-                    match request_model(&chat, &session, share_context, &agent_cwd, protocol) {
-                        Ok(reply) => reply,
-                        Err(error) => {
-                            if let Some(status) = take_agent_interrupt(&mut session, state) {
-                                return status;
-                            }
-                            let _ = session.model_failed(&error);
-                            let error = crate::ai::redact_sensitive_text(&error);
-                            eprintln!(
-                                "{}",
-                                terminal_safe_message(
-                                    "agent: model request failed: ",
-                                    &error,
-                                    MAX_AGENT_DISPLAY_BYTES
-                                )
-                            );
-                            if session.can_retry_model() && confirm("retry? [y/N] ") {
-                                let _ = session.retry_model();
-                                continue;
-                            }
-                            return 1;
+                let reply = match request_model(&chat, &session, share_context, &agent_cwd, wire) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        if let Some(status) = take_agent_interrupt(&mut session, state) {
+                            return status;
                         }
-                    };
+                        let _ = session.model_failed(&error);
+                        let error = crate::ai::redact_sensitive_text(&error);
+                        eprintln!(
+                            "{}",
+                            terminal_safe_message(
+                                "agent: model request failed: ",
+                                &error,
+                                MAX_AGENT_DISPLAY_BYTES
+                            )
+                        );
+                        if session.can_retry_model() && confirm("retry? [y/N] ") {
+                            let _ = session.retry_model();
+                            continue;
+                        }
+                        return 1;
+                    }
+                };
                 if let Some(status) = take_agent_interrupt(&mut session, state) {
                     return status;
                 }
@@ -1224,7 +1233,7 @@ fn request_model(
     session: &AgentSession,
     share_context: bool,
     agent_cwd: &Path,
-    protocol: AgentProtocol,
+    wire: AgentWireChoice,
 ) -> Result<AgentResponse, String> {
     let environment = environment_meta(share_context, agent_cwd);
     if crate::signal::pending_status().is_some() {
@@ -1235,7 +1244,7 @@ fn request_model(
     // redacts every history turn and binds this protocol to its matching
     // system prompt, provider schema, and response decoder.
     let user_text = jagent::agent_user_prompt(
-        &session.build_user_prompt_with(protocol),
+        &session.build_user_prompt_with(wire.protocol),
         &environment,
         None,
     );
@@ -1243,17 +1252,51 @@ fn request_model(
         role: Role::User,
         text: user_text,
     }];
-    let mut prepared = prepare_agent_request(chat, AgentRequestSpec::new(&history, protocol))
-        .map_err(|error| error.to_string())?;
+    let streaming = wire.delivery == AgentDelivery::Streaming;
+    let mut prepared = prepare_agent_request(
+        chat,
+        AgentRequestSpec::new(&history, wire.protocol).streaming(streaming),
+    )
+    .map_err(|error| error.to_string())?;
     debug_assert!(prepared.report.redaction_enabled);
     // The Agent lane builds its body through the same jagent code the chat
     // lane does, so it inherits the same `preserve_order` member order and
     // needs the same canonical re-encoding. See `crate::wire_json`.
     prepared.request.body = crate::wire_json::canonical_request_body(&prepared.request.body)?;
     let raw = model_request(prepared.request.clone(), chat.provider)?;
-    prepared
-        .parse_response(&raw)
-        .map_err(|error| error.to_string())
+    if streaming {
+        decode_streaming_agent_response(&prepared, &raw)
+    } else {
+        prepared
+            .parse_response(&raw)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Fold a complete transport body through jagent's streaming decoder.
+///
+/// The HTTP child still delivers one bounded body so cancellation remains
+/// process-kill based. Streaming peers require `"stream":true` plus the stream
+/// parsers; proposals still appear only after `into_response`, never from
+/// partial `StreamEvent::ToolCall` or text deltas.
+fn decode_streaming_agent_response(
+    prepared: &jagent::PreparedAgentRequest,
+    raw: &[u8],
+) -> Result<AgentResponse, String> {
+    let mut stream = prepared
+        .response_stream()
+        .map_err(|error| error.to_string())?;
+    for event in stream.push(raw) {
+        if let StreamEvent::Protocol(message) = event {
+            return Err(message);
+        }
+    }
+    for event in stream.finish() {
+        if let StreamEvent::Protocol(message) = event {
+            return Err(message);
+        }
+    }
+    stream.into_response().map_err(|error| error.to_string())
 }
 
 /// Perform one model request in a child process, so cancelling it ends it.
@@ -2366,6 +2409,7 @@ fn configured_max_turns(value: Option<&str>) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentProtocolConfigError {
     InvalidProtocol,
+    InvalidDelivery,
     InvalidPeer(CapabilityError),
     UnsupportedSelection(AgentProtocol),
 }
@@ -2376,6 +2420,10 @@ impl std::fmt::Display for AgentProtocolConfigError {
             Self::InvalidProtocol => write!(
                 formatter,
                 "{AGENT_PROTOCOL_ENV} must be 'text' or 'native-tools' (text is the compatible default)"
+            ),
+            Self::InvalidDelivery => write!(
+                formatter,
+                "{AGENT_DELIVERY_ENV} must be 'complete' or 'streaming' when set"
             ),
             Self::InvalidPeer(CapabilityError::TooLarge) => write!(
                 formatter,
@@ -2391,7 +2439,7 @@ impl std::fmt::Display for AgentProtocolConfigError {
             ),
             Self::UnsupportedSelection(protocol) => write!(
                 formatter,
-                "agent protocol '{}' is not supported by both the configured provider and peer for complete delivery",
+                "agent protocol '{}' is not supported by both the configured provider and peer for the requested delivery",
                 protocol.as_wire_name()
             ),
         }
@@ -2408,26 +2456,53 @@ fn requested_agent_protocol(
     }
 }
 
+fn requested_agent_delivery(
+    value: Option<&str>,
+) -> Result<Option<AgentDelivery>, AgentProtocolConfigError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some("complete") => Ok(Some(AgentDelivery::Complete)),
+        Some("streaming") => Ok(Some(AgentDelivery::Streaming)),
+        Some(_) => Err(AgentProtocolConfigError::InvalidDelivery),
+    }
+}
+
 fn configured_agent_protocol(
     provider: Provider,
     protocol_value: Option<&str>,
     peer_value: Option<&str>,
-) -> Result<AgentProtocol, AgentProtocolConfigError> {
+    delivery_value: Option<&str>,
+) -> Result<AgentWireChoice, AgentProtocolConfigError> {
     let protocol = requested_agent_protocol(protocol_value)?;
+    let delivery_pref = requested_agent_delivery(delivery_value)?;
     let peer = AgentCapabilities::from_wire(peer_value.unwrap_or(LEGACY_AGENT_PEER_CAPABILITIES))
         .map_err(AgentProtocolConfigError::InvalidPeer)?;
     // Reply in the peer's schema version so an exact-pair v2 capability set
     // remains exact if a provider's matrix becomes asymmetric in the future.
     // Compatibility-first v1 peers still receive the legacy Cartesian form.
     let local = agent_capabilities_for_peer(provider, peer);
-    local
-        .negotiate_with(peer, &[protocol], AgentDelivery::Complete)
-        .ok_or(AgentProtocolConfigError::UnsupportedSelection(protocol))
+    // Prefer complete when both sides support it; fall back to streaming so
+    // streaming-only peers work. An explicit JSH_AGENT_DELIVERY narrows the
+    // preference and fails closed when that delivery is unavailable.
+    let candidates: &[AgentDelivery] = match delivery_pref {
+        None => &[AgentDelivery::Complete, AgentDelivery::Streaming],
+        Some(AgentDelivery::Complete) => &[AgentDelivery::Complete],
+        Some(AgentDelivery::Streaming) => &[AgentDelivery::Streaming],
+    };
+    for delivery in candidates {
+        if let Some(protocol) = local.negotiate_with(peer, &[protocol], *delivery) {
+            return Ok(AgentWireChoice {
+                protocol,
+                delivery: *delivery,
+            });
+        }
+    }
+    Err(AgentProtocolConfigError::UnsupportedSelection(protocol))
 }
 
 pub(crate) fn configured_agent_protocol_from_env(
     provider: Provider,
-) -> Result<AgentProtocol, AgentProtocolConfigError> {
+) -> Result<AgentWireChoice, AgentProtocolConfigError> {
     let protocol = match std::env::var(AGENT_PROTOCOL_ENV) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -2444,7 +2519,19 @@ pub(crate) fn configured_agent_protocol_from_env(
             ))
         }
     };
-    configured_agent_protocol(provider, protocol.as_deref(), peer.as_deref())
+    let delivery = match std::env::var(AGENT_DELIVERY_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(AgentProtocolConfigError::InvalidDelivery)
+        }
+    };
+    configured_agent_protocol(
+        provider,
+        protocol.as_deref(),
+        peer.as_deref(),
+        delivery.as_deref(),
+    )
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -2596,8 +2683,8 @@ mod tests {
     use crate::environment::ShellState;
     use jagent::provider::{ChatConfig, HttpRequest, Message, Provider, Role};
     use jagent::{
-        prepare_agent_request as prepare_request, AgentProtocol, AgentRequestSpec as RequestSpec,
-        AgentSession, CommandExecutionFailure, ModelOutcome, Turn,
+        prepare_agent_request as prepare_request, AgentDelivery, AgentProtocol,
+        AgentRequestSpec as RequestSpec, AgentSession, CommandExecutionFailure, ModelOutcome, Turn,
     };
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -3561,19 +3648,26 @@ mod tests {
             MAX_AGENT_SESSION_TURNS
         );
         assert_eq!(
-            configured_agent_protocol(Provider::Ollama, None, None),
-            Ok(jagent::AgentProtocol::Text)
+            configured_agent_protocol(Provider::Ollama, None, None, None),
+            Ok(super::AgentWireChoice {
+                protocol: jagent::AgentProtocol::Text,
+                delivery: AgentDelivery::Complete,
+            })
         );
         assert_eq!(
             configured_agent_protocol(
                 Provider::Ollama,
                 Some("native-tools"),
                 Some(jagent::AGENT_CAPABILITIES_V1_WIRE),
+                None,
             ),
-            Ok(jagent::AgentProtocol::NativeTools)
+            Ok(super::AgentWireChoice {
+                protocol: jagent::AgentProtocol::NativeTools,
+                delivery: AgentDelivery::Complete,
+            })
         );
         assert_eq!(
-            configured_agent_protocol(Provider::Ollama, Some("guess"), None),
+            configured_agent_protocol(Provider::Ollama, Some("guess"), None, None),
             Err(AgentProtocolConfigError::InvalidProtocol)
         );
         for command in [
@@ -3593,11 +3687,12 @@ mod tests {
     }
 
     #[test]
-    fn complete_peer_negotiation_is_strict_and_default_text_is_stable_for_every_provider() {
+    fn peer_negotiation_prefers_complete_and_accepts_streaming_only_peers() {
         const TEXT_COMPLETE: &str = "jagent-agent/1;protocols=text;delivery=complete";
         const NATIVE_COMPLETE: &str = "jagent-agent/1;protocols=native-tools;delivery=complete";
         const STREAMING_ONLY: &str =
             "jagent-agent/1;protocols=text,native-tools;delivery=streaming";
+        const BOTH: &str = "jagent-agent/1;protocols=text,native-tools;delivery=complete,streaming";
 
         for provider in [
             Provider::Anthropic,
@@ -3605,42 +3700,133 @@ mod tests {
             Provider::Ollama,
         ] {
             assert_eq!(
-                configured_agent_protocol(provider, None, None),
-                Ok(AgentProtocol::Text),
+                configured_agent_protocol(provider, None, None, None),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::Text,
+                    delivery: AgentDelivery::Complete,
+                }),
                 "legacy default drifted for {provider:?}"
             );
             assert_eq!(
-                configured_agent_protocol(provider, None, Some(jagent::AGENT_CAPABILITIES_V1_WIRE),),
-                Ok(AgentProtocol::Text),
+                configured_agent_protocol(
+                    provider,
+                    None,
+                    Some(jagent::AGENT_CAPABILITIES_V1_WIRE),
+                    None,
+                ),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::Text,
+                    delivery: AgentDelivery::Complete,
+                }),
                 "capability discovery must not silently opt {provider:?} into native tools"
             );
             assert_eq!(
-                configured_agent_protocol(provider, Some("text"), Some(TEXT_COMPLETE)),
-                Ok(AgentProtocol::Text)
+                configured_agent_protocol(provider, Some("text"), Some(TEXT_COMPLETE), None),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::Text,
+                    delivery: AgentDelivery::Complete,
+                })
             );
             assert_eq!(
-                configured_agent_protocol(provider, Some("native-tools"), Some(NATIVE_COMPLETE),),
-                Ok(AgentProtocol::NativeTools)
+                configured_agent_protocol(
+                    provider,
+                    Some("native-tools"),
+                    Some(NATIVE_COMPLETE),
+                    None,
+                ),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::NativeTools,
+                    delivery: AgentDelivery::Complete,
+                })
             );
             assert_eq!(
-                configured_agent_protocol(provider, Some("native-tools"), Some(TEXT_COMPLETE)),
+                configured_agent_protocol(
+                    provider,
+                    Some("native-tools"),
+                    Some(TEXT_COMPLETE),
+                    None
+                ),
                 Err(AgentProtocolConfigError::UnsupportedSelection(
                     AgentProtocol::NativeTools
                 ))
             );
             assert_eq!(
-                configured_agent_protocol(provider, None, Some(NATIVE_COMPLETE)),
+                configured_agent_protocol(provider, None, Some(NATIVE_COMPLETE), None),
                 Err(AgentProtocolConfigError::UnsupportedSelection(
                     AgentProtocol::Text
                 ))
             );
             assert_eq!(
-                configured_agent_protocol(provider, Some("text"), Some(STREAMING_ONLY)),
+                configured_agent_protocol(provider, Some("text"), Some(STREAMING_ONLY), None),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::Text,
+                    delivery: AgentDelivery::Streaming,
+                }),
+                "streaming-only peers must negotiate streaming for {provider:?}"
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, Some("text"), Some(BOTH), None),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::Text,
+                    delivery: AgentDelivery::Complete,
+                }),
+                "complete must stay preferred when both deliveries are advertised for {provider:?}"
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, Some("text"), Some(BOTH), Some("streaming"),),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::Text,
+                    delivery: AgentDelivery::Streaming,
+                }),
+            );
+            assert_eq!(
+                configured_agent_protocol(
+                    provider,
+                    Some("text"),
+                    Some(TEXT_COMPLETE),
+                    Some("streaming"),
+                ),
                 Err(AgentProtocolConfigError::UnsupportedSelection(
                     AgentProtocol::Text
                 )),
-                "jsh's complete-only transport must reject streaming-only {provider:?} peers"
             );
+        }
+    }
+
+    #[test]
+    fn streaming_transport_folds_into_reviewable_proposals_only() {
+        let history = [Message {
+            role: Role::User,
+            text: "inspect".into(),
+        }];
+        let config = ChatConfig {
+            provider: Provider::OpenAiCompatible,
+            api_key: None,
+            model: "test-model".into(),
+            base_url: "http://127.0.0.1:1234".into(),
+            max_tokens: 128,
+            temperature: Some(0.0),
+        };
+        let prepared = prepare_request(
+            &config,
+            RequestSpec::new(&history, AgentProtocol::NativeTools).streaming(true),
+        )
+        .unwrap();
+        assert!(prepared.is_streaming());
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",",
+            "\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],",
+            "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = super::decode_streaming_agent_response(&prepared, body.as_bytes()).unwrap();
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        match session.accept_agent_response(&response).unwrap() {
+            ModelOutcome::Proposal { command, .. } => assert_eq!(command, "pwd"),
+            other => panic!("expected proposal, got {other:?}"),
         }
     }
 
@@ -3648,7 +3834,7 @@ mod tests {
     fn malformed_peer_capabilities_are_bounded_and_never_echoed() {
         let secret = "not-a-token-jsh-peer-secret";
         let error =
-            configured_agent_protocol(Provider::OpenAiCompatible, Some("text"), Some(secret))
+            configured_agent_protocol(Provider::OpenAiCompatible, Some("text"), Some(secret), None)
                 .unwrap_err();
         assert_eq!(
             error,
@@ -3657,8 +3843,9 @@ mod tests {
         assert!(!error.to_string().contains(secret));
 
         let oversized = "x".repeat(jagent::MAX_AGENT_CAPABILITIES_WIRE_BYTES + 1);
-        let error = configured_agent_protocol(Provider::Anthropic, Some("text"), Some(&oversized))
-            .unwrap_err();
+        let error =
+            configured_agent_protocol(Provider::Anthropic, Some("text"), Some(&oversized), None)
+                .unwrap_err();
         assert_eq!(
             error,
             AgentProtocolConfigError::InvalidPeer(jagent::CapabilityError::TooLarge)
