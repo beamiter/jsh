@@ -378,7 +378,7 @@ described below.
 After changing either canonical script, synchronize and test every vendored
 jterm copy. `jterm_core/scripts/install-jsh.sh` carries `install-jsh.sh`, and
 `jterm_core/scripts/jsh-remote.sh` carries the launcher. Both vendor bodies
-match script revision `fd605616b56bd73265a3a6141c814938aa2859f9`; each differs
+match script revision `348b9a0ad9c86832e7d1a0d1dfa5758685abbbdb`; each differs
 from its canonical copy only by a four-line provenance header.
 
 ## Release checks
