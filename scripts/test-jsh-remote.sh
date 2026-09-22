@@ -21,6 +21,13 @@ for f in "${REMOTE}" "${INSTALLER}"; do
     }
 done
 
+command -v minisign > /dev/null 2>&1 || {
+    echo "need minisign on PATH to run remote acceptance tests" >&2
+    echo "(Debian/Ubuntu: sudo apt install minisign)" >&2
+    exit 1
+}
+MINISIGN_DIR="$(cd -- "$(dirname -- "$(command -v minisign)")" && pwd)"
+
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/test-jsh-remote.XXXXXX")"
 trap 'rm -rf "${ROOT}"' EXIT
 
@@ -32,6 +39,17 @@ LOG="${ROOT}/session.log"      # what the deployed jsh saw
 TARGET="x86_64-unknown-linux-musl"
 VERSION="0.3.0"
 mkdir -p "${LOCAL_HOME}" "${CTR_HOME}" "${STUB}"
+
+# Real signatures exercise the same trust checks as a published release.
+# The fixture key override is accepted only alongside JSH_INSTALL_BASE_URL.
+MINI_DIR="${ROOT}/minisign"
+mkdir -p "${MINI_DIR}"
+printf '\n\n' | minisign -G -p "${MINI_DIR}/test.pub" -s "${MINI_DIR}/test.secret" > /dev/null 2>&1
+TEST_MINISIGN_PUBKEY="$(awk '/^R/{print; exit}' "${MINI_DIR}/test.pub")"
+[ -n "${TEST_MINISIGN_PUBKEY}" ] || {
+    echo "failed to generate ephemeral minisign pubkey" >&2
+    exit 1
+}
 
 pass=0
 fail=0
@@ -137,11 +155,34 @@ make_release() {
     make_jsh "${stage}/jsh" "${v}"
     tar -C "${ROOT}/stage" -czf "${REL}/download/v${v}/jsh-${v}-${TARGET}.tar.gz" "jsh-${v}-${TARGET}"
     (cd "${REL}/download/v${v}" && sha256sum "jsh-${v}-${TARGET}.tar.gz" > "jsh-${v}-${TARGET}.tar.gz.sha256")
-    printf '{"schema":1,"version":"%s"}\n' "${v}" > "${REL}/latest/download/manifest.json"
+    local archive="jsh-${v}-${TARGET}.tar.gz"
+    local dir="${REL}/download/v${v}"
+    local sha
+    sha="$(cut -d' ' -f1 < "${dir}/${archive}.sha256")"
+    cat > "${REL}/latest/download/manifest.json" <<EOF
+{
+  "schema": 1,
+  "name": "jsh",
+  "version": "${v}",
+  "tag": "v${v}",
+  "repository": "beamiter/jsh",
+  "artifacts": [
+    {
+      "target": "${TARGET}",
+      "file": "${archive}",
+      "sha256": "${sha}",
+      "url": "file://${dir}/${archive}"
+    }
+  ]
+}
+EOF
+    cp "${REL}/latest/download/manifest.json" "${dir}/manifest.json"
+    printf '\n' | minisign -Sm "${REL}/latest/download/manifest.json" -s "${MINI_DIR}/test.secret" > /dev/null 2>&1
+    cp "${REL}/latest/download/manifest.json.minisig" "${dir}/manifest.json.minisig"
 }
 make_release "${VERSION}"
 
-PATH_FOR_RUN="${STUB}:/usr/local/bin:/usr/bin:/bin"
+PATH_FOR_RUN="${STUB}:${MINISIGN_DIR}:/usr/local/bin:/usr/bin:/bin"
 
 # FAKE_DOCKER_PATH is the PATH the stub gives the "container", so a test can put
 # a jsh inside it without also putting one on the launcher's PATH.
@@ -153,6 +194,7 @@ run() {
         TERM="${FAKE_TERM-xterm-256color}" COLORTERM="${FAKE_COLORTERM-truecolor}" \
         XDG_CACHE_HOME="${LOCAL_HOME}/.cache" \
         JSH_INSTALL_BASE_URL="file://${REL}" \
+        JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
         FAKE_DOCKER_PATH="${FAKE_DOCKER_PATH}" \
         sh "${REMOTE}" --docker testctr "$@" < /dev/null
 }
@@ -251,11 +293,13 @@ LDDSTUB="${ROOT}/ldd-dynamic"
 mkdir -p "${LDDSTUB}"
 printf '#!/bin/sh\necho "\tlinux-vdso.so.1 (0x0000)"\n' > "${LDDSTUB}/ldd"
 chmod +x "${LDDSTUB}/ldd"
+rm -f "${LOG}"
 out="$(env -i HOME="${LOCAL_HOME}" PATH="${LDDSTUB}:${PATH_FOR_RUN}" \
     TERM=xterm-256color COLORTERM=truecolor XDG_CACHE_HOME="${LOCAL_HOME}/.cache" \
     JSH_INSTALL_BASE_URL="file://${REL}" \
+    JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
     FAKE_DOCKER_PATH="${FAKE_DOCKER_PATH}" \
-    sh "${REMOTE}" --docker testctr -v 2>&1 < /dev/null)"
+    sh "${REMOTE}" --docker testctr --fallback fail -v 2>&1 < /dev/null)"
 rc=$?
 assert "exit 0" [ ${rc} -eq 0 ]
 assert "no loan is offered" lacks "${out}" "lending it"
@@ -477,6 +521,7 @@ run_ssh() {
     env -i HOME="${LOCAL_HOME}" PATH="${PATH_FOR_RUN}" TERM=xterm-256color \
         XDG_CACHE_HOME="${LOCAL_HOME}/.cache" XDG_RUNTIME_DIR="${ROOT}/run" \
         JSH_INSTALL_BASE_URL="file://${REL}" \
+        JSH_MINISIGN_PUBKEY="${TEST_MINISIGN_PUBKEY}" \
         sh "${REMOTE}" testhost "$@" < /dev/null
 }
 

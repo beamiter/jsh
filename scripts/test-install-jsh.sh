@@ -19,6 +19,7 @@ have minisign || {
     echo "(Debian/Ubuntu: sudo apt install minisign)" >&2
     exit 1
 }
+have python3 || { echo "need python3 to validate installer JSON" >&2; exit 1; }
 MINISIGN_DIR="$(cd -- "$(dirname -- "$(command -v minisign)")" && pwd)"
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/test-install-jsh.XXXXXX")"
@@ -62,8 +63,21 @@ matches() { grep -qE -- "$2" <<< "$1"; }
 lacks() { ! grep -qE -- "$2" <<< "$1"; }
 has_prefix() { [[ "$1" == "$2"* ]]; }
 
+# Parse the entire stdout: extra diagnostics or a second object must fail.
+valid_check_error_json() {
+    python3 -c '
+import json, sys
+result = json.loads(sys.argv[1])
+assert isinstance(result, dict)
+assert result["latest"] is None
+assert result["update_available"] is False
+assert isinstance(result["error"], str) and result["error"]
+' "$1"
+}
+
 # version_is <binary> <expected --version output>
 version_is() { [ "$("$1" --version)" = "$2" ]; }
+digest_is() { [ -f "$1" ] && [ "$(sha256sum "$1")" = "$2" ]; }
 
 indent() { printf '    %s\n' "${1//$'\n'/$'\n'    }"; }
 
@@ -367,6 +381,18 @@ echo "== missing or bad manifest signature aborts =="
 make_release 0.3.27
 rm -f "${REL}/latest/download/manifest.json.minisig" \
     "${REL}/download/v0.3.27/manifest.json.minisig"
+check_err="${ROOT}/check-signature.err"
+installed_digest="$(sha256sum "${BIN}/jsh")"
+out="$(run --check --json 2> "${check_err}")"
+rc=$?
+indent "${out}"
+assert "unsigned --check exits nonzero" [ ${rc} -ne 0 ]
+assert "unsigned --check emits one JSON object with unknown latest and no update" valid_check_error_json "${out}"
+assert "unsigned --check leaves the installed bytes untouched" digest_is "${BIN}/jsh" "${installed_digest}"
+assert "unsigned --check reports its authentication error" \
+    matches "${out}" '"error":"no signature for the release manifest.*refusing to trust unsigned metadata"'
+assert "unsigned --check keeps the human diagnostic on stderr" \
+    matches "$(< "${check_err}")" 'refusing to trust unsigned metadata'
 out="$(run 2>&1)"
 rc=$?
 indent "${out}"
@@ -380,12 +406,42 @@ printf '{"tampered":true}\n' > "${ROOT}/tamper-manifest.json"
 printf '\n' | minisign -Sm "${ROOT}/tamper-manifest.json" -s "${MINI_DIR}/test.secret" > /dev/null 2>&1
 cp "${ROOT}/tamper-manifest.json.minisig" "${REL}/latest/download/manifest.json.minisig"
 cp "${ROOT}/tamper-manifest.json.minisig" "${REL}/download/v0.3.28/manifest.json.minisig"
+out="$(run --check --json 2> "${check_err}")"
+rc=$?
+indent "${out}"
+assert "bad-signature --check exits nonzero" [ ${rc} -ne 0 ]
+assert "bad-signature --check emits one JSON object with unknown latest and no update" valid_check_error_json "${out}"
+assert "bad-signature --check leaves the installed bytes untouched" digest_is "${BIN}/jsh" "${installed_digest}"
+assert "bad-signature --check reports verification failure" \
+    matches "${out}" '"error":"release manifest signature verification failed"'
 out="$(run 2>&1)"
 rc=$?
 indent "${out}"
 assert "bad signature exits nonzero" [ ${rc} -ne 0 ]
 assert "signature verification failed" matches "${out}" 'signature verification failed'
 assert "old binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+
+echo "== unavailable minisign is structured in --check --json =="
+make_release 0.3.281
+# Keep the normal check tools but omit minisign even when the host has it in
+# /usr/bin. This case must exercise the missing dependency on every machine.
+NO_MINISIGN_BIN="${ROOT}/no-minisign-bin"
+mkdir -p "${NO_MINISIGN_BIN}"
+for tool in awk basename cat curl cut date dirname grep head mkdir mktemp readlink rm sed sh timeout tr uname wc; do
+    if have "${tool}"; then
+        ln -s "$(command -v "${tool}")" "${NO_MINISIGN_BIN}/${tool}"
+    fi
+done
+PATH_FOR_RUN="${BIN}:${NO_MINISIGN_BIN}"
+out="$(run --check --json 2> "${check_err}")"
+rc=$?
+indent "${out}"
+assert "missing-minisign --check exits nonzero" [ ${rc} -ne 0 ]
+assert "missing-minisign --check emits one JSON object with unknown latest and no update" valid_check_error_json "${out}"
+assert "missing-minisign --check leaves the installed bytes untouched" digest_is "${BIN}/jsh" "${installed_digest}"
+assert "missing-minisign --check reports how to install the missing verifier" \
+    matches "${out}" '"error":"need minisign to verify the release manifest.*sudo apt install minisign'
+PATH_FOR_RUN="${BIN}:${MINISIGN_DIR}:/usr/local/bin:/usr/bin:/bin"
 
 echo "== sidecar matching archive but not signed manifest aborts =="
 make_release 0.3.29
@@ -402,6 +458,20 @@ assert "nonzero exit" [ ${rc} -ne 0 ]
 assert "sidecar/manifest disagreement refused" \
     matches "${out}" 'does not match the signed manifest digest'
 assert "old binary untouched" version_is "${BIN}/jsh" "jsh 0.3.1 (fake)"
+
+echo "== signed manifest digests must contain exactly 64 hex characters =="
+for digest_length in 63 65; do
+    make_release 0.3.291
+    publish_manifest 0.3.291 "$(printf '%0*d' "${digest_length}" 0)"
+    out="$(run 2>&1)"
+    rc=$?
+    indent "${out}"
+    assert "${digest_length}-character manifest digest exits nonzero" [ ${rc} -ne 0 ]
+    assert "${digest_length}-character manifest digest is refused" \
+        matches "${out}" 'signed manifest has no SHA-256 for target'
+    assert "${digest_length}-character manifest digest leaves installed bytes untouched" \
+        digest_is "${BIN}/jsh" "${installed_digest}"
+done
 
 echo "== hostile archive members are rejected before extraction =="
 make_release 0.3.23

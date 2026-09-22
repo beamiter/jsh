@@ -378,8 +378,14 @@ described below.
 After changing either canonical script, synchronize and test every vendored
 jterm copy. `jterm_core/scripts/install-jsh.sh` carries `install-jsh.sh`, and
 `jterm_core/scripts/jsh-remote.sh` carries the launcher. Both vendor bodies
-match script revision `348b9a0ad9c86832e7d1a0d1dfa5758685abbbdb`; each differs
-from its canonical copy only by a four-line provenance header.
+derive from script revision `348b9a0ad9c86832e7d1a0d1dfa5758685abbbdb`.
+The installer copies additionally include the coordinated JSON check-error
+and portable awk fixes in the current working trees; only the provenance
+header differs between their bodies. Signature/tool failures in
+`--check --json` now return an error object with no latest version or update
+offer. Digest extraction works on older mawk while still requiring exactly
+64 hexadecimal characters. Installer and remote acceptance tests use real,
+ephemeral minisign signatures, including failed verification and deployment.
 
 ## Release checks
 

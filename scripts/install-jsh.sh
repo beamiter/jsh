@@ -62,6 +62,8 @@ max_age=0
 tmp_dir=""
 stage_dir=""
 check_requested=0
+# Set only after the check's installed-version state and JSON emitter exist.
+check_json_ready=0
 # Empty means "not resolved yet"; a source build fills it in with the checkout
 # to build, and leaves it empty when the repository is the right source.
 source_dir=""
@@ -119,6 +121,11 @@ say() {
 warn() { printf 'install-jsh: %s\n' "$*" >&2; }
 die() {
     printf 'install-jsh: %s\n' "$*" >&2
+    # Authentication failures are still fatal, but a terminal needs their
+    # structured reason instead of an empty stdout / JSON parse error.
+    if [ "${mode}" = "check" ] && [ "${json}" -eq 1 ] && [ "${check_json_ready}" -eq 1 ]; then
+        emit_check_json "" "$*"
+    fi
     exit 1
 }
 have() { command -v "$1" > /dev/null 2>&1; }
@@ -602,7 +609,9 @@ manifest_artifact_sha256() {
             }
         }
         /"sha256"[[:space:]]*:/ {
-            if (match($0, /"sha256"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]{64}"/)) {
+            # Older mawk releases do not implement interval expressions.
+            # Match the hex alphabet here and enforce 64 bytes below.
+            if (match($0, /"sha256"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]+"/)) {
                 s = substr($0, RSTART, RLENGTH)
                 sub(/^"sha256"[[:space:]]*:[[:space:]]*"/, "", s)
                 sub(/"$/, "", s)
@@ -734,6 +743,7 @@ emit_check_json() {
 }
 
 if [ "${mode}" = "check" ]; then
+    check_json_ready=1
     latest=""
     check_error=""
     if [ -n "${want_version}" ]; then

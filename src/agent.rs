@@ -3793,6 +3793,58 @@ mod tests {
         }
     }
 
+    /// Version 2 carries exact protocol/delivery pairs. Keep this integration
+    /// test at the jsh boundary: reducing the token to independent protocol
+    /// and delivery sets would invent both crossed modes and could make jsh
+    /// send a complete native-tools request to a peer that only accepts that
+    /// protocol as a stream.
+    #[test]
+    fn peer_negotiation_preserves_version_two_exact_pairs() {
+        const SPLIT: &str = "jagent-agent/2;modes=text+complete,native-tools+streaming";
+
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            assert_eq!(
+                configured_agent_protocol(provider, None, Some(SPLIT), None),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::Text,
+                    delivery: AgentDelivery::Complete,
+                }),
+                "default text mode crossed the v2 matrix for {provider:?}"
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, Some("native-tools"), Some(SPLIT), None,),
+                Ok(super::AgentWireChoice {
+                    protocol: AgentProtocol::NativeTools,
+                    delivery: AgentDelivery::Streaming,
+                }),
+                "native-tools must use its sole advertised delivery for {provider:?}"
+            );
+            assert_eq!(
+                configured_agent_protocol(
+                    provider,
+                    Some("native-tools"),
+                    Some(SPLIT),
+                    Some("complete"),
+                ),
+                Err(AgentProtocolConfigError::UnsupportedSelection(
+                    AgentProtocol::NativeTools
+                )),
+                "negotiation invented native-tools+complete for {provider:?}"
+            );
+            assert_eq!(
+                configured_agent_protocol(provider, Some("text"), Some(SPLIT), Some("streaming"),),
+                Err(AgentProtocolConfigError::UnsupportedSelection(
+                    AgentProtocol::Text
+                )),
+                "negotiation invented text+streaming for {provider:?}"
+            );
+        }
+    }
+
     #[test]
     fn streaming_transport_folds_into_reviewable_proposals_only() {
         let history = [Message {
