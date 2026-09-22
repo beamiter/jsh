@@ -117,14 +117,14 @@ fn wait_for_fg(pid: Pid, state: &mut ShellState) -> i32 {
     let status = match waitpid(pid, Some(WaitPidFlag::WUNTRACED)) {
         Ok(WaitStatus::Exited(_, code)) => code,
         Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
-        Ok(WaitStatus::Stopped(_, _)) => {
+        Ok(WaitStatus::Stopped(_, sig)) => {
             let cmd_str = format!("(pid {})", pid);
             let jid = state.jobs.add(pid, cmd_str.clone());
             if let Some(job) = state.jobs.get_by_id(jid) {
                 job.status = crate::job::JobStatus::Stopped;
                 eprintln!("\n[{}]+  Stopped                    {}", jid, cmd_str);
             }
-            148
+            128 + sig as i32
         }
         _ => 1,
     };
@@ -2316,6 +2316,23 @@ fn apply_redirects_in_child(redirects: &[Redirect], state: &mut ShellState) {
 #[cfg(test)]
 mod output_tests {
     use super::*;
+
+    #[test]
+    fn initial_foreground_stop_status_preserves_the_actual_signal() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -STOP $$"])
+            .spawn()
+            .expect("spawn stopping child");
+        let pid = Pid::from_raw(child.id() as i32);
+        let mut state = ShellState::new(false);
+        let status = wait_for_fg(pid, &mut state);
+        let stopped = state.jobs.jobs.first().map(|job| job.status.clone());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(status, 128 + nix::sys::signal::Signal::SIGSTOP as i32);
+        assert_eq!(stopped, Some(crate::job::JobStatus::Stopped));
+    }
 
     #[test]
     fn color_requires_a_terminal_and_no_color_must_be_absent() {

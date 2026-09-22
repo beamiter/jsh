@@ -143,8 +143,8 @@ impl JobTable {
                     Ok(WaitStatus::Exited(_, code)) => {
                         job.status = JobStatus::Done(code);
                     }
-                    Ok(WaitStatus::Signaled(_, _, _)) => {
-                        job.status = JobStatus::Done(128);
+                    Ok(WaitStatus::Signaled(_, sig, _)) => {
+                        job.status = JobStatus::Done(128 + sig as i32);
                     }
                     Ok(WaitStatus::Stopped(_, _)) => {
                         job.status = JobStatus::Stopped;
@@ -173,7 +173,7 @@ impl JobTable {
             match waitpid(pid, Some(WaitPidFlag::WUNTRACED)) {
                 Ok(WaitStatus::Exited(_, code)) => return code,
                 Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
-                Ok(WaitStatus::Stopped(_, _)) => {
+                Ok(WaitStatus::Stopped(_, sig)) => {
                     if let Some(job) = self.jobs.iter_mut().find(|j| j.pid == pid) {
                         job.status = JobStatus::Stopped;
                         eprintln!(
@@ -181,7 +181,7 @@ impl JobTable {
                             job.id, job.command
                         );
                     }
-                    return 148;
+                    return 128 + sig as i32;
                 }
                 Err(_) => return 1,
                 _ => continue,
@@ -305,6 +305,54 @@ fn format_job_duration(d: Duration) -> String {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn foreground_stop_status_preserves_the_actual_signal() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -STOP $$"])
+            .spawn()
+            .expect("spawn stopping child");
+        let pid = Pid::from_raw(child.id() as i32);
+        let mut table = JobTable::new();
+        let id = table.add(pid, "stopping child".into());
+        let status = table.wait_fg(pid);
+        let stopped = table.get_by_id(id).unwrap().status.clone();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(status, 128 + Signal::SIGSTOP as i32);
+        assert_eq!(stopped, JobStatus::Stopped);
+    }
+
+    #[test]
+    fn background_termination_status_preserves_the_actual_signal() {
+        for signal in [Signal::SIGTERM, Signal::SIGKILL] {
+            let mut child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn background child");
+            let pid = Pid::from_raw(child.id() as i32);
+            let mut table = JobTable::new();
+            let id = table.add(pid, "background child".into());
+            kill(pid, signal).expect("signal child");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                table.check_background();
+                if table.get_by_id(id).unwrap().status != JobStatus::Running
+                    || Instant::now() >= deadline
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let status = table.get_by_id(id).unwrap().status.clone();
+            if status == JobStatus::Running {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            assert_eq!(status, JobStatus::Done(128 + signal as i32));
+        }
+    }
 
     /// Records what each channel was told, so "one event, one notification" is
     /// an assertion rather than a hope.
