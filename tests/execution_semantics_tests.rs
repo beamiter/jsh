@@ -31,6 +31,14 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+#[test]
+fn fg_removes_completed_jobs_and_preserves_their_exit_status() {
+    let output = run_c("sh -c 'exit 7' & fg; echo $?; jobs; fg");
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "7\n");
+    assert!(stderr(&output).contains("fg: no current job"));
+}
+
 #[cfg(unix)]
 fn wait_promptly(child: &mut Child) -> ExitStatus {
     use nix::sys::signal::{kill, Signal};

@@ -169,10 +169,10 @@ impl JobTable {
     }
 
     pub fn wait_fg(&mut self, pid: Pid) -> i32 {
-        loop {
+        let code = loop {
             match waitpid(pid, Some(WaitPidFlag::WUNTRACED)) {
-                Ok(WaitStatus::Exited(_, code)) => return code,
-                Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
+                Ok(WaitStatus::Exited(_, code)) => break code,
+                Ok(WaitStatus::Signaled(_, sig, _)) => break 128 + sig as i32,
                 Ok(WaitStatus::Stopped(_, sig)) => {
                     if let Some(job) = self.jobs.iter_mut().find(|j| j.pid == pid) {
                         job.status = JobStatus::Stopped;
@@ -186,7 +186,11 @@ impl JobTable {
                 Err(_) => return 1,
                 _ => continue,
             }
-        }
+        };
+        // This wait reaped the foreground job; background polling can no
+        // longer observe its completion. Remove it without a done notification.
+        self.jobs.retain(|job| job.pid != pid);
+        code
     }
 
     pub fn continue_fg(&mut self, id: usize) -> i32 {
@@ -305,6 +309,33 @@ fn format_job_duration(d: Duration) -> String {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn resumed_foreground_jobs_are_retained_only_while_stopped() {
+        for (finish, expected) in [("exit 7", 7), ("kill -TERM $$", 143)] {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("kill -STOP $$; kill -STOP $$; {finish}")])
+                .process_group(0)
+                .spawn()
+                .expect("spawn stopping child");
+            let pid = Pid::from_raw(child.id() as i32);
+            let mut table = JobTable::new();
+            let other = table.add(Pid::from_raw(i32::MAX), "other job".into());
+            let id = table.add(pid, "resumed child".into());
+
+            assert_eq!(table.wait_fg(pid), 128 + Signal::SIGSTOP as i32);
+            assert_eq!(table.continue_fg(id), 128 + Signal::SIGSTOP as i32);
+            assert_eq!(table.get_by_id(id).unwrap().status, JobStatus::Stopped);
+            let status = table.continue_fg(id);
+            let _ = child.wait();
+
+            assert_eq!(status, expected);
+            assert!(table.get_by_id(id).is_none(), "reaped job remains in table");
+            assert_eq!(table.get_last().map(|job| job.id), Some(other));
+            assert_eq!(table.resolve_spec(&format!("%{id}")), None);
+        }
+    }
 
     #[test]
     fn foreground_stop_status_preserves_the_actual_signal() {
