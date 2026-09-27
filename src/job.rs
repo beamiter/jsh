@@ -93,11 +93,23 @@ impl JobTable {
             .find(|j| j.status == JobStatus::Running || j.status == JobStatus::Stopped)
     }
 
-    /// Resolve Bash-like job specs: `%N`, `%%`, `%+`, `%-` (and bare `N`).
+    /// Resolve Bash-like job specs: `%N`, `%%`, `%+`, `%-`, `%?cmd` (and bare `N`).
     /// `%+` and `%%` are the current job (last stopped, else last).
     /// `%-` is the previous job if available, else current.
+    /// `%?text` is the newest active job whose command contains `text`.
     pub fn resolve_spec(&mut self, spec: &str) -> Option<usize> {
         let s = spec.strip_prefix('%').unwrap_or(spec);
+        if let Some(pattern) = s.strip_prefix('?') {
+            if pattern.is_empty() {
+                return None;
+            }
+            return self
+                .jobs
+                .iter()
+                .rev()
+                .find(|job| Self::is_active(&job.status) && job.command.contains(pattern))
+                .map(|job| job.id);
+        }
         match s {
             "" | "+" | "%" => self
                 .get_last_stopped()
@@ -513,6 +525,11 @@ mod tests {
         assert_eq!(table.resolve_spec("2"), Some(2));
         assert_eq!(table.resolve_spec("%99"), None);
         assert_eq!(table.resolve_spec("%foo"), None);
+
+        assert_eq!(table.resolve_spec("%?sleep 2"), Some(2));
+        assert_eq!(table.resolve_spec("?sleep 3"), Some(3));
+        assert_eq!(table.resolve_spec("%?missing"), None);
+        assert_eq!(table.resolve_spec("%?"), None);
 
         // Prefer last stopped for current.
         if let Some(job) = table.get_by_id(2) {

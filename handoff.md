@@ -70,6 +70,9 @@ described below.
   waiting for a done notification, and `fg`/`bg` refuse them instead of
   resurrecting a reaped pid. Regressions cover the stale-table window and the
   builtin refusal path.
+- `%?substring` (and bare `?substring`) now resolve to the newest active job
+  whose command contains the substring; empty patterns and completed jobs are
+  rejected. Regressions cover match order and refusal paths.
 - `expand_command_sub` now records the reaped child's exact exit or signal
   status at the existing `ShellState` handoff. Assignment-only commands consume
   the last such status, including across multiple assignments, so
