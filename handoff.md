@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25
+Updated: 2026-09-27
 
 This baseline unifies command discovery, separates executable AI suggestions
 from read-only explanations, completes workflow parameter filling, and fixes
@@ -66,6 +66,10 @@ described below.
 
 ## Completed since the previous handoff
 
+- Job specs `%−`, `%N`, and bare `N` now ignore completed entries that are still
+  waiting for a done notification, and `fg`/`bg` refuse them instead of
+  resurrecting a reaped pid. Regressions cover the stale-table window and the
+  builtin refusal path.
 - `expand_command_sub` now records the reaped child's exact exit or signal
   status at the existing `ShellState` handoff. Assignment-only commands consume
   the last such status, including across multiple assignments, so

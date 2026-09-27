@@ -67,6 +67,18 @@ impl JobTable {
         self.jobs.iter_mut().find(|j| j.id == id)
     }
 
+    fn is_active(status: &JobStatus) -> bool {
+        matches!(status, JobStatus::Running | JobStatus::Stopped)
+    }
+
+    fn active_job_ids(&self) -> Vec<usize> {
+        self.jobs
+            .iter()
+            .filter(|job| Self::is_active(&job.status))
+            .map(|job| job.id)
+            .collect()
+    }
+
     pub fn get_last_stopped(&mut self) -> Option<&mut Job> {
         self.jobs
             .iter_mut()
@@ -92,15 +104,22 @@ impl JobTable {
                 .map(|j| j.id)
                 .or_else(|| self.get_last().map(|j| j.id)),
             "-" => {
-                if self.jobs.len() >= 2 {
-                    Some(self.jobs[self.jobs.len() - 2].id)
-                } else {
-                    self.jobs.last().map(|j| j.id)
+                let active = self.active_job_ids();
+                match active.len() {
+                    0 => None,
+                    1 => Some(active[0]),
+                    n => Some(active[n - 2]),
                 }
             }
             digits if digits.chars().all(|c| c.is_ascii_digit()) && !digits.is_empty() => {
                 let id: usize = digits.parse().ok()?;
-                self.get_by_id(id).map(|j| j.id)
+                self.get_by_id(id).and_then(|job| {
+                    if Self::is_active(&job.status) {
+                        Some(job.id)
+                    } else {
+                        None
+                    }
+                })
             }
             _ => None,
         }
@@ -195,6 +214,10 @@ impl JobTable {
 
     pub fn continue_fg(&mut self, id: usize) -> i32 {
         if let Some(job) = self.get_by_id(id) {
+            if !Self::is_active(&job.status) {
+                eprintln!("jsh: fg: {}: no such job", id);
+                return 1;
+            }
             let pid = job.pid;
             job.status = JobStatus::Running;
             eprintln!("{}", job.command);
@@ -212,6 +235,10 @@ impl JobTable {
 
     pub fn continue_bg(&mut self, id: usize) -> i32 {
         if let Some(job) = self.get_by_id(id) {
+            if !Self::is_active(&job.status) {
+                eprintln!("jsh: bg: {}: no such job", id);
+                return 1;
+            }
             job.status = JobStatus::Running;
             eprintln!("[{}]+ {} &", job.id, job.command);
             kill(job.pid, Signal::SIGCONT).ok();
@@ -493,5 +520,31 @@ mod tests {
         }
         assert_eq!(table.resolve_spec("%%"), Some(2));
         assert_eq!(table.resolve_spec("%+"), Some(2));
+    }
+
+    #[test]
+    fn resolve_spec_ignores_completed_jobs_for_previous_and_numeric_specs() {
+        let mut table = JobTable::new();
+        let id1 = table.add(Pid::from_raw(1001), "sleep 1".into());
+        let id2 = table.add(Pid::from_raw(1002), "sleep 2".into());
+        table.get_by_id(id1).unwrap().status = JobStatus::Done(0);
+
+        assert_eq!(table.resolve_spec("%%"), Some(id2));
+        assert_eq!(table.resolve_spec("%-"), Some(id2));
+        assert_eq!(table.resolve_spec("%1"), None);
+        assert_eq!(table.resolve_spec("1"), None);
+        assert_eq!(table.resolve_spec("2"), Some(id2));
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn fg_and_bg_refuse_completed_jobs() {
+        let mut table = JobTable::new();
+        let id = table.add(Pid::from_raw(1001), "sleep 1".into());
+        table.get_by_id(id).unwrap().status = JobStatus::Done(0);
+
+        assert_eq!(table.continue_fg(id), 1);
+        assert_eq!(table.continue_bg(id), 1);
     }
 }
