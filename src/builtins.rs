@@ -3402,17 +3402,17 @@ fn builtin_disown(args: &[String], state: &mut ShellState) -> i32 {
         return 0;
     }
 
-    let id = state.jobs.resolve_spec(&args[0]);
-    match id {
-        Some(id) => {
-            state.jobs.jobs.retain(|j| j.id != id);
-            0
-        }
-        None => {
-            eprintln!("jsh: disown: {}: no such job", args[0]);
-            1
+    let mut last_status = 0;
+    for arg in args {
+        match state.jobs.resolve_spec(arg) {
+            Some(id) => state.jobs.jobs.retain(|j| j.id != id),
+            None => {
+                eprintln!("jsh: disown: {arg}: no such job");
+                last_status = 1;
+            }
         }
     }
+    last_status
 }
 
 fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {

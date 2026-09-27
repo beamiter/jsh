@@ -73,6 +73,8 @@ described below.
 - `%?substring` (and bare `?substring`) now resolve to the newest active job
   whose command contains the substring; empty patterns and completed jobs are
   rejected. Regressions cover match order and refusal paths.
+- `disown` accepts multiple job specs in one invocation, mirroring `wait`, and
+  returns the last failing status when any spec is invalid.
 - `expand_command_sub` now records the reaped child's exact exit or signal
   status at the existing `ShellState` handoff. Assignment-only commands consume
   the last such status, including across multiple assignments, so

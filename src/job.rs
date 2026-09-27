@@ -564,4 +564,12 @@ mod tests {
         assert_eq!(table.continue_fg(id), 1);
         assert_eq!(table.continue_bg(id), 1);
     }
+
+    #[test]
+    fn resolve_spec_supports_bare_question_mark_substrings() {
+        let mut table = JobTable::new();
+        let id = table.add(Pid::from_raw(1001), "make -j8".into());
+        assert_eq!(table.resolve_spec("?make"), Some(id));
+        assert_eq!(table.resolve_spec("?missing"), None);
+    }
 }
