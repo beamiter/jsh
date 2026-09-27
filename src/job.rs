@@ -202,6 +202,14 @@ impl JobTable {
         }
     }
 
+    pub fn print_stopped_job_pids(&self) {
+        for job in &self.jobs {
+            if job.status == JobStatus::Stopped {
+                println!("{}", job.pid);
+            }
+        }
+    }
+
     pub fn print_jobs(&self) {
         self.print_jobs_filtered(false, false);
     }
@@ -616,6 +624,23 @@ mod tests {
             .map(|job| job.pid)
             .collect();
         assert_eq!(running_pids, vec![table.get_by_id(running).unwrap().pid]);
+        table.print_running_job_pids();
+    }
+
+    #[test]
+    fn print_stopped_job_pids_omits_running_jobs() {
+        let mut table = JobTable::new();
+        table.add(Pid::from_raw(1001), "sleep 1".into());
+        let stopped = table.add(Pid::from_raw(1002), "sleep 2".into());
+        table.get_by_id(stopped).unwrap().status = JobStatus::Stopped;
+        let stopped_pids: Vec<Pid> = table
+            .jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Stopped)
+            .map(|job| job.pid)
+            .collect();
+        assert_eq!(stopped_pids, vec![table.get_by_id(stopped).unwrap().pid]);
+        table.print_stopped_job_pids();
     }
 
     #[test]

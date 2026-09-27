@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-28 (wave 7)
+Updated: 2026-09-28 (wave 8)
+
+## 2026-09-28 (wave 8)
+
+- **`jobs -ps` / clustered shorts** — `-p` with `-s` prints stopped PIDs only
+  (mirroring `-pr` for running). Clustered spellings such as `-ps`/`-sp` are
+  accepted; unknown letters still fail closed. A unit regression pins the
+  stopped-pid filter.
 
 ## 2026-09-28 (wave 7)
 

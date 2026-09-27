@@ -163,21 +163,27 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             let mut stopped_only = false;
             let mut args = args;
             while let Some(flag) = args.first().map(String::as_str) {
-                match flag {
-                    "-p" => {
-                        print_pids = true;
-                        args = &args[1..];
-                    }
-                    "-r" => {
-                        running_only = true;
-                        args = &args[1..];
-                    }
-                    "-s" => {
-                        stopped_only = true;
-                        args = &args[1..];
-                    }
-                    _ => break,
+                if !flag.starts_with('-') || flag == "-" || flag == "--" {
+                    break;
                 }
+                // Bash accepts clustered shorts (`-ps`, `-pr`) as well as
+                // separate flags (`-p -s`). Reject unknown letters fail-closed.
+                let mut ok = true;
+                for ch in flag.chars().skip(1) {
+                    match ch {
+                        'p' => print_pids = true,
+                        'r' => running_only = true,
+                        's' => stopped_only = true,
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok || flag.len() < 2 {
+                    break;
+                }
+                args = &args[1..];
             }
             if running_only && stopped_only {
                 eprintln!("jsh: jobs: -r and -s are mutually exclusive");
@@ -189,6 +195,8 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             }
             if print_pids && running_only {
                 state.jobs.print_running_job_pids();
+            } else if print_pids && stopped_only {
+                state.jobs.print_stopped_job_pids();
             } else if print_pids {
                 state.jobs.print_job_pids();
             } else if running_only {
