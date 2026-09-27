@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-28 (wave 6)
+Updated: 2026-09-28 (wave 7)
+
+## 2026-09-28 (wave 7)
+
+- **`jobs -s`** — restricts listings to stopped jobs only; `-r` and `-s` are
+  mutually exclusive with status 2. A unit regression pins the stopped-only
+  filter.
 
 ## 2026-09-28 (wave 6)
 

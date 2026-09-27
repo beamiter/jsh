@@ -203,12 +203,15 @@ impl JobTable {
     }
 
     pub fn print_jobs(&self) {
-        self.print_jobs_filtered(false);
+        self.print_jobs_filtered(false, false);
     }
 
-    pub fn print_jobs_filtered(&self, running_only: bool) {
+    pub fn print_jobs_filtered(&self, running_only: bool, stopped_only: bool) {
         for job in &self.jobs {
             if running_only && job.status != JobStatus::Running {
+                continue;
+            }
+            if stopped_only && job.status != JobStatus::Stopped {
                 continue;
             }
             let elapsed = job.start_time.elapsed();
@@ -575,6 +578,29 @@ mod tests {
             .map(|job| job.pid)
             .collect();
         assert_eq!(active_pids, vec![table.get_by_id(id2).unwrap().pid]);
+    }
+
+    #[test]
+    fn print_jobs_filtered_stopped_only_omits_running_jobs() {
+        let mut table = JobTable::new();
+        table.add(Pid::from_raw(1001), "sleep 1".into());
+        let stopped = table.add(Pid::from_raw(1002), "sleep 2".into());
+        table.get_by_id(stopped).unwrap().status = JobStatus::Stopped;
+        let stopped_ids: Vec<usize> = table
+            .jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Stopped)
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(stopped_ids, vec![stopped]);
+        let listed: Vec<usize> = table
+            .jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Stopped)
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(listed.len(), 1);
+        table.print_jobs_filtered(false, true);
     }
 
     #[test]

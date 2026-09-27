@@ -160,6 +160,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "jobs" => {
             let mut print_pids = false;
             let mut running_only = false;
+            let mut stopped_only = false;
             let mut args = args;
             while let Some(flag) = args.first().map(String::as_str) {
                 match flag {
@@ -171,8 +172,16 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
                         running_only = true;
                         args = &args[1..];
                     }
+                    "-s" => {
+                        stopped_only = true;
+                        args = &args[1..];
+                    }
                     _ => break,
                 }
+            }
+            if running_only && stopped_only {
+                eprintln!("jsh: jobs: -r and -s are mutually exclusive");
+                return 2;
             }
             if !args.is_empty() {
                 eprintln!("jsh: jobs: too many arguments");
@@ -183,7 +192,9 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             } else if print_pids {
                 state.jobs.print_job_pids();
             } else if running_only {
-                state.jobs.print_jobs_filtered(true);
+                state.jobs.print_jobs_filtered(true, false);
+            } else if stopped_only {
+                state.jobs.print_jobs_filtered(false, true);
             } else {
                 state.jobs.print_jobs();
             }
