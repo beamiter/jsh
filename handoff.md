@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-27 (wave 5)
+Updated: 2026-09-28 (wave 6)
+
+## 2026-09-28 (wave 6)
+
+- **`jobs -r`** — restricts listings or pid output to running jobs only;
+  `-pr`/`-rp` prints running PIDs without stopped ones. Extra arguments after
+  flags are rejected with status 2. A unit regression pins the running-only
+  filter.
 
 ## 2026-09-27 (wave 5)
 

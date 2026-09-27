@@ -159,17 +159,31 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "trap" => builtin_trap(args, state),
         "jobs" => {
             let mut print_pids = false;
+            let mut running_only = false;
             let mut args = args;
-            if args.first().map(String::as_str) == Some("-p") {
-                print_pids = true;
-                args = &args[1..];
+            while let Some(flag) = args.first().map(String::as_str) {
+                match flag {
+                    "-p" => {
+                        print_pids = true;
+                        args = &args[1..];
+                    }
+                    "-r" => {
+                        running_only = true;
+                        args = &args[1..];
+                    }
+                    _ => break,
+                }
             }
             if !args.is_empty() {
                 eprintln!("jsh: jobs: too many arguments");
                 return 2;
             }
-            if print_pids {
+            if print_pids && running_only {
+                state.jobs.print_running_job_pids();
+            } else if print_pids {
                 state.jobs.print_job_pids();
+            } else if running_only {
+                state.jobs.print_jobs_filtered(true);
             } else {
                 state.jobs.print_jobs();
             }
@@ -282,10 +296,10 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "avg" => crate::stream::builtin_avg(args),
         "min" => crate::stream::builtin_min(args),
         "max" => crate::stream::builtin_max(args),
-        // `lines` is value-aware (Phase 6b) — falls through to `_` adapter.
+        // `lines` is value-aware (Phase 6b); falls through to `_` adapter.
         "stats" => crate::stream::builtin_stats(args),
         "trim" => crate::stream::builtin_trim(args),
-        // `reverse` is value-aware (Phase 5a) — fall through to adapter.
+        // `reverse` is value-aware (Phase 5a); fall through to adapter.
         "upper" => crate::stream::builtin_upper(args),
         "lower" => crate::stream::builtin_lower(args),
         // Debug commands
@@ -296,9 +310,9 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         // Data processing commands
         "filter" => crate::data::builtin_filter(args),
         "map" => crate::data::builtin_map(args),
-        // `group-by` and `select` are value-aware in Phase 5a — fall through.
+        // `group-by` and `select` are value-aware in Phase 5a ; fall through.
         "uniq" => crate::data::builtin_uniq(args),
-        // `shuffle` is value-aware (Phase 10c) — fall through to adapter.
+        // `shuffle` is value-aware (Phase 10c) ; fall through to adapter.
         "dedupe" => crate::data::builtin_dedupe(args),
         _ => {
             // Phase 5a: fork-path adapter for value-aware builtins.
@@ -922,8 +936,8 @@ fn command_describe(names: &[String], verbose: bool, state: &ShellState) -> i32 
 /// Drop the two lines an interactive bash prints when it is started without a
 /// controlling terminal.
 ///
-/// The helper has to be interactive — that is the only way the startup file it
-/// is sourcing will run past its own `case $- in *i*)` guard — but its stdin is
+/// The helper has to be interactive ; that is the only way the startup file it
+/// is sourcing will run past its own `case $- in *i*)` guard ; but its stdin is
 /// a pipe, so bash announces that it cannot claim the terminal. Reporting that
 /// as a warning from the sourced file would put two lines of noise under every
 /// `source` of anything jsh's own parser could not read.
@@ -2824,7 +2838,7 @@ fn eval_cond_binary(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i
 
 /// The right operand of `[[ x == pat ]]`. Bash always treats it as a pattern;
 /// matching literally when it holds no metacharacter is just the cheap path to
-/// the same answer. `[` counts as one — `[[ a == [ab] ]]` is true — and so do
+/// the same answer. `[` counts as one ; `[[ a == [ab] ]]` is true ; and so do
 /// the extended-glob openers once `shopt -s extglob` is on.
 fn cond_pattern_match(pattern: &str, text: &str, state: &ShellState) -> bool {
     let extglob = state.shell_opts.extglob;
@@ -3272,8 +3286,8 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
         i += 1;
     }
 
-    // One `complete` call names any number of commands — bash-completion
-    // registers `_longopt` for two dozen at a time — and `''` is one of them,
+    // One `complete` call names any number of commands ; bash-completion
+    // registers `_longopt` for two dozen at a time ; and `''` is one of them,
     // the spec bash uses when the command word is empty.
     if command_names.is_empty() {
         if remove {
@@ -3716,7 +3730,7 @@ fn print_shopt_line(name: &str, enabled: bool, reusable: bool, set_o: bool) {
     }
 }
 
-/// `shopt` with no names lists options: all of them, or — after `-s` / `-u` —
+/// `shopt` with no names lists options: all of them, or ; after `-s` / `-u` ;
 /// only those currently on or off.
 fn print_shopt_options(state: &ShellState, setting: Option<bool>, reusable: bool, set_o: bool) {
     if set_o {
@@ -3914,7 +3928,7 @@ fn builtin_workflow(args: &[String], state: &ShellState) -> i32 {
             println!("{USAGE}");
             println!("  list [--json]                 List available workflows");
             println!("  show NAME [--json]            Inspect one workflow template");
-            println!("  render NAME parameter=value…  Render without executing");
+            println!("  render NAME parameter=value;  Render without executing");
             0
         }
         "list" => {
@@ -3959,7 +3973,7 @@ fn builtin_workflow(args: &[String], state: &ShellState) -> i32 {
                     }
                 }
             } else {
-                println!("{} — {}", workflow.name, workflow.description);
+                println!("{} ; {}", workflow.name, workflow.description);
                 println!("  {}", workflow.command);
                 if !workflow.parameters.is_empty() {
                     println!("Parameters:");
@@ -4110,7 +4124,7 @@ fn builtin_math(args: &[String]) -> i32 {
 
 fn builtin_help(args: &[String], state: &ShellState) -> i32 {
     if args.is_empty() {
-        println!("jsh — a Bash-inspired shell with structured data pipelines\n");
+        println!("jsh ; a Bash-inspired shell with structured data pipelines\n");
         println!("Commands:");
         for command in crate::command_catalog::entries() {
             println!("  {:18} {}", command.name, command.summary());
