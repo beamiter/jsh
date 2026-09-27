@@ -158,7 +158,21 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "dirs" => builtin_dirs(state),
         "trap" => builtin_trap(args, state),
         "jobs" => {
-            state.jobs.print_jobs();
+            let mut print_pids = false;
+            let mut args = args;
+            if args.first().map(String::as_str) == Some("-p") {
+                print_pids = true;
+                args = &args[1..];
+            }
+            if !args.is_empty() {
+                eprintln!("jsh: jobs: too many arguments");
+                return 2;
+            }
+            if print_pids {
+                state.jobs.print_job_pids();
+            } else {
+                state.jobs.print_jobs();
+            }
             0
         }
         "fg" => match args.first() {

@@ -186,6 +186,14 @@ impl JobTable {
         }
     }
 
+    pub fn print_job_pids(&self) {
+        for job in &self.jobs {
+            if Self::is_active(&job.status) {
+                println!("{}", job.pid);
+            }
+        }
+    }
+
     pub fn print_jobs(&self) {
         for job in &self.jobs {
             let elapsed = job.start_time.elapsed();
@@ -537,6 +545,21 @@ mod tests {
         }
         assert_eq!(table.resolve_spec("%%"), Some(2));
         assert_eq!(table.resolve_spec("%+"), Some(2));
+    }
+
+    #[test]
+    fn print_job_pids_skips_completed_jobs() {
+        let mut table = JobTable::new();
+        let id1 = table.add(Pid::from_raw(1001), "sleep 1".into());
+        let id2 = table.add(Pid::from_raw(1002), "sleep 2".into());
+        table.get_by_id(id1).unwrap().status = JobStatus::Done(0);
+        let active_pids: Vec<Pid> = table
+            .jobs
+            .iter()
+            .filter(|job| JobTable::is_active(&job.status))
+            .map(|job| job.pid)
+            .collect();
+        assert_eq!(active_pids, vec![table.get_by_id(id2).unwrap().pid]);
     }
 
     #[test]

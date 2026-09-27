@@ -325,6 +325,7 @@ fn fallback_usage(name: &str) -> Option<&'static str> {
         "dirs" => "dirs",
         "complete" => "complete [-W words] [-F func] cmd",
         "compgen" => "compgen [-abcdfv] [-A action] [-W words] [-G glob] [prefix]",
+        "jobs" => "jobs [-p]",
         "disown" => "disown [-a] [%N]",
         "shopt" => "shopt [-su] opt...",
         "exec" => "exec cmd [args...]",

@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-27
+Updated: 2026-09-27 (wave 5)
+
+## 2026-09-27 (wave 5)
+
+- **`jobs -p`** — prints one decimal pid per line for each active (running or
+  stopped) job, mirroring bash's machine-readable listing. Extra arguments are
+  rejected with status 2. A unit regression pins the active-only filter.
 
 This baseline unifies command discovery, separates executable AI suggestions
 from read-only explanations, completes workflow parameter filling, and fixes
