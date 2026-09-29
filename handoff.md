@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (refresh pending jagent tip hashes through sticky FE07/FE06/MAX-6 final align)
+
+## 2026-09-29 (pending jagent tip refresh — sticky FE07/FE06/MAX-6 final align)
+
+- Pending jagent tip `7284159` and jterm_core HEAD `0a637a7` remain
+  path-patch-only until the tip cohort is pushed/repinned.
+
 Updated: 2026-09-29 (refresh pending jagent tip hashes through wave-35 / round-54)
 
 ## 2026-09-29 (pending jagent tip refresh — wave-35 leftovers/deepen + round-54)
