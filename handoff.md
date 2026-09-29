@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through STAGE 64 + wave 23)
+
+## 2026-09-29 (pending jagent tip refresh — STAGE 64 + wave 23)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `967c2d4`
+  (systemd-socket-activate STAGE 64; daemonize/setlock/s6-setuidgid) and
+  jterm_core HEAD `55c798a` (STAGE len 67, `between()` 76) remain
+  path-patch-only until the tip cohort is pushed; then repin jsh with the
+  family.
+
 Updated: 2026-09-29 (pending jagent tip through systemd-socket-activate STAGE 64)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 22 socket-activate + STAGE 64)
