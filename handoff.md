@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through wave 20 edge pins + classify STAGE audit)
+
+## 2026-09-29 (pending jagent tip refresh — wave 20 edge pins + classify STAGE audit)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `5e09180`
+  (systemd-cat / aa-exec edge-case pins; see-through; PATH-probe leftovers)
+  and jterm_core HEAD `60c7378` (STAGE len 62 + classify membership pin for
+  all prefixes) remain path-patch-only until the tip cohort is pushed; then
+  repin jsh with the family.
+
 Updated: 2026-09-29 (pending jagent tip through wave 20 systemd-cat/aa-exec)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 20 systemd-cat / aa-exec)
