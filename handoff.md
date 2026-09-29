@@ -4,7 +4,7 @@ Updated: 2026-09-30 (refresh pending jagent tip hashes through sticky 1804/1803/
 
 ## 2026-09-30 (pending jagent tip refresh — sticky 1804/1803/MAX-10 final align)
 
-- Pending jagent tip `3e6fa19` and jterm_core HEAD `f8be39b` remain
+- Pending jagent tip `b323602` and jterm_core HEAD `46c602c` remain
   path-patch-only until the tip cohort is pushed/repinned.
 
 Updated: 2026-09-30 (refresh pending jagent tip hashes through sticky 1804/1803/MAX-10 final align)
