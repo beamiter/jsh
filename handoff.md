@@ -1,13 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (repair pending jagent tip through cancel cohort and round-47)
+Updated: 2026-09-29 (pending jagent tip through cancel cohort and round-47)
 
 ## 2026-09-29 (pending jagent tip refresh — cancel cohort + round-47)
 
-- **Cargo.toml stays on published `628811b`** — local jagent HEAD `ad7a120`
-  and jterm_core HEAD `37c4204` remain path-patch-only until the tip cohort is
-  pushed; then repin jsh with the family. Anvil `dcf2ff2` (rounds 155–159) /
-  forge `6bd0903` (196–201) / ember-frost round-47 smokes sit beside.
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `fe74fba`
+  and jterm_core HEAD `e72436c` remain path-patch-only until the tip cohort is
+  pushed; then repin jsh with the family. Anvil `db42070` (rounds 155–159) /
+  forge `acd144e` (196–201) / ember-frost round-47 smokes sit beside.
 
 
 Updated: 2026-09-29 (pending jagent tip through VS/marks/GlanceAside and round-47)
