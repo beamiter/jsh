@@ -11,7 +11,7 @@ Updated: 2026-09-29 (refresh pending jagent tip hashes through wave-35 / round-5
 
 ## 2026-09-29 (pending jagent tip refresh — wave-35 leftovers/deepen + round-54)
 
-- Pending jagent tip `ae19414` and jterm_core HEAD `985c2fe` remain
+- Pending jagent tip `9eeb4ce` and jterm_core HEAD `5f81dc6` remain
   path-patch-only until the tip cohort is pushed/repinned. Covers wave-35
   host/hw inventory leftover pin + chrt/ionice STAGE deepen beside ember/frost
   round-54 smoke.
