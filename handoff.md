@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through busybox/pipe nests + CLASSIFY set-eq)
+
+## 2026-09-29 (pending jagent tip refresh — wave 27 busybox/pipe + CLASSIFY)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `9cd0211`
+  (busybox applet + pipe-to-bash nest deepenings for uclampset/gamemoderun/
+  gnome-session-inhibit) and jterm_core HEAD `68982a3` (STAGE arity/pipe peels +
+  CLASSIFY_FORMS set-eq with STAGE_PREFIXES len 70) remain path-patch-only
+  until the tip cohort is pushed; then repin jsh with the family. Anvil
+  `e0eb8b2` (rounds 101–104) / forge `178d09b` (135–138) / ember-frost
+  round-32 smokes also pending the push/repin cohort.
+
 Updated: 2026-09-29 (pending jagent tip through wave-26 PATH leftovers)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 26 PATH non-launcher leftovers)
