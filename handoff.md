@@ -7,7 +7,7 @@ Updated: 2026-09-29 (pending jagent tip through sticky/find/notice + round-40)
 - **Cargo.toml stays on published `628811b`** — local jagent HEAD `aefca5f`
   and jterm_core HEAD `ef2727c` remain path-patch-only until the tip cohort is
   pushed; then repin jsh with the family. Anvil
-  `183c059` (rounds 126–127) / forge `e790c60` (161–163) /
+  `9adb857` (rounds 129–130) / forge `a25aaf4` (164–166) /
   ember-frost round-40 smokes also pending the push/repin cohort.
 
 
