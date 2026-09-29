@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through sticky FE05/find/MAX-4 and round-51)
+
+## 2026-09-29 (pending jagent tip refresh — sticky FE05/find/MAX-4 + round-51)
+
+- Pending jagent tip  and jterm_core HEAD  remain
+  path-patch-only until the tip cohort is pushed/repinned. Covers anvil 175–178 /
+  forge 220–224 sticky FE05/Manchu + FE04 find + MAX-4 cancel + Rest→Unknown
+  beside round-51 smoke.
+
+
 Updated: 2026-09-29 (refresh pending jagent tip hashes through sticky FE04/find/MAX-3 final align)
 
 ## 2026-09-29 (pending jagent tip refresh — sticky FE04/find/MAX-3 final align)
