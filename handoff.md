@@ -4,8 +4,8 @@ Updated: 2026-09-29 (pending jagent tip through wave-33 leftovers/setsid + round
 
 ## 2026-09-29 (pending jagent tip refresh — wave-33 + round-49)
 
-- **Cargo.toml stays on published `628811b`** — local jagent HEAD `fa60410`
-  and jterm_core HEAD `8ea7344` remain path-patch-only until the tip cohort is
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `e6b8792`
+  and jterm_core HEAD `93c7ad6` remain path-patch-only until the tip cohort is
   pushed; then repin jsh with the family. Anvil `db42070` (rounds 158–160) /
   forge `acd144e` (200–202) / ember-frost round-49 smokes sit beside wave-33
   device/sysctl leftovers + setsid deepen (CLASSIFY/DISPATCHES STAGE 71).
