@@ -4,9 +4,9 @@ Updated: 2026-09-29 (pending jagent tip through systemd-inhibit STAGE 63)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 21 systemd-inhibit + STAGE 63)
 
-- **Cargo.toml stays on published ** — local jagent HEAD 
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `c4e71a2`
   (systemd-inhibit see-through; PATH-probe leftovers for socket-activate /
-  aa-enabled) and jterm_core HEAD  (STAGE len 63 + ambient
+  aa-enabled) and jterm_core HEAD `81c4679` (STAGE len 63 + ambient
   VisualTransition N/A pin + CrossBlockSearchReport constructor contract)
   remain path-patch-only until the tip cohort is pushed; then repin jsh with
   the family.
