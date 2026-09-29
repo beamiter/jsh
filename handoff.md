@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (refresh pending jagent tip hashes through wave-38 / round-60)
+
+## 2026-09-30 (pending jagent tip refresh — wave-38 leftovers/deepen + round-60)
+
+- Pending jagent tip `cedee08` and jterm_core HEAD `4844296` remain
+  path-patch-only until the tip cohort is pushed/repinned. Covers wave-38
+  process-table monitor leftover pin + softlimit/cgexec STAGE deepen beside
+  ember/frost round-60 smoke.
+
+
 Updated: 2026-09-30 (refresh pending jagent tip hashes through sticky 1804/1803/MAX-10 final align)
 
 ## 2026-09-30 (pending jagent tip refresh — sticky 1804/1803/MAX-10 final align)
