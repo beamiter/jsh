@@ -1,5 +1,31 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (refresh pending jagent tip hashes through sticky FE06/FE05/MAX-5 final align)
+
+## 2026-09-29 (pending jagent tip refresh — sticky FE06/FE05/MAX-5 final align)
+
+- Pending jagent tip `1c3d308` and jterm_core HEAD `a4d3b5d` remain
+  path-patch-only until the tip cohort is pushed/repinned.
+
+
+Updated: 2026-09-29 (refresh pending jagent tip hashes through sticky FE06/FE05/MAX-5 and round-52)
+
+## 2026-09-29 (pending jagent tip refresh — sticky FE06/FE05/MAX-5 + round-52 hashes)
+
+- Pending jagent tip `1c3d308` and jterm_core HEAD `a4d3b5d` remain
+  path-patch-only until the tip cohort is pushed/repinned.
+
+
+Updated: 2026-09-29 (pending jagent tip through sticky FE06/FE05/MAX-5 and round-52)
+
+## 2026-09-29 (pending jagent tip refresh — sticky FE06/FE05/MAX-5 + round-52)
+
+- Pending jagent tip `1c3d308` and jterm_core HEAD `a4d3b5d` remain
+  path-patch-only until the tip cohort is pushed/repinned. Covers anvil 179–183 /
+  forge 225–230 sticky FE06/Manchu-full-stop + FE05 find + MAX-5 cancel +
+  Celebrate/Rest verify + SitNear/Inspect→Unknown beside round-52 smoke.
+
+
 Updated: 2026-09-29 (refresh pending jagent tip hashes through sticky FE05/find/MAX-4 final align)
 
 ## 2026-09-29 (pending jagent tip refresh — sticky FE05/find/MAX-4 final align)
