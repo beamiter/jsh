@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through cancel cohort and round-47)
+
+## 2026-09-29 (pending jagent tip refresh — cancel cohort + round-47)
+
+- **Cargo.toml stays on published ** — local jagent HEAD 
+  and jterm_core HEAD  remain path-patch-only until the tip cohort is
+  pushed; then repin jsh with the family. Anvil  (rounds 155–159) /
+  forge  (196–201) / ember-frost round-47 smokes sit beside.
+
+
 Updated: 2026-09-29 (pending jagent tip through VS/marks/GlanceAside and round-47)
 
 ## 2026-09-29 (pending jagent tip refresh — VS/marks/GlanceAside + round-47)
