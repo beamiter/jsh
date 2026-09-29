@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through STAGE 68 wave 24)
+
+## 2026-09-29 (pending jagent tip refresh — wave 24 gnome-session-inhibit STAGE 68)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `a8dad03`
+  (gnome-session-inhibit see-through; timeout/nice nest deepen; setuidgid `--`)
+  and jterm_core HEAD `09d3a97` (STAGE len 68 + fail-closed nest/transparency
+  + output_notice/organism polish) remain path-patch-only until the tip cohort
+  is pushed; then repin jsh with the family.
+
 Updated: 2026-09-29 (pending jagent tip through STAGE 67 wave 23)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 23 daemonize STAGE 67)
