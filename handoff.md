@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through systemd-socket-activate STAGE 64)
+
+## 2026-09-29 (pending jagent tip refresh — wave 22 socket-activate + STAGE 64)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `af4f101`
+  (systemd-socket-activate see-through; PATH-probe leftovers for dbus-launch /
+  flatpak-spawn / snap; chrt/schedtool/setpriv already STAGE) and jterm_core
+  HEAD `1391c88` (STAGE len 64 + classify see-through + membership pin)
+  remain path-patch-only until the tip cohort is pushed; then repin jsh with
+  the family.
+
 Updated: 2026-09-29 (pending jagent tip through systemd-inhibit STAGE 63)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 21 systemd-inhibit + STAGE 63)
