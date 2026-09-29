@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through sticky/find/organism and round-42)
+
+## 2026-09-29 (pending tip — round-42 smoke)
+
+- jagent `adeeea8` / jterm_core `c660336` still
+  path-patch-only after ember/frost round-42 smoke and anvil 137–140 /
+  forge 175–179 Ogham sticky + All whitespace + Guard/Celebrate Full-motion
+  pins beside STAGE 71 / between() 93. Push/repin cohort pending.
+
+
 Updated: 2026-09-29 (pending jagent tip through wave-31 PATH leftovers + round-43)
 
 ## 2026-09-29 (pending jagent tip refresh — wave-31 PATH leftovers + round-43)
