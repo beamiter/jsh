@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (refresh pending jagent tip hashes through sticky FE05/find/MAX-4 final align)
+
+## 2026-09-29 (pending jagent tip refresh — sticky FE05/find/MAX-4 final align)
+
+- Pending jagent tip  and jterm_core HEAD  remain
+  path-patch-only until the tip cohort is pushed/repinned.
+
+
 Updated: 2026-09-29 (refresh pending jagent tip hashes through sticky FE05/find/MAX-4 and round-51)
 
 ## 2026-09-29 (pending jagent tip refresh — sticky FE05/find/MAX-4 + round-51 hashes)
