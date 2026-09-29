@@ -1,5 +1,27 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through bidi/ambient + round-45/46)
+
+## 2026-09-29 (pending jagent tip refresh — bidi/ambient + round-45/46)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `cf9cb68`
+  and jterm_core HEAD `bedcc55` remain path-patch-only until the tip cohort is
+  pushed; then repin jsh with the family. Anvil `36a2a79` (rounds 152–154) /
+  forge `a9d9eea` (192–195) / ember-frost round-45 smokes sit beside the
+  wave-32 / round-46 tip cohort.
+
+
+Updated: 2026-09-29 (pending jagent tip through bidi/ambient + round-45/46)
+
+## 2026-09-29 (pending jagent tip refresh — bidi/ambient + round-45/46)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `3883d57`
+  and jterm_core HEAD `8f79132` remain path-patch-only until the tip cohort is
+  pushed; then repin jsh with the family. Anvil `36a2a79` (rounds 152–154) /
+  forge `a9d9eea` (192–195) / ember-frost round-45 smokes sit beside the
+  wave-32 / round-46 tip cohort.
+
+
 Updated: 2026-09-29 (pending jagent tip through bidi/ambient pins and round-45)
 
 ## 2026-09-29 (pending jagent tip refresh — bidi/ambient + round-45)
