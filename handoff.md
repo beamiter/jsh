@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through wave-26 PATH leftovers)
+
+## 2026-09-29 (pending jagent tip refresh — wave 26 PATH non-launcher leftovers)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `3a11135`
+  (PATH non-launcher leftover pin: snice/skill/run-mailcap/xdg-open) and
+  jterm_core HEAD `511aec1` (STAGE len 70 + wave-26 leftovers out of STAGE)
+  remain path-patch-only until the tip cohort is pushed; then repin jsh
+  with the family.
+
 Updated: 2026-09-29 (pending jagent tip through STAGE 70 + gnome arity/nest)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 25 STAGE 70 + gnome nest)
