@@ -1,5 +1,16 @@
 Updated: 2026-09-29 (pending jagent tip through wave-27 PATH leftovers + ambient None)
 
+Updated: 2026-09-29 (pending jagent tip through CelebrateBig 91 lockstep + round-36)
+
+## 2026-09-29 (pending jagent tip refresh — CelebrateBig 91 + ambient hold/rest + round-36)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `746040c`
+  (PATH wave-28 systemd inspector leftovers) and jterm_core HEAD `99d72d2`
+  (ambient→hold/rest None beside `between()` 91 / STAGE 70) remain
+  path-patch-only until the tip cohort is pushed; then repin jsh with the
+  family. Anvil `7822f4a` (rounds 111–116) / forge `fb58cb9` (145–150) /
+  ember-frost round-36 smokes also pending the push/repin cohort.
+
 ## 2026-09-29 (pending jagent tip refresh — wave 27 PATH identity/agent + ambient)
 
 - **Cargo.toml stays on published `628811b`** — local jagent HEAD `cd32d7a`
