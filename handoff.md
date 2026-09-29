@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through systemd-inhibit STAGE 63)
+
+## 2026-09-29 (pending jagent tip refresh — wave 21 systemd-inhibit + STAGE 63)
+
+- **Cargo.toml stays on published ** — local jagent HEAD 
+  (systemd-inhibit see-through; PATH-probe leftovers for socket-activate /
+  aa-enabled) and jterm_core HEAD  (STAGE len 63 + ambient
+  VisualTransition N/A pin + CrossBlockSearchReport constructor contract)
+  remain path-patch-only until the tip cohort is pushed; then repin jsh with
+  the family.
+
 Updated: 2026-09-29 (pending jagent tip through wave 20 edge pins + classify STAGE audit)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 20 edge pins + classify STAGE audit)
