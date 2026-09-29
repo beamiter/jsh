@@ -1,14 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (pending jagent tip includes bubblewrap alias)
+Updated: 2026-09-29 (pending jagent tip through wave 17b parity assert)
 
 ## 2026-09-29 (pending jagent tip refresh — bubblewrap / unshare note)
 
-- **Cargo.toml stays on published `628811b`** — local jagent HEAD `2e6f5ca`
-  (bubblewrap argv0 alias of bwrap; unshare/nsenter documented as
-  PIPE_INTERPRETERS not STAGE_PREFIXES; annotate-output and prior wrapper
-  see-through arms) remains path-patch-only until the tip cohort is pushed;
-  then repin jsh with the family.
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `476c015`
+  (bubblewrap/bwrap danger reason parity for `--ro-bind / / rm -rf /`;
+  unshare/nsenter documented as PIPE_INTERPRETERS not STAGE_PREFIXES;
+  annotate-output and prior wrapper see-through arms) remains
+  path-patch-only until the tip cohort is pushed; then repin jsh with the
+  family.
 
 ## 2026-09-29 (vendored-script header parity)
 
