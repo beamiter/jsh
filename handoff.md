@@ -4,7 +4,7 @@ Updated: 2026-09-30 (refresh pending jagent tip hashes through wave-38 / round-6
 
 ## 2026-09-30 (pending jagent tip refresh — wave-38 / round-60 final align)
 
-- Pending jagent tip `cedee08` and jterm_core HEAD `4844296` remain
+- Pending jagent tip `da51c1c` and jterm_core HEAD `7b1f1c0` remain
   path-patch-only until the tip cohort is pushed/repinned.
 
 
