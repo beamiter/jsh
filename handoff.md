@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through sticky/find/notice + round-41)
+
+## 2026-09-29 (pending jagent tip refresh — sticky/find/notice + round-41)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `eddbaf1`
+  and jterm_core HEAD `786f924` remain path-patch-only until the tip cohort is
+  pushed; then repin jsh with the family. Anvil
+  `82450d0` (rounds 131–132) / forge `96f7bb1` (167–169) /
+  ember-frost round-41 smokes also pending the push/repin cohort.
+
+
 Updated: 2026-09-29 (pending jagent tip through sticky/find/notice + round-40)
 
 ## 2026-09-29 (pending jagent tip refresh — sticky/find/notice + round-40)
