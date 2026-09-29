@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (family pin align: jagent `628811b`)
+Updated: 2026-09-29 (vendored script sync note)
+
+## 2026-09-29 (vendored script sync note)
+
+- **Vendored jterm copies stay body-identical** — `jterm_core` provenance pins
+  `jsh-remote.sh` at `fd605616` and `install-jsh.sh` at `b6928e5` (last commits
+  that touched each script). Bodies match this tree; only the four-/five-line
+  provenance headers differ. No script body resync needed this wave.
 
 ## 2026-09-29 (family pin align)
 
@@ -419,11 +426,10 @@ described below.
 
 After changing either canonical script, synchronize and test every vendored
 jterm copy. `jterm_core/scripts/install-jsh.sh` carries `install-jsh.sh`, and
-`jterm_core/scripts/jsh-remote.sh` carries the launcher. Both vendor bodies
-derive from script revision `348b9a0ad9c86832e7d1a0d1dfa5758685abbbdb`.
-The installer copies additionally include the coordinated JSON check-error
-and portable awk fixes in the current working trees; only the provenance
-header differs between their bodies. Signature/tool failures in
+`jterm_core/scripts/jsh-remote.sh` carries the launcher. Vendor bodies match
+script tips `b6928e5e8291deed5d19e44f47cc6d836668ffc3` (installer) and
+`fd605616b56bd73265a3a6141c814938aa2859f9` (remote); each differs from its
+canonical copy only by a short provenance header. Signature/tool failures in
 `--check --json` now return an error object with no latest version or update
 offer. Digest extraction works on older mawk while still requiring exactly
 64 hexadecimal characters. Installer and remote acceptance tests use real,
