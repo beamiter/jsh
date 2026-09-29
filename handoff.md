@@ -1,5 +1,19 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through STAGE 71 deepen + round-38)
+
+## 2026-09-29 (pending jagent tip refresh — STAGE 71 busybox/DISPATCHES + round-38)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `aefca5f`
+  (openvt/daemonize busybox + pipe-to-bash nests) and jterm_core HEAD
+  `ef2727c`
+  (DISPATCHES set-eq with STAGE 71 + busybox arity/pipe peels beside
+  Inspect/Sit→Unknown `between()` 93) remain path-patch-only until the tip
+  cohort is pushed; then repin jsh with the family. Anvil
+  `ed761b8` (rounds 122–125) / forge `29d1716` (156–160) /
+  ember-frost round-38 smokes also pending the push/repin cohort.
+
+
 Updated: 2026-09-29 (pending jagent tip through openvt 71 + round-37)
 
 ## 2026-09-29 (pending jagent tip refresh — openvt STAGE 71 + between 93 + round-37)
