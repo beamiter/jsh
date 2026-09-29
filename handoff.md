@@ -1,6 +1,20 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (pending jagent repin note)
+Updated: 2026-09-29 (vendored-script header parity + pending jagent tip)
+
+## 2026-09-29 (vendored-script header parity)
+
+- **Bodies still match `jterm_core` vendored copies** — `install-jsh.sh` pin
+  `b6928e5` and `jsh-remote.sh` pin `fd605616` unchanged; only provenance
+  headers differ on the core side. No header/body resync needed this wave.
+
+## 2026-09-29 (pending jagent tip refresh)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `1aaad24`
+  (annotate-output / torsocks / proxychains / cgexec / schedtool / fakeroot /
+  proot / firejail / softlimit / chpst / setuidgid / envdir / rlwrap /
+  eatmydata / chronic / numactl / flock see-through) remains path-patch-only
+  until the tip cohort is pushed; then repin jsh with the family.
 
 ## 2026-09-29 (pending jagent repin)
 
