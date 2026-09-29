@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (refresh pending jagent tip hashes through wave-35 / round-54)
+
+## 2026-09-29 (pending jagent tip refresh — wave-35 leftovers/deepen + round-54)
+
+- Pending jagent tip `a4ee569` and jterm_core HEAD `858ccf6` remain
+  path-patch-only until the tip cohort is pushed/repinned. Covers wave-35
+  host/hw inventory leftover pin + chrt/ionice STAGE deepen beside ember/frost
+  round-54 smoke.
+
+
 Updated: 2026-09-29 (refresh pending jagent tip hashes through sticky FE07/FE06/MAX-6 and round-53)
 
 ## 2026-09-29 (pending jagent tip refresh — sticky FE07/FE06/MAX-6 + round-53 hashes)
