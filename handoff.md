@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through STAGE 67 wave 23)
+
+## 2026-09-29 (pending jagent tip refresh — wave 23 daemonize STAGE 67)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `a7474e9`
+  (daemonize / setlock / s6-setuidgid see-through; PATH-probe leftovers for
+  s6-sudo / multilog / runsv) and jterm_core HEAD `a442971` (STAGE len 67 +
+  classify see-through + leftover outs + nested/arity pins) remain
+  path-patch-only until the tip cohort is pushed; then repin jsh with the
+  family.
+
 Updated: 2026-09-29 (pending jagent tip through STAGE 64 + wave 23)
 
 ## 2026-09-29 (pending jagent tip refresh — STAGE 64 + wave 23)
