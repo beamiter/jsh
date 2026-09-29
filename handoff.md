@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (vendored script sync note)
+Updated: 2026-09-29 (pending jagent repin note)
+
+## 2026-09-29 (pending jagent repin)
+
+- **Cargo.toml stays on published `628811b`** — do not repin to unpublished
+  local tips. Local jagent HEAD `10eca1a` (and intervening
+  `bde9376`/`9471b1b`/`323119c`/`2e966a9`) adds wrapper see-through arms that
+  `jterm_core` already path-patches for DISPATCHES tests. After those tips are
+  pushed, repin jsh (and the family) in one cohort; until then keep the
+  published rev and treat local tips as path-patch-only.
 
 ## 2026-09-29 (vendored script sync note)
 
