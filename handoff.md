@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (pending jagent tip through wave 18 launchers)
+Updated: 2026-09-29 (pending jagent tip through wave 19 strace/scriptlive)
+
+## 2026-09-29 (pending jagent tip refresh — wave 19 strace / scriptlive)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `17a89b7`
+  (strace / scriptlive see-through; dbus-run-session / runcon / xvfb-run and
+  prior wrapper arms) remains path-patch-only until the tip cohort is pushed;
+  then repin jsh with the family. jterm_core STAGE_PREFIXES len == 60 mirrors
+  those two launchers (+ wave 18's three).
 
 ## 2026-09-29 (pending jagent tip refresh — wave 18 launchers)
 
