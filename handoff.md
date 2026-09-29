@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (pending jagent tip through wave 19 strace/scriptlive)
+Updated: 2026-09-29 (pending jagent tip through wave 20 systemd-cat/aa-exec)
+
+## 2026-09-29 (pending jagent tip refresh — wave 20 systemd-cat / aa-exec)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `ae81682`
+  (systemd-cat / aa-exec see-through; PATH-probe leftover notes; strace /
+  scriptlive and prior wrapper arms) remains path-patch-only until the tip
+  cohort is pushed; then repin jsh with the family. jterm_core STAGE_PREFIXES
+  len == 62 mirrors those two launchers (+ wave 19's strace/scriptlive).
 
 ## 2026-09-29 (pending jagent tip refresh — wave 19 strace / scriptlive)
 
