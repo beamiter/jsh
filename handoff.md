@@ -1,15 +1,13 @@
-# Engineering handoff
-
 Updated: 2026-09-29 (pending jagent tip through wave-27 PATH leftovers + ambient None)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 27 PATH identity/agent + ambient)
 
-- **Cargo.toml stays on published ** — local jagent HEAD 
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `cd32d7a`
   (PATH identity/agent leftover non-peel pin: chcon/sg/newgrp/ssh-agent/…) and
-  jterm_core HEAD  (ambient→vigil/celebrate None + STAGE leftovers
-  lockstep,  still 91, STAGE len 70) remain path-patch-only until
-  the tip cohort is pushed; then repin jsh with the family. Anvil 
-  (rounds 105–107) / forge  (139–141) / ember-frost round-34 smokes
+  jterm_core HEAD `89c2320` (ambient→vigil/celebrate None + STAGE leftovers
+  lockstep, `between()` still 91, STAGE len 70) remain path-patch-only until
+  the tip cohort is pushed; then repin jsh with the family. Anvil `006e4bf`
+  (rounds 105–107) / forge `5f17d66` (139–141) / ember-frost round-34 smokes
   also pending the push/repin cohort.
 
 Updated: 2026-09-29 (pending jagent tip through busybox/pipe nests + CLASSIFY set-eq)
