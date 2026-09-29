@@ -4,8 +4,8 @@ Updated: 2026-09-29 (pending jagent tip through sticky/find/Watch* and round-48)
 
 ## 2026-09-29 (pending jagent tip refresh — sticky/find/Watch* + round-48)
 
-- **Cargo.toml stays on published `628811b`** — local jagent HEAD `a6c4530`
-  and jterm_core HEAD `9764ae2` remain path-patch-only until the tip cohort is
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `3da3a3d`
+  and jterm_core HEAD `f772516` remain path-patch-only until the tip cohort is
   pushed; then repin jsh with the family. Anvil `f40fa66` (rounds 161–164) /
   forge `7302823` (203–207) / ember-frost round-48 smokes sit beside.
 
