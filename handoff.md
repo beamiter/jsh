@@ -1,3 +1,16 @@
+# Engineering handoff
+
+Updated: 2026-09-29 (pending jagent tip through openvt 71 + round-37)
+
+## 2026-09-29 (pending jagent tip refresh — openvt STAGE 71 + between 93 + round-37)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `ef296ac`
+  (openvt STAGE peel + timeout/nice nest) and jterm_core HEAD `04cc282`
+  (openvt 71 classify nest beside Inspect/Sit→Unknown `between()` 93) remain
+  path-patch-only until the tip cohort is pushed; then repin jsh with the
+  family. Anvil `82c17b2` (rounds 117–121) / forge `dd42415` (151–155) /
+  ember-frost round-37 smokes also pending the push/repin cohort.
+
 Updated: 2026-09-29 (pending jagent tip through wave-27 PATH leftovers + ambient None)
 
 Updated: 2026-09-29 (pending jagent tip through CelebrateBig 91 lockstep + round-36)
