@@ -1,5 +1,26 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending jagent tip through STAGE 70 + gnome arity/nest)
+
+## 2026-09-29 (pending jagent tip refresh — wave 25 STAGE 70 + gnome nest)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `543415b`
+  (uclampset/gamemoderun see-through; gnome-session-inhibit timeout/nice nest)
+  and jterm_core HEAD `ee39a12` (STAGE len 70 + membership/DISPATCHES/
+  CLASSIFY_FORMS lockstep + gnome-session-inhibit arity edges + classify nest)
+  remain path-patch-only until the tip cohort is pushed; then repin jsh with
+  the family.
+
+Updated: 2026-09-29 (pending jagent tip through STAGE 70 wave 25)
+
+## 2026-09-29 (pending jagent tip refresh — wave 25 uclampset/gamemoderun STAGE 70)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `543415b`
+  (uclampset / gamemoderun see-through; gnome-session-inhibit nest deepen) and
+  jterm_core HEAD `ee39a12` (STAGE len 70 + Guard*→Celebrate* None + classify
+  nest/arity polish) remain path-patch-only until the tip cohort is pushed;
+  then repin jsh with the family.
+
 Updated: 2026-09-29 (pending jagent tip through STAGE 68 wave 24)
 
 ## 2026-09-29 (pending jagent tip refresh — wave 24 gnome-session-inhibit STAGE 68)
