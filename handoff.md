@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (pending jagent tip through wave 17b parity assert)
+Updated: 2026-09-29 (pending jagent tip through wave 18 launchers)
+
+## 2026-09-29 (pending jagent tip refresh — wave 18 launchers)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `804c320`
+  (dbus-run-session / runcon / xvfb-run see-through; catchsegv/run-parts/qemu
+  probe notes; bubblewrap/bwrap danger parity and prior wrapper arms) remains
+  path-patch-only until the tip cohort is pushed; then repin jsh with the
+  family. jterm_core STAGE_PREFIXES len == 58 mirrors those three launchers.
 
 ## 2026-09-29 (pending jagent tip refresh — bubblewrap / unshare note)
 
