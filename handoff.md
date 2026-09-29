@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (family pin align: jagent `628811b`)
+
+## 2026-09-29 (family pin align)
+
+- **jagent pin `6ed0b9f` → `628811b`** — same exec-child classification waves as
+  `jterm_core` / forge. No jterm_core dependency.
+
 Updated: 2026-09-28 (wave 8)
 
 ## 2026-09-28 (wave 8)
