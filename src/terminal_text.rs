@@ -36,17 +36,26 @@ pub(crate) fn is_terminal_ambiguous(ch: char) -> bool {
 /// protocols or visually ambiguous Unicode. The result is capped in bytes on
 /// a UTF-8 boundary; an ellipsis marks truncation when it fits.
 pub(crate) fn escape_inline(value: &str, max_bytes: usize) -> String {
-    let mut output = String::new();
+    let mut output = String::with_capacity(value.len().min(max_bytes));
     for ch in value.chars() {
+        if !is_terminal_ambiguous(ch) {
+            if ch.len_utf8() > max_bytes.saturating_sub(output.len()) {
+                if '…'.len_utf8() <= max_bytes.saturating_sub(output.len()) {
+                    output.push('…');
+                }
+                break;
+            }
+            output.push(ch);
+            continue;
+        }
         let rendered = match ch {
             '\n' => "\\n".to_string(),
             '\r' => "\\r".to_string(),
             '\t' => "\\t".to_string(),
-            ch if is_terminal_ambiguous(ch) && u32::from(ch) <= 0x7f => {
+            ch if u32::from(ch) <= 0x7f => {
                 format!("\\x{:02x}", u32::from(ch))
             }
-            ch if is_terminal_ambiguous(ch) => format!("\\u{{{:x}}}", u32::from(ch)),
-            ch => ch.to_string(),
+            ch => format!("\\u{{{:x}}}", u32::from(ch)),
         };
         if output.len().saturating_add(rendered.len()) > max_bytes {
             if output.len().saturating_add('…'.len_utf8()) <= max_bytes {
