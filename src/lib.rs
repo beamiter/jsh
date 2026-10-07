@@ -15,6 +15,7 @@ pub mod config;
 pub mod container;
 pub mod data;
 pub mod debug;
+mod desktop_open;
 pub mod doctor;
 pub mod editor;
 pub mod environment;

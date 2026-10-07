@@ -27,6 +27,9 @@ pub(crate) fn automatic_system_helper(name: &str) -> Option<&'static Path> {
         "docker" => &["/usr/bin/docker", "/bin/docker", "/usr/local/bin/docker"],
         "systemctl" => &["/usr/bin/systemctl", "/bin/systemctl"],
         "notify-send" => &["/usr/bin/notify-send", "/bin/notify-send"],
+        "xdg-open" => &["/usr/bin/xdg-open", "/bin/xdg-open"],
+        #[cfg(target_os = "macos")]
+        "open" => &["/usr/bin/open"],
         _ => return None,
     };
     candidates.iter().find_map(|candidate| {

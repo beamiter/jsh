@@ -87,6 +87,26 @@ Run an interactive shell:
 jsh
 ```
 
+At the interactive prompt, type a file or folder path and press Enter to open
+it with the system's default application (a folder opens in the file manager).
+This works in anvil, forge, ember, frost, and other terminals running jsh:
+
+```sh
+report.pdf
+./documents/
+~/Pictures/photo.png
+"project notes.txt"
+```
+
+Tab also completes local files and folders at the start of the input. Existing
+commands, aliases, functions, and executable paths take priority; use
+`./report.pdf` if the filename collides with a command. Paths containing spaces
+can be quoted or escaped; a literally typed full filename with spaces is also
+accepted when its first word is not a command. Shell operators, command
+arguments, scripts, and `-c` execution keep their usual shell behavior.
+Opening launches asynchronously so the prompt remains usable; `$?` reports
+whether the launcher started. Linux uses `xdg-open`, macOS uses `open`.
+
 Execute a command or a script:
 
 ```sh
@@ -199,7 +219,8 @@ names that look like credentials, tokens, passwords, or secrets.
 
 A few features start a system program: `bash` for the `~/.bashrc` import and for
 `source` of a script jsh's own parser cannot read, `git` for the prompt, and
-`notify-send` for background-job notifications. jsh looks for these at fixed
+`notify-send` for background-job notifications, plus `xdg-open` (Linux) or
+`open` (macOS) for desktop file opening. jsh looks for these at fixed
 absolute paths and never through `PATH`, which is mutable shell state any
 sourced script can rewrite.
 
@@ -210,6 +231,7 @@ immutable root — say where the program is:
 export JSH_HELPER_GIT=/run/current-system/sw/bin/git
 export JSH_HELPER_BASH=/run/current-system/sw/bin/bash
 export JSH_HELPER_NOTIFY_SEND=/run/current-system/sw/bin/notify-send
+export JSH_HELPER_XDG_OPEN=/run/current-system/sw/bin/xdg-open
 ```
 
 The variable name is `JSH_HELPER_` plus the program name uppercased, with `-`

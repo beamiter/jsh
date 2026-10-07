@@ -857,7 +857,7 @@ fn builtin_type(args: &[String], state: &mut ShellState) -> i32 {
     ret
 }
 
-fn find_in_path(cmd: &str) -> Option<String> {
+pub(crate) fn find_in_path(cmd: &str) -> Option<String> {
     // A name containing a slash is used as-is, never searched for in PATH.
     if cmd.contains('/') {
         return if is_executable_file(Path::new(cmd)) {

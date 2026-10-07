@@ -629,7 +629,14 @@ impl Shell {
                     let cmd_start = std::time::Instant::now();
                     match parser::parse(&line) {
                         Ok(commands) => {
-                            executor::execute_program(&commands, &mut self.state);
+                            if let Some(path) =
+                                crate::desktop_open::path_to_open(&line, &commands, &mut self.state)
+                            {
+                                self.state.last_exit_code =
+                                    crate::desktop_open::open(&path, &self.state);
+                            } else {
+                                executor::execute_program(&commands, &mut self.state);
+                            }
                         }
                         Err(e) => {
                             eprintln!("jsh: {}", e);

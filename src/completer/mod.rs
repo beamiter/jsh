@@ -194,6 +194,8 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     // entire editable buffer so `l<TAB> | where ...` still sees that `ls` is
     // a valid context-only route.
     let in_pipeline = buffer_contains_pipeline(buffer);
+    let standalone_path_completion =
+        state.interactive && !in_pipeline && buf[..word_start].trim().is_empty();
 
     // Everything after the command name reasons about the alias-expanded
     // line: with `alias gs='git status'`, `gs -<TAB>` is a `git status` flag
@@ -221,7 +223,10 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     } else if let Some(kind) = wrapper_value {
         format!("wrapval:{kind:?}:{word}")
     } else if is_cmd_pos {
-        format!("cmd:{}:{word}", if in_pipeline { "pipe" } else { "bare" })
+        format!(
+            "cmd:{}:{standalone_path_completion}:{word}",
+            if in_pipeline { "pipe" } else { "bare" }
+        )
     } else if word.starts_with('$') && !word.contains('/') {
         format!("var:{word}")
     } else {
@@ -323,6 +328,11 @@ pub fn complete(buffer: &str, cursor: usize, state: &mut ShellState) -> (usize, 
     } else if is_cmd_pos {
         record_source("command name");
         let mut cmd_completions = complete_command(&word, state, in_pipeline);
+        if standalone_path_completion && !word.is_empty() && !word.contains('/') {
+            // A standalone local file or folder can also start interactive
+            // input; quote/escape it with the same machinery as argument paths.
+            cmd_completions.extend(complete_path(&word, state));
+        }
         // Append project-aware completions for short prefixes
         if word.len() <= 3 {
             let project = complete_project_commands(&word);
@@ -5953,6 +5963,27 @@ mod tests {
         let results = complete_path(&prefix, &state);
         assert_eq!(results.len(), 1);
         assert!(results[0].text.ends_with("/readme"));
+    }
+
+    #[test]
+    fn interactive_first_word_completes_local_documents() {
+        let file = tempfile::Builder::new()
+            .prefix("jsh-desktop-completion-")
+            .suffix(" notes.txt")
+            .tempfile_in(".")
+            .unwrap();
+        let name = file.path().file_name().unwrap().to_str().unwrap();
+        let prefix = &name[..name.len() - " notes.txt".len()];
+        let mut state = ShellState::new(true);
+        clear_cache();
+        let (_, results) = complete(prefix, prefix.len(), &mut state);
+        assert!(results.iter().any(|item| {
+            item.kind == CompletionKind::File && unescape_shell_word(&item.text) == name
+        }));
+        // A wrapper asking for command names must not offer local documents.
+        let buffer = format!("command {prefix}");
+        let (_, results) = complete(&buffer, buffer.len(), &mut state);
+        assert!(!results.iter().any(|item| item.kind == CompletionKind::File));
     }
 
     #[test]

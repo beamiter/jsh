@@ -65,8 +65,13 @@ pub fn highlight(buffer: &str, state: &mut ShellState) -> Vec<StyledSpan> {
                         bold: true,
                         underline: false,
                     }
-                } else if raw.contains('/') {
-                    // Looks like a path — show as valid (skip stat on every keystroke)
+                } else if raw.contains('/')
+                    || (state.interactive
+                        && std::fs::metadata(&raw)
+                            .is_ok_and(|metadata| metadata.is_file() || metadata.is_dir()))
+                {
+                    // Paths can be entered directly; slash-prefixed input also
+                    // stays valid while an incomplete path is being typed.
                     StyledSpan {
                         text,
                         fg: Some(Color::Green),
