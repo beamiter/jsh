@@ -2279,7 +2279,7 @@ fn run_captured_with_transport(
                     if captured.len() < MAX_CAPTURED_OUTPUT_BYTES {
                         let room = MAX_CAPTURED_OUTPUT_BYTES - captured.len();
                         captured.extend_from_slice(&chunk[..count.min(room)]);
-                        if room <= count {
+                        if room < count {
                             truncated = true;
                         }
                     } else {
@@ -3108,6 +3108,44 @@ mod tests {
             Some(Turn::Observation { exit_code: 1, .. })
         ));
         assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn captured_output_marks_truncation_only_beyond_capacity() {
+        let mut state = ShellState::new(false);
+        let mut cwd = std::env::current_dir().expect("current directory");
+        // Test builds enter the child through a libtest helper, which prints a
+        // fixed preamble. Measure it so the combined pipe output hits the
+        // production byte boundary exactly, regardless of harness formatting.
+        let mut preamble = Vec::new();
+        let baseline = run_captured_to("true", &mut state, &mut cwd, &mut preamble);
+        assert_eq!(baseline.exit_code(), Some(0));
+        assert_eq!(baseline.evidence().as_bytes(), preamble);
+        assert!(preamble.len() < super::MAX_CAPTURED_OUTPUT_BYTES);
+
+        for extra in [0, 1] {
+            let mut terminal_output = Vec::new();
+            let size = super::MAX_CAPTURED_OUTPUT_BYTES - preamble.len() + extra;
+            let command = format!("/usr/bin/head -c {size} /dev/zero");
+            let execution = run_captured_to(&command, &mut state, &mut cwd, &mut terminal_output);
+
+            assert_eq!(execution.exit_code(), Some(0));
+            assert_eq!(execution.failure(), None);
+            let mut complete_output = preamble.clone();
+            complete_output.resize(preamble.len() + size, 0);
+            assert!(
+                terminal_output == complete_output,
+                "terminal receives all bytes"
+            );
+            complete_output.truncate(super::MAX_CAPTURED_OUTPUT_BYTES);
+            if extra != 0 {
+                complete_output.extend_from_slice(b"\n[jsh: further output not captured]");
+            }
+            assert!(
+                execution.evidence().as_bytes() == complete_output,
+                "incorrect truncation evidence with {extra} bytes beyond capacity"
+            );
+        }
     }
 
     #[test]
