@@ -1195,7 +1195,7 @@ fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
     let mut prompt_str = None;
     let mut silent = false;
     let mut raw = false;
-    let mut _timeout_secs: Option<f64> = None;
+    let mut timeout = None;
     let mut count_chars: Option<usize> = None;
     let mut delim = '\n';
     let mut exact_count: Option<usize> = None;
@@ -1215,9 +1215,17 @@ fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
             "-r" => raw = true,
             "-t" => {
                 i += 1;
-                if i < args.len() {
-                    _timeout_secs = args[i].parse::<f64>().ok();
-                }
+                let Some(value) = args.get(i) else {
+                    eprintln!("read: -t requires a timeout");
+                    return 2;
+                };
+                timeout = match parse_read_timeout(value) {
+                    Some(timeout) => Some(timeout),
+                    None => {
+                        eprintln!("read: invalid timeout");
+                        return 1;
+                    }
+                };
             }
             "-n" => {
                 i += 1;
@@ -1255,6 +1263,20 @@ fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
         var_names.push("REPLY");
     }
 
+    if timeout == Some(std::time::Duration::ZERO) {
+        return poll_read_stdin(0).map_or_else(|status| status, |ready| if ready { 0 } else { 1 });
+    }
+    let deadline = match timeout {
+        Some(timeout) => match std::time::Instant::now().checked_add(timeout) {
+            Some(deadline) => Some(deadline),
+            None => {
+                eprintln!("read: invalid timeout");
+                return 1;
+            }
+        },
+        None => None,
+    };
+
     if let Some(p) = prompt_str {
         eprint!("{}", p);
         use std::io::Write;
@@ -1264,14 +1286,14 @@ fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
     let echo_guard = silent.then(StdinEchoGuard::disable).flatten();
 
     let result = if let Some(count) = exact_count {
-        // Read exactly N characters
-        read_exact_chars(count, &var_names, read_array, state)
+        // Existing -N count is bytes, not Unicode scalar values.
+        read_exact_chars(count, &var_names, read_array, state, deadline)
     } else if let Some(count) = count_chars {
-        // Read up to N characters
-        read_limited_chars(count, delim, &var_names, read_array, state)
+        // Existing -n count is bytes, while still honoring the delimiter.
+        read_limited_chars(count, delim, &var_names, read_array, state, deadline)
     } else {
         // Read line with delimiter
-        read_line_with_delimiter(delim, raw, &var_names, read_array, state)
+        read_line_with_delimiter(delim, raw, &var_names, read_array, state, deadline)
     };
 
     drop(echo_guard);
@@ -1308,18 +1330,82 @@ impl Drop for StdinEchoGuard {
     }
 }
 
+const READ_TIMEOUT_STATUS: i32 = 128 + nix::libc::SIGALRM;
+
+fn parse_read_timeout(value: &str) -> Option<std::time::Duration> {
+    let number = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if number.is_empty()
+        || !number.bytes().any(|byte| byte.is_ascii_digit())
+        || number.bytes().filter(|&byte| byte == b'.').count() > 1
+        || !number
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    let nonzero = number
+        .bytes()
+        .any(|byte| byte.is_ascii_digit() && byte != b'0');
+    if value.starts_with('-') && nonzero {
+        return None;
+    }
+    let seconds = value.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let duration = std::time::Duration::try_from_secs_f64(seconds).ok()?;
+    Some(if nonzero && duration.is_zero() {
+        std::time::Duration::from_nanos(1)
+    } else {
+        duration
+    })
+}
+
+fn poll_read_stdin(timeout_ms: i32) -> Result<bool, i32> {
+    if let Some(status) = crate::signal::pending_status() {
+        return Err(status);
+    }
+    let mut descriptor = nix::libc::pollfd {
+        fd: nix::libc::STDIN_FILENO,
+        events: nix::libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { nix::libc::poll(&mut descriptor, 1, timeout_ms) };
+    if let Some(status) = crate::signal::pending_status() {
+        return Err(status);
+    }
+    if result < 0 {
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            // The caller recomputes the remaining absolute deadline.
+            return Ok(false);
+        }
+        return Err(1);
+    }
+    if descriptor.revents & (nix::libc::POLLERR | nix::libc::POLLNVAL) != 0 {
+        return Err(1);
+    }
+    Ok(descriptor.revents & (nix::libc::POLLIN | nix::libc::POLLHUP) != 0)
+}
+
 fn read_exact_chars(
     count: usize,
     var_names: &[&str],
     read_array: bool,
     state: &mut ShellState,
+    deadline: Option<std::time::Instant>,
 ) -> i32 {
     let mut buffer = vec![0u8; count];
     let mut filled = 0;
+    let mut status = 0;
     while filled < buffer.len() {
-        match read_stdin_interruptibly(&mut buffer[filled..]) {
+        match read_stdin_interruptibly(&mut buffer[filled..], deadline) {
             Ok(0) => return 1,
             Ok(read) => filled += read,
+            Err(READ_TIMEOUT_STATUS) => {
+                status = READ_TIMEOUT_STATUS;
+                buffer.truncate(filled);
+                break;
+            }
             Err(status) => return status,
         }
     }
@@ -1336,16 +1422,35 @@ fn read_exact_chars(
     } else if var_names.len() == 1 {
         state.set_var(var_names[0], &line);
     }
-    0
+    status
 }
 
 /// Read only the requested bytes from fd 0. A buffered stdin reader may
 /// prefetch bytes past a delimiter/count, hiding input from the next external
 /// command that inherits the same descriptor.
-fn read_stdin_interruptibly(buffer: &mut [u8]) -> Result<usize, i32> {
+fn read_stdin_interruptibly(
+    buffer: &mut [u8],
+    deadline: Option<std::time::Instant>,
+) -> Result<usize, i32> {
     loop {
         if let Some(status) = crate::signal::pending_status() {
             return Err(status);
+        }
+        if let Some(deadline) = deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(READ_TIMEOUT_STATUS);
+            }
+            let remaining = deadline.duration_since(now);
+            let millis = remaining
+                .as_millis()
+                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+            if !poll_read_stdin(millis.min(100) as i32)? {
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(READ_TIMEOUT_STATUS);
+            }
         }
         let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
         match nix::unistd::read(stdin, buffer) {
@@ -1366,32 +1471,52 @@ fn read_limited_chars(
     var_names: &[&str],
     read_array: bool,
     state: &mut ShellState,
+    deadline: Option<std::time::Instant>,
 ) -> i32 {
-    let mut buffer = vec![0u8; max_count];
-    match read_stdin_interruptibly(&mut buffer) {
-        Ok(n) if n > 0 => {
-            buffer.truncate(n);
-            let line = String::from_utf8_lossy(&buffer).into_owned();
-            if read_array {
-                let parts: Vec<&str> = line.split(delim).collect();
-                if let Some(arr_name) = var_names.first() {
-                    state.arrays.insert(
-                        arr_name.to_string(),
-                        parts.into_iter().map(|s| s.to_string()).collect(),
-                    );
-                }
-            } else if var_names.len() == 1 {
-                state.set_var(var_names[0], &line);
-            } else {
-                let parts: Vec<&str> = line.split(delim).collect();
-                for (vi, var) in var_names.iter().enumerate() {
-                    state.set_var(var, parts.get(vi).unwrap_or(&""));
+    if max_count == 0 {
+        return 1;
+    }
+    let mut buffer = Vec::new();
+    let mut encoded_delim = [0_u8; 4];
+    let delimiter = delim.encode_utf8(&mut encoded_delim).as_bytes();
+    let mut status = 0;
+    while buffer.len() < max_count {
+        let mut byte = [0_u8; 1];
+        match read_stdin_interruptibly(&mut byte, deadline) {
+            Ok(0) if buffer.is_empty() => return 1,
+            Ok(0) => break,
+            Ok(_) => {
+                buffer.push(byte[0]);
+                if buffer.ends_with(delimiter) {
+                    buffer.truncate(buffer.len() - delimiter.len());
+                    break;
                 }
             }
-            0
+            Err(READ_TIMEOUT_STATUS) => {
+                status = READ_TIMEOUT_STATUS;
+                break;
+            }
+            Err(status) => return status,
         }
-        _ => 1,
     }
+    let line = String::from_utf8_lossy(&buffer).into_owned();
+    if read_array {
+        let parts: Vec<&str> = line.split(delim).collect();
+        if let Some(arr_name) = var_names.first() {
+            state.arrays.insert(
+                arr_name.to_string(),
+                parts.into_iter().map(|s| s.to_string()).collect(),
+            );
+        }
+    } else if var_names.len() == 1 {
+        state.set_var(var_names[0], &line);
+    } else {
+        let parts: Vec<&str> = line.split(delim).collect();
+        for (vi, var) in var_names.iter().enumerate() {
+            state.set_var(var, parts.get(vi).unwrap_or(&""));
+        }
+    }
+    status
 }
 
 fn read_line_with_delimiter(
@@ -1400,6 +1525,7 @@ fn read_line_with_delimiter(
     var_names: &[&str],
     read_array: bool,
     state: &mut ShellState,
+    deadline: Option<std::time::Instant>,
 ) -> i32 {
     let mut bytes = Vec::new();
     let mut encoded_delim = [0_u8; 4];
@@ -1407,7 +1533,7 @@ fn read_line_with_delimiter(
 
     let read_status = loop {
         let mut byte = [0_u8; 1];
-        match read_stdin_interruptibly(&mut byte) {
+        match read_stdin_interruptibly(&mut byte, deadline) {
             Ok(0) if bytes.is_empty() => break Err(1),
             Ok(0) => break Ok(()),
             Ok(_) => {
@@ -1422,9 +1548,13 @@ fn read_line_with_delimiter(
     };
 
     match read_status {
-        Ok(()) => {
+        Ok(()) | Err(READ_TIMEOUT_STATUS) => {
             let line = String::from_utf8_lossy(&bytes);
-            let line = line.trim_end_matches('\r');
+            let line = if read_status == Err(READ_TIMEOUT_STATUS) {
+                line.as_ref()
+            } else {
+                line.trim_end_matches('\r')
+            };
             let line = if !raw {
                 line.replace("\\\n", "")
             } else {
@@ -1457,7 +1587,7 @@ fn read_line_with_delimiter(
                     state.set_var(var, parts.get(vi).unwrap_or(&""));
                 }
             }
-            0
+            read_status.err().unwrap_or(0)
         }
         Err(status) => status,
     }

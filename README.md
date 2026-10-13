@@ -194,6 +194,14 @@ CLI errors and syntax errors exit with status `2`. Command-not-found and
 missing-script failures use `127`; commands or scripts that cannot be
 executed or read use `126`.
 
+The `read` builtin accepts fractional decimal timeouts, such as
+`read -t 0.5 value`. One deadline covers the whole read; timeout returns `142`
+and assigns any partial input already received. `read -t 0` only checks input
+readiness, without consuming data or changing variables. Invalid, negative,
+non-finite, and overflowing timeout values fail before reading. The current
+`-n` and `-N` counts are byte counts: `-n` also stops at the delimiter, while
+`-N` waits for exactly the requested byte count, EOF, or timeout.
+
 An assignment-only command takes the status of its last command substitution,
 as in Bash: `out=$(false)` returns `1`. That status also reaches `ERR` traps and
 `set -e`, so a failed substitution cannot be mistaken for a successful setup
