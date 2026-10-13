@@ -2247,9 +2247,7 @@ fn run_captured_with_transport(
             }
         }
     };
-    'capture: loop {
-        drain_agent_child_readiness(control_reader.as_fd(), &mut readiness);
-        drain_agent_child_cwd_reader(&mut cwd_report_reader, &mut cwd_report, &cwd_nonce);
+    let mut forward_pending_signal = || {
         if let Some(status) = crate::signal::pending_status() {
             let signal = status.saturating_sub(128);
             if signal > 0 && forwarded_signal != Some(signal) {
@@ -2264,9 +2262,17 @@ fn run_captured_with_transport(
                 forwarded_signal = Some(signal);
             }
         }
+    };
+    'capture: loop {
+        drain_agent_child_readiness(control_reader.as_fd(), &mut readiness);
+        drain_agent_child_cwd_reader(&mut cwd_report_reader, &mut cwd_report, &cwd_nonce);
+        forward_pending_signal();
         refresh_child_status(&mut child_status);
 
         while output_open {
+            // A slow terminal can keep the pipe readable indefinitely. Check
+            // between reads so output cannot postpone an interrupt or shutdown.
+            forward_pending_signal();
             match unsafe { read(BorrowedFd::borrow_raw(r), &mut buffer) } {
                 Ok(0) => {
                     output_open = false;
@@ -3146,6 +3152,63 @@ mod tests {
                 "incorrect truncation evidence with {extra} bytes beyond capacity"
             );
         }
+    }
+
+    #[test]
+    fn cancellation_reaches_a_continuously_readable_capture_pipe() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "agent::tests::internal_capture_cancellation_process",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("isolated cancellation test");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated process for capture cancellation signal state"]
+    fn internal_capture_cancellation_process() {
+        struct SlowTerminal {
+            bytes: usize,
+        }
+        impl std::io::Write for SlowTerminal {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.contains(&0) {
+                    crate::signal::SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.bytes += bytes.iter().filter(|&&byte| byte == 0).count();
+                    // Give the producer time to keep the pipe continuously
+                    // readable, as a real slow terminal can do.
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut state = ShellState::new(false);
+        let mut cwd = std::env::current_dir().unwrap();
+        let mut terminal = SlowTerminal { bytes: 0 };
+        let execution = run_captured_to(
+            "/usr/bin/head -c 1048576 /dev/zero",
+            &mut state,
+            &mut cwd,
+            &mut terminal,
+        );
+        crate::signal::reset_pending_signals();
+        assert!(terminal.bytes > 0);
+        assert!(
+            terminal.bytes < 1048576,
+            "cancellation was postponed until all output drained"
+        );
+        assert_ne!(execution.exit_code(), Some(0));
     }
 
     #[test]
