@@ -3175,13 +3175,35 @@ mod tests {
     #[test]
     #[ignore = "isolated process for capture cancellation signal state"]
     fn internal_capture_cancellation_process() {
+        // Keep global signal-state checks in this isolated helper process.
+        for signal in [nix::libc::SIGTERM, nix::libc::SIGHUP] {
+            crate::signal::reset_pending_signals();
+            crate::signal::SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::signal::TERMINATION_SIGNAL.store(signal, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(crate::signal::pending_status(), Some(128 + signal));
+            assert_eq!(crate::signal::take_pending_status(), Some(128 + signal));
+            assert!(!crate::signal::SIGINT_RECEIVED.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(crate::signal::take_pending_status(), Some(128 + signal));
+        }
+        crate::signal::reset_pending_signals();
+        crate::signal::SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(crate::signal::pending_status(), Some(130));
+        assert_eq!(crate::signal::take_pending_status(), Some(130));
+        assert_eq!(crate::signal::pending_status(), None);
+        assert_eq!(crate::signal::take_pending_status(), None);
+
         struct SlowTerminal {
             bytes: usize,
+            terminate: bool,
         }
         impl std::io::Write for SlowTerminal {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if bytes.contains(&0) {
                     crate::signal::SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if self.terminate {
+                        crate::signal::TERMINATION_SIGNAL
+                            .store(nix::libc::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+                    }
                     self.bytes += bytes.iter().filter(|&&byte| byte == 0).count();
                     // Give the producer time to keep the pipe continuously
                     // readable, as a real slow terminal can do.
@@ -3193,22 +3215,32 @@ mod tests {
                 Ok(())
             }
         }
-        let mut state = ShellState::new(false);
-        let mut cwd = std::env::current_dir().unwrap();
-        let mut terminal = SlowTerminal { bytes: 0 };
-        let execution = run_captured_to(
-            "/usr/bin/head -c 1048576 /dev/zero",
-            &mut state,
-            &mut cwd,
-            &mut terminal,
-        );
-        crate::signal::reset_pending_signals();
-        assert!(terminal.bytes > 0);
-        assert!(
-            terminal.bytes < 1048576,
-            "cancellation was postponed until all output drained"
-        );
-        assert_ne!(execution.exit_code(), Some(0));
+        for terminate in [false, true] {
+            let mut state = ShellState::new(false);
+            let mut cwd = std::env::current_dir().unwrap();
+            let mut terminal = SlowTerminal {
+                bytes: 0,
+                terminate,
+            };
+            let execution = run_captured_to(
+                "/usr/bin/head -c 1048576 /dev/zero",
+                &mut state,
+                &mut cwd,
+                &mut terminal,
+            );
+            crate::signal::reset_pending_signals();
+            assert!(terminal.bytes > 0);
+            assert!(
+                terminal.bytes < 1048576,
+                "cancellation was postponed until all output drained"
+            );
+            let expected_signal = if terminate {
+                nix::libc::SIGTERM
+            } else {
+                nix::libc::SIGINT
+            };
+            assert_eq!(execution.exit_code(), Some(128 + expected_signal));
+        }
     }
 
     #[test]

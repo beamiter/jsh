@@ -64,22 +64,28 @@ pub fn reset_pending_signals() {
 /// prompt or program. `SIGHUP` and `SIGTERM` are process-termination requests:
 /// keep their status latched until the next explicit signal reset so an early
 /// executor check cannot accidentally turn a later orderly shutdown into exit
-/// status 0.
+/// status 0. A latched termination also takes precedence over a pending
+/// interrupt; consuming the interrupt must not hide process shutdown.
 pub fn take_pending_status() -> Option<i32> {
-    if SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
-        return Some(128 + libc::SIGINT);
-    }
+    let interrupted = SIGINT_RECEIVED.swap(false, Ordering::SeqCst);
     let signal = TERMINATION_SIGNAL.load(Ordering::SeqCst);
-    (signal != 0).then_some(128 + signal)
+    if signal != 0 {
+        Some(128 + signal)
+    } else {
+        interrupted.then_some(128 + libc::SIGINT)
+    }
 }
 
 /// Inspect, but do not consume, a pending terminating signal.
 pub fn pending_status() -> Option<i32> {
-    if SIGINT_RECEIVED.load(Ordering::SeqCst) {
-        return Some(128 + libc::SIGINT);
-    }
     let signal = TERMINATION_SIGNAL.load(Ordering::SeqCst);
-    (signal != 0).then_some(128 + signal)
+    if signal != 0 {
+        Some(128 + signal)
+    } else {
+        SIGINT_RECEIVED
+            .load(Ordering::SeqCst)
+            .then_some(128 + libc::SIGINT)
+    }
 }
 
 pub fn install_shell_signals() {
