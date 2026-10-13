@@ -1316,9 +1316,8 @@ fn read_exact_chars(
 ) -> i32 {
     let mut buffer = vec![0u8; count];
     let mut filled = 0;
-    let mut stdin = std::io::stdin().lock();
     while filled < buffer.len() {
-        match read_interruptibly(&mut stdin, &mut buffer[filled..]) {
+        match read_stdin_interruptibly(&mut buffer[filled..]) {
             Ok(0) => return 1,
             Ok(read) => filled += read,
             Err(status) => return status,
@@ -1340,14 +1339,18 @@ fn read_exact_chars(
     0
 }
 
-fn read_interruptibly(reader: &mut impl std::io::Read, buffer: &mut [u8]) -> Result<usize, i32> {
+/// Read only the requested bytes from fd 0. A buffered stdin reader may
+/// prefetch bytes past a delimiter/count, hiding input from the next external
+/// command that inherits the same descriptor.
+fn read_stdin_interruptibly(buffer: &mut [u8]) -> Result<usize, i32> {
     loop {
         if let Some(status) = crate::signal::pending_status() {
             return Err(status);
         }
-        match reader.read(buffer) {
+        let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
+        match nix::unistd::read(stdin, buffer) {
             Ok(read) => return Ok(read),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            Err(nix::errno::Errno::EINTR) => {
                 if let Some(status) = crate::signal::pending_status() {
                     return Err(status);
                 }
@@ -1365,8 +1368,7 @@ fn read_limited_chars(
     state: &mut ShellState,
 ) -> i32 {
     let mut buffer = vec![0u8; max_count];
-    let mut stdin = std::io::stdin().lock();
-    match read_interruptibly(&mut stdin, &mut buffer) {
+    match read_stdin_interruptibly(&mut buffer) {
         Ok(n) if n > 0 => {
             buffer.truncate(n);
             let line = String::from_utf8_lossy(&buffer).into_owned();
@@ -1399,14 +1401,13 @@ fn read_line_with_delimiter(
     read_array: bool,
     state: &mut ShellState,
 ) -> i32 {
-    let mut stdin = std::io::stdin().lock();
     let mut bytes = Vec::new();
     let mut encoded_delim = [0_u8; 4];
     let delimiter = delim.encode_utf8(&mut encoded_delim).as_bytes();
 
     let read_status = loop {
         let mut byte = [0_u8; 1];
-        match read_interruptibly(&mut stdin, &mut byte) {
+        match read_stdin_interruptibly(&mut byte) {
             Ok(0) if bytes.is_empty() => break Err(1),
             Ok(0) => break Ok(()),
             Ok(_) => {
