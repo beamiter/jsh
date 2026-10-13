@@ -2552,6 +2552,7 @@ fn env_truthy(name: &str) -> bool {
 fn read_line(prompt: &str) -> Option<String> {
     print!("{prompt}");
     std::io::stdout().flush().ok();
+    let mut line = Vec::new();
     loop {
         if crate::signal::pending_status().is_some() {
             return None;
@@ -2562,21 +2563,37 @@ fn read_line(prompt: &str) -> Option<String> {
             revents: 0,
         };
         let result = unsafe { nix::libc::poll(&mut descriptor, 1, 100) };
-        if result > 0 {
-            break;
-        }
-        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        if result < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return None;
         }
+        if result == 0 {
+            continue;
+        }
+        if crate::signal::pending_status().is_some() {
+            return None;
+        }
+        // Match the line editor's unbuffered stdin reads: a global BufReader
+        // may read the next answer ahead, making a subsequent poll wait even
+        // though that answer is already buffered. One byte also ensures a
+        // partial line never blocks cancellation while waiting for a newline.
+        let mut byte = [0_u8; 1];
+        let count =
+            unsafe { nix::libc::read(nix::libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+        match count {
+            0 if line.is_empty() => return None,
+            0 => break,
+            1 if byte[0] == b'\n' => break,
+            1 => line.push(byte[0]),
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return None,
+        }
     }
-    if crate::signal::pending_status().is_some() {
-        return None;
-    }
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
-    }
+    String::from_utf8(line)
+        .ok()
+        .map(|line| line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 fn confirm(prompt: &str) -> bool {
@@ -3152,6 +3169,50 @@ mod tests {
                 "incorrect truncation evidence with {extra} bytes beyond capacity"
             );
         }
+    }
+
+    #[test]
+    fn consecutive_agent_replies_do_not_wait_for_stdin_eof() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "agent::tests::internal_agent_buffered_input_process",
+                "--exact",
+                "--ignored",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        input.write_all("first雪\r\nsecond\n".as_bytes()).unwrap();
+        input.flush().unwrap();
+        // Keep stdin open: both complete replies are already available, so
+        // EOF must not be required to wake the second prompt.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("second Agent reply stalled until EOF despite complete input");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(input);
+    }
+
+    #[test]
+    #[ignore = "isolated process for Agent stdin buffering"]
+    fn internal_agent_buffered_input_process() {
+        assert_eq!(super::read_line("first> ").as_deref(), Some("first雪"));
+        assert_eq!(super::read_line("second> ").as_deref(), Some("second"));
     }
 
     #[test]

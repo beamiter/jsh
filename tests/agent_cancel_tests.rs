@@ -1,6 +1,6 @@
 #![cfg(feature = "ai")]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -8,6 +8,15 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn sigint_cancels_an_agent_input_prompt() {
+    assert_sigint_cancels_agent_input(b"");
+}
+
+#[test]
+fn sigint_cancels_an_agent_partial_input_line() {
+    assert_sigint_cancels_agent_input(b"unfinished goal");
+}
+
+fn assert_sigint_cancels_agent_input(partial_line: &[u8]) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
         .args(["-c", "agent"])
         .env("JSH_AI_PROVIDER", "ollama")
@@ -17,7 +26,7 @@ fn sigint_cancels_an_agent_input_prompt() {
         .spawn()
         .expect("spawn jsh Agent prompt");
     // Keep stdin open: EOF must not be what releases the prompt.
-    let _stdin = child.stdin.take().expect("Agent stdin");
+    let mut stdin = child.stdin.take().expect("Agent stdin");
     let mut stdout = child.stdout.take().expect("Agent stdout");
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
@@ -44,6 +53,14 @@ fn sigint_cancels_an_agent_input_prompt() {
     ready_rx
         .recv_timeout(Duration::from_secs(3))
         .expect("Agent prompt did not become ready");
+    stdin
+        .write_all(partial_line)
+        .expect("write partial Agent input");
+    stdin.flush().expect("flush Agent input");
+    if !partial_line.is_empty() {
+        // Let the prompt consume the bytes without receiving a newline.
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let pid = i32::try_from(child.id()).expect("PID fits pid_t");
     assert_eq!(unsafe { nix::libc::kill(pid, nix::libc::SIGINT) }, 0);
 
