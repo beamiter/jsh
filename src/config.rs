@@ -84,6 +84,66 @@ pub fn refresh_shell_integrations(state: &mut ShellState) {
     load_conda_hook(state);
 }
 
+/// The owning terminal's child-local Vim entry must survive rc files and
+/// environment hooks that replace PATH. Capture it before session restore or
+/// startup imports so a saved session cannot select a different frontend.
+pub(crate) struct TerminalVimIntegration {
+    shim_dir: String,
+    frontend: String,
+}
+
+fn vim_entry_disabled(value: Option<&str>) -> bool {
+    matches!(value, Some("0" | "false" | "off"))
+}
+
+fn executable_file(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+impl TerminalVimIntegration {
+    pub(crate) fn capture() -> Option<Self> {
+        if vim_entry_disabled(std::env::var("JTERM_VIM9_AUTO_GUI").ok().as_deref()) {
+            return None;
+        }
+        let integration = Self {
+            shim_dir: std::env::var("JTERM_VIM9_SHIM_DIR").ok()?,
+            frontend: std::env::var("JTERM_VIM9_FRONTEND").ok()?,
+        };
+        integration.available().then_some(integration)
+    }
+
+    fn available(&self) -> bool {
+        executable_file(&Path::new(&self.shim_dir).join("vim"))
+            && executable_file(Path::new(&self.frontend))
+    }
+
+    pub(crate) fn restore(&self, state: &mut ShellState) {
+        if vim_entry_disabled(state.get_var("JTERM_VIM9_AUTO_GUI")) || !self.available() {
+            return;
+        }
+        let shim = Path::new(&self.shim_dir);
+        let previous_shim = state.get_var("JTERM_VIM9_SHIM_DIR").map(Path::new);
+        let paths = std::iter::once(shim.to_path_buf()).chain(
+            std::env::split_paths(state.get_var("PATH").unwrap_or_default())
+                .filter(|path| path != shim && Some(path.as_path()) != previous_shim),
+        );
+        let Ok(path) = std::env::join_paths(paths) else {
+            return;
+        };
+        let Ok(path) = path.into_string() else {
+            return;
+        };
+        // Export through ShellState so command lookup, child env, and PATH
+        // completion caches agree. Aliases and functions retain precedence.
+        state.export_var("JTERM_VIM9_SHIM_DIR", &self.shim_dir);
+        state.export_var("JTERM_VIM9_FRONTEND", &self.frontend);
+        state.export_var("PATH", &path);
+    }
+}
+
 /// Load an explicitly selected startup file.
 ///
 /// Native jsh syntax is attempted first. Files using syntax that jsh cannot

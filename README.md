@@ -217,6 +217,12 @@ Interactive shells import `~/.bashrc` by default for compatibility. Use
 session. Non-interactive `-c`, script, and stdin execution do not implicitly
 load interactive configuration or write interactive history.
 
+In anvil, ember, frost, and forge, interactive `vim` uses the terminal's native
+Vim buffer display. jsh restores the terminal-provided entry after startup files,
+conda hooks, and session restoration replace `PATH`. User `vim` aliases and
+functions still take precedence; `JTERM_VIM9_AUTO_GUI=0 vim file` uses ordinary
+terminal Vim. Non-interactive execution keeps its existing command lookup.
+
 History is stored at `~/.jsh_history`; named session snapshots live under
 `~/.jsh/sessions`. New files are written with private permissions. History uses
 a newline-safe JSONL format while retaining compatibility with the previous

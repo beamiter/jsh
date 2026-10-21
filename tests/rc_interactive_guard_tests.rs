@@ -122,10 +122,21 @@ fn a_failing_guarded_file_still_reports_its_error() {
 /// configuration. Only a pty tells those two apart.
 #[cfg(target_os = "linux")]
 fn startup_on_a_terminal(home: &Path, probe: &str) -> String {
+    startup_on_a_terminal_with(home, probe, jsh())
+}
+
+#[cfg(target_os = "linux")]
+fn startup_on_a_terminal_with(home: &Path, probe: &str, mut command: Command) -> String {
     use std::io::Write;
 
     let mut leader = 0;
     let mut follower = 0;
+    let size = nix::libc::winsize {
+        ws_row: 40,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     // SAFETY: openpty writes two fds through the out-params and touches nothing
     // else; the remaining arguments are documented as optional.
     let opened = unsafe {
@@ -134,7 +145,7 @@ fn startup_on_a_terminal(home: &Path, probe: &str) -> String {
             &mut follower,
             std::ptr::null_mut(),
             std::ptr::null(),
-            std::ptr::null(),
+            &size,
         )
     };
     assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
@@ -142,7 +153,7 @@ fn startup_on_a_terminal(home: &Path, probe: &str) -> String {
     let (leader, follower) =
         unsafe { (OwnedFd::from_raw_fd(leader), OwnedFd::from_raw_fd(follower)) };
 
-    let mut child = jsh()
+    let mut child = command
         .env("HOME", home)
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
@@ -192,15 +203,251 @@ fn startup_on_a_terminal(home: &Path, probe: &str) -> String {
     wait_for(&mut seen, "❯", 60);
     write!(writer, "{probe}\r").expect("write to pty");
     wait_for(&mut seen, PROBE_MARKER, 60);
+    if let Some(marker) = seen
+        .windows(PROBE_MARKER.len())
+        .rposition(|bytes| bytes == PROBE_MARKER.as_bytes())
+    {
+        // Command output can arrive before the editor enables raw mode for
+        // the next prompt. Typing exit before then can be flushed on entry.
+        let mut after_probe = seen.split_off(marker + PROBE_MARKER.len());
+        wait_for(&mut after_probe, "❯", 10);
+        seen.extend_from_slice(&after_probe);
+    }
     write!(writer, "exit\r").expect("write to pty");
 
     let stop = Instant::now() + Duration::from_secs(10);
     while Instant::now() < stop && !matches!(child.try_wait(), Ok(Some(_))) {
+        // Drain the next prompt while waiting for exit; otherwise a repaint
+        // can fill the PTY and prevent the shell from reading the exit line.
+        if let Ok(n) = reader.read(&mut chunk) {
+            seen.extend_from_slice(&chunk[..n]);
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = child.kill();
     let _ = child.wait();
     String::from_utf8_lossy(&seen).into_owned()
+}
+
+#[cfg(target_os = "linux")]
+struct VimShellFixture {
+    directory: tempfile::TempDir,
+    home: std::path::PathBuf,
+    shim: std::path::PathBuf,
+    original: std::path::PathBuf,
+    frontend: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl VimShellFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let home = directory.path().join("home");
+        let shim = directory.path().join("native vim shim");
+        let original = directory.path().join("original tools");
+        for path in [&home, &shim, &original] {
+            fs::create_dir(path).expect("fixture directory");
+        }
+        let frontend = directory.path().join("terminal frontend");
+        for (path, script) in [
+            (
+                shim.join("vim"),
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$VIM_TEST_ARGS\"\nexit 23\n",
+            ),
+            (original.join("vim"), "#!/bin/sh\nexit 17\n"),
+            (frontend.clone(), "#!/bin/sh\nexit 0\n"),
+        ] {
+            fs::write(&path, script).expect("write executable fixture");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod fixture");
+        }
+        Self {
+            directory,
+            home,
+            shim,
+            original,
+            frontend,
+        }
+    }
+
+    fn reset_path_rc(&self, extra: &str) {
+        // The real failure: startup replaces PATH rather than extending it.
+        write_guarded_rc(
+            &self.home,
+            ".bashrc",
+            &format!(
+                "export PATH='{}':/usr/bin:/bin\n{extra}",
+                self.original.display()
+            ),
+        );
+    }
+
+    fn command(&self) -> Command {
+        let mut command = jsh();
+        command
+            .env("JTERM_VIM9_FRONTEND", &self.frontend)
+            .env("JTERM_VIM9_SHIM_DIR", &self.shim)
+            .env_remove("JTERM_VIM9_AUTO_GUI")
+            .env("VIM_TEST_ARGS", self.directory.path().join("vim-args"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    self.shim.display(),
+                    self.original.display()
+                ),
+            );
+        command
+    }
+
+    fn run(&self, probe: &str, command: Command) -> String {
+        startup_on_a_terminal_with(&self.home, probe, command)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_vim_entry_survives_bashrc_replacing_path() {
+    let fixture = VimShellFixture::new();
+    fixture.reset_path_rc("");
+    let seen = fixture.run(
+        "vim +42 'first source.txt' second.txt; echo \"PRO\"\"BE=[$?]\"",
+        fixture.command(),
+    );
+    assert!(seen.contains("PROBE=[23]"), "terminal session:\n{seen}");
+    assert_eq!(
+        fs::read_to_string(fixture.directory.path().join("vim-args")).expect("shim received argv"),
+        "+42\nfirst source.txt\nsecond.txt\n",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_vim_entry_survives_conda_hook_replacing_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = VimShellFixture::new();
+    let conda = fixture.directory.path().join("conda");
+    fs::write(
+        &conda,
+        format!(
+            "#!/bin/sh\nif [ \"$1 $2\" = 'shell.posix hook' ]; then\n\
+             printf '%s\\n' \"export PATH='{}':/usr/bin:/bin\"\nfi\n",
+            fixture.original.display()
+        ),
+    )
+    .expect("write conda hook");
+    fs::set_permissions(&conda, fs::Permissions::from_mode(0o700)).expect("chmod conda");
+    fixture.reset_path_rc(&format!("export CONDA_EXE='{}'\n", conda.display()));
+    let seen = fixture.run("vim; echo \"PRO\"\"BE=[$?]\"", fixture.command());
+    assert!(seen.contains("PROBE=[23]"), "terminal session:\n{seen}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_vim_entry_uses_current_frontend_after_session_restore() {
+    let first = VimShellFixture::new();
+    first.reset_path_rc("");
+    let mut command = first.command();
+    command.args(["--session", "native-vim-restore"]);
+    let seen = first.run("vim; echo \"PRO\"\"BE=[$?]\"", command);
+    assert!(seen.contains("PROBE=[23]"), "first terminal:\n{seen}");
+    assert!(first
+        .home
+        .join(".jsh/sessions/native-vim-restore.json")
+        .exists());
+
+    let second = VimShellFixture::new();
+    fs::write(second.shim.join("vim"), "#!/bin/sh\nexit 24\n").expect("write second shim");
+    let mut command = second.command();
+    command.args(["--session", "native-vim-restore"]);
+    let seen = startup_on_a_terminal_with(
+        &first.home,
+        "vim; echo \"PRO\"\"BE=[$?][$JTERM_VIM9_FRONTEND][$PATH]\"",
+        command,
+    );
+    let expected_path = format!(
+        "{}:{}:/usr/bin:/bin",
+        second.shim.display(),
+        first.original.display()
+    );
+    assert!(
+        seen.contains(&format!(
+            "PROBE=[24][{}][{expected_path}]",
+            second.frontend.display()
+        )),
+        "restored terminal:\n{seen}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_vim_entry_respects_environment_and_startup_opt_out() {
+    let fixture = VimShellFixture::new();
+    fixture.reset_path_rc("");
+    for disabled in ["0", "false", "off"] {
+        let mut command = fixture.command();
+        command.env("JTERM_VIM9_AUTO_GUI", disabled);
+        let seen = fixture.run("vim; echo \"PRO\"\"BE=[$?]\"", command);
+        assert!(seen.contains("PROBE=[17]"), "{disabled}:\n{seen}");
+    }
+    fixture.reset_path_rc("export JTERM_VIM9_AUTO_GUI=0\n");
+    let seen = fixture.run("vim; echo \"PRO\"\"BE=[$?]\"", fixture.command());
+    assert!(seen.contains("PROBE=[17]"), "startup opt-out:\n{seen}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_vim_entry_preserves_user_aliases_and_functions() {
+    let fixture = VimShellFixture::new();
+    for (rc, status) in [("alias vim='false'\n", 1), ("vim() { return 32; }\n", 32)] {
+        // Use the native startup parser for both aliases and functions.
+        fs::write(
+            fixture.home.join(".bashrc"),
+            format!(
+                "export PATH='{}':/usr/bin:/bin\n{rc}",
+                fixture.original.display()
+            ),
+        )
+        .expect("write rc");
+        let mut command = fixture.command();
+        command.args(["--rcfile", fixture.home.join(".bashrc").to_str().unwrap()]);
+        let seen = fixture.run("vim; echo \"PRO\"\"BE=[$?]\"", command);
+        assert!(seen.contains(&format!("PROBE=[{status}]")), "{rc}:\n{seen}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_vim_entry_does_not_rewrite_noninteractive_path() {
+    let fixture = VimShellFixture::new();
+    let output = fixture
+        .command()
+        .args([
+            "-c",
+            &format!("PATH='{}':/usr/bin:/bin; vim", fixture.original.display()),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run noninteractive jsh");
+    assert_eq!(output.status.code(), Some(17));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_vim_entry_requires_a_live_terminal_frontend() {
+    let fixture = VimShellFixture::new();
+    fixture.reset_path_rc("");
+    for frontend in [None, Some("/nonexistent/jterm-frontend")] {
+        let mut command = fixture.command();
+        command.env_remove("JTERM_VIM9_FRONTEND");
+        if let Some(frontend) = frontend {
+            command.env("JTERM_VIM9_FRONTEND", frontend);
+        }
+        let seen = fixture.run("vim; echo \"PRO\"\"BE=[$?]\"", command);
+        assert!(seen.contains("PROBE=[17]"), "{frontend:?}:\n{seen}");
+    }
 }
 
 /// The whole reported failure, on a terminal: a stock guarded `~/.bashrc`, a

@@ -31,6 +31,7 @@ pub struct Shell {
     session_restored: bool,
     load_startup_config: bool,
     startup_file: Option<PathBuf>,
+    terminal_vim: Option<config::TerminalVimIntegration>,
     execution_seq: u64,
 }
 
@@ -375,6 +376,7 @@ impl Default for Shell {
 
 impl Shell {
     pub fn new() -> Self {
+        let terminal_vim = config::TerminalVimIntegration::capture();
         Shell {
             state: ShellState::new(true),
             history: History::new(10000),
@@ -383,6 +385,7 @@ impl Shell {
             session_restored: false,
             load_startup_config: true,
             startup_file: None,
+            terminal_vim,
             execution_seq: 0,
         }
     }
@@ -482,6 +485,9 @@ impl Shell {
             }
             if signal::pending_status().is_some() {
                 return self.finish_interactive();
+            }
+            if let Some(integration) = &self.terminal_vim {
+                integration.restore(&mut self.state);
             }
             init_interactive_job_control();
             // Interactive mode with editor
