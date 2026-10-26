@@ -476,7 +476,7 @@ pub(super) fn unescape_shell_word(word: &str) -> String {
     result
 }
 
-pub(super) fn escape_shell_word(word: &str) -> String {
+pub(crate) fn escape_shell_word(word: &str) -> String {
     let mut result = String::with_capacity(word.len());
     for ch in word.chars() {
         if ch.is_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.' | '~') {

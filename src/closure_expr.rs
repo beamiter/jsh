@@ -15,11 +15,15 @@ use crate::parser::ast::PathSeg;
 ///   unary := ('!'|'-') unary | primary
 ///   primary := number | string | true|false|null | '$' name path? | '(' or ')'
 use crate::value::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    Num(f64, bool), // value, is_int
+    Int(u64), // unsigned magnitude permits the literal -9223372036854775808
+    OutOfRangeInt,
+    Float(f64),
     Str(String),
     Ident(String), // true|false|null
     Var(String, Vec<PathSeg>),
@@ -241,8 +245,13 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                     }
                 }
                 let s = std::str::from_utf8(&bytes[start..j]).unwrap();
-                let f: f64 = s.parse().map_err(|_| format!("bad number '{}'", s))?;
-                out.push(Tok::Num(f, !is_float));
+                if is_float {
+                    out.push(Tok::Float(
+                        s.parse().map_err(|_| format!("bad number '{s}'"))?,
+                    ));
+                } else {
+                    out.push(s.parse().map(Tok::Int).unwrap_or(Tok::OutOfRangeInt));
+                }
                 i = j;
             }
             c if c.is_ascii_alphabetic() || c == b'_' => {
@@ -264,6 +273,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
 struct Parser<'a> {
     toks: &'a [Tok],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -343,6 +353,18 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        if self.pos >= 1024 {
+            return Err("expression exceeds 1024 tokens".into());
+        }
+        if self.depth >= 128 {
+            return Err("expression nesting exceeds 128 levels".into());
+        }
+        self.depth += 1;
+        let result = self.parse_unary_inner();
+        self.depth -= 1;
+        result
+    }
+    fn parse_unary_inner(&mut self) -> Result<Expr, String> {
         match self.peek() {
             Some(Tok::Bang) => {
                 self.bump();
@@ -351,6 +373,10 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Minus) => {
                 self.bump();
+                if matches!(self.peek(), Some(Tok::Int(n)) if *n == 1_u64 << 63) {
+                    self.bump();
+                    return Ok(Expr::Int(i64::MIN));
+                }
                 let e = self.parse_unary()?;
                 Ok(Expr::Neg(Box::new(e)))
             }
@@ -359,13 +385,11 @@ impl<'a> Parser<'a> {
     }
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.bump() {
-            Some(Tok::Num(n, is_int)) => {
-                if is_int {
-                    Ok(Expr::Int(n as i64))
-                } else {
-                    Ok(Expr::Float(n))
-                }
-            }
+            Some(Tok::Int(n)) => i64::try_from(n)
+                .map(Expr::Int)
+                .map_err(|_| "integer literal out of range".into()),
+            Some(Tok::Float(n)) => Ok(Expr::Float(n)),
+            Some(Tok::OutOfRangeInt) => Err("integer literal out of range".into()),
             Some(Tok::Str(s)) => Ok(Expr::Str(s)),
             Some(Tok::Ident(name)) => match name.as_str() {
                 "true" => Ok(Expr::Bool(true)),
@@ -442,20 +466,23 @@ impl<'a> Parser<'a> {
         };
         match self.bump() {
             Some(Tok::Ident(s)) if s == "_" && !negate => Ok(MatchPat::Wildcard),
-            Some(Tok::Ident(s)) => match s.as_str() {
+            Some(Tok::Ident(s)) if !negate => match s.as_str() {
                 "true" => Ok(MatchPat::Lit(Value::Bool(true))),
                 "false" => Ok(MatchPat::Lit(Value::Bool(false))),
                 "null" => Ok(MatchPat::Lit(Value::Null)),
                 _ => Err(format!("match pattern must be literal or _, got {}", s)),
             },
-            Some(Tok::Num(n, is_int)) => {
-                let n = if negate { -n } else { n };
-                if is_int {
-                    Ok(MatchPat::Lit(Value::Int(n as i64)))
+            Some(Tok::Int(n)) => {
+                let n = if negate && n == 1_u64 << 63 {
+                    i64::MIN
                 } else {
-                    Ok(MatchPat::Lit(Value::Float(n)))
-                }
+                    i64::try_from(n).map_err(|_| "integer literal out of range")?
+                        * if negate { -1 } else { 1 }
+                };
+                Ok(MatchPat::Lit(Value::Int(n)))
             }
+            Some(Tok::Float(n)) => Ok(MatchPat::Lit(Value::Float(if negate { -n } else { n }))),
+            Some(Tok::OutOfRangeInt) => Err("integer literal out of range".into()),
             Some(Tok::Str(s)) if !negate => Ok(MatchPat::Lit(Value::String(s))),
             other => Err(format!("invalid match pattern: {:?}", other)),
         }
@@ -519,6 +546,7 @@ enum Cmp {
 
 #[derive(Debug, Clone)]
 enum Expr {
+    Literal(Value),
     Int(i64),
     Float(f64),
     Str(String),
@@ -544,46 +572,138 @@ enum MatchPat {
     Lit(Value),
 }
 
-/// Try to evaluate `src` as a closure-body expression against `vars`.
-/// Returns Ok(Some(value)) on success, Ok(None) if the body is not a pure
-/// expression (so the caller can fall back to the command interpreter), or
-/// Err(msg) on a real parse/eval error in an expression-looking body.
-pub fn try_eval(src: &str, vars: &HashMap<String, Value>) -> Result<Option<Value>, String> {
-    // Cheap heuristic: if the body contains shell-only syntax like `|`, `;`,
-    // backtick, or unquoted command-looking tokens, bail out so the command
-    // interpreter handles it. We only handle pure expressions here.
-    if has_shell_syntax(src) {
+/// Parsed expressions are immutable and can be reused across argument scopes.
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledExpr(Arc<Expr>);
+
+impl CompiledExpr {
+    pub(crate) fn evaluate_with<'a>(
+        &self,
+        lookup: impl Fn(&str) -> Option<&'a Value>,
+    ) -> Result<Value, String> {
+        eval(&self.0, &lookup, 0)
+    }
+}
+
+#[derive(Default)]
+struct ExpressionCache {
+    entries: HashMap<String, (Option<CompiledExpr>, u64)>,
+    source_bytes: usize,
+    clock: u64,
+}
+
+impl ExpressionCache {
+    fn get(&mut self, source: &str) -> Option<Option<CompiledExpr>> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(source)?;
+        entry.1 = self.clock;
+        Some(entry.0.clone())
+    }
+
+    fn insert(&mut self, source: &str, expression: Option<CompiledExpr>) {
+        const MAX_ENTRIES: usize = 128;
+        const MAX_BYTES: usize = 256 * 1024;
+        if source.len() > 8192 || self.entries.contains_key(source) {
+            return;
+        }
+        while self.entries.len() >= MAX_ENTRIES || self.source_bytes + source.len() > MAX_BYTES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, value)| value.1)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.source_bytes -= oldest.len();
+            self.entries.remove(&oldest);
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.entries
+            .insert(source.to_owned(), (expression, self.clock));
+        self.source_bytes += source.len();
+    }
+}
+
+thread_local! {
+    static EXPRESSIONS: RefCell<ExpressionCache> = RefCell::new(ExpressionCache::default());
+}
+
+/// Compile a pure expression, or return None for a shell-command body. Only
+/// syntax is cached: runtime values and closure captures never enter the cache.
+pub(crate) fn compile(source: &str) -> Result<Option<CompiledExpr>, String> {
+    let source = source.trim();
+    if let Some(cached) = EXPRESSIONS.with(|cache| cache.borrow_mut().get(source)) {
+        return Ok(cached);
+    }
+    let expression = compile_uncached(source)?;
+    EXPRESSIONS.with(|cache| cache.borrow_mut().insert(source, expression.clone()));
+    Ok(expression)
+}
+
+fn compile_uncached(source: &str) -> Result<Option<CompiledExpr>, String> {
+    // Share the same literal boundary between sequential and parallel closure
+    // application (notably JSON Unicode escapes, arrays and records).
+    if let Ok(value) = serde_json::from_str(source) {
+        return Ok(Some(CompiledExpr(Arc::new(Expr::Literal(
+            Value::from_json(value),
+        )))));
+    }
+    if has_shell_syntax(source) {
         return Ok(None);
     }
-    let toks = match tokenize(src.trim()) {
-        Ok(t) => t,
+    let toks = match tokenize(source) {
+        Ok(tokens) => tokens,
+        Err(error) if error == "integer literal out of range" => return Err(error),
         Err(_) => return Ok(None),
     };
     if toks.is_empty() {
         return Ok(None);
     }
-    // Reject token sequences that don't look expression-y (e.g. just an Ident
-    // that isn't true/false/null — those are commands to run).
-    if toks.len() == 1 {
-        if let Tok::Ident(s) = &toks[0] {
-            if !matches!(s.as_str(), "true" | "false" | "null") {
-                return Ok(None);
-            }
+    if let [Tok::Ident(name)] = toks.as_slice() {
+        if !matches!(name.as_str(), "true" | "false" | "null") {
+            return Ok(None);
         }
     }
-    let mut p = Parser {
+    let mut parser = Parser {
         toks: &toks,
         pos: 0,
+        depth: 0,
     };
-    let expr = match p.parse_or() {
-        Ok(e) => e,
+    let expression = match parser.parse_or() {
+        Ok(expression) => expression,
+        Err(error)
+            if error == "integer literal out of range"
+                || error.starts_with("expression nesting")
+                || error == "expression exceeds 1024 tokens" =>
+        {
+            return Err(error)
+        }
         Err(_) => return Ok(None),
     };
-    if p.pos != toks.len() {
+    if parser.pos != toks.len() {
         return Ok(None);
     }
-    let v = eval(&expr, vars)?;
-    Ok(Some(v))
+    if toks.len() > 1024 {
+        return Err("expression exceeds 1024 tokens".into());
+    }
+    Ok(Some(CompiledExpr(Arc::new(expression))))
+}
+
+/// Evaluate a closure expression against a borrowed scope. No values are
+/// cloned until the expression actually returns or operates on one of them.
+pub(crate) fn try_eval_with<'a>(
+    source: &str,
+    lookup: impl Fn(&str) -> Option<&'a Value>,
+) -> Result<Option<Value>, String> {
+    compile(source)?
+        .map(|expression| expression.evaluate_with(lookup))
+        .transpose()
+}
+
+/// Compatibility entry point for callers that already own a variable map.
+pub fn try_eval(source: &str, vars: &HashMap<String, Value>) -> Result<Option<Value>, String> {
+    try_eval_with(source, |name| vars.get(name))
 }
 
 fn has_shell_syntax(src: &str) -> bool {
@@ -593,12 +713,17 @@ fn has_shell_syntax(src: &str) -> bool {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
-        if c == b'"' {
-            in_str = !in_str;
-            i += 1;
+        if in_str && c != b'"' {
+            // An escaped quote is part of the string, not its closing quote.
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                i += 1;
+            }
             continue;
         }
-        if in_str {
+        if c == b'"' {
+            in_str = !in_str;
             i += 1;
             continue;
         }
@@ -624,94 +749,100 @@ fn has_shell_syntax(src: &str) -> bool {
     false
 }
 
-fn eval(e: &Expr, vars: &HashMap<String, Value>) -> Result<Value, String> {
+fn eval<'a>(
+    e: &Expr,
+    vars: &impl Fn(&str) -> Option<&'a Value>,
+    depth: usize,
+) -> Result<Value, String> {
+    if depth > 128 {
+        return Err("expression evaluation exceeds 128 levels".into());
+    }
     match e {
+        Expr::Literal(value) => Ok(value.clone()),
         Expr::Int(i) => Ok(Value::Int(*i)),
         Expr::Float(f) => Ok(Value::Float(*f)),
         Expr::Str(s) => Ok(Value::String(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
         Expr::Null => Ok(Value::Null),
-        Expr::Var(name, path) => {
-            let base = vars.get(name).cloned().unwrap_or(Value::Null);
-            Ok(crate::expand::resolve_path(&base, path)
-                .cloned()
-                .unwrap_or(Value::Null))
-        }
-        Expr::Neg(x) => match eval(x, vars)? {
-            Value::Int(i) => Ok(Value::Int(-i)),
+        Expr::Var(name, path) => Ok(vars(name)
+            .and_then(|base| crate::expand::resolve_path(base, path))
+            .cloned()
+            .unwrap_or(Value::Null)),
+        Expr::Neg(x) => match eval(x, vars, depth + 1)? {
+            Value::Int(i) => i
+                .checked_neg()
+                .map(Value::Int)
+                .ok_or_else(|| "integer overflow".into()),
             Value::Float(f) => Ok(Value::Float(-f)),
             v => Err(format!("cannot negate {:?}", v)),
         },
-        Expr::Not(x) => Ok(Value::Bool(!is_truthy(&eval(x, vars)?))),
+        Expr::Not(x) => Ok(Value::Bool(!is_truthy(&eval(x, vars, depth + 1)?))),
         Expr::And(a, b) => {
-            let va = eval(a, vars)?;
+            let va = eval(a, vars, depth + 1)?;
             if !is_truthy(&va) {
                 return Ok(Value::Bool(false));
             }
-            Ok(Value::Bool(is_truthy(&eval(b, vars)?)))
+            Ok(Value::Bool(is_truthy(&eval(b, vars, depth + 1)?)))
         }
         Expr::Or(a, b) => {
-            let va = eval(a, vars)?;
+            let va = eval(a, vars, depth + 1)?;
             if is_truthy(&va) {
                 return Ok(Value::Bool(true));
             }
-            Ok(Value::Bool(is_truthy(&eval(b, vars)?)))
+            Ok(Value::Bool(is_truthy(&eval(b, vars, depth + 1)?)))
         }
         Expr::If(c, t, e) => {
-            if is_truthy(&eval(c, vars)?) {
-                eval(t, vars)
+            if is_truthy(&eval(c, vars, depth + 1)?) {
+                eval(t, vars, depth + 1)
             } else {
-                eval(e, vars)
+                eval(e, vars, depth + 1)
             }
         }
         Expr::Match(scrut, arms) => {
-            let sv = eval(scrut, vars)?;
+            let sv = eval(scrut, vars, depth + 1)?;
             for (pat, body) in arms {
                 let hit = match pat {
                     MatchPat::Wildcard => true,
                     MatchPat::Lit(v) => &sv == v,
                 };
                 if hit {
-                    return eval(body, vars);
+                    return eval(body, vars, depth + 1);
                 }
             }
             Ok(Value::Null)
         }
         Expr::Cmp(l, op, r) => {
-            let lv = eval(l, vars)?;
-            let rv = eval(r, vars)?;
+            let lv = eval(l, vars, depth + 1)?;
+            let rv = eval(r, vars, depth + 1)?;
             let res = match op {
                 Cmp::Eq => lv == rv,
                 Cmp::Ne => lv != rv,
                 Cmp::Lt | Cmp::Gt | Cmp::Le | Cmp::Ge => {
-                    match (lv.as_f64(), rv.as_f64()) {
-                        (Some(a), Some(b)) => match op {
-                            Cmp::Lt => a < b,
-                            Cmp::Gt => a > b,
-                            Cmp::Le => a <= b,
-                            Cmp::Ge => a >= b,
-                            _ => unreachable!(),
-                        },
-                        _ => {
-                            // Fall back to string compare for ordering of strings.
-                            let a = lv.to_display_string();
-                            let b = rv.to_display_string();
-                            match op {
-                                Cmp::Lt => a < b,
-                                Cmp::Gt => a > b,
-                                Cmp::Le => a <= b,
-                                Cmp::Ge => a >= b,
-                                _ => unreachable!(),
-                            }
+                    let order = match (&lv, &rv) {
+                        (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
+                        (Value::Int(a), Value::Float(b)) => crate::value::compare_int_float(*a, *b),
+                        (Value::Float(a), Value::Int(b)) => {
+                            crate::value::compare_int_float(*b, *a).map(std::cmp::Ordering::reverse)
                         }
+                        _ => match (lv.as_f64(), rv.as_f64()) {
+                            (Some(a), Some(b)) => a.partial_cmp(&b),
+                            _ => Some(lv.to_display_string().cmp(&rv.to_display_string())),
+                        },
+                    };
+                    match op {
+                        Cmp::Lt => order.is_some_and(std::cmp::Ordering::is_lt),
+                        Cmp::Gt => order.is_some_and(std::cmp::Ordering::is_gt),
+                        Cmp::Le => order.is_some_and(std::cmp::Ordering::is_le),
+                        Cmp::Ge => order.is_some_and(std::cmp::Ordering::is_ge),
+                        _ => unreachable!(),
                     }
                 }
             };
             Ok(Value::Bool(res))
         }
         Expr::Bin(l, op, r) => {
-            let lv = eval(l, vars)?;
-            let rv = eval(r, vars)?;
+            let lv = eval(l, vars, depth + 1)?;
+            let rv = eval(r, vars, depth + 1)?;
             // String concatenation: `+` on any String operand.
             if let Bin::Add = op {
                 if matches!(lv, Value::String(_)) || matches!(rv, Value::String(_)) {
@@ -722,36 +853,49 @@ fn eval(e: &Expr, vars: &HashMap<String, Value>) -> Result<Value, String> {
                     )));
                 }
             }
+            // Evaluate each operand once, and keep integer operations exact.
+            if let (Value::Int(a), Value::Int(b)) = (&lv, &rv) {
+                let exact = match op {
+                    Bin::Add => a.checked_add(*b),
+                    Bin::Sub => a.checked_sub(*b),
+                    Bin::Mul => a.checked_mul(*b),
+                    Bin::Mod if *b == 0 => return Err("modulo by zero".into()),
+                    Bin::Mod if *b == -1 => Some(0),
+                    Bin::Mod => Some(a % b),
+                    Bin::Div if *b == 0 => return Err("division by zero".into()),
+                    Bin::Div => {
+                        let quotient = a.checked_div(*b).ok_or("integer overflow")?;
+                        if a % b == 0 {
+                            return Ok(Value::Int(quotient));
+                        }
+                        return Ok(Value::Float(*a as f64 / *b as f64));
+                    }
+                };
+                return exact
+                    .map(Value::Int)
+                    .ok_or_else(|| "integer overflow".into());
+            }
             let (a, b) = match (lv.as_f64(), rv.as_f64()) {
                 (Some(a), Some(b)) => (a, b),
                 _ => return Err(format!("non-numeric in arithmetic: {:?} {:?}", lv, rv)),
             };
-            let both_int =
-                matches!(eval(l, vars)?, Value::Int(_)) && matches!(eval(r, vars)?, Value::Int(_));
-            let f = match op {
+            Ok(Value::Float(match op {
                 Bin::Add => a + b,
                 Bin::Sub => a - b,
                 Bin::Mul => a * b,
                 Bin::Div => {
                     if b == 0.0 {
-                        return Err("division by zero".to_string());
+                        return Err("division by zero".into());
                     }
                     a / b
                 }
                 Bin::Mod => {
                     if b == 0.0 {
-                        return Err("modulo by zero".to_string());
+                        return Err("modulo by zero".into());
                     }
                     a % b
                 }
-            };
-            if both_int && matches!(op, Bin::Add | Bin::Sub | Bin::Mul | Bin::Mod) {
-                Ok(Value::Int(f as i64))
-            } else if both_int && matches!(op, Bin::Div) && (a as i64) % (b as i64) == 0 {
-                Ok(Value::Int((a as i64) / (b as i64)))
-            } else {
-                Ok(Value::Float(f))
-            }
+            }))
         }
     }
 }
@@ -767,5 +911,93 @@ fn is_truthy(v: &Value) -> bool {
         Value::Record(m) => !m.is_empty(),
         Value::Binary(b) => !b.is_empty(),
         Value::Closure(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cached_expressions_reuse_syntax_and_resolve_each_scope_again() {
+        let first = compile("$cache_test_value + 2").unwrap().unwrap();
+        let second = compile("$cache_test_value + 2").unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        for value in [Value::Int(3), Value::Int(40)] {
+            assert_eq!(
+                first.evaluate_with(|_| Some(&value)).unwrap(),
+                if value == Value::Int(3) {
+                    Value::Int(5)
+                } else {
+                    Value::Int(42)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn every_operand_is_evaluated_once() {
+        let reads = Cell::new(0);
+        let value = Value::Int(3);
+        let expression = compile("($x + 1) * ($x + 2)").unwrap().unwrap();
+        assert_eq!(
+            expression
+                .evaluate_with(|_| {
+                    reads.set(reads.get() + 1);
+                    Some(&value)
+                })
+                .unwrap(),
+            Value::Int(20)
+        );
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn expression_cache_is_bounded_by_entries_and_source_bytes() {
+        let mut cache = ExpressionCache::default();
+        for index in 0..256 {
+            let source = format!("{index}{}", " ".repeat(4090));
+            cache.insert(&source, None);
+            assert!(cache.entries.len() <= 128);
+            assert!(cache.source_bytes <= 256 * 1024);
+        }
+        assert_eq!(
+            cache.source_bytes,
+            cache.entries.keys().map(String::len).sum::<usize>()
+        );
+        cache.insert(&"x".repeat(8193), None);
+        assert!(!cache.entries.contains_key(&"x".repeat(8193)));
+    }
+
+    #[test]
+    fn excessive_expression_depth_and_size_are_errors() {
+        let vars = HashMap::new();
+        for source in [
+            format!("{}1", "!".repeat(140)),
+            std::iter::repeat_n("1", 300)
+                .collect::<Vec<_>>()
+                .join(" + "),
+            std::iter::repeat_n("1", 600)
+                .collect::<Vec<_>>()
+                .join(" + "),
+            std::iter::repeat_n("1", 10_000)
+                .collect::<Vec<_>>()
+                .join(" + "),
+        ] {
+            assert!(try_eval(&source, &vars).is_err());
+        }
+    }
+
+    #[test]
+    fn shell_arguments_are_not_subject_to_expression_numeric_or_size_limits() {
+        for source in [
+            "echo 18446744073709551616".to_owned(),
+            "$command 18446744073709551616".to_owned(),
+            format!("echo {}", "arg ".repeat(1500)),
+            format!("$command {}", "arg ".repeat(1500)),
+        ] {
+            assert!(matches!(try_eval(&source, &HashMap::new()), Ok(None)));
+        }
     }
 }

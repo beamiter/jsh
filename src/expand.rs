@@ -780,7 +780,8 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
                 }
                 return subscript_element(var_name, subscript, state)
                     .unwrap_or_default()
-                    .len()
+                    .chars()
+                    .count()
                     .to_string();
             }
         }
@@ -911,7 +912,7 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
     if let Some(var) = name.strip_prefix('#') {
         if !var.is_empty() && !var.contains('#') && !var.contains('[') {
             let val = state.get_var(var).unwrap_or("");
-            return val.len().to_string();
+            return val.chars().count().to_string();
         }
     }
 
@@ -928,26 +929,24 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
         // treat an empty value like an unset one; the colon-less forms below
         // only react to a genuinely unset parameter.
         if let Some(rest) = spec.strip_prefix(":-") {
-            let default = expand_param_operand(rest, state);
             return match parameter_value(var, state) {
                 Some(v) if !v.is_empty() => v,
-                _ => default,
+                _ => expand_param_operand(rest, state),
             };
         }
         if let Some(rest) = spec.strip_prefix(":=") {
-            let default = expand_param_operand(rest, state);
             return match parameter_value(var, state) {
                 Some(v) if !v.is_empty() => v,
                 _ => {
+                    let default = expand_param_operand(rest, state);
                     state.set_var(var, &default);
                     default
                 }
             };
         }
         if let Some(rest) = spec.strip_prefix(":+") {
-            let alt = expand_param_operand(rest, state);
             return match parameter_value(var, state) {
-                Some(v) if !v.is_empty() => alt,
+                Some(v) if !v.is_empty() => expand_param_operand(rest, state),
                 _ => String::new(),
             };
         }
@@ -980,8 +979,8 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
             };
         }
         if let Some(rest) = spec.strip_prefix('-') {
-            let default = expand_param_operand(rest, state);
-            return parameter_value(var, state).unwrap_or(default);
+            return parameter_value(var, state)
+                .unwrap_or_else(|| expand_param_operand(rest, state));
         }
         if let Some(rest) = spec.strip_prefix('=') {
             return match parameter_value(var, state) {
@@ -994,9 +993,8 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
             };
         }
         if let Some(rest) = spec.strip_prefix('+') {
-            let alt = expand_param_operand(rest, state);
             return if parameter_value(var, state).is_some() {
-                alt
+                expand_param_operand(rest, state)
             } else {
                 String::new()
             };
@@ -1062,25 +1060,33 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
                     Some((o, l)) => (o, Some(l)),
                     None => (rest, None),
                 };
+                // Shell string offsets count characters, not UTF-8 bytes.
+                // Keep byte boundaries only for the final slice, and saturate
+                // additions so user-supplied integer extremes cannot panic.
+                let boundaries: Vec<usize> = val
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(std::iter::once(val.len()))
+                    .collect();
+                let count = boundaries.len() - 1;
                 let offset: i64 = offset_text.trim().parse().unwrap_or(0);
                 let start = if offset < 0 {
-                    (val.len() as i64 + offset).max(0) as usize
+                    (count as i64).saturating_add(offset).max(0) as usize
                 } else {
-                    (offset as usize).min(val.len())
+                    (offset as usize).min(count)
                 };
                 let end = match length_text {
                     Some(l) => {
-                        let len: i64 = l.trim().parse().unwrap_or(val.len() as i64);
+                        let len: i64 = l.trim().parse().unwrap_or(count as i64);
                         if len < 0 {
-                            // A negative length is an offset from the end.
-                            ((val.len() as i64 + len).max(start as i64) as usize).min(val.len())
+                            (count as i64).saturating_add(len).max(start as i64) as usize
                         } else {
-                            (start + len as usize).min(val.len())
+                            start.saturating_add(len as usize).min(count)
                         }
                     }
-                    None => val.len(),
+                    None => count,
                 };
-                return val.get(start..end).unwrap_or("").to_string();
+                return val[boundaries[start]..boundaries[end]].to_string();
             }
             _ => {}
         }
@@ -1455,8 +1461,12 @@ fn expand_command_sub(cmd: &str, state: &mut ShellState) -> String {
             loop {
                 // Safe because r is a valid file descriptor
                 match unsafe { read(BorrowedFd::borrow_raw(r), &mut buf) } {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => output.extend_from_slice(&buf[..n]),
+                    // An unrelated signal is not EOF. Preserve cancellation
+                    // ownership when the shell has a pending terminating signal.
+                    Err(Errno::EINTR) if crate::signal::pending_status().is_none() => continue,
+                    Err(_) => break,
                 }
             }
             close(r).ok();
@@ -1476,7 +1486,7 @@ fn expand_command_sub(cmd: &str, state: &mut ShellState) -> String {
             // substitutions naturally leave the rightmost one's status.
             state.last_command_sub_status = Some(status);
             let mut s = String::from_utf8_lossy(&output).to_string();
-            while s.ends_with('\n') || s.ends_with('\r') {
+            while s.ends_with('\n') {
                 s.pop();
             }
             s
@@ -1550,12 +1560,51 @@ fn expand_process_sub(cmd: &str, kind: &ProcessSubKind, state: &mut ShellState) 
     }
 }
 
+/// Evaluate shell arithmetic using fixed-width, wrapping integer semantics.
+/// Explicit wrapping keeps debug and release behavior identical, including
+/// extreme shift counts and the signed minimum divided by minus one.
 pub fn expand_arithmetic(expr: &str, state: &mut ShellState) -> String {
     let tokens = tokenize_arith(expr);
-    match eval_arith_expr(&tokens, &mut 0, state) {
-        Ok(n) => n.to_string(),
-        Err(_) => String::from("0"),
+    if tokens.is_empty() {
+        return "0".into();
     }
+    let mut pos = 0;
+    let result = eval_arith_expr(&tokens, &mut pos, state, true).and_then(|value| {
+        if pos != tokens.len() {
+            Err("unexpected token in arithmetic expression".into())
+        } else {
+            Ok(value)
+        }
+    });
+    match result {
+        Ok(n) => n.to_string(),
+        Err(error) => {
+            state.expansion_error = Some(format!("{expr}: {error}"));
+            "0".into()
+        }
+    }
+}
+
+fn parse_arith_integer(text: &str) -> Result<i64, String> {
+    let (radix, digits) =
+        if let Some(digits) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            (16, digits)
+        } else if text.starts_with('0') && text.len() > 1 {
+            (8, text)
+        } else {
+            (10, text)
+        };
+    if digits.is_empty() {
+        return Err(format!("invalid arithmetic integer: {text}"));
+    }
+    let mut value = 0u64;
+    for ch in digits.chars() {
+        let digit = ch
+            .to_digit(radix)
+            .ok_or_else(|| format!("invalid arithmetic integer: {text}"))?;
+        value = value.wrapping_mul(radix as u64).wrapping_add(digit as u64);
+    }
+    Ok(value as i64)
 }
 
 fn tokenize_arith(expr: &str) -> Vec<ArithToken> {
@@ -1565,6 +1614,14 @@ fn tokenize_arith(expr: &str) -> Vec<ArithToken> {
         match c {
             ' ' | '\t' | '\n' => {
                 chars.next();
+            }
+            '\\' => {
+                chars.next();
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                } else {
+                    tokens.push(ArithToken::Invalid("invalid arithmetic escape".into()));
+                }
             }
             '0'..='9' => {
                 let mut n = String::new();
@@ -1606,14 +1663,10 @@ fn tokenize_arith(expr: &str) -> Vec<ArithToken> {
                         }
                     }
                 }
-                let val = if n.starts_with("0x") || n.starts_with("0X") {
-                    i64::from_str_radix(&n[2..], 16).unwrap_or(0)
-                } else if n.starts_with('0') && n.len() > 1 {
-                    i64::from_str_radix(&n[1..], 8).unwrap_or(0)
-                } else {
-                    n.parse().unwrap_or(0)
-                };
-                tokens.push(ArithToken::Num(val));
+                tokens.push(match parse_arith_integer(&n) {
+                    Ok(value) => ArithToken::Num(value),
+                    Err(error) => ArithToken::Invalid(error),
+                });
             }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let mut name = String::new();
@@ -1638,7 +1691,13 @@ fn tokenize_arith(expr: &str) -> Vec<ArithToken> {
                         break;
                     }
                 }
-                tokens.push(ArithToken::Ident(name));
+                if name.is_empty() {
+                    tokens.push(ArithToken::Invalid(
+                        "expected arithmetic variable after '$'".into(),
+                    ));
+                } else {
+                    tokens.push(ArithToken::Ident(name));
+                }
             }
             '+' => {
                 chars.next();
@@ -1789,6 +1848,9 @@ fn tokenize_arith(expr: &str) -> Vec<ArithToken> {
             }
             _ => {
                 chars.next();
+                tokens.push(ArithToken::Invalid(format!(
+                    "invalid arithmetic character: {c}"
+                )));
             }
         }
     }
@@ -1798,6 +1860,7 @@ fn tokenize_arith(expr: &str) -> Vec<ArithToken> {
 #[derive(Debug, Clone)]
 enum ArithToken {
     Num(i64),
+    Invalid(String),
     Ident(String),
     Plus,
     Minus,
@@ -1838,11 +1901,12 @@ fn eval_arith_expr(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let val = eval_arith_assign(tokens, pos, state)?;
+    let val = eval_arith_assign(tokens, pos, state, evaluate)?;
     if *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::Comma)) {
         *pos += 1;
-        return eval_arith_expr(tokens, pos, state);
+        return eval_arith_expr(tokens, pos, state, evaluate);
     }
     Ok(val)
 }
@@ -1851,6 +1915,7 @@ fn eval_arith_assign(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
     let save_pos = *pos;
     if let Some(ArithToken::Ident(name)) = tokens.get(*pos) {
@@ -1859,74 +1924,108 @@ fn eval_arith_assign(
         match tokens.get(*pos) {
             Some(ArithToken::Assign) => {
                 *pos += 1;
-                let val = eval_arith_assign(tokens, pos, state)?;
-                state.set_var(&name, &val.to_string());
+                let val = eval_arith_assign(tokens, pos, state, evaluate)?;
+                if evaluate {
+                    state.set_var(&name, &val.to_string());
+                }
                 return Ok(val);
             }
             Some(ArithToken::PlusAssign) => {
                 *pos += 1;
-                let cur = get_var_value(&name, state);
-                let val = cur + eval_arith_assign(tokens, pos, state)?;
-                state.set_var(&name, &val.to_string());
+                let cur = if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                };
+                let val = cur.wrapping_add(eval_arith_assign(tokens, pos, state, evaluate)?);
+                if evaluate {
+                    state.set_var(&name, &val.to_string());
+                }
                 return Ok(val);
             }
             Some(ArithToken::MinusAssign) => {
                 *pos += 1;
-                let cur = get_var_value(&name, state);
-                let val = cur - eval_arith_assign(tokens, pos, state)?;
-                state.set_var(&name, &val.to_string());
+                let cur = if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                };
+                let val = cur.wrapping_sub(eval_arith_assign(tokens, pos, state, evaluate)?);
+                if evaluate {
+                    state.set_var(&name, &val.to_string());
+                }
                 return Ok(val);
             }
             Some(ArithToken::StarAssign) => {
                 *pos += 1;
-                let cur = get_var_value(&name, state);
-                let val = cur * eval_arith_assign(tokens, pos, state)?;
-                state.set_var(&name, &val.to_string());
+                let cur = if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                };
+                let val = cur.wrapping_mul(eval_arith_assign(tokens, pos, state, evaluate)?);
+                if evaluate {
+                    state.set_var(&name, &val.to_string());
+                }
                 return Ok(val);
             }
             Some(ArithToken::SlashAssign) => {
                 *pos += 1;
-                let cur = get_var_value(&name, state);
-                let rhs = eval_arith_assign(tokens, pos, state)?;
-                if rhs == 0 {
+                let cur = if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                };
+                let rhs = eval_arith_assign(tokens, pos, state, evaluate)?;
+                if evaluate && rhs == 0 {
                     return Err("division by zero".into());
                 }
-                let val = cur / rhs;
-                state.set_var(&name, &val.to_string());
+                let val = if evaluate { cur.wrapping_div(rhs) } else { 0 };
+                if evaluate {
+                    state.set_var(&name, &val.to_string());
+                }
                 return Ok(val);
             }
             Some(ArithToken::PercentAssign) => {
                 *pos += 1;
-                let cur = get_var_value(&name, state);
-                let rhs = eval_arith_assign(tokens, pos, state)?;
-                if rhs == 0 {
+                let cur = if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                };
+                let rhs = eval_arith_assign(tokens, pos, state, evaluate)?;
+                if evaluate && rhs == 0 {
                     return Err("division by zero".into());
                 }
-                let val = cur % rhs;
-                state.set_var(&name, &val.to_string());
+                let val = if evaluate { cur.wrapping_rem(rhs) } else { 0 };
+                if evaluate {
+                    state.set_var(&name, &val.to_string());
+                }
                 return Ok(val);
             }
             _ => {}
         }
     }
     *pos = save_pos;
-    eval_arith_ternary(tokens, pos, state)
+    eval_arith_ternary(tokens, pos, state, evaluate)
 }
 
 fn eval_arith_ternary(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let cond = eval_arith_logical_or(tokens, pos, state)?;
-    if *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::Question)) {
+    let cond = eval_arith_logical_or(tokens, pos, state, evaluate)?;
+    if matches!(tokens.get(*pos), Some(ArithToken::Question)) {
         *pos += 1;
-        let true_val = eval_arith_assign(tokens, pos, state)?;
-        if *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::Colon)) {
-            *pos += 1;
-            let false_val = eval_arith_assign(tokens, pos, state)?;
-            return Ok(if cond != 0 { true_val } else { false_val });
+        let true_val = eval_arith_expr(tokens, pos, state, evaluate && cond != 0)?;
+        if !matches!(tokens.get(*pos), Some(ArithToken::Colon)) {
+            return Err("missing ':' in conditional expression".into());
         }
+        *pos += 1;
+        let false_val = eval_arith_ternary(tokens, pos, state, evaluate && cond == 0)?;
+        return Ok(if cond != 0 { true_val } else { false_val });
     }
     Ok(cond)
 }
@@ -1935,16 +2034,13 @@ fn eval_arith_logical_or(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_logical_and(tokens, pos, state)?;
-    while *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::LogicalOr)) {
+    let mut left = eval_arith_logical_and(tokens, pos, state, evaluate)?;
+    while matches!(tokens.get(*pos), Some(ArithToken::LogicalOr)) {
         *pos += 1;
-        if left != 0 {
-            let _ = eval_arith_logical_and(tokens, pos, state)?;
-            return Ok(1);
-        }
-        let right = eval_arith_logical_and(tokens, pos, state)?;
-        left = if right != 0 { 1 } else { 0 };
+        let right = eval_arith_logical_and(tokens, pos, state, evaluate && left == 0)?;
+        left = i64::from(left != 0 || right != 0);
     }
     Ok(left)
 }
@@ -1953,16 +2049,13 @@ fn eval_arith_logical_and(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_bitwise_or(tokens, pos, state)?;
-    while *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::LogicalAnd)) {
+    let mut left = eval_arith_bitwise_or(tokens, pos, state, evaluate)?;
+    while matches!(tokens.get(*pos), Some(ArithToken::LogicalAnd)) {
         *pos += 1;
-        if left == 0 {
-            let _ = eval_arith_bitwise_or(tokens, pos, state)?;
-            return Ok(0);
-        }
-        let right = eval_arith_bitwise_or(tokens, pos, state)?;
-        left = if right != 0 { 1 } else { 0 };
+        let right = eval_arith_bitwise_or(tokens, pos, state, evaluate && left != 0)?;
+        left = i64::from(left != 0 && right != 0);
     }
     Ok(left)
 }
@@ -1971,11 +2064,12 @@ fn eval_arith_bitwise_or(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_bitwise_xor(tokens, pos, state)?;
+    let mut left = eval_arith_bitwise_xor(tokens, pos, state, evaluate)?;
     while *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::BitOr)) {
         *pos += 1;
-        left |= eval_arith_bitwise_xor(tokens, pos, state)?;
+        left |= eval_arith_bitwise_xor(tokens, pos, state, evaluate)?;
     }
     Ok(left)
 }
@@ -1984,11 +2078,12 @@ fn eval_arith_bitwise_xor(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_bitwise_and(tokens, pos, state)?;
+    let mut left = eval_arith_bitwise_and(tokens, pos, state, evaluate)?;
     while *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::BitXor)) {
         *pos += 1;
-        left ^= eval_arith_bitwise_and(tokens, pos, state)?;
+        left ^= eval_arith_bitwise_and(tokens, pos, state, evaluate)?;
     }
     Ok(left)
 }
@@ -1997,55 +2092,55 @@ fn eval_arith_bitwise_and(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_comparison(tokens, pos, state)?;
+    let mut left = eval_arith_equality(tokens, pos, state, evaluate)?;
     while *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::BitAnd)) {
         *pos += 1;
-        left &= eval_arith_comparison(tokens, pos, state)?;
+        left &= eval_arith_equality(tokens, pos, state, evaluate)?;
     }
     Ok(left)
 }
 
-fn eval_arith_comparison(
+fn eval_arith_equality(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_shift(tokens, pos, state)?;
-    while *pos < tokens.len() {
-        match tokens.get(*pos) {
-            Some(ArithToken::Lt) => {
-                *pos += 1;
-                let r = eval_arith_shift(tokens, pos, state)?;
-                left = if left < r { 1 } else { 0 };
-            }
-            Some(ArithToken::Le) => {
-                *pos += 1;
-                let r = eval_arith_shift(tokens, pos, state)?;
-                left = if left <= r { 1 } else { 0 };
-            }
-            Some(ArithToken::Gt) => {
-                *pos += 1;
-                let r = eval_arith_shift(tokens, pos, state)?;
-                left = if left > r { 1 } else { 0 };
-            }
-            Some(ArithToken::Ge) => {
-                *pos += 1;
-                let r = eval_arith_shift(tokens, pos, state)?;
-                left = if left >= r { 1 } else { 0 };
-            }
-            Some(ArithToken::Eq) => {
-                *pos += 1;
-                let r = eval_arith_shift(tokens, pos, state)?;
-                left = if left == r { 1 } else { 0 };
-            }
-            Some(ArithToken::Ne) => {
-                *pos += 1;
-                let r = eval_arith_shift(tokens, pos, state)?;
-                left = if left != r { 1 } else { 0 };
-            }
+    let mut left = eval_arith_relational(tokens, pos, state, evaluate)?;
+    loop {
+        let equal = match tokens.get(*pos) {
+            Some(ArithToken::Eq) => true,
+            Some(ArithToken::Ne) => false,
             _ => break,
-        }
+        };
+        *pos += 1;
+        let right = eval_arith_relational(tokens, pos, state, evaluate)?;
+        left = i64::from((left == right) == equal);
+    }
+    Ok(left)
+}
+
+fn eval_arith_relational(
+    tokens: &[ArithToken],
+    pos: &mut usize,
+    state: &mut ShellState,
+    evaluate: bool,
+) -> Result<i64, String> {
+    let mut left = eval_arith_shift(tokens, pos, state, evaluate)?;
+    while let Some(operator @ (ArithToken::Lt | ArithToken::Le | ArithToken::Gt | ArithToken::Ge)) =
+        tokens.get(*pos)
+    {
+        *pos += 1;
+        let right = eval_arith_shift(tokens, pos, state, evaluate)?;
+        left = i64::from(match operator {
+            ArithToken::Lt => left < right,
+            ArithToken::Le => left <= right,
+            ArithToken::Gt => left > right,
+            ArithToken::Ge => left >= right,
+            _ => unreachable!(),
+        });
     }
     Ok(left)
 }
@@ -2054,17 +2149,18 @@ fn eval_arith_shift(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_additive(tokens, pos, state)?;
+    let mut left = eval_arith_additive(tokens, pos, state, evaluate)?;
     while *pos < tokens.len() {
         match tokens.get(*pos) {
             Some(ArithToken::LShift) => {
                 *pos += 1;
-                left <<= eval_arith_additive(tokens, pos, state)?;
+                left = left.wrapping_shl(eval_arith_additive(tokens, pos, state, evaluate)? as u32);
             }
             Some(ArithToken::RShift) => {
                 *pos += 1;
-                left >>= eval_arith_additive(tokens, pos, state)?;
+                left = left.wrapping_shr(eval_arith_additive(tokens, pos, state, evaluate)? as u32);
             }
             _ => break,
         }
@@ -2076,17 +2172,18 @@ fn eval_arith_additive(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_term(tokens, pos, state)?;
+    let mut left = eval_arith_term(tokens, pos, state, evaluate)?;
     while *pos < tokens.len() {
         match tokens.get(*pos) {
             Some(ArithToken::Plus) => {
                 *pos += 1;
-                left += eval_arith_term(tokens, pos, state)?;
+                left = left.wrapping_add(eval_arith_term(tokens, pos, state, evaluate)?);
             }
             Some(ArithToken::Minus) => {
                 *pos += 1;
-                left -= eval_arith_term(tokens, pos, state)?;
+                left = left.wrapping_sub(eval_arith_term(tokens, pos, state, evaluate)?);
             }
             _ => break,
         }
@@ -2098,29 +2195,30 @@ fn eval_arith_term(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
-    let mut left = eval_arith_unary(tokens, pos, state)?;
+    let mut left = eval_arith_unary(tokens, pos, state, evaluate)?;
     while *pos < tokens.len() {
         match tokens.get(*pos) {
             Some(ArithToken::Star) => {
                 *pos += 1;
-                left *= eval_arith_unary(tokens, pos, state)?;
+                left = left.wrapping_mul(eval_arith_unary(tokens, pos, state, evaluate)?);
             }
             Some(ArithToken::Slash) => {
                 *pos += 1;
-                let r = eval_arith_unary(tokens, pos, state)?;
-                if r == 0 {
+                let r = eval_arith_unary(tokens, pos, state, evaluate)?;
+                if evaluate && r == 0 {
                     return Err("division by zero".into());
                 }
-                left /= r;
+                left = if evaluate { left.wrapping_div(r) } else { 0 };
             }
             Some(ArithToken::Percent) => {
                 *pos += 1;
-                let r = eval_arith_unary(tokens, pos, state)?;
-                if r == 0 {
+                let r = eval_arith_unary(tokens, pos, state, evaluate)?;
+                if evaluate && r == 0 {
                     return Err("division by zero".into());
                 }
-                left %= r;
+                left = if evaluate { left.wrapping_rem(r) } else { 0 };
             }
             _ => break,
         }
@@ -2132,35 +2230,43 @@ fn eval_arith_unary(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
     match tokens.get(*pos) {
         Some(ArithToken::Minus) => {
             *pos += 1;
-            Ok(-eval_arith_unary(tokens, pos, state)?)
+            Ok(eval_arith_unary(tokens, pos, state, evaluate)?.wrapping_neg())
         }
         Some(ArithToken::Plus) => {
             *pos += 1;
-            eval_arith_unary(tokens, pos, state)
+            eval_arith_unary(tokens, pos, state, evaluate)
         }
         Some(ArithToken::Not) => {
             *pos += 1;
-            let v = eval_arith_unary(tokens, pos, state)?;
+            let v = eval_arith_unary(tokens, pos, state, evaluate)?;
             Ok(if v == 0 { 1 } else { 0 })
         }
         Some(ArithToken::BitNot) => {
             *pos += 1;
-            Ok(!eval_arith_unary(tokens, pos, state)?)
+            Ok(!eval_arith_unary(tokens, pos, state, evaluate)?)
         }
         Some(ArithToken::Increment) => {
             *pos += 1;
             if let Some(ArithToken::Ident(name)) = tokens.get(*pos) {
                 let name = name.clone();
                 *pos += 1;
-                let val = get_var_value(&name, state) + 1;
-                state.set_var(&name, &val.to_string());
+                let val = (if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                })
+                .wrapping_add(1);
+                if evaluate {
+                    state.set_var(&name, &val.to_string());
+                }
                 Ok(val)
             } else {
-                Ok(0)
+                Err("increment or decrement requires a variable".into())
             }
         }
         Some(ArithToken::Decrement) => {
@@ -2168,14 +2274,21 @@ fn eval_arith_unary(
             if let Some(ArithToken::Ident(name)) = tokens.get(*pos) {
                 let name = name.clone();
                 *pos += 1;
-                let val = get_var_value(&name, state) - 1;
-                state.set_var(&name, &val.to_string());
+                let val = (if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                })
+                .wrapping_sub(1);
+                if evaluate {
+                    state.set_var(&name, &val.to_string());
+                }
                 Ok(val)
             } else {
-                Ok(0)
+                Err("increment or decrement requires a variable".into())
             }
         }
-        _ => eval_arith_postfix(tokens, pos, state),
+        _ => eval_arith_postfix(tokens, pos, state, evaluate),
     }
 }
 
@@ -2183,6 +2296,7 @@ fn eval_arith_postfix(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
     if let Some(ArithToken::Ident(name)) = tokens.get(*pos) {
         let name = name.clone();
@@ -2190,26 +2304,45 @@ fn eval_arith_postfix(
         match tokens.get(*pos) {
             Some(ArithToken::Increment) => {
                 *pos += 1;
-                let val = get_var_value(&name, state);
-                state.set_var(&name, &(val + 1).to_string());
+                let val = if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                };
+                if evaluate {
+                    state.set_var(&name, &val.wrapping_add(1).to_string());
+                }
                 return Ok(val);
             }
             Some(ArithToken::Decrement) => {
                 *pos += 1;
-                let val = get_var_value(&name, state);
-                state.set_var(&name, &(val - 1).to_string());
+                let val = if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                };
+                if evaluate {
+                    state.set_var(&name, &val.wrapping_sub(1).to_string());
+                }
                 return Ok(val);
             }
-            _ => return Ok(get_var_value(&name, state)),
+            _ => {
+                return Ok(if evaluate {
+                    get_var_value(&name, state)?
+                } else {
+                    0i64
+                })
+            }
         }
     }
-    eval_arith_primary(tokens, pos, state)
+    eval_arith_primary(tokens, pos, state, evaluate)
 }
 
 fn eval_arith_primary(
     tokens: &[ArithToken],
     pos: &mut usize,
     state: &mut ShellState,
+    evaluate: bool,
 ) -> Result<i64, String> {
     match tokens.get(*pos) {
         Some(ArithToken::Num(n)) => {
@@ -2219,22 +2352,37 @@ fn eval_arith_primary(
         }
         Some(ArithToken::LParen) => {
             *pos += 1;
-            let v = eval_arith_expr(tokens, pos, state)?;
-            if matches!(tokens.get(*pos), Some(ArithToken::RParen)) {
-                *pos += 1;
+            let v = eval_arith_expr(tokens, pos, state, evaluate)?;
+            if !matches!(tokens.get(*pos), Some(ArithToken::RParen)) {
+                return Err("missing ')' in arithmetic expression".into());
             }
+            *pos += 1;
             Ok(v)
         }
-        _ => Ok(0),
+        Some(ArithToken::Invalid(message)) => Err(message.clone()),
+        _ => Err("expected arithmetic operand".into()),
     }
 }
 
-fn get_var_value(name: &str, state: &ShellState) -> i64 {
-    state
-        .get_var(name)
-        .unwrap_or("0")
-        .parse::<i64>()
-        .unwrap_or(0)
+/// Numeric values share literal radix/bit-pattern rules. General recursive
+/// arithmetic values remain unsupported, rather than recursing without a bound.
+fn get_var_value(name: &str, state: &ShellState) -> Result<i64, String> {
+    let value = state.get_var(name).unwrap_or("0").trim();
+    if value.is_empty() {
+        return Ok(0);
+    }
+    let (negative, value) = if let Some(value) = value.strip_prefix('-') {
+        (true, value)
+    } else {
+        (false, value.strip_prefix('+').unwrap_or(value))
+    };
+    parse_arith_integer(value).map(|number| {
+        if negative {
+            number.wrapping_neg()
+        } else {
+            number
+        }
+    })
 }
 
 /// Does this field contain a glob metacharacter that quoting left eligible?
@@ -2357,14 +2505,10 @@ fn split_pattern_dir(pattern: &str) -> (String, String) {
     let mut in_extglob = false;
     let mut paren_depth = 0;
 
-    for (i, c) in pattern.chars().enumerate() {
+    let mut previous = None;
+    for (i, c) in pattern.char_indices() {
         match c {
-            '(' if i > 0
-                && matches!(
-                    pattern.chars().nth(i.saturating_sub(1)),
-                    Some('!' | '?' | '*' | '+' | '@')
-                ) =>
-            {
+            '(' if matches!(previous, Some('!' | '?' | '*' | '+' | '@')) => {
                 in_extglob = true;
                 paren_depth += 1;
             }
@@ -2379,6 +2523,7 @@ fn split_pattern_dir(pattern: &str) -> (String, String) {
             }
             _ => {}
         }
+        previous = Some(c);
     }
 
     if let Some(pos) = last_slash {
@@ -2427,6 +2572,22 @@ pub fn expand_conditional_words(words: &[Word], state: &mut ShellState) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extglob_directory_offsets_follow_utf8_boundaries() {
+        assert_eq!(
+            split_pattern_dir("中文/@(a|b)"),
+            ("中文".into(), "@(a|b)".into())
+        );
+        assert_eq!(
+            split_pattern_dir("中文/子目录/@(a|b)"),
+            ("中文/子目录".into(), "@(a|b)".into())
+        );
+        assert_eq!(
+            split_pattern_dir("中文/@(a/b|c)"),
+            ("中文".into(), "@(a/b|c)".into())
+        );
+    }
 
     /// `${a[}` reaches `split_subscript` as the name `a[`, where the old
     /// hand-rolled `&name[bracket + 1..len - 1]` is the reversed range 2..1 and

@@ -143,6 +143,46 @@ help where
 help --record where
 ```
 
+Structured deduplication keeps value types and nested structure intact:
+`1`, `1.0`, `"1"`, `null`, and `""` remain distinct. `unique`,
+`unique --count`, and `histogram` preserve the first representative of each
+value. Record field order is part of that identity; floating positive and
+negative zero share one identity. With a field argument, `unique field`
+distinguishes a missing field from `null`, while `histogram field` counts
+missing fields in the `null` bucket.
+
+`range`, `skip`, `enumerate`, `wrap`, `flatten`, `select`, `reject`, `compact`,
+and `default` preserve lazy stream input, so a chain ending in `take` does not
+need to fit its entire source in memory. Streamed records display one per line;
+append `to-table` for an aligned table or `to-json` for JSON. Table output aligns
+Chinese, emoji, and combining characters by their terminal display width.
+
+`first`, `last`, `take`, `skip`, and `drop` default to one item and reject
+invalid or negative counts. `compact a b` requires both fields to be present
+and non-null. `default 0 a b` fills missing or null values in both columns,
+preserving existing values including `false` and zero.
+
+`count`, `length`, `reduce`, and the simple `math` aggregates consume streams
+without retaining every input row. `last N` retains only the final N rows.
+`median`, `variance`, and `stddev` still collect numeric samples.
+
+Pure closure expressions reuse their parsed form across rows and read captured
+values without copying the entire scope. Integer arithmetic in typed closures
+stays exact within `i64`; overflow reports an error. Division returns an integer
+when exact and a float otherwise. This differs from the wrapping arithmetic of
+the Bash-style `$((...))` syntax. Expression bodies are limited to 1,024 tokens
+and 128 nesting/evaluation levels.
+`par-each` shares that parsed expression across workers and preserves input
+order and the same parameter/capture binding rules as `each`.
+
+Text pipelines also support zero-based field templates and preserve blank
+lines when collapsing adjacent duplicates:
+
+```sh
+printf 'Ada 36\nLin 28\n' | jsh -c 'map "{1}: {0}"'
+printf '\n\nalpha\nalpha\n' | jsh -c 'uniq -c'
+```
+
 Check whether the surrounding environment can provide startup compatibility,
 persistent state, trusted helpers, and optional AI without starting a shell or
 making a network request:
@@ -193,6 +233,31 @@ script, stdin, or syntax-check execution.
 CLI errors and syntax errors exit with status `2`. Command-not-found and
 missing-script failures use `127`; commands or scripts that cannot be
 executed or read use `126`.
+
+`test` and `[` return `0` for true, `1` for false, and `2` for an invalid
+expression. `[` requires its final `]`; `test` treats `]` as ordinary data.
+Parameter default and alternate words are evaluated only when selected, so
+`${value:-$(command)}` does not run `command` when `value` is nonempty.
+String lengths (`${#value}`) and substring offsets (`${value:1:2}`) count
+Unicode characters, including for strings containing Chinese or emoji.
+Integer arithmetic wraps at 64 bits, including boundary additions, shifts,
+increments and division of the minimum signed integer by `-1`.
+Arithmetic `&&`, `||`, and `?:` only evaluate the selected operands; skipped
+branches cannot change variables or cause division-by-zero errors. Malformed
+arithmetic reports a failure instead of silently substituting zero.
+
+`printf` supports field flags, width and precision, dynamic `*` fields, and
+`%s`, `%b`, `%c`, `%d`, `%i`, `%u`, `%o`, `%x`, `%X`, `%f`, `%F`, `%e`, `%E`,
+`%g`, and `%G`. Formats repeat over remaining arguments. `%b` decodes escapes;
+`\c` in a `%b` argument stops output. Use `printf --` before a format beginning
+with `-`. Width and precision are capped at 1,048,576 per field; floating-point
+formatting uses `f64`. String precision counts bytes; `%c` preserves one complete
+Unicode character. Output is streamed, and write failures return a failure
+status. `echo -e` shares hexadecimal, octal and Unicode escapes and `\c` handling.
+
+```sh
+jsh -c 'printf "%04d %.2f\n" 7 3.14159'
+```
 
 The `read` builtin accepts fractional decimal timeouts, such as
 `read -t 0.5 value`. One deadline covers the whole read; timeout returns `142`
@@ -694,6 +759,9 @@ or other secrets.
 
 Tab completes by what the word actually names, not by filename alone.
 
+History Up/Down preserves the current draft and cursor position, including
+empty and multiline drafts, in both Emacs and Vi editing modes.
+
 - **Commands and syntax**: builtins, functions, aliases, `PATH` entries and
   shell keywords; the word after `do`, `then`, `else`, `|`, `&&`, `` ` `` and
   `$(` is a command position; redirection targets are files, and `2>&` takes a
@@ -721,6 +789,11 @@ case-insensitive matching, and everything else to fuzzy subsequence matching,
 only when nothing matches exactly — so precise typing keeps its precise order.
 The menu underlines the characters that matched. Accepting a candidate is
 remembered per command, so the next list leads with what you chose before.
+
+Generated Git and path suggestions escape shell metacharacters, including
+spaces, semicolons and dollar signs, so accepting a suggestion preserves the
+argument's spelling. Generated arguments containing hidden terminal controls
+are omitted.
 
 Everything is local. Completion never runs a command to find out what to
 offer, and never makes a network request: Docker, Git and systemd are probed
@@ -795,6 +868,18 @@ shellcheck -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 Benchmarks are available through `cargo bench` and the comparison scripts
 `bench.sh` and `bench_nu.sh`.
 
+For repeatable closure and streaming measurements:
+
+```sh
+cargo bench --bench bench_value -- 'value/(each|where|reduce)/.*n1000$'
+cargo bench --bench bench_streaming
+```
+
+The streaming benchmark compares bounded-retention implementations against
+the former materializing algorithms over identical generated inputs. Compare
+results on the same machine and build profile; these are core-operation
+measurements, not whole-shell startup or cross-shell rankings.
+
 ## Current compatibility boundaries
 
 - Startup-file import can transfer environment variables, aliases, and selected
@@ -808,6 +893,9 @@ Benchmarks are available through `cargo bench` and the comparison scripts
 - `fg`/`bg`/`wait`/`disown` accept Bash job specs `%N`, `%%`, `%+`, and `%-`.
 - `DEBUG` and `RETURN` traps are accepted for compatibility but are not fired.
 - Structured pipeline commands are jsh extensions and are not portable to Bash.
+- Arithmetic variables accept numeric strings and radix prefixes; recursively
+  evaluating a variable's contents as another arithmetic expression is not
+  implemented.
 - HTTP and AI features are available only in builds with the `ai` Cargo feature.
 
 Please include the smallest reproducing command, expected status, actual status,

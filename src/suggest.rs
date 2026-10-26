@@ -205,6 +205,7 @@ pub fn suggest(buffer: &str, history: &History, ctx: &SuggestionContext) -> Opti
         if !query.is_empty() {
             if let Ok(db) = crate::zjump::get_z_db().lock() {
                 if let Some(path) = db.query(&[query]) {
+                    let path = escaped_suggestion_word(&path, true)?;
                     // If user's arg is a prefix of the z-jump path, complete it
                     if path.starts_with(current_arg) && path.len() > current_arg.len() {
                         return Some(path[current_arg.len()..].to_string());
@@ -255,7 +256,8 @@ fn probe_filesystem_suggestion(buffer: &str) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
 
     // Call the probe module to get the best filesystem completion
-    let full_completion = probe::probe_filesystem(cmd, last_arg, &cwd)?;
+    let full_completion =
+        escaped_suggestion_word(&probe::probe_filesystem(cmd, last_arg, &cwd)?, true)?;
 
     // Return only the suffix (the part after what the user has typed)
     if full_completion.len() > last_arg.len() && full_completion.starts_with(last_arg) {
@@ -269,33 +271,36 @@ fn probe_filesystem_suggestion(buffer: &str) -> Option<String> {
 /// and current branch.
 fn suggest_git_command(buffer: &str, ctx: &SuggestionContext) -> Option<String> {
     let branch = ctx.git_branch?;
-    let remote = ctx.git_remote.unwrap_or("origin");
+    let escaped_branch = escaped_suggestion_word(branch, false)?;
+    let remote = escaped_suggestion_word(ctx.git_remote.unwrap_or("origin"), false)?;
 
     for cmd in &["git push", "git pull"] {
         // "git push" or "git pull" (no trailing space)
         if buffer == *cmd {
-            return Some(format!(" {} {}", remote, branch));
+            return Some(format!(" {} {}", remote, escaped_branch));
         }
         // "git push " (with trailing space, no remote yet)
         let with_space = format!("{} ", cmd);
         if buffer == with_space {
-            return Some(format!("{} {}", remote, branch));
+            return Some(format!("{} {}", remote, escaped_branch));
         }
         // "git push origin" (no trailing space after origin)
         let with_remote = format!("{} {}", cmd, remote);
         if buffer == with_remote {
-            return Some(format!(" {}", branch));
+            return Some(format!(" {}", escaped_branch));
         }
         // "git push origin " (with trailing space, ready for branch)
         let remote_space = format!("{} {} ", cmd, remote);
         if buffer == remote_space {
-            return Some(branch.to_string());
+            return Some(escaped_branch.clone());
         }
         // "git push origin ma" -> suggest "ster" if branch is "master"
         if buffer.starts_with(&remote_space) {
             let partial = &buffer[remote_space.len()..];
-            if !partial.is_empty() && branch.starts_with(partial) && branch.len() > partial.len() {
-                return Some(branch[partial.len()..].to_string());
+            if !partial.is_empty() {
+                if let Some(suffix) = ghost_suffix(&escaped_branch, partial) {
+                    return Some(suffix);
+                }
             }
         }
     }
@@ -317,7 +322,7 @@ fn suggest_git_command(buffer: &str, ctx: &SuggestionContext) -> Option<String> 
             continue;
         }
         if include_current {
-            if let Some(suffix) = ghost_suffix(branch, partial) {
+            if let Some(suffix) = ghost_suffix(&escaped_branch, partial) {
                 return Some(suffix);
             }
         }
@@ -325,13 +330,31 @@ fn suggest_git_command(buffer: &str, ctx: &SuggestionContext) -> Option<String> 
             if !include_current && candidate == branch {
                 continue;
             }
-            if let Some(suffix) = ghost_suffix(candidate, partial) {
+            let Some(candidate) = escaped_suggestion_word(candidate, false) else {
+                continue;
+            };
+            if let Some(suffix) = ghost_suffix(&candidate, partial) {
                 return Some(suffix);
             }
         }
     }
 
     None
+}
+
+/// Generated arguments are data, even when a filename or Git ref contains
+/// shell operators. Keep the exact escaped spelling reviewable in the editor.
+/// Paths may deliberately start with `~/`; Git names must keep a literal `~`.
+fn escaped_suggestion_word(word: &str, expand_home: bool) -> Option<String> {
+    if !crate::terminal_text::is_safe_inline(word) {
+        return None;
+    }
+    let escaped = crate::completer::escape_shell_word(word);
+    Some(if !expand_home && escaped.starts_with('~') {
+        format!("\\{escaped}")
+    } else {
+        escaped
+    })
 }
 
 /// The rest of `full` when `partial` is a proper prefix of it.
@@ -396,7 +419,7 @@ fn suggest_next_command(ctx: &SuggestionContext, history: &History) -> Option<St
     }
 
     // Prefer live repository state over a generic static command chain.
-    if last_cmd.starts_with("git status") {
+    if command_prefix_matches(last_cmd, "git status") {
         if ctx.git_has_conflicts {
             return Some("git diff --name-only --diff-filter=U".to_string());
         }
@@ -414,7 +437,7 @@ fn suggest_next_command(ctx: &SuggestionContext, history: &History) -> Option<St
         }
     }
 
-    if last_cmd.starts_with("git add") {
+    if command_prefix_matches(last_cmd, "git add") {
         if ctx.git_has_staged && !ctx.git_has_conflicts {
             // Return the full commit prompt at once; the cursor is ready for the message.
             return Some("git commit -m ".to_string());
@@ -434,7 +457,7 @@ fn suggest_next_command(ctx: &SuggestionContext, history: &History) -> Option<St
 
     // 1. Check static chain patterns first
     for (prefix, suggestion) in COMMAND_CHAINS {
-        if last_cmd.starts_with(prefix) {
+        if command_prefix_matches(last_cmd, prefix) {
             // Enrich git push with branch info
             if *suggestion == "git push" {
                 if let Some(command) = git_push_command(ctx) {
@@ -447,6 +470,13 @@ fn suggest_next_command(ctx: &SuggestionContext, history: &History) -> Option<St
 
     // 2. Fall back to history-based chain learning
     suggest_from_history_chains(last_cmd, history)
+}
+
+fn command_prefix_matches(command: &str, prefix: &str) -> bool {
+    command
+        .trim_start()
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 /// The command most often typed in this directory, when that habit is strong
@@ -536,8 +566,8 @@ fn correct_mistyped_command(last_cmd: &str, ctx: &SuggestionContext) -> Option<S
 }
 
 fn git_push_command(ctx: &SuggestionContext) -> Option<String> {
-    let branch = ctx.git_branch?;
-    let remote = ctx.git_remote.unwrap_or("origin");
+    let branch = escaped_suggestion_word(ctx.git_branch?, false)?;
+    let remote = escaped_suggestion_word(ctx.git_remote.unwrap_or("origin"), false)?;
     Some(format!("git push {} {}", remote, branch))
 }
 
@@ -689,6 +719,79 @@ mod tests {
             suggest_git_command("git pull ", &ctx),
             Some("upstream master".to_string())
         );
+    }
+
+    #[test]
+    fn generated_git_arguments_escape_shell_syntax() {
+        let branches = vec!["feature;echo-injected".to_string()];
+        let ctx = SuggestionContext {
+            git_branch: Some("topic$(id)"),
+            git_remote: Some("upstream;echo"),
+            git_branches: &branches,
+            ..SuggestionContext::default()
+        };
+        assert_eq!(
+            suggest_git_command("git push", &ctx).as_deref(),
+            Some(r" upstream\;echo topic\$\(id\)")
+        );
+        assert_eq!(
+            suggest_git_command("git checkout fea", &ctx).as_deref(),
+            Some(r"ture\;echo-injected")
+        );
+        assert_eq!(
+            git_push_command(&ctx).as_deref(),
+            Some(r"git push upstream\;echo topic\$\(id\)")
+        );
+        assert_eq!(
+            suggest_git_command(r"git push upstream\;echo top", &ctx).as_deref(),
+            Some(r"ic\$\(id\)")
+        );
+    }
+
+    #[test]
+    fn generated_arguments_reject_hidden_controls_and_preserve_literal_tildes() {
+        for name in ["line\nbreak", "escape\u{1b}", "hidden\u{202e}"] {
+            assert_eq!(escaped_suggestion_word(name, false), None);
+        }
+        assert_eq!(
+            escaped_suggestion_word("~remote", false).as_deref(),
+            Some(r"\~remote")
+        );
+        assert_eq!(
+            escaped_suggestion_word("~/my file", true).as_deref(),
+            Some(r"~/my\ file")
+        );
+    }
+
+    #[test]
+    fn filesystem_ghosts_escape_spaces_and_operators() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report $(id);draft.txt");
+        std::fs::write(&path, "content").unwrap();
+        let prefix = format!("cat {}/rep", directory.path().display());
+        assert_eq!(
+            probe_filesystem_suggestion(&prefix).as_deref(),
+            Some(r"ort\ \$\(id\)\;draft.txt")
+        );
+    }
+
+    #[test]
+    fn next_command_chains_require_whole_command_words() {
+        let (_history_dir, history) = isolated_history(0);
+        for command in [
+            "makeup",
+            "git additive",
+            "cargo builder",
+            "git status-extra",
+        ] {
+            let ctx = SuggestionContext {
+                last_command: Some(command),
+                git_has_unstaged: true,
+                ..SuggestionContext::default()
+            };
+            assert_eq!(suggest_next_command(&ctx, &history), None, "{command}");
+        }
+        assert!(command_prefix_matches("  git add\tfile", "git add"));
     }
 
     #[test]

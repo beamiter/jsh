@@ -233,7 +233,6 @@ const PARAMS_EACH: &[Param] = &[p("closure", Type::Closure)];
 const PARAMS_REDUCE: &[Param] = &[p_opt("init", Type::Any), p("closure", Type::Closure)];
 const PARAMS_PREDICATE: &[Param] = &[p("closure", Type::Closure)];
 const PARAMS_FIRST: &[Param] = &[p_opt("n", Type::Int)];
-const PARAMS_TAKEN: &[Param] = &[p("n", Type::Int)];
 const PARAMS_DROPN: &[Param] = &[p_opt("n", Type::Int)];
 const PARAMS_GET: &[Param] = &[p_rest("path", Type::String)];
 const PARAMS_SELECT: &[Param] = &[p_rest("cols", Type::String)];
@@ -417,15 +416,15 @@ const SIGS: &[Signature] = &[
         name: "take",
         input: Type::List,
         output: Type::List,
-        params: PARAMS_TAKEN,
-        desc: "Take the first N items.",
+        params: PARAMS_FIRST,
+        desc: "Take the first N items (default 1).",
     },
     Signature {
         name: "skip",
         input: Type::List,
         output: Type::List,
-        params: PARAMS_TAKEN,
-        desc: "Skip the first N items.",
+        params: PARAMS_FIRST,
+        desc: "Skip the first N items (default 1).",
     },
     Signature {
         name: "drop",
@@ -717,8 +716,8 @@ const SIGS: &[Signature] = &[
         name: "compact",
         input: Type::List,
         output: Type::List,
-        params: &[],
-        desc: "Drop Null/missing items from the list.",
+        params: PARAMS_SELECT,
+        desc: "Drop Null items and records with Null/missing selected columns.",
     },
     Signature {
         name: "path",

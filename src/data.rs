@@ -48,14 +48,20 @@ pub fn builtin_map(args: &[String]) -> i32 {
         return 1;
     }
 
-    let _pattern = &args[0];
+    let pattern = &args[0];
+    let placeholders = regex::Regex::new(r"\{([0-9]+)\}").expect("valid field placeholder pattern");
     for_each_stdin_line("map", |line| {
-        // Simple substitution: replace {x} with field x
-        let mut result = line.clone();
-        for (i, field) in line.split_whitespace().enumerate() {
-            let placeholder = format!("{{{}}}", i);
-            result = result.replace(&placeholder, field);
-        }
+        // Zero-based whitespace-delimited fields are substituted into the
+        // template once. Inserted field text is never treated as a template.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let result = placeholders.replace_all(pattern, |capture: &regex::Captures<'_>| {
+            capture[1]
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| fields.get(index).copied())
+                .unwrap_or_else(|| capture.get(0).unwrap().as_str())
+                .to_owned()
+        });
         println!("{}", result);
     })
 }
@@ -142,21 +148,21 @@ pub fn builtin_uniq(args: &[String]) -> i32 {
     }
     let count = args.iter().any(|a| a == "-c");
 
-    let mut prev = String::new();
+    let mut prev: Option<String> = None;
     let mut count_val = 0;
 
     let status = for_each_stdin_line("uniq", |line| {
-        if line == prev {
+        if prev.as_ref() == Some(&line) {
             count_val += 1;
         } else {
-            if !prev.is_empty() {
+            if let Some(previous) = &prev {
                 if count {
-                    println!("{} {}", count_val, prev);
+                    println!("{} {}", count_val, previous);
                 } else {
-                    println!("{}", prev);
+                    println!("{}", previous);
                 }
             }
-            prev = line;
+            prev = Some(line);
             count_val = 1;
         }
     });
@@ -164,11 +170,11 @@ pub fn builtin_uniq(args: &[String]) -> i32 {
         return status;
     }
 
-    if !prev.is_empty() {
+    if let Some(previous) = prev {
         if count {
-            println!("{} {}", count_val, prev);
+            println!("{} {}", count_val, previous);
         } else {
-            println!("{}", prev);
+            println!("{}", previous);
         }
     }
 

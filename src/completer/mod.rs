@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 pub(crate) use syntax::active_command_segment;
+pub(crate) use syntax::escape_shell_word;
 pub use syntax::resolve_alias;
 // `first_command` is exercised only by the tests below, which assert the
 // wrapper- and alias-skipping rules directly.
@@ -19,9 +20,9 @@ pub use syntax::resolve_alias;
 use syntax::first_command;
 use syntax::{
     active_command_segment_start, alias_expanded_segment, assignment_value_start, command_words,
-    effective_command_index, escape_shell_word, extract_word_at, is_command_position,
-    is_redirect_target, open_quote_context, quote_aware_words, resolve_transparent_alias,
-    split_command_segments, unescape_shell_word, wrapper_value_kind, WrapperValueKind,
+    effective_command_index, extract_word_at, is_command_position, is_redirect_target,
+    open_quote_context, quote_aware_words, resolve_transparent_alias, split_command_segments,
+    unescape_shell_word, wrapper_value_kind, WrapperValueKind,
 };
 use tables::{
     command_file_extensions, option_value_choices, COMMON_FLAGS, COMPOSE_FILE_NAMES,

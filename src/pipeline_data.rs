@@ -83,6 +83,33 @@ impl PipelineData {
         }
     }
 
+    /// Transform each value without pulling from a lazy stream until requested.
+    /// Byte input is decoded eagerly, preserving the normal JSON boundary errors.
+    pub fn map_values<F>(self, map: F) -> Result<Self, i32>
+    where
+        F: FnMut(Value) -> Value + Send + 'static,
+    {
+        match self {
+            Self::Stream(values) => Ok(Self::Stream(Box::new(values.map(map)))),
+            other => Ok(Self::Values(
+                other.into_values()?.into_iter().map(map).collect(),
+            )),
+        }
+    }
+
+    /// Filter values while retaining laziness for streaming inputs.
+    pub fn filter_values<F>(self, predicate: F) -> Result<Self, i32>
+    where
+        F: FnMut(&Value) -> bool + Send + 'static,
+    {
+        match self {
+            Self::Stream(values) => Ok(Self::Stream(Box::new(values.filter(predicate)))),
+            other => Ok(Self::Values(
+                other.into_values()?.into_iter().filter(predicate).collect(),
+            )),
+        }
+    }
+
     /// Whether the variant is a lazy Stream (useful for short-circuit ops).
     pub fn is_stream(&self) -> bool {
         matches!(self, PipelineData::Stream(_))

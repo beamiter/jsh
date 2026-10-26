@@ -1229,6 +1229,30 @@ esac
     /// can change *this* process rather than a binary that cannot.
     #[test]
     fn conda_activate_survives_a_guarded_bashrc() {
+        // This test mutates the process environment and forks through command
+        // substitution. Other test threads can be inside environment/library
+        // locks at fork time, so exercise the scenario in its own process.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::internal_guarded_conda_process",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .output()
+            .expect("isolated guarded conda test");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated process for guarded conda startup"]
+    fn internal_guarded_conda_process() {
         let dir = tempfile::tempdir().expect("tempdir");
         let conda = fake_conda(dir.path());
         let home = dir.path().join("home");

@@ -7,6 +7,7 @@ use serde_json::{Number, Value as JsonValue};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -30,6 +31,19 @@ pub struct ClosureData {
     pub captured: HashMap<String, Value>,
 }
 
+impl ClosureData {
+    /// Resolve a closure-local binding without cloning its captured scope or
+    /// argument records. Missing parameters still shadow captures with Null.
+    pub(crate) fn lookup<'a>(&'a self, args: &'a [Value], name: &str) -> Option<&'a Value> {
+        if let Some(index) = self.params.iter().rposition(|parameter| parameter == name) {
+            return Some(args.get(index).unwrap_or(&Value::Null));
+        }
+        self.captured
+            .get(name)
+            .or_else(|| (name == "in").then(|| args.first().unwrap_or(&Value::Null)))
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -38,7 +52,7 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => {
-                (*a as f64) == *b
+                compare_int_float(*a, *b) == Some(std::cmp::Ordering::Equal)
             }
             (Value::String(a), Value::String(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
@@ -51,6 +65,26 @@ impl PartialEq for Value {
             (Value::Binary(a), Value::Binary(b)) => a == b,
             _ => false,
         }
+    }
+}
+
+/// Compare without rounding an integer to f64 first. Above 2^53, adjacent
+/// integers no longer have distinct floating-point representations.
+pub(crate) fn compare_int_float(integer: i64, float: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if float.is_nan() {
+        return None;
+    }
+    if float >= 9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Less);
+    }
+    if float < -9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Greater);
+    }
+    match integer.cmp(&(float as i64)) {
+        Ordering::Equal if float.fract() > 0.0 => Some(Ordering::Less),
+        Ordering::Equal if float.fract() < 0.0 => Some(Ordering::Greater),
+        order => Some(order),
     }
 }
 
@@ -216,11 +250,11 @@ pub fn render_table(records: &[Value]) -> String {
         rows.push(row);
     }
 
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.width()).collect();
     for row in &rows[1..] {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(cell.len());
+                widths[i] = widths[i].max(cell.width());
             }
         }
     }
@@ -232,7 +266,8 @@ pub fn render_table(records: &[Value]) -> String {
                 out.push_str("  ");
             }
             let w = widths.get(i).copied().unwrap_or(0);
-            out.push_str(&format!("{:<width$}", cell, width = w));
+            out.push_str(cell);
+            out.push_str(&" ".repeat(w.saturating_sub(cell.width())));
         }
         out.push('\n');
         if ri == 0 {

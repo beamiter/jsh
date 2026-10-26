@@ -3062,6 +3062,30 @@ mod tests {
 
     #[test]
     fn child_exit_one_before_ready_is_an_execution_failure() {
+        // Other unit tests fork concurrently. A fork can briefly inherit our
+        // CLOEXEC readiness writer before its exec, delaying EOF beyond this
+        // child's exit. Create the pipes in an isolated process so this test
+        // checks the intended no-writer case without depending on scheduling.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "agent::tests::internal_child_exit_before_ready_process",
+                "--nocapture",
+            ])
+            .output()
+            .expect("isolated pre-ready child test");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated process for pre-ready Agent EOF"]
+    fn internal_child_exit_before_ready_process() {
         let state = ShellState::new(false);
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let transport = AgentChildTransport::new(&state, &cwd).expect("Agent transport");

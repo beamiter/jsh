@@ -1,6 +1,7 @@
 /// Structured data pipeline: JSON-based data processing builtins.
 use serde_json::Value;
 use std::io::{self, BufRead, IsTerminal, Write};
+use unicode_width::UnicodeWidthStr;
 
 /// Read JSON from stdin (array or newline-delimited objects).
 pub fn read_json_stdin() -> Vec<Value> {
@@ -201,11 +202,11 @@ pub fn to_table(records: &[Value]) -> String {
     }
 
     // Compute column widths
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.width()).collect();
     for row in &rows[1..] {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(cell.len());
+                widths[i] = widths[i].max(cell.width());
             }
         }
     }
@@ -218,7 +219,8 @@ pub fn to_table(records: &[Value]) -> String {
                 output.push_str("  ");
             }
             let w = widths.get(i).copied().unwrap_or(0);
-            output.push_str(&format!("{:<width$}", cell, width = w));
+            output.push_str(cell);
+            output.push_str(&" ".repeat(w.saturating_sub(cell.width())));
         }
         output.push('\n');
         // Separator after header

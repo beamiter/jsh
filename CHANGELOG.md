@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+- Pure closure expressions cache parsed syntax and borrow argument/capture
+  bindings. Integer operations and mixed integer/float comparisons avoid
+  precision loss; typed integer overflow reports an error.
+- `par-each` shares the compiled expression, moves input chunks, and collects
+  worker-local results in order. Capture/parameter bindings match `each`, and
+  worker failures cannot silently leave null placeholders.
+- Streamed `count`, `length`, `reduce`, simple math aggregates and `last N`
+  avoid whole-input retention. A new streaming benchmark compares these with
+  their prior materializing algorithms.
+- Arithmetic logical chains and ternaries short-circuit side effects while
+  consuming all syntax. Equality and relational precedence are distinct;
+  malformed arithmetic fails instead of silently becoming zero. Nested
+  arithmetic parentheses are extracted correctly in quoted and unquoted words.
+- History navigation restores drafts and cursor positions, including empty
+  drafts and edits whose cursor is in the middle of a line.
+- Agent readiness and guarded Conda startup regressions run in isolated
+  processes so concurrent test forks cannot delay pipe EOF or inherit locks.
+
+- Numeric `printf` now supports flags, width, precision, dynamic fields and
+  scientific/general formats, with bounded per-field buffers and streaming
+  output. `%b` and `echo -e` decode octal, hexadecimal and Unicode escapes and
+  honor `\c`; output errors return failure without panicking.
+- Keep `enumerate`, `wrap`, `flatten`, `select`, `reject`, `compact`, and
+  `default` lazy on stream input. Row-count commands reject invalid counts;
+  `take`/`skip` expose their one-item defaults. `compact` accepts column names,
+  and `default` fills every requested column.
+- Integer arithmetic explicitly wraps at 64-bit boundaries in all build
+  profiles, including shifts and minimum-integer division. Command substitution
+  preserves trailing carriage returns and retries interrupted reads.
+- Vi word-end movement lands on the final character. Character edits and
+  horizontal movement preserve line breaks; deletion keeps the cursor on valid
+  Unicode characters.
+
+- Structured `unique`, `unique --count`, and `histogram` now distinguish
+  typed and nested values instead of merging values with identical display
+  text. Counted deduplication keeps stable order without a second key list.
+- Keep `skip` lazy for stream input, and allow inclusive ranges ending at
+  `i64::MAX` without overflow. Both table renderers align Unicode display
+  columns correctly.
+- Git and filesystem ghost suggestions escape shell metacharacters and omit
+  hidden terminal controls. Next-command chains match complete command words.
+- Parameter defaults and alternatives evaluate only the selected operand.
+  String lengths and substrings count Unicode characters; extended globs in
+  Unicode directories no longer panic and scan paths in one pass.
+- `test` and `[` preserve literal brackets and operator-shaped string
+  operands, require a closing `]` for `[`, and report malformed expressions
+  instead of accepting trailing arguments or hiding errors in compound tests.
+- Text `uniq` preserves blank-line runs and their counts. `map` applies its
+  zero-based field template once, leaving unknown fields unchanged.
+
 - Agent delivery negotiation now prefers `complete` and falls back to
   `streaming` when a peer is streaming-only. `JSH_AGENT_DELIVERY` can narrow
   the preference; streaming bodies still fold through jagent into a complete

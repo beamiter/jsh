@@ -142,7 +142,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         ":" => 0,
         "true" => 0,
         "false" => 1,
-        "test" | "[" => builtin_test(args),
+        "test" | "[" => builtin_test(name, args),
         "set" => builtin_set(args, state),
         "local" => builtin_local(args, state),
         "return" => builtin_return(args, state),
@@ -723,69 +723,57 @@ fn builtin_unset(args: &[String], state: &mut ShellState) -> i32 {
 }
 
 fn builtin_echo(args: &[String]) -> i32 {
+    use std::io::Write;
     let mut newline = true;
     let mut interpret_escapes = false;
     let mut start = 0;
-
     for (i, arg) in args.iter().enumerate() {
-        match arg.as_str() {
-            "-n" => {
-                newline = false;
-                start = i + 1;
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| {
+            !flags.is_empty() && flags.chars().all(|c| matches!(c, 'n' | 'e' | 'E'))
+        }) else {
+            break;
+        };
+        for flag in flags.chars() {
+            match flag {
+                'n' => newline = false,
+                'e' => interpret_escapes = true,
+                'E' => interpret_escapes = false,
+                _ => unreachable!(),
             }
-            "-e" => {
-                interpret_escapes = true;
-                start = i + 1;
-            }
-            "-E" => {
-                interpret_escapes = false;
-                start = i + 1;
-            }
-            "-ne" | "-en" => {
-                newline = false;
-                interpret_escapes = true;
-                start = i + 1;
-            }
-            _ => break,
         }
+        start = i + 1;
     }
 
-    let text = args[start..].join(" ");
-    if interpret_escapes {
-        print!("{}", unescape_echo(&text));
-    } else {
-        print!("{}", text);
-    }
-    if newline {
-        println!();
-    }
-    0
-}
-
-fn unescape_echo(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('t') => result.push('\t'),
-                Some('r') => result.push('\r'),
-                Some('\\') => result.push('\\'),
-                Some('a') => result.push('\x07'),
-                Some('b') => result.push('\x08'),
-                Some('0') => result.push('\0'),
-                Some(c2) => {
-                    result.push('\\');
-                    result.push(c2);
+    let stdout = std::io::stdout();
+    let mut output = std::io::BufWriter::new(stdout.lock());
+    let result = (|| -> std::io::Result<()> {
+        let mut stopped = false;
+        for (i, arg) in args[start..].iter().enumerate() {
+            if i > 0 {
+                output.write_all(b" ")?;
+            }
+            if interpret_escapes {
+                stopped =
+                    crate::printf::escaped(&mut output, arg, crate::printf::EscapeMode::Echo)?;
+                if stopped {
+                    break;
                 }
-                None => result.push('\\'),
+            } else {
+                output.write_all(arg.as_bytes())?;
             }
-        } else {
-            result.push(c);
+        }
+        if newline && !stopped {
+            output.write_all(b"\n")?;
+        }
+        output.flush()
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("jsh: echo: {error}");
+            1
         }
     }
-    result
 }
 
 fn builtin_pwd() -> i32 {
@@ -1593,21 +1581,28 @@ fn read_line_with_delimiter(
     }
 }
 
-fn builtin_test(args: &[String]) -> i32 {
-    let args: Vec<&str> = args
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|s| *s != "]")
-        .collect();
-
-    if args.is_empty() {
-        return 1;
-    }
-
-    match parse_test_expr(&args, 0).0 {
+fn builtin_test(name: &str, args: &[String]) -> i32 {
+    // Only `[` has a closing delimiter. A literal `]` remains ordinary data
+    // for `test`, and for `[` everywhere except its final argument.
+    let args = if name == "[" {
+        match args.split_last() {
+            Some((last, rest)) if last == "]" => rest,
+            _ => {
+                eprintln!("jsh: [: missing ']'");
+                return 2;
+            }
+        }
+    } else {
+        args
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match evaluate_test(&args) {
         TestResult::True => 0,
         TestResult::False => 1,
-        TestResult::Error => 2,
+        TestResult::Error => {
+            eprintln!("jsh: {name}: invalid expression");
+            2
+        }
     }
 }
 
@@ -1616,6 +1611,65 @@ enum TestResult {
     True,
     False,
     Error,
+}
+
+impl TestResult {
+    fn negate(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Error => Self::Error,
+        }
+    }
+}
+
+fn evaluate_test(args: &[&str]) -> TestResult {
+    // Small-argument rules disambiguate strings that happen to be operators:
+    // `test !` tests a nonempty string, and `test ! = !` compares strings.
+    match args {
+        [] => return TestResult::False,
+        [value] => {
+            return if value.is_empty() {
+                TestResult::False
+            } else {
+                TestResult::True
+            };
+        }
+        ["!", rest] => return evaluate_test(&[rest]).negate(),
+        [_, op, _] if is_test_binary_op(op) => return parse_test_binary(args, 0).0,
+        [left, "-a", right] => {
+            return if !left.is_empty() && !right.is_empty() {
+                TestResult::True
+            } else {
+                TestResult::False
+            };
+        }
+        [left, "-o", right] => {
+            return if !left.is_empty() || !right.is_empty() {
+                TestResult::True
+            } else {
+                TestResult::False
+            };
+        }
+        ["(", value, ")"] => return evaluate_test(&[value]),
+        ["!", "!", _] => return TestResult::Error,
+        ["!", rest @ ..] if args.len() <= 4 => return evaluate_test(rest).negate(),
+        ["(", inner @ .., ")"] if args.len() == 4 => return evaluate_test(inner),
+        _ => {}
+    }
+    let (result, consumed) = parse_test_expr(args, 0);
+    if consumed == args.len() {
+        result
+    } else {
+        TestResult::Error
+    }
+}
+
+fn is_test_binary_op(op: &str) -> bool {
+    matches!(
+        op,
+        "=" | "==" | "!=" | "<" | ">" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+    )
 }
 
 fn parse_test_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
@@ -1631,10 +1685,10 @@ fn parse_or_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
         let (right, next_idx) = parse_and_expr(args, new_idx);
 
         left = match (left, right) {
+            (TestResult::Error, _) | (_, TestResult::Error) => TestResult::Error,
             (TestResult::True, _) => TestResult::True,
             (_, TestResult::True) => TestResult::True,
             (TestResult::False, TestResult::False) => TestResult::False,
-            _ => TestResult::Error,
         };
         new_idx = next_idx;
     }
@@ -1650,10 +1704,10 @@ fn parse_and_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
         let (right, next_idx) = parse_primary(args, new_idx);
 
         left = match (left, right) {
+            (TestResult::Error, _) | (_, TestResult::Error) => TestResult::Error,
             (TestResult::False, _) => TestResult::False,
             (_, TestResult::False) => TestResult::False,
             (TestResult::True, TestResult::True) => TestResult::True,
-            _ => TestResult::Error,
         };
         new_idx = next_idx;
     }
@@ -1664,6 +1718,12 @@ fn parse_and_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
 fn parse_primary(args: &[&str], idx: usize) -> (TestResult, usize) {
     if idx >= args.len() {
         return (TestResult::Error, idx);
+    }
+
+    // Binary comparisons take precedence over interpreting the left operand
+    // as a unary operator or a negation token.
+    if idx + 2 < args.len() && is_test_binary_op(args[idx + 1]) {
+        return parse_test_binary(args, idx);
     }
 
     // Handle negation
@@ -1835,7 +1895,22 @@ fn parse_primary(args: &[&str], idx: usize) -> (TestResult, usize) {
         }
     }
 
-    // Handle binary operators
+    // A bare string may end at a logical operator or closing parenthesis.
+    if idx + 1 == args.len() || matches!(args.get(idx + 1), Some(&"-a" | &"-o" | &")")) {
+        return (
+            if !args[idx].is_empty() {
+                TestResult::True
+            } else {
+                TestResult::False
+            },
+            idx + 1,
+        );
+    }
+
+    (TestResult::Error, idx)
+}
+
+fn parse_test_binary(args: &[&str], idx: usize) -> (TestResult, usize) {
     if idx + 2 < args.len() {
         match args[idx + 1] {
             "=" | "==" => {
@@ -1958,18 +2033,6 @@ fn parse_primary(args: &[&str], idx: usize) -> (TestResult, usize) {
             }
             _ => {}
         }
-    }
-
-    // Single argument - check if non-empty string
-    if idx + 1 == args.len() {
-        return (
-            if !args[idx].is_empty() {
-                TestResult::True
-            } else {
-                TestResult::False
-            },
-            idx + 1,
-        );
     }
 
     (TestResult::Error, idx)
@@ -2332,71 +2395,43 @@ fn builtin_history(_state: &ShellState) -> i32 {
 
 fn builtin_printf(args: &[String]) -> i32 {
     use std::io::Write;
-    if args.is_empty() {
-        return 0;
+    if let Some(option) = args
+        .first()
+        .filter(|arg| arg.starts_with('-') && arg.len() > 1 && *arg != "--")
+    {
+        eprintln!(
+            "jsh: printf: unsupported option {option:?}; use -- before a format beginning with '-'"
+        );
+        return 2;
     }
-    let fmt = &args[0];
-    let params = &args[1..];
-    let mut out = String::new();
-    let mut pi = 0;
-    // Reuse the format string over remaining arguments, like bash printf.
-    loop {
-        let start_pi = pi;
-        let mut consumed_conversion = false;
-        let mut chars = fmt.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                match chars.next() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('r') => out.push('\r'),
-                    Some('\\') => out.push('\\'),
-                    Some('0') => out.push('\0'),
-                    Some('a') => out.push('\x07'),
-                    Some('b') => out.push('\x08'),
-                    Some(c2) => {
-                        out.push('\\');
-                        out.push(c2);
-                    }
-                    None => out.push('\\'),
-                }
-            } else if c == '%' {
-                let arg = params.get(pi).map(|s| s.as_str()).unwrap_or("");
-                match chars.next() {
-                    Some('s') => out.push_str(arg),
-                    Some('d') | Some('i') => {
-                        out.push_str(&arg.parse::<i64>().unwrap_or(0).to_string())
-                    }
-                    Some('f') => out.push_str(&arg.parse::<f64>().unwrap_or(0.0).to_string()),
-                    Some('x') => out.push_str(&format!("{:x}", arg.parse::<i64>().unwrap_or(0))),
-                    Some('X') => out.push_str(&format!("{:X}", arg.parse::<i64>().unwrap_or(0))),
-                    Some('o') => out.push_str(&format!("{:o}", arg.parse::<i64>().unwrap_or(0))),
-                    Some('c') => out.push(arg.chars().next().unwrap_or('\0')),
-                    Some('%') => {
-                        out.push('%');
-                        continue;
-                    }
-                    Some(c2) => {
-                        out.push('%');
-                        out.push(c2);
-                    }
-                    None => out.push('%'),
-                }
-                pi += 1;
-                consumed_conversion = true;
-            } else {
-                out.push(c);
-            }
+    let args = if args.first().map(String::as_str) == Some("--") {
+        &args[1..]
+    } else {
+        args
+    };
+    let Some(format) = args.first() else {
+        eprintln!("jsh: printf: usage: printf [--] format [arguments ...]");
+        return 2;
+    };
+    let stdout = std::io::stdout();
+    let mut output = std::io::BufWriter::new(stdout.lock());
+    let result = crate::printf::write_printf(&mut output, format, &args[1..], |message| {
+        eprintln!("jsh: printf: {message}");
+    });
+    // Preserve output before a bad conversion and report write failures without
+    // a print!/stdout panic (including a closed downstream pipe).
+    let flushed = output.flush();
+    match (result, flushed) {
+        (Ok(status), Ok(())) => status,
+        (Err(error), _) => {
+            eprintln!("jsh: printf: {error}");
+            1
         }
-        // A format with no arg-consuming conversion prints exactly once; otherwise
-        // repeat until all arguments are consumed.
-        if !consumed_conversion || pi >= params.len() || pi == start_pi {
-            break;
+        (_, Err(error)) => {
+            eprintln!("jsh: printf: {error}");
+            1
         }
     }
-    print!("{}", out);
-    std::io::stdout().flush().ok();
-    0
 }
 
 fn builtin_shift(args: &[String], state: &mut ShellState) -> i32 {

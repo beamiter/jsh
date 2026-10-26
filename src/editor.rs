@@ -41,7 +41,7 @@ enum ViMode {
 pub struct Editor {
     buffer: String,
     cursor: usize, // byte position in buffer
-    saved_buffer: String,
+    history_draft: Option<(String, usize)>,
     suggestion: Option<String>,
     terminal_width: u16,
     terminal_height: u16,
@@ -135,7 +135,7 @@ impl Editor {
         Editor {
             buffer: String::new(),
             cursor: 0,
-            saved_buffer: String::new(),
+            history_draft: None,
             suggestion: None,
             terminal_width: w,
             terminal_height: h,
@@ -180,7 +180,7 @@ impl Editor {
         self.buffer.clear();
         self.cursor = 0;
         self.suggestion = None;
-        self.saved_buffer.clear();
+        self.history_draft = None;
         self.completion_menu = None;
         self.search_mode = None;
         self.workflow_mode = None;
@@ -675,13 +675,7 @@ impl Editor {
                     self.move_cursor_up();
                 } else {
                     // First line — navigate history
-                    if self.cursor == self.buffer.len() && self.saved_buffer.is_empty() {
-                        self.saved_buffer = self.buffer.clone();
-                    }
-                    if let Some(entry) = history.prev() {
-                        self.buffer = entry.to_string();
-                        self.cursor = self.buffer.len();
-                    }
+                    self.previous_history(history);
                 }
             }
             (KeyCode::Down, _) => {
@@ -690,16 +684,7 @@ impl Editor {
                 if after_cursor.contains('\n') {
                     self.move_cursor_down();
                 } else {
-                    match history.next() {
-                        Some(entry) => {
-                            self.buffer = entry.to_string();
-                            self.cursor = self.buffer.len();
-                        }
-                        None => {
-                            self.buffer = std::mem::take(&mut self.saved_buffer);
-                            self.cursor = self.buffer.len();
-                        }
-                    }
+                    self.next_history(history);
                 }
             }
             (KeyCode::Backspace, _) => {
@@ -756,10 +741,14 @@ impl Editor {
         state: &mut ShellState,
         history: &mut History,
     ) -> io::Result<KeyAction> {
-        match self.vi_mode {
+        let action = match self.vi_mode {
             ViMode::Insert => self.handle_vi_insert_key(key, state, history),
             ViMode::Normal => self.handle_vi_normal_key(key, state, history),
+        }?;
+        if self.vi_mode == ViMode::Normal {
+            self.clamp_vi_normal_cursor();
         }
+        Ok(action)
     }
 
     fn handle_vi_insert_key(
@@ -772,7 +761,7 @@ impl Editor {
             (KeyCode::Esc, _) => {
                 self.vi_mode = ViMode::Normal;
                 // Move cursor back one if possible (vi behavior)
-                if self.cursor > 0 {
+                if self.cursor > self.last_line_start() {
                     self.move_left();
                 }
                 // Set block cursor
@@ -803,7 +792,9 @@ impl Editor {
             }
             (KeyCode::Char('a'), KeyModifiers::NONE) => {
                 self.vi_mode = ViMode::Insert;
-                self.move_right();
+                if self.cursor < self.current_line_end() {
+                    self.move_right();
+                }
                 print!("\x1b[5 q");
             }
             (KeyCode::Char('A'), KeyModifiers::SHIFT) => {
@@ -833,10 +824,12 @@ impl Editor {
 
             // Movement
             (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _) => {
-                self.move_left();
+                if self.cursor > self.last_line_start() {
+                    self.move_left();
+                }
             }
             (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _) => {
-                if self.cursor < self.buffer.len() {
+                if self.cursor < self.current_line_end() {
                     self.move_right();
                 }
             }
@@ -845,16 +838,7 @@ impl Editor {
                 if after_cursor.contains('\n') {
                     self.move_cursor_down();
                 } else {
-                    match history.next() {
-                        Some(entry) => {
-                            self.buffer = entry.to_string();
-                            self.cursor = self.buffer.len();
-                        }
-                        None => {
-                            self.buffer = std::mem::take(&mut self.saved_buffer);
-                            self.cursor = self.buffer.len();
-                        }
-                    }
+                    self.next_history(history);
                 }
             }
             (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
@@ -862,13 +846,7 @@ impl Editor {
                 if before_cursor.contains('\n') {
                     self.move_cursor_up();
                 } else {
-                    if self.cursor == self.buffer.len() && self.saved_buffer.is_empty() {
-                        self.saved_buffer = self.buffer.clone();
-                    }
-                    if let Some(entry) = history.prev() {
-                        self.buffer = entry.to_string();
-                        self.cursor = self.buffer.len();
-                    }
+                    self.previous_history(history);
                 }
             }
             (KeyCode::Char('0'), KeyModifiers::NONE) => {
@@ -904,10 +882,12 @@ impl Editor {
 
             // Editing
             (KeyCode::Char('x'), KeyModifiers::NONE) => {
-                self.delete_char();
+                if self.cursor < self.current_line_end() {
+                    self.delete_char();
+                }
             }
             (KeyCode::Char('X'), KeyModifiers::SHIFT) => {
-                if self.cursor > 0 {
+                if self.cursor > self.last_line_start() {
                     let prev = self.prev_char_boundary();
                     self.buffer.drain(prev..self.cursor);
                     self.cursor = prev;
@@ -933,7 +913,9 @@ impl Editor {
             }
             (KeyCode::Char('s'), KeyModifiers::NONE) => {
                 // Substitute char
-                self.delete_char();
+                if self.cursor < self.current_line_end() {
+                    self.delete_char();
+                }
                 self.vi_mode = ViMode::Insert;
                 print!("\x1b[5 q");
             }
@@ -1085,7 +1067,7 @@ impl Editor {
             'r' => {
                 // Replace single character
                 if let KeyCode::Char(c) = key.code {
-                    if self.cursor < self.buffer.len()
+                    if self.cursor < self.current_line_end()
                         && !crate::terminal_text::is_terminal_ambiguous(c)
                     {
                         let old_char = self.buffer[self.cursor..].chars().next().unwrap();
@@ -2775,6 +2757,42 @@ impl Editor {
 
     // Character/cursor helpers
 
+    fn previous_history(&mut self, history: &mut History) {
+        if let Some(entry) = history.prev() {
+            // An empty draft is still a draft. Save it exactly once, before
+            // replacing the buffer, even when the caret is in its middle.
+            self.history_draft
+                .get_or_insert_with(|| (self.buffer.clone(), self.cursor));
+            self.buffer = entry.to_string();
+            self.cursor = self.buffer.len();
+        }
+    }
+
+    fn next_history(&mut self, history: &mut History) {
+        if self.history_draft.is_none() {
+            // Down on the current input is a no-op, not "replace with an
+            // empty saved buffer" when no history traversal has begun.
+            return;
+        }
+        if let Some(entry) = history.next() {
+            self.buffer = entry.to_string();
+            self.cursor = self.buffer.len();
+        } else if let Some((buffer, cursor)) = self.history_draft.take() {
+            self.buffer = buffer;
+            self.cursor = cursor;
+        }
+    }
+
+    /// Normal-mode commands address a character, not the insertion position
+    /// past a nonempty line. Derive the endpoint from UTF-8 boundaries rather
+    /// than subtracting one byte after a deletion or a history replacement.
+    fn clamp_vi_normal_cursor(&mut self) {
+        let end = self.current_line_end();
+        if self.cursor == end && end > self.last_line_start() {
+            self.cursor = self.prev_char_boundary_from(end);
+        }
+    }
+
     fn move_right(&mut self) {
         if self.cursor < self.buffer.len() {
             let c = self.buffer[self.cursor..].chars().next().unwrap();
@@ -2957,24 +2975,25 @@ impl Editor {
                 .chars()
                 .next()
                 .map_or(0, |c| c.len_utf8());
-        let buf = &self.buffer[start..];
-        let mut moved = 0;
-        let mut chars = buf.chars();
-        // Skip whitespace
-        for c in chars.by_ref() {
-            moved += c.len_utf8();
-            if !c.is_whitespace() {
+        let mut chars = self.buffer[start..].char_indices().peekable();
+        while let Some(&(offset, ch)) = chars.peek() {
+            if !ch.is_whitespace() {
                 break;
             }
+            // If no word remains, `e` still reaches the final character
+            // rather than leaving the cursor stuck before trailing spaces.
+            self.cursor = start + offset;
+            chars.next();
         }
-        // Move to end of word
-        for c in chars {
-            if c.is_whitespace() {
+        // Keep the start of the final character. A byte count after it is an
+        // insertion point and made `e` followed by `x` delete the next space.
+        while let Some(&(offset, ch)) = chars.peek() {
+            if ch.is_whitespace() {
                 break;
             }
-            moved += c.len_utf8();
+            self.cursor = start + offset;
+            chars.next();
         }
-        self.cursor = (start + moved).min(self.buffer.len());
     }
 
     fn prev_char_boundary_from(&self, pos: usize) -> usize {
@@ -3348,6 +3367,260 @@ fn find_next_word_boundary(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vi_test_editor(
+        buffer: &str,
+        cursor: usize,
+    ) -> (tempfile::TempDir, Editor, ShellState, History) {
+        let directory = tempfile::tempdir().unwrap();
+        let history = History::new_for_test(0, directory.path().join("history"));
+        let mut editor = Editor::new();
+        editor.buffer = buffer.into();
+        editor.cursor = cursor;
+        editor.vi_mode = ViMode::Normal;
+        (directory, editor, ShellState::new(false), history)
+    }
+
+    #[test]
+    fn history_round_trip_restores_the_whole_draft_and_unicode_caret() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut history = History::new_for_test(100, directory.path().join("history"));
+        history.add("older command");
+        for vi in [false, true] {
+            history.reset_position();
+            let mut editor = Editor::new();
+            let mut state = ShellState::new(false);
+            editor.buffer = "echo 中文\nprintf tail".into();
+            editor.cursor = "echo 中".len();
+            let draft = editor.buffer.clone();
+            let caret = editor.cursor;
+            editor.vi_mode = ViMode::Normal;
+            for code in [KeyCode::Up, KeyCode::Down] {
+                let event = KeyEvent::new(code, KeyModifiers::NONE);
+                if vi {
+                    editor
+                        .handle_vi_key(event, &mut state, &mut history)
+                        .unwrap();
+                } else {
+                    editor
+                        .handle_emacs_key(event, &mut state, &mut history)
+                        .unwrap();
+                }
+            }
+            assert_eq!(editor.buffer, draft);
+            assert_eq!(editor.cursor, caret);
+            assert!(editor.history_draft.is_none());
+        }
+    }
+
+    #[test]
+    fn history_restores_an_empty_draft_after_multiple_steps() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut history = History::new_for_test(100, directory.path().join("history"));
+        history.add("older command");
+        history.add("newer command");
+        let mut editor = Editor::new();
+        editor.previous_history(&mut history);
+        editor.previous_history(&mut history);
+        editor.next_history(&mut history);
+        assert_eq!(editor.buffer, "newer command");
+        editor.next_history(&mut history);
+        assert_eq!(editor.buffer, "");
+        assert_eq!(editor.cursor, 0);
+        assert!(editor.history_draft.is_none());
+    }
+
+    #[test]
+    fn history_down_without_traversal_or_after_restore_does_not_erase_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut history = History::new_for_test(100, directory.path().join("history"));
+        let mut editor = Editor::new();
+        editor.buffer = "unfinished 中文".into();
+        editor.cursor = 4;
+        editor.next_history(&mut history);
+        editor.previous_history(&mut history);
+        editor.next_history(&mut history);
+        assert_eq!(editor.buffer, "unfinished 中文");
+        assert_eq!(editor.cursor, 4);
+        history.add("old command");
+        editor.previous_history(&mut history);
+        editor.next_history(&mut history);
+        editor.next_history(&mut history);
+        assert_eq!(editor.buffer, "unfinished 中文");
+        assert_eq!(editor.cursor, 4);
+    }
+
+    #[test]
+    fn vi_editing_sequences_keep_utf8_cursor_invariants() {
+        let keys = [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+        ];
+        let chars = [
+            'h', 'l', 'j', 'k', 'w', 'b', 'e', 'd', 'c', 'r', 'x', 'i', 'a', 's', 'é', '中',
+        ];
+        for seed in 0..16u64 {
+            let (_directory, mut editor, mut state, mut history) =
+                vi_test_editor("甲乙\ne\u{301} 🦀\n\nlast", 0);
+            let mut random = seed + 1;
+            for step in 0..100 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let choice = (random >> 32) as usize % (keys.len() + chars.len());
+                let key = if choice < keys.len() {
+                    keys[choice]
+                } else {
+                    KeyEvent::new(
+                        KeyCode::Char(chars[choice - keys.len()]),
+                        KeyModifiers::NONE,
+                    )
+                };
+                editor.handle_vi_key(key, &mut state, &mut history).unwrap();
+                assert!(
+                    editor.cursor <= editor.buffer.len(),
+                    "seed {seed}, step {step}"
+                );
+                assert!(
+                    editor.buffer.is_char_boundary(editor.cursor),
+                    "seed {seed}, step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vi_end_motion_addresses_the_last_character_of_each_word() {
+        let (_directory, mut editor, mut state, mut history) = vi_test_editor("echo 中文 🦀", 0);
+        for expected in [3, 8, 12, 12] {
+            editor
+                .handle_vi_key(
+                    KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.cursor, expected);
+            assert!(editor.buffer.is_char_boundary(editor.cursor));
+        }
+        editor
+            .handle_vi_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &mut state,
+                &mut history,
+            )
+            .unwrap();
+        assert_eq!(editor.buffer, "echo 中文 ");
+        assert_eq!(editor.cursor, 11);
+    }
+
+    #[test]
+    fn vi_end_motion_reaches_trailing_whitespace_when_no_word_remains() {
+        for (buffer, start, expected) in [("echo   ", 3, 6), ("echo  \n\n", 3, 7), ("   ", 0, 2)] {
+            let (_directory, mut editor, mut state, mut history) = vi_test_editor(buffer, start);
+            editor
+                .handle_vi_key(
+                    KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.cursor, expected, "{buffer:?}");
+            assert!(editor.buffer.is_char_boundary(editor.cursor));
+        }
+    }
+
+    #[test]
+    fn vi_normal_mode_deletions_keep_a_character_cursor_for_multibyte_text() {
+        let (_directory, mut editor, mut state, mut history) = vi_test_editor("甲乙", 3);
+        for expected in ["甲", ""] {
+            editor
+                .handle_vi_key(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.buffer, expected);
+            assert_eq!(editor.cursor, 0);
+            assert!(editor.buffer.is_char_boundary(editor.cursor));
+        }
+    }
+
+    #[test]
+    fn vi_horizontal_motion_and_character_edits_do_not_cross_newlines() {
+        let (_directory, mut editor, mut state, mut history) = vi_test_editor("甲\n\n乙", 4);
+        for (code, modifiers) in [
+            (KeyCode::Left, KeyModifiers::NONE),
+            (KeyCode::Right, KeyModifiers::NONE),
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+            (KeyCode::Char('X'), KeyModifiers::SHIFT),
+            (KeyCode::Char('r'), KeyModifiers::NONE),
+            (KeyCode::Char('z'), KeyModifiers::NONE),
+        ] {
+            editor
+                .handle_vi_key(KeyEvent::new(code, modifiers), &mut state, &mut history)
+                .unwrap();
+            assert_eq!(editor.buffer, "甲\n\n乙");
+            assert_eq!(editor.cursor, 4);
+        }
+
+        editor.cursor = 5;
+        editor.vi_mode = ViMode::Insert;
+        editor
+            .handle_vi_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut state,
+                &mut history,
+            )
+            .unwrap();
+        assert_eq!(
+            editor.cursor, 5,
+            "Escape at a line start must stay on that line"
+        );
+    }
+
+    #[test]
+    fn vi_delete_line_leaves_a_valid_cursor_on_the_surviving_line() {
+        for (buffer, cursor, expected, expected_cursor) in [
+            ("甲\n乙", 4, "甲", 0),
+            ("甲\n乙\n", 4, "甲\n", 0),
+            ("甲\n乙", 0, "乙", 0),
+            ("甲", 0, "", 0),
+        ] {
+            let (_directory, mut editor, mut state, mut history) = vi_test_editor(buffer, cursor);
+            for _ in 0..2 {
+                editor
+                    .handle_vi_key(
+                        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        &mut state,
+                        &mut history,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(editor.buffer, expected);
+            assert_eq!(editor.cursor, expected_cursor);
+            assert!(editor.buffer.is_char_boundary(editor.cursor));
+        }
+    }
+
+    #[test]
+    fn vi_append_and_substitute_on_empty_lines_preserve_the_line_break() {
+        for command in ['a', 's'] {
+            let (_directory, mut editor, mut state, mut history) = vi_test_editor("甲\n\n乙", 4);
+            editor
+                .handle_vi_key(
+                    KeyEvent::new(KeyCode::Char(command), KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.buffer, "甲\n\n乙");
+            assert_eq!(editor.cursor, 4);
+            assert_eq!(editor.vi_mode, ViMode::Insert);
+        }
+    }
 
     fn test_workflow(
         command: &str,

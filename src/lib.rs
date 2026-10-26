@@ -33,6 +33,7 @@ pub mod keybindings;
 pub mod osc;
 pub mod parser;
 pub mod pipeline_data;
+mod printf;
 pub mod probe;
 pub mod prompt;
 pub mod session;

@@ -304,7 +304,7 @@ fn vb_par_each(
     args: &[String],
     state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
     let mut keep_empty = false;
     let mut closure_arg: Option<&String> = None;
     let mut threads_override: Option<usize> = None;
@@ -332,122 +332,121 @@ fn vb_par_each(
             return Err(1);
         }
     };
-    // Pre-flight: if the body isn't a pure expression, fall back to sequential
-    // each so semantics (closures that call builtins, mutate state, etc.) are
-    // preserved. We probe with an empty var map — try_eval doesn't need the
-    // real params to decide if the body is parseable as an expression.
-    let probe_vars: std::collections::HashMap<String, Value> = closure.captured.clone();
-    let is_pure = matches!(
-        crate::closure_expr::try_eval(&closure.body_src, &probe_vars),
-        Ok(Some(_)) | Err(_)
-    );
-    if !is_pure {
-        // Fall back: defer to vb_each by re-dispatching with the same args.
-        return vb_each(input, args, state);
-    }
-
-    let vs = input.into_values()?;
-    let n = vs.len();
+    // Compile once, without evaluating against a fabricated binding scope.
+    // Unsupported shell bodies retain sequential each's full semantics.
+    let prepared = match crate::closure_expr::compile(&closure.body_src) {
+        Ok(Some(expression)) => Ok(expression),
+        Ok(None) => {
+            // Worker flags are not each arguments. Forward only the closure
+            // and the shared keep-empty option when taking this fallback.
+            let mut sequential_args = Vec::new();
+            if keep_empty {
+                sequential_args.push("--keep-empty".to_owned());
+            }
+            sequential_args.extend(closure_arg.cloned());
+            return vb_each(input, &sequential_args, state);
+        }
+        Err(message) => Err(message),
+    };
+    let values = input.into_values()?;
+    let n = values.len();
     if n == 0 {
         return Ok(PipelineData::Values(Vec::new()));
     }
-
+    let prepared = prepared.map_err(|message| {
+        eprintln!("jsh: {message}");
+        state.set_error(message, 1);
+        1
+    })?;
     let workers = threads_override
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .map(|p| p.get())
+                .map(|parallelism| parallelism.get())
                 .unwrap_or(4)
         })
         .max(1)
         .min(n);
 
-    let param = closure
-        .params
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "in".to_string());
-    let body = Arc::new(closure.body_src.clone());
-    let captured = Arc::new(closure.captured.clone());
-    let param = Arc::new(param);
-    let results = Arc::new(Mutex::new(vec![Value::Null; n]));
-    let err_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-    // Static chunking — simpler than a work-stealing queue and good enough for
-    // the typical "expensive but uniform" workload.
-    let chunk = n.div_ceil(workers);
-    let work: Vec<(usize, Value)> = vs.into_iter().enumerate().collect();
-
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let chunk_size = n.div_ceil(workers);
+    let mut source = values.into_iter();
     let mut handles = Vec::with_capacity(workers);
-    for w in 0..workers {
-        let start = w * chunk;
-        let end = (start + chunk).min(n);
-        if start >= end {
+    let mut error = None;
+    for worker_index in 0..workers {
+        if cancelled.load(Ordering::Relaxed) {
             break;
         }
-        let slice = work[start..end].to_vec();
-        let results = results.clone();
-        let err_slot = err_slot.clone();
-        let spawn_error_slot = err_slot.clone();
-        let body = body.clone();
-        let captured = captured.clone();
-        let param = param.clone();
+        // Move input records into each chunk, avoiding a second copy of their
+        // nested payloads. Workers return local output in their input order.
+        let chunk: Vec<Value> = source.by_ref().take(chunk_size).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let cancellation = Arc::clone(&cancelled);
+        let expression = prepared.clone();
+        let closure = Arc::clone(&closure);
         let worker = std::thread::Builder::new()
-            .name(format!("jsh-par-each-{w}"))
+            .name(format!("jsh-par-each-{worker_index}"))
             .spawn(move || {
-                for (idx, val) in slice {
-                    if err_slot.lock().unwrap().is_some() {
-                        return;
+                let mut output = Vec::with_capacity(chunk.len());
+                for value in chunk {
+                    if cancellation.load(Ordering::Relaxed) {
+                        break;
                     }
-                    let mut vars: std::collections::HashMap<String, Value> = (*captured).clone();
-                    vars.insert((*param).clone(), val.clone());
-                    vars.insert("in".to_string(), val);
-                    match crate::closure_expr::try_eval(&body, &vars) {
-                        Ok(Some(v)) => {
-                            results.lock().unwrap()[idx] = v;
+                    match expression
+                        .evaluate_with(|name| closure.lookup(std::slice::from_ref(&value), name))
+                    {
+                        Ok(result) => {
+                            if keep_empty || !matches!(result, Value::Null) {
+                                output.push(result);
+                            }
                         }
-                        Ok(None) => {
-                            *err_slot.lock().unwrap() =
-                                Some("par-each: closure body is not a pure expression".to_string());
-                            return;
-                        }
-                        Err(msg) => {
-                            *err_slot.lock().unwrap() = Some(msg);
-                            return;
+                        Err(message) => {
+                            cancellation.store(true, Ordering::Relaxed);
+                            return Err(message);
                         }
                     }
                 }
+                Ok(output)
             });
         match worker {
             Ok(handle) => handles.push(handle),
-            Err(error) => {
-                *spawn_error_slot.lock().unwrap() =
-                    Some(format!("par-each: could not start worker thread: {error}"));
+            Err(failure) => {
+                cancelled.store(true, Ordering::Relaxed);
+                error = Some(format!(
+                    "par-each: could not start worker thread: {failure}"
+                ));
                 break;
             }
         }
     }
-    for h in handles {
-        let _ = h.join();
-    }
+    drop(source);
 
-    if let Some(msg) = err_slot.lock().unwrap().take() {
-        eprintln!("jsh: {}", msg);
-        state.set_error(msg, 1);
+    let mut output = Vec::new();
+    // Joining in chunk order preserves global order without per-row locks.
+    // Even after failure, join every worker before returning to the shell.
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(values)) => {
+                if error.is_none() {
+                    output.extend(values);
+                }
+            }
+            Ok(Err(message)) => {
+                error.get_or_insert(message);
+            }
+            Err(_) => {
+                cancelled.store(true, Ordering::Relaxed);
+                error.get_or_insert_with(|| "par-each: worker thread panicked".to_owned());
+            }
+        }
+    }
+    if let Some(message) = error {
+        eprintln!("jsh: {message}");
+        state.set_error(message, 1);
         return Err(1);
     }
-    let out_vec = Arc::try_unwrap(results)
-        .map_err(|_| 1_i32)?
-        .into_inner()
-        .map_err(|_| 1_i32)?;
-    let final_out: Vec<Value> = if keep_empty {
-        out_vec
-    } else {
-        out_vec
-            .into_iter()
-            .filter(|v| !matches!(v, Value::Null))
-            .collect()
-    };
-    Ok(PipelineData::Values(final_out))
+    Ok(PipelineData::Values(output))
 }
 
 fn vb_sort_by(
@@ -484,23 +483,19 @@ fn vb_select(
         eprintln!("Usage: select <field1> [field2] ...");
         return Err(1);
     }
-    let vs = input.into_values()?;
-    let out: Vec<Value> = vs
-        .into_iter()
-        .map(|v| match v {
-            Value::Record(map) => {
-                let mut new_map = IndexMap::new();
-                for f in args {
-                    if let Some(val) = map.get(f) {
-                        new_map.insert(f.clone(), val.clone());
-                    }
+    let fields = args.to_vec();
+    input.map_values(move |v| match v {
+        Value::Record(mut map) => {
+            let mut selected = IndexMap::new();
+            for field in &fields {
+                if let Some(value) = map.swap_remove(field) {
+                    selected.insert(field.clone(), value);
                 }
-                Value::Record(new_map)
             }
-            other => other,
-        })
-        .collect();
-    Ok(PipelineData::Values(out))
+            Value::Record(selected)
+        }
+        other => other,
+    })
 }
 
 fn vb_group_by(
@@ -529,6 +524,47 @@ fn vb_group_by(
     Ok(PipelineData::Values(vec![Value::Record(rec)]))
 }
 
+/// Hashable identity for grouping values without confusing their display text.
+/// Keep type tags and collection boundaries, including record field order.
+#[derive(Hash, PartialEq, Eq)]
+enum ValueKey {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(u64),
+    String(String),
+    List(Vec<ValueKey>),
+    Record(Vec<(String, ValueKey)>),
+    Binary(Vec<u8>),
+    Closure(usize),
+}
+
+impl From<&Value> for ValueKey {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Bool(v) => Self::Bool(*v),
+            Value::Int(v) => Self::Int(*v),
+            // Positive and negative zero represent the same floating value.
+            Value::Float(v) => Self::Float(if *v == 0.0 { 0 } else { v.to_bits() }),
+            Value::String(v) => Self::String(v.clone()),
+            Value::List(v) => Self::List(v.iter().map(Self::from).collect()),
+            Value::Record(v) => {
+                Self::Record(v.iter().map(|(k, v)| (k.clone(), Self::from(v))).collect())
+            }
+            Value::Binary(v) => Self::Binary(v.clone()),
+            Value::Closure(v) => Self::Closure(Arc::as_ptr(v) as usize),
+        }
+    }
+}
+
+fn unique_key(value: &Value, field: Option<&str>) -> Option<ValueKey> {
+    match field {
+        Some(field) => value.get(field).map(ValueKey::from),
+        None => Some(ValueKey::from(value)),
+    }
+}
+
 fn vb_unique(
     input: PipelineData,
     args: &[String],
@@ -546,27 +582,15 @@ fn vb_unique(
     }
     let vs = input.into_values()?;
     if count_mode {
-        let mut order: Vec<String> = Vec::new();
-        let mut counts: std::collections::HashMap<String, (Value, i64)> =
-            std::collections::HashMap::new();
+        let mut counts: IndexMap<Option<ValueKey>, (Value, i64)> = IndexMap::new();
         for v in vs {
-            let key = match field {
-                Some(f) => v
-                    .get(f)
-                    .map(|fv| fv.to_display_string())
-                    .unwrap_or_default(),
-                None => v.to_display_string(),
-            };
-            let entry = counts.entry(key.clone()).or_insert_with(|| {
-                order.push(key.clone());
-                (v.clone(), 0)
-            });
+            let key = unique_key(&v, field);
+            let entry = counts.entry(key).or_insert((v, 0));
             entry.1 += 1;
         }
-        let mut rows: Vec<Value> = order
-            .into_iter()
-            .map(|k| {
-                let (val, n) = counts.remove(&k).unwrap();
+        let mut rows: Vec<Value> = counts
+            .into_values()
+            .map(|(val, n)| {
                 let mut rec = IndexMap::new();
                 rec.insert("value".to_string(), val);
                 rec.insert("count".to_string(), Value::Int(n));
@@ -583,13 +607,7 @@ fn vb_unique(
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for v in vs {
-        let key = match field {
-            Some(f) => v
-                .get(f)
-                .map(|fv| fv.to_display_string())
-                .unwrap_or_default(),
-            None => v.to_display_string(),
-        };
+        let key = unique_key(&v, field);
         if seen.insert(key) {
             out.push(v);
         }
@@ -602,8 +620,11 @@ fn vb_count(
     _args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let vs = input.into_values()?;
-    Ok(PipelineData::Values(vec![Value::Int(vs.len() as i64)]))
+    let count = match input {
+        PipelineData::Stream(values) => values.count(),
+        other => other.into_values()?.len(),
+    };
+    Ok(PipelineData::Values(vec![Value::Int(count as i64)]))
 }
 
 fn vb_math(
@@ -656,28 +677,32 @@ fn vb_math(
         return Ok(PipelineData::Values(out));
     }
 
-    let vs = input.into_values()?;
-    // Aggregations: `math sum field` (extract field from records) OR
-    // `math sum` (pipeline is a list of numbers).
-    let nums: Vec<f64> = if let Some(f) = field {
-        vs.iter()
-            .filter_map(|v| v.get(f).and_then(|fv| fv.as_f64()))
-            .collect()
-    } else {
-        vs.iter().filter_map(|v| v.as_f64()).collect()
-    };
-    if nums.is_empty() {
+    // Extract numeric values one at a time. Simple folds retain no input rows;
+    // order-dependent statistics still collect only the numeric projection.
+    let mut nums = input
+        .into_value_iter()?
+        .filter_map(|value| match field {
+            Some(field) => value.get(field).and_then(Value::as_f64),
+            None => value.as_f64(),
+        })
+        .peekable();
+    if nums.peek().is_none() {
         eprintln!("math: no numeric values");
         return Err(1);
     }
     let r = match op {
-        "sum" => nums.iter().sum::<f64>(),
-        "avg" | "mean" => nums.iter().sum::<f64>() / nums.len() as f64,
-        "min" => nums.iter().copied().fold(f64::INFINITY, f64::min),
-        "max" => nums.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        "product" => nums.iter().product::<f64>(),
+        "sum" => nums.sum::<f64>(),
+        "avg" | "mean" => {
+            let (sum, count) = nums.fold((0.0, 0usize), |(sum, count), value| {
+                (sum + value, count + 1)
+            });
+            sum / count as f64
+        }
+        "min" => nums.fold(f64::INFINITY, f64::min),
+        "max" => nums.fold(f64::NEG_INFINITY, f64::max),
+        "product" => nums.product::<f64>(),
         "median" => {
-            let mut sorted = nums.clone();
+            let mut sorted: Vec<f64> = nums.collect();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = sorted.len();
             if n.is_multiple_of(2) {
@@ -686,14 +711,16 @@ fn vb_math(
                 sorted[n / 2]
             }
         }
-        "stddev" | "std" => {
+        "stddev" | "std" | "variance" | "var" => {
+            // Keep the established two-pass floating-point calculation.
+            let nums: Vec<f64> = nums.collect();
             let mean = nums.iter().sum::<f64>() / nums.len() as f64;
-            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nums.len() as f64;
-            var.sqrt()
-        }
-        "variance" | "var" => {
-            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
-            nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nums.len() as f64
+            let variance = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nums.len() as f64;
+            if matches!(op, "stddev" | "std") {
+                variance.sqrt()
+            } else {
+                variance
+            }
         }
         _ => {
             eprintln!("math: unknown op '{}'", op);
@@ -753,11 +780,26 @@ fn vb_from_csv(
 
 fn vb_length(
     input: PipelineData,
-    _args: &[String],
-    _state: &mut ShellState,
+    args: &[String],
+    state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let vs = input.into_values()?;
-    Ok(PipelineData::Values(vec![Value::Int(vs.len() as i64)]))
+    vb_count(input, args, state)
+}
+
+/// Row-count commands default to one row, but never silently reinterpret
+/// malformed or additional arguments as that default.
+fn parse_row_count(command: &str, args: &[String]) -> Result<usize, i32> {
+    match args {
+        [] => Ok(1),
+        [count] => count.parse::<usize>().map_err(|_| {
+            eprintln!("{command}: count must be a non-negative integer");
+            1
+        }),
+        _ => {
+            eprintln!("{command}: expected at most one count argument");
+            Err(1)
+        }
+    }
 }
 
 fn vb_first(
@@ -765,7 +807,7 @@ fn vb_first(
     args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let n = parse_row_count("first", args)?;
     if input.is_stream() {
         let vs: Vec<Value> = input.into_value_iter()?.take(n).collect();
         return Ok(PipelineData::Values(vs));
@@ -780,10 +822,31 @@ fn vb_last(
     args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
-    let vs = input.into_values()?;
-    let start = vs.len().saturating_sub(n);
-    Ok(PipelineData::Values(vs[start..].to_vec()))
+    let n = parse_row_count("last", args)?;
+    if !input.is_stream() {
+        let mut values = input.into_values()?;
+        let start = values.len().saturating_sub(n);
+        // Move the selected values rather than cloning nested records. The
+        // returned tail also releases the unused prefix allocation.
+        return Ok(PipelineData::Values(if start == 0 {
+            values
+        } else {
+            values.split_off(start)
+        }));
+    }
+    // Preserve consumption of the whole input, but retain only the requested
+    // tail. Do not allocate from an unchecked user count before seeing rows.
+    let mut tail = std::collections::VecDeque::new();
+    for value in input.into_value_iter()? {
+        if n == 0 {
+            continue;
+        }
+        if tail.len() == n {
+            tail.pop_front();
+        }
+        tail.push_back(value);
+    }
+    Ok(PipelineData::Values(tail.into_iter().collect()))
 }
 
 fn vb_reverse(
@@ -2143,20 +2206,16 @@ fn vb_reject(
         eprintln!("reject: missing column names");
         return Err(1);
     }
-    let vs = input.into_values()?;
-    let mut out = Vec::with_capacity(vs.len());
-    for v in vs {
-        let pruned = if let Value::Record(mut r) = v {
-            for col in args {
-                r.shift_remove(col);
+    let columns = args.to_vec();
+    input.map_values(move |v| match v {
+        Value::Record(mut record) => {
+            for column in &columns {
+                record.shift_remove(column);
             }
-            Value::Record(r)
-        } else {
-            v
-        };
-        out.push(pruned);
-    }
-    Ok(PipelineData::Values(out))
+            Value::Record(record)
+        }
+        other => other,
+    })
 }
 
 fn vb_wrap(
@@ -2171,16 +2230,11 @@ fn vb_wrap(
             return Err(1);
         }
     };
-    let vs = input.into_values()?;
-    let out: Vec<Value> = vs
-        .into_iter()
-        .map(|v| {
-            let mut r = IndexMap::new();
-            r.insert(col.clone(), v);
-            Value::Record(r)
-        })
-        .collect();
-    Ok(PipelineData::Values(out))
+    input.map_values(move |value| {
+        let mut record = IndexMap::new();
+        record.insert(col.clone(), value);
+        Value::Record(record)
+    })
 }
 
 fn vb_flatten(
@@ -2188,15 +2242,19 @@ fn vb_flatten(
     _args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let vs = input.into_values()?;
-    let mut out = Vec::new();
-    for v in vs {
-        match v {
-            Value::List(items) => out.extend(items),
-            other => out.push(other),
-        }
+    let is_stream = input.is_stream();
+    let values = input.into_value_iter()?.flat_map(|value| {
+        let (items, scalar) = match value {
+            Value::List(items) => (items, None),
+            other => (Vec::new(), Some(other)),
+        };
+        items.into_iter().chain(scalar)
+    });
+    if is_stream {
+        Ok(PipelineData::Stream(Box::new(values)))
+    } else {
+        Ok(PipelineData::Values(values.collect()))
     }
-    Ok(PipelineData::Values(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -2298,11 +2356,14 @@ fn vb_range(
             return Err(1);
         }
     };
-    let end = if inclusive { hi + 1 } else { hi };
-    // Phase 15b: return a lazy stream so `range 1..10_000_000 | take 5`
-    // doesn't have to materialize 10M ints first.
-    let it = (lo..end).map(Value::Int);
-    Ok(PipelineData::Stream(Box::new(it)))
+    // Keep the inclusive bound in the iterator: converting it to `hi + 1`
+    // overflows for i64::MAX, even when the consumer only requests one item.
+    // Both forms remain lazy so a downstream `take` bounds the work.
+    if inclusive {
+        Ok(PipelineData::Stream(Box::new((lo..=hi).map(Value::Int))))
+    } else {
+        Ok(PipelineData::Stream(Box::new((lo..hi).map(Value::Int))))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2332,8 +2393,7 @@ fn vb_reduce(
             return Err(1);
         }
     };
-    let vs = input.into_values()?;
-    let mut iter = vs.into_iter();
+    let mut iter = input.into_value_iter()?;
     let mut acc = match init {
         Some(v) => v,
         None => match iter.next() {
@@ -2352,7 +2412,7 @@ fn vb_take(
     args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let n = parse_row_count("take", args)?;
     // Phase 15b: short-circuit on Stream — pull only N items.
     if input.is_stream() {
         let it = input.into_value_iter()?.take(n);
@@ -2369,7 +2429,12 @@ fn vb_skip(
     args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let n = parse_row_count("skip", args)?;
+    if input.is_stream() {
+        return Ok(PipelineData::Stream(Box::new(
+            input.into_value_iter()?.skip(n),
+        )));
+    }
     let vs = input.into_values()?;
     Ok(PipelineData::Values(vs.into_iter().skip(n).collect()))
 }
@@ -2379,18 +2444,14 @@ fn vb_enumerate(
     _args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let vs = input.into_values()?;
-    let out: Vec<Value> = vs
-        .into_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let mut r = IndexMap::new();
-            r.insert("index".to_string(), Value::Int(i as i64));
-            r.insert("item".to_string(), item);
-            Value::Record(r)
-        })
-        .collect();
-    Ok(PipelineData::Values(out))
+    let mut index = 0usize;
+    input.map_values(move |item| {
+        let mut record = IndexMap::new();
+        record.insert("index".to_string(), Value::Int(index as i64));
+        record.insert("item".to_string(), item);
+        index += 1;
+        Value::Record(record)
+    })
 }
 
 fn vb_zip(
@@ -2631,23 +2692,20 @@ fn vb_compact(
 ) -> Result<PipelineData, i32> {
     // Without args: drop records containing any Null value, and drop Null elements
     // from lists. With column args: drop records where any named column is Null/missing.
-    let vs = input.into_values()?;
-    let out: Vec<Value> = vs
-        .into_iter()
-        .filter(|v| match v {
-            Value::Null => false,
-            Value::Record(m) => {
-                if args.is_empty() {
-                    m.values().all(|x| !matches!(x, Value::Null))
-                } else {
-                    args.iter()
-                        .all(|c| matches!(m.get(c), Some(x) if !matches!(x, Value::Null)))
-                }
+    let columns = args.to_vec();
+    input.filter_values(move |value| match value {
+        Value::Null => false,
+        Value::Record(record) => {
+            if columns.is_empty() {
+                record.values().all(|value| !matches!(value, Value::Null))
+            } else {
+                columns.iter().all(|column| {
+                    matches!(record.get(column), Some(value) if !matches!(value, Value::Null))
+                })
             }
-            _ => true,
-        })
-        .collect();
-    Ok(PipelineData::Values(out))
+        }
+        _ => true,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3119,9 +3177,9 @@ fn vb_do(
 // Phase 10c — table utilities
 // ---------------------------------------------------------------------------
 
-/// `default <value> [field]` — replace Null with `value`. With `field`, only
-/// touch that field on Record inputs; without it, apply to each pipeline
-/// value (scalar replacement).
+/// `default <value> [fields...]` — replace Null with `value`. With fields,
+/// fill each missing/Null field on Record inputs; without fields, replace
+/// Null pipeline values directly.
 fn vb_default(
     input: PipelineData,
     args: &[String],
@@ -3134,25 +3192,23 @@ fn vb_default(
             return Err(1);
         }
     };
-    let field = args.get(1).cloned();
+    let fields = args[1..].to_vec();
     let default_val = coerce_string_to_value(&default_str);
-    let vs = input.into_values()?;
-    let mut out = Vec::with_capacity(vs.len());
-    for v in vs {
-        let new_v = match (&field, v) {
-            (Some(f), Value::Record(mut rec)) => {
-                let is_missing = rec.get(f).map(|x| matches!(x, Value::Null)).unwrap_or(true);
-                if is_missing {
-                    rec.insert(f.clone(), default_val.clone());
+    input.map_values(move |value| match value {
+        Value::Record(mut record) if !fields.is_empty() => {
+            for field in &fields {
+                if record
+                    .get(field)
+                    .is_none_or(|value| matches!(value, Value::Null))
+                {
+                    record.insert(field.clone(), default_val.clone());
                 }
-                Value::Record(rec)
             }
-            (None, Value::Null) => default_val.clone(),
-            (_, other) => other,
-        };
-        out.push(new_v);
-    }
-    Ok(PipelineData::Values(out))
+            Value::Record(record)
+        }
+        Value::Null if fields.is_empty() => default_val.clone(),
+        other => other,
+    })
 }
 
 pub fn coerce_string_to_value(s: &str) -> Value {
@@ -3891,7 +3947,7 @@ fn vb_drop(
     args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let n = parse_row_count("drop", args)?;
     let mut vs = input.into_values()?;
     let keep = vs.len().saturating_sub(n);
     vs.truncate(keep);
@@ -3949,13 +4005,13 @@ fn vb_histogram(
     if total == 0 {
         return Ok(PipelineData::Values(vec![]));
     }
-    let mut buckets: IndexMap<String, (Value, usize)> = IndexMap::new();
+    let mut buckets: IndexMap<ValueKey, (Value, usize)> = IndexMap::new();
     for v in vs {
         let key_val = match &field {
             Some(f) => v.get(f).cloned().unwrap_or(Value::Null),
             None => v.clone(),
         };
-        let key = key_val.to_display_string();
+        let key = ValueKey::from(&key_val);
         let entry = buckets.entry(key).or_insert((key_val, 0));
         entry.1 += 1;
     }

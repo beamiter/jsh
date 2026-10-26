@@ -1622,6 +1622,28 @@ fn read_backtick_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> S
     body
 }
 
+/// Read `$((...))` after its two opening parentheses. Ordinary nested
+/// parentheses each have their own depth; only `))` at depth zero closes the
+/// substitution. Pair-counting loses inner parentheses or includes the outer
+/// terminator in the expression when arithmetic is nested or quoted.
+fn read_arithmetic_sub(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut expression = String::new();
+    let mut depth = 0usize;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '(' => depth += 1,
+            ')' if depth == 0 && chars.peek() == Some(&')') => {
+                chars.next();
+                break;
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        expression.push(ch);
+    }
+    expression
+}
+
 fn read_command_sub(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
     let mut cmd = String::new();
     let mut depth = 1;
@@ -2023,33 +2045,7 @@ pub fn parse_word_parts(raw: &str) -> Word {
                         if chars.peek() == Some(&'(') {
                             // Arithmetic $((...))
                             chars.next();
-                            let mut expr = String::new();
-                            let mut depth = 1;
-                            while let Some(&c2) = chars.peek() {
-                                if c2 == ')' {
-                                    chars.next();
-                                    if chars.peek() == Some(&')') {
-                                        chars.next();
-                                        depth -= 1;
-                                        if depth == 0 {
-                                            break;
-                                        }
-                                    }
-                                    expr.push(')');
-                                } else if c2 == '(' {
-                                    chars.next();
-                                    if chars.peek() == Some(&'(') {
-                                        chars.next();
-                                        depth += 1;
-                                        expr.push_str("((");
-                                    } else {
-                                        expr.push('(');
-                                    }
-                                } else {
-                                    expr.push(c2);
-                                    chars.next();
-                                }
-                            }
+                            let expr = read_arithmetic_sub(&mut chars);
                             parts.push(WordPart::Arithmetic(expr));
                         } else {
                             // Command substitution $(...)
@@ -2354,30 +2350,7 @@ fn parse_word_parts_inner(input: &str) -> Vec<WordPart> {
                     if chars.peek() == Some(&'(') {
                         // Arithmetic $((...))
                         chars.next();
-                        let mut expr = String::new();
-                        let mut depth = 1;
-                        while let Some(&c2) = chars.peek() {
-                            if c2 == ')' {
-                                chars.next();
-                                if chars.peek() == Some(&')') {
-                                    chars.next();
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        break;
-                                    }
-                                    expr.push_str("))");
-                                } else {
-                                    expr.push(')');
-                                }
-                            } else if c2 == '(' {
-                                chars.next();
-                                depth += 1;
-                                expr.push('(');
-                            } else {
-                                expr.push(c2);
-                                chars.next();
-                            }
-                        }
+                        let expr = read_arithmetic_sub(&mut chars);
                         parts.push(WordPart::Arithmetic(expr));
                     } else {
                         // Command substitution $(...)

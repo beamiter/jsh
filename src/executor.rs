@@ -960,36 +960,13 @@ pub fn apply_closure(
     use crate::value::Value;
     use std::collections::HashMap;
 
-    // Phase 14c hot path: the literal-value JSON and pure-expression
-    // shortcuts don't need to touch `state.let_vars` at all — they read
-    // captures from a local map. Avoiding the take+clone+restore here
-    // saves a sizeable allocation per `each`/`where`/`reduce` iteration.
-    let trimmed = closure.body_src.trim();
-    if !trimmed.is_empty() {
-        if let Ok(j) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            return Ok(Value::from_json(j));
-        }
-    }
-
-    // Build a lightweight var view: captured + params + $in. Cloning captured
-    // is unavoidable (try_eval may need the values), but we skip the broader
-    // state.let_vars swap unless we fall through to the shell path.
-    let mut local_vars: HashMap<String, Value> = closure.captured.clone();
-    for (i, p) in closure.params.iter().enumerate() {
-        let v = args.get(i).cloned().unwrap_or(Value::Null);
-        local_vars.insert(p.clone(), v);
-    }
-    if !local_vars.contains_key("in") {
-        local_vars.insert(
-            "in".to_string(),
-            args.first().cloned().unwrap_or(Value::Null),
-        );
-    }
-
+    // Literal values and pure expressions never need to install a local shell
+    // scope. Their parsed expression and borrowed bindings are reusable across
+    // every row without cloning the captured map or entire argument records.
     // Expression-body shortcut: `{|a, b| $a + $b}`, `{|r| if $r.x > 5 ... }`,
     // etc. Runs BEFORE installing into state so the bulk-iteration case
     // (each / where / reduce) avoids per-iteration state churn.
-    match crate::closure_expr::try_eval(&closure.body_src, &local_vars) {
+    match crate::closure_expr::try_eval_with(&closure.body_src, |name| closure.lookup(args, name)) {
         Ok(Some(v)) => return Ok(v),
         Ok(None) => {} // not a pure expression — fall through to shell path
         Err(msg) => {
@@ -1000,6 +977,16 @@ pub fn apply_closure(
 
     // Fall through to the shell-command path: now we need state.let_vars to
     // hold the local view so variable resolution inside the parsed body works.
+    let mut local_vars: HashMap<String, Value> = closure.captured.clone();
+    for (index, parameter) in closure.params.iter().enumerate() {
+        local_vars.insert(
+            parameter.clone(),
+            args.get(index).cloned().unwrap_or(Value::Null),
+        );
+    }
+    local_vars
+        .entry("in".into())
+        .or_insert_with(|| args.first().cloned().unwrap_or(Value::Null));
     let saved = std::mem::replace(&mut state.let_vars, local_vars);
 
     let result = (|| -> Result<Value, i32> {
@@ -1731,6 +1718,10 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                 // Execute init expression
                 if !init.is_empty() {
                     let _ = crate::expand::expand_arithmetic(init, state);
+                    if let Some(error) = state.expansion_error.take() {
+                        eprintln!("jsh: ((: {error}");
+                        return 1;
+                    }
                 }
 
                 let mut code = 0;
@@ -1743,7 +1734,12 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                         true
                     } else {
                         let cond_str = crate::expand::expand_arithmetic(condition, state);
-                        cond_str.parse::<i32>().unwrap_or(0) != 0
+                        if let Some(error) = state.expansion_error.take() {
+                            eprintln!("jsh: ((: {error}");
+                            code = 1;
+                            break;
+                        }
+                        cond_str.parse::<i64>().unwrap_or(0) != 0
                     };
 
                     if !cond_result {
@@ -1770,6 +1766,11 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                     // Execute update expression
                     if !update.is_empty() {
                         let _ = crate::expand::expand_arithmetic(update, state);
+                        if let Some(error) = state.expansion_error.take() {
+                            eprintln!("jsh: ((: {error}");
+                            code = 1;
+                            break;
+                        }
                     }
                 }
                 state.loop_depth -= 1;
@@ -1969,7 +1970,11 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             with_redirects(redirects, state, |state| {
                 // Evaluate the arithmetic expression
                 let result_str = crate::expand::expand_arithmetic(expr, state);
-                if let Ok(result) = result_str.parse::<i32>() {
+                if let Some(error) = state.expansion_error.take() {
+                    eprintln!("jsh: ((: {error}");
+                    return 1;
+                }
+                if let Ok(result) = result_str.parse::<i64>() {
                     // In bash, (( expr )) returns 0 if expr != 0, and 1 if expr == 0
                     // This is the opposite of C - expressions are checked for truthiness
                     if result != 0 {
