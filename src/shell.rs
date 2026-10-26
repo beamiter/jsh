@@ -334,6 +334,8 @@ fn run_exit_trap(state: &mut ShellState) -> i32 {
     let prior_exit_requested = builtins::EXIT_REQUESTED.swap(false, Ordering::SeqCst);
     let prior_exit_code = builtins::EXIT_CODE.load(Ordering::SeqCst);
     let prior_abort = std::mem::replace(&mut state.abort_current_program, false);
+    let prior_errexit = state.errexit_status.take();
+    let prior_failure_exempt = std::mem::replace(&mut state.last_failure_exempt, false);
     if let Some(cmd) = state.traps.get("EXIT").cloned() {
         if let Ok(commands) = parser::parse(&cmd) {
             for c in &commands {
@@ -364,6 +366,8 @@ fn run_exit_trap(state: &mut ShellState) -> i32 {
         Ordering::SeqCst,
     );
     state.abort_current_program = prior_abort;
+    state.errexit_status = prior_errexit;
+    state.last_failure_exempt = prior_failure_exempt;
     state.last_exit_code = final_status;
     final_status
 }

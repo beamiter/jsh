@@ -166,6 +166,23 @@ preserving existing values including `false` and zero.
 without retaining every input row. `last N` retains only the final N rows.
 `median`, `variance`, and `stddev` still collect numeric samples.
 
+Field predicates (`where field op value`), `chunks N`, and
+`window N [--stride S]` also preserve streams. Chunk and window iterators retain
+only O(N) input rows, produce output on demand, and do not read the source when
+followed by `take 0`. Chunks include a final short group; windows contain only
+complete groups. Sizes and strides must be positive integers.
+`any` and `all` stop at the first deciding result or predicate error;
+`is-empty` needs at most two input items to preserve its singleton-empty rules.
+
+Integer `math sum` uses an exact i128 accumulator and requires the final result
+to fit in i64. Once a floating-point input is encountered, summation uses f64.
+`math min`/`max`, relational predicates, and sorting compare integers and floats
+without first rounding the integer to f64. By default (ascending),
+`sort`/`sort-by` order nulls first,
+then numbers (including numeric strings and booleans), then other values by
+text; NaNs form a stable group at the end of the numeric category. Descending
+sort reverses this order. Both directions preserve the input order of equal values.
+
 Pure closure expressions reuse their parsed form across rows and read captured
 values without copying the entire scope. Integer arithmetic in typed closures
 stays exact within `i64`; overflow reports an error. Division returns an integer
@@ -234,6 +251,33 @@ CLI errors and syntax errors exit with status `2`. Command-not-found and
 missing-script failures use `127`; commands or scripts that cannot be
 executed or read use `126`.
 
+Redirection errors stop the affected command before its body runs and report a
+nonzero status. This includes builtins, functions, typed functions, compounds,
+and external programs. File targets must expand to exactly one path; quote
+variables that may contain spaces. Redirect-only commands such as `> output`
+create or truncate the file. Temporary descriptors are restored after the
+command, including descriptors that were originally closed, and nested
+redirections cannot overwrite internal restoration descriptors.
+
+`set -C` / `set -o noclobber` protects existing regular files from `>` and `&>`;
+use `>|` (also `N>|`) for an explicit overwrite, or `>>` to append. Here-documents
+preserve blank lines, carriage returns, and their final newline. Their backing
+files are private and unlinked before data is written. Structured scalar output
+is flushed to its own destination before descriptors are restored, and delayed
+write errors become command failures.
+
+`exec [-cl] [-a name] [--] command [args...]` replaces the current process and
+keeps its PID. `-c` clears the replacement's environment, `-a` sets its argument
+zero, and `-l` prefixes that argument with `-`. With no command, successful
+`exec` redirections remain active in the shell. Failed process replacement
+terminates a noninteractive shell unless `shopt -s execfail` is enabled.
+
+With `set -e`, an unhandled failure in a `for`, arithmetic `for`, `while`, or
+`until` body unwinds immediately. Direct compound commands retain the final
+`&&`, `||`, or `!` exemption, and tested functions/loops keep conditional
+suppression. `eval` and sourced programs propagate exit/return/error control;
+loop-condition `break` and `continue` are consumed by their own loop.
+
 `test` and `[` return `0` for true, `1` for false, and `2` for an invalid
 expression. `[` requires its final `]`; `test` treats `]` as ordinary data.
 Parameter default and alternate words are evaluated only when selected, so
@@ -293,6 +337,16 @@ History is stored at `~/.jsh_history`; named session snapshots live under
 a newline-safe JSONL format while retaining compatibility with the previous
 tab-separated format. Session snapshots exclude process-specific variables and
 names that look like credentials, tokens, passwords, or secrets.
+
+Bookmarks (`~/.jsh_bookmarks`) and directory frecency (`~/.jsh_z`) coordinate
+updates across new jsh instances. Each mutation acquires a bounded-wait lock,
+reloads the shared file, applies only that operation, and atomically saves the
+result. Concurrent additions accumulate and stale snapshots cannot resurrect
+deletions. Existing text formats remain compatible; bookmark names and paths
+keep leading and trailing spaces. Explicit add/remove commands report failures.
+Read-only lists still use the current process snapshot, refreshed on its next
+successful update or reload. Already-running older versions do not participate
+in this locking protocol.
 
 ### Helper programs
 
@@ -795,17 +849,31 @@ spaces, semicolons and dollar signs, so accepting a suggestion preserves the
 argument's spelling. Generated arguments containing hidden terminal controls
 are omitted.
 
-Everything is local. Completion never runs a command to find out what to
-offer, and never makes a network request: Docker, Git and systemd are probed
-with fixed, trusted binaries under a timeout and an output cap, once per
-command line; everything else is read from files. Kubernetes resource names
-and remote `scp` paths are deliberately absent for exactly this reason.
+Path completion preserves quoting when inserting filenames containing dollar
+signs, command-substitution text, backticks, quotes, or backslashes. Names with
+non-UTF-8 bytes or hidden terminal controls are omitted. Symlinks to directories
+remain navigable. The scan and candidate budgets are separate:
+up to 65,536 directory entries are examined and up to 4,096 candidates returned.
+Descriptions are read for at most 64 candidates per matching pass, and directory
+item counts stop at 257 entries and display `256+ items` above 256.
+
+Docker, Git and systemd completion sources use fixed, trusted binaries under a
+timeout and an output cap, once per command line; other sources read files.
+Helpers inherit the user's configuration, so Docker can contact a remote daemon
+selected by its context or `DOCKER_HOST`. Kubernetes resource names and remote
+`scp` paths are deliberately absent.
 
 `complete` and `compgen` accept the bash spellings, including `-A <action>`,
 which resolves to the sources above, and `-F <function>`, which is called with
 `COMP_WORDS`, `COMP_CWORD`, `COMP_LINE` and `$1`/`$2`/`$3` as bash sets them.
 Both reach one implementation of each action, so a script and a keystroke
 cannot disagree about what a user or a service is.
+
+Programmable completion keeps quoted/escaped arguments together in
+`COMP_WORDS`, supports function `return`, and restores prior completion arrays,
+positionals, exit/pipeline status, and control-flow state afterward. A registered
+completion function is ordinary trusted shell code; explicit filesystem,
+environment, and directory changes inside it are not sandboxed.
 
 Specifications ship for `git`, `docker`, `cargo`, `kubectl`, `npm`, `gh`,
 `systemctl`, `tmux`, `terraform` and `apt`, and more can be placed in
@@ -886,13 +954,20 @@ measurements, not whole-shell startup or cross-shell rankings.
   shell options, but not every arbitrary Bash function or interactive plugin.
 - Some advanced Bash options and edge cases remain incomplete. Prefer an
   explicit Bash shebang for production scripts that depend on exact Bash
-  parsing or `set -e` corner cases.
+  parsing or `set -e` corner cases. ERR-trap inheritance across ordinary
+  function calls is not yet fully aligned with Bash.
 - `shopt -s lastpipe` runs the final pipeline stage in the current shell when
   job control (`monitor`) is off. Interactive shells keep `monitor` on by
   default, matching Bash.
 - `fg`/`bg`/`wait`/`disown` accept Bash job specs `%N`, `%%`, `%+`, and `%-`.
 - `DEBUG` and `RETURN` traps are accepted for compatibility but are not fired.
 - Structured pipeline commands are jsh extensions and are not portable to Bash.
+- Closure forms of `where` and `each` still materialize their inputs.
+  `from-ndjson` currently skips invalid JSON lines; it does not provide a strict
+  malformed-line error mode. `avg`, `product`, and statistical formulas use
+  floating-point arithmetic.
+- Descriptor duplication and closure (`N>&M`, `N<&M`, `N>&-`) are supported;
+  descriptor-moving forms such as `N>&M-` remain unsupported and return an error.
 - Arithmetic variables accept numeric strings and radix prefixes; recursively
   evaluating a variable's contents as another arithmetic expression is not
   implemented.

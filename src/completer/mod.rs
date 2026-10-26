@@ -20,9 +20,10 @@ pub use syntax::resolve_alias;
 use syntax::first_command;
 use syntax::{
     active_command_segment_start, alias_expanded_segment, assignment_value_start, command_words,
-    effective_command_index, extract_word_at, is_command_position, is_redirect_target,
-    open_quote_context, quote_aware_words, resolve_transparent_alias, split_command_segments,
-    unescape_shell_word, wrapper_value_kind, WrapperValueKind,
+    effective_command_index, escape_in_quote, extract_word_at, is_command_position,
+    is_redirect_target, leading_path_expansion, open_quote_context, quote_aware_words,
+    resolve_transparent_alias, split_command_segments, trailing_quote_context, unescape_shell_word,
+    wrapper_value_kind, WrapperValueKind,
 };
 use tables::{
     command_file_extensions, option_value_choices, COMMON_FLAGS, COMPOSE_FILE_NAMES,
@@ -31,6 +32,9 @@ use tables::{
 };
 
 const MAX_COMPLETION_ITEMS: usize = 4096;
+const MAX_PATH_SCAN_ENTRIES: usize = 65_536;
+const MAX_PATH_METADATA_ITEMS: usize = 64;
+const MAX_DIRECTORY_DESCRIPTION_ITEMS: usize = 256;
 const MAX_COMPLETION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_COMPLETION_PROJECT_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GIT_COMPLETION_BYTES: usize = 8 * 1024 * 1024;
@@ -501,16 +505,19 @@ fn apply_completion_spec(
             // prefix made every `-F` function see a one-word command line,
             // so anything that looked at `${COMP_WORDS[1]}` — which is most
             // of bash-completion — decided it was completing a command name.
-            let mut words: Vec<String> = line
-                .split_whitespace()
-                .map(|word| word.to_string())
-                .collect();
-            if line.ends_with(char::is_whitespace) || words.is_empty() {
+            let raw_words = quote_aware_words(line);
+            // A trailing space inside a quote or escaped word is still part
+            // of that word, not an empty next argument. Preserve raw quoting
+            // just as Bash's COMP_WORDS does.
+            let (_, current_start) = extract_word_at(line);
+            let mut words: Vec<String> =
+                raw_words.into_iter().map(|word| word.to_string()).collect();
+            if current_start == line.len() || words.is_empty() {
                 // The word being completed is the empty one after the space.
                 words.push(String::new());
             }
             let cword = words.len().saturating_sub(1);
-            state.arrays.insert("COMP_WORDS".to_string(), words.clone());
+            let saved_words = state.arrays.insert("COMP_WORDS".to_string(), words.clone());
             if let Some(scope) = state.local_vars_stack.last_mut() {
                 scope.insert("COMP_CWORD".to_string(), cword.to_string());
                 scope.insert("COMP_LINE".to_string(), line.to_string());
@@ -530,7 +537,32 @@ fn apply_completion_spec(
                     .cloned()
                     .unwrap_or_default(),
             ];
-            state.arrays.insert("COMPREPLY".to_string(), Vec::new());
+            let saved_replies = state.arrays.insert("COMPREPLY".to_string(), Vec::new());
+
+            // Completion is an editor query, not the user's next command.
+            // Give its callback a real function context (including `return`)
+            // without letting status or control flow leak back to the prompt.
+            let saved_exit_code = state.last_exit_code;
+            let saved_pipestatus = state.pipestatus.clone();
+            let saved_return = (
+                state.return_requested,
+                state.return_value,
+                state.return_depth,
+            );
+            let saved_loop = (state.loop_break, state.loop_continue, state.loop_depth);
+            let saved_abort = state.abort_current_program;
+            let saved_errexit = state.errexit_status.take();
+            let saved_failure_exempt = std::mem::replace(&mut state.last_failure_exempt, false);
+            let saved_expansion_error = state.expansion_error.take();
+            let saved_last_error = state.last_error.take();
+            let saved_sub_status = state.last_command_sub_status;
+            state.return_requested = false;
+            state.return_value = 0;
+            state.return_depth += 1;
+            state.loop_break = false;
+            state.loop_continue = false;
+            state.loop_depth = 0;
+            state.abort_current_program = false;
 
             // Execute the function
             crate::executor::execute_compound(&func_body, state);
@@ -553,8 +585,27 @@ fn apply_completion_spec(
             // Clean up - pop the local scope
             state.pop_local_scope();
             state.positional_params = state.positional_stack.pop().unwrap_or_default();
-            state.arrays.remove("COMP_WORDS");
-            state.arrays.remove("COMPREPLY");
+            for (name, saved) in [("COMP_WORDS", saved_words), ("COMPREPLY", saved_replies)] {
+                if let Some(saved) = saved {
+                    state.arrays.insert(name.to_string(), saved);
+                } else {
+                    state.arrays.remove(name);
+                }
+            }
+            state.last_exit_code = saved_exit_code;
+            state.pipestatus = saved_pipestatus;
+            (
+                state.return_requested,
+                state.return_value,
+                state.return_depth,
+            ) = saved_return;
+            (state.loop_break, state.loop_continue, state.loop_depth) = saved_loop;
+            state.abort_current_program = saved_abort;
+            state.errexit_status = saved_errexit;
+            state.last_failure_exempt = saved_failure_exempt;
+            state.expansion_error = saved_expansion_error;
+            state.last_error = saved_last_error;
+            state.last_command_sub_status = saved_sub_status;
         }
     }
 
@@ -783,15 +834,19 @@ fn requote_completions(completions: Vec<Completion>, word: &str) -> Vec<Completi
     completions
         .into_iter()
         .map(|mut completion| {
-            let raw = unescape_shell_word(&completion.text);
-            // A quote cannot appear inside itself; leave those escaped.
-            if !raw.contains(quote) {
-                completion.text = if completion.is_dir {
-                    format!("{quote}{raw}")
-                } else {
-                    format!("{quote}{raw}{quote}")
-                };
+            // Path completion already encoded the basename in the actual
+            // directory's quote context. Decoding it again would confuse
+            // literal filename data with the user's expandable prefix.
+            if completion.text.starts_with(quote) {
+                return completion;
             }
+            let raw = unescape_shell_word(&completion.text);
+            let escaped = escape_in_quote(&raw, quote);
+            completion.text = if completion.is_dir {
+                format!("{quote}{escaped}")
+            } else {
+                format!("{quote}{escaped}{quote}")
+            };
             completion
         })
         .collect()
@@ -4229,8 +4284,17 @@ fn path_metadata_desc(entry: &fs::DirEntry) -> Option<String> {
         return Some(format!("→ {}", target.display()));
     }
     if ft.is_dir() {
-        let count = fs::read_dir(entry.path()).ok()?.count();
-        return Some(format!("{} items", count));
+        // A menu hint must not enumerate a million-entry build directory
+        // before the user gets their prompt back.
+        let count = fs::read_dir(entry.path())
+            .ok()?
+            .take(MAX_DIRECTORY_DESCRIPTION_ITEMS + 1)
+            .count();
+        return Some(if count > MAX_DIRECTORY_DESCRIPTION_ITEMS {
+            format!("{MAX_DIRECTORY_DESCRIPTION_ITEMS}+ items")
+        } else {
+            format!("{count} items")
+        });
     }
     if ft.is_file() {
         let meta = entry.metadata().ok()?;
@@ -4255,19 +4319,25 @@ fn format_file_size(bytes: u64) -> String {
 
 fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
     let lookup_prefix = unescape_shell_word(prefix);
+    let expansion = leading_path_expansion(prefix);
 
     // `~alice<TAB>` names a person, not a path: there is nothing to scan
     // until the home directory it stands for is known.
     if let Some(user_prefix) = lookup_prefix
         .strip_prefix('~')
-        .filter(|rest| !rest.contains('/'))
+        .filter(|rest| expansion == Some('~') && !rest.contains('/'))
     {
         if !user_prefix.is_empty() {
             return complete_user_homes(user_prefix);
         }
     }
 
-    let Some(expanded) = expand_completion_prefix(&lookup_prefix, state) else {
+    let expanded = if expansion.is_some() {
+        expand_completion_prefix(&lookup_prefix, state)
+    } else {
+        Some(lookup_prefix)
+    };
+    let Some(expanded) = expanded else {
         return Vec::new();
     };
 
@@ -4286,6 +4356,9 @@ fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
         Some(pos) => &prefix[..=pos],
         None => "",
     };
+    let directory_quote = trailing_quote_context(typed_directory);
+    let quote = directory_quote.or_else(|| trailing_quote_context(prefix));
+    let folded_prefix = lowered(file_prefix);
 
     let mut completions = Vec::new();
     // Case-insensitive prefix matches, used only when nothing matches the
@@ -4293,29 +4366,59 @@ fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
     let mut case_fallback = Vec::new();
 
     if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten().take(MAX_COMPLETION_ITEMS) {
-            let name = entry.file_name().to_string_lossy().to_string();
+        for entry in entries.flatten().take(MAX_PATH_SCAN_ENTRIES) {
+            // Lossy conversion can turn one filename into a different,
+            // executable spelling. Only offer names the editor can preserve.
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
             let exact = name.starts_with(file_prefix);
-            if !exact && !name.to_lowercase().starts_with(&file_prefix.to_lowercase()) {
+            if !exact && !lowered(&name).starts_with(folded_prefix.as_ref()) {
                 continue;
             }
             if name.starts_with('.') && !file_prefix.starts_with('.') {
                 continue;
             }
 
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let target = if exact {
+                &mut completions
+            } else {
+                &mut case_fallback
+            };
+            if target.len() >= MAX_COMPLETION_ITEMS {
+                continue;
+            }
+            let is_dir = entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()));
             // Keep everything the user already typed exactly as they typed
             // it — their own quoting, a `~user`, a `$VAR` — and escape only
             // the name being appended. Re-escaping the typed part would turn
             // `$HOME/` into a literal `\$HOME/`.
-            let text = format!(
-                "{}{}{}",
-                typed_directory,
-                escape_shell_word(&name),
-                if is_dir { "/" } else { "" }
-            );
+            let mut text = typed_directory.to_string();
+            if let Some(quote) = quote {
+                if directory_quote.is_none() {
+                    text.push(quote);
+                }
+                text.push_str(&escape_in_quote(&name, quote));
+                text.push(if is_dir { '/' } else { quote });
+            } else {
+                // A generated leading tilde is a filename, not a request to
+                // expand a different user's home directory.
+                if typed_directory.is_empty() && name.starts_with('~') {
+                    text.push('\\');
+                }
+                text.push_str(&escape_shell_word(&name));
+                if is_dir {
+                    text.push('/');
+                }
+            }
 
-            let description = path_metadata_desc(&entry);
+            let description = if target.len() < MAX_PATH_METADATA_ITEMS {
+                path_metadata_desc(&entry)
+            } else {
+                None
+            };
 
             let completion = Completion {
                 text,
@@ -4332,10 +4435,9 @@ fn complete_path(prefix: &str, state: &ShellState) -> Vec<Completion> {
                 },
                 is_dir,
             };
-            if exact {
-                completions.push(completion);
-            } else {
-                case_fallback.push(completion);
+            target.push(completion);
+            if completions.len() >= MAX_COMPLETION_ITEMS {
+                break;
             }
         }
     }
@@ -6157,6 +6259,16 @@ mod tests {
             .expect("directory candidate");
         // The path continues, so the quote stays open for the next segment.
         assert_eq!(dir.text.matches('"').count(), 1);
+    }
+
+    #[test]
+    fn clobber_redirection_keeps_the_active_command_context() {
+        assert_eq!(active_command_segment("echo >| file"), "echo >| file");
+        assert_eq!(active_command_segment(r"echo \>| cat"), "cat");
+        assert_eq!(active_command_segment("echo '>'| cat"), "cat");
+        assert!(is_redirect_target("echo >| "));
+        assert!(!is_redirect_target(r"echo \>| "));
+        assert!(!is_redirect_target("echo '>| "));
     }
 
     #[test]

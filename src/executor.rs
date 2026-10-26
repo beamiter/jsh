@@ -8,10 +8,14 @@ use crate::signal;
 use nix::errno::Errno;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{close, execvp, fork, pipe, setpgid, tcsetpgrp, ForkResult, Pid};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{IsTerminal, Write};
-use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
+use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::rc::{Rc, Weak};
 
 fn shell_error(msg: &str) {
     eprintln!("{}", format_shell_error(msg, stderr_supports_color()));
@@ -153,6 +157,8 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
     // failure. Keep the flag set while unwinding nested compound lists, then
     // allow the next independently parsed program to run.
     state.abort_current_program = false;
+    state.errexit_status = None;
+    state.last_failure_exempt = false;
     if exit_requested() {
         let status = builtins::EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
         state.last_exit_code = status;
@@ -189,8 +195,17 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
             break;
         }
 
-        if last != 0 && !outcome.failure_exempt {
+        // A nested list already handled this failure and its ERR trap. Keep
+        // unwinding rather than running another iteration or firing it twice.
+        if let Some(status) = state.errexit_status {
+            last = status;
+            state.last_exit_code = last;
+            break;
+        }
+
+        if last != 0 && !outcome.failure_exempt && state.errexit_suppression_depth == 0 {
             fire_err_trap(state);
+            state.last_failure_exempt = outcome.failure_exempt;
         }
 
         if let Some(signal_status) = signal::take_pending_status() {
@@ -207,6 +222,7 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
             break;
         }
         if errexit_active(state) && last != 0 && !outcome.failure_exempt {
+            state.errexit_status = Some(last);
             break;
         }
     }
@@ -246,12 +262,15 @@ fn exit_requested() -> bool {
 }
 
 fn control_flow_requested(state: &ShellState) -> bool {
+    execution_unwind_requested(state) || state.loop_break || state.loop_continue
+}
+
+fn execution_unwind_requested(state: &ShellState) -> bool {
     exit_requested()
         || signal::pending_status().is_some()
         || state.abort_current_program
+        || state.errexit_status.is_some()
         || state.return_requested
-        || state.loop_break
-        || state.loop_continue
 }
 
 fn errexit_active(state: &ShellState) -> bool {
@@ -441,12 +460,14 @@ fn execute_complete_command_outcome(
 
     let outcome = execute_and_or(&cmd.list, state);
     state.last_exit_code = outcome.status;
+    state.last_failure_exempt = outcome.failure_exempt;
     outcome
 }
 
 fn execute_and_or(list: &AndOrList, state: &mut ShellState) -> CommandOutcome {
     let first_is_conditional = list.first.negated || !list.rest.is_empty();
     let mut code = execute_pipeline_in_context(&list.first, state, first_is_conditional);
+    let mut inherited_exemption = state.last_failure_exempt;
     // `$?` is observable while expanding the next pipeline in the same
     // AND-OR list, not only after the complete command finishes.
     state.last_exit_code = code;
@@ -464,6 +485,7 @@ fn execute_and_or(list: &AndOrList, state: &mut ShellState) -> CommandOutcome {
             let has_following_connector = index + 1 < list.rest.len();
             let conditional = pipeline.negated || has_following_connector;
             code = execute_pipeline_in_context(pipeline, state, conditional);
+            inherited_exemption = state.last_failure_exempt;
             state.last_exit_code = code;
             last_executed = index + 1;
         }
@@ -476,7 +498,9 @@ fn execute_and_or(list: &AndOrList, state: &mut ShellState) -> CommandOutcome {
     };
     CommandOutcome {
         status: code,
-        failure_exempt: final_pipeline.negated || last_executed < list.rest.len(),
+        failure_exempt: final_pipeline.negated
+            || last_executed < list.rest.len()
+            || inherited_exemption,
     }
 }
 
@@ -605,6 +629,7 @@ fn job_control_active(state: &ShellState) -> bool {
 }
 
 fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
+    state.last_failure_exempt = false;
     let cmds = &pipeline.commands;
 
     if cmds.len() == 1 {
@@ -786,6 +811,8 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
         "PIPESTATUS",
         pipestatus.iter().map(|c| c.to_string()).collect(),
     );
+    // A pipeline reports its aggregate status as a new command boundary.
+    state.last_failure_exempt = false;
 
     if pipeline.negated {
         if last_status == 0 {
@@ -800,7 +827,13 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
 
 fn execute_command(cmd: &Command, state: &mut ShellState) -> i32 {
     match cmd {
-        Command::Simple(simple) => execute_simple(simple, state),
+        Command::Simple(simple) => {
+            let code = execute_simple(simple, state);
+            // Function/eval/source return statuses are new command statuses;
+            // they do not inherit the body's final AND/OR exemption.
+            state.last_failure_exempt = false;
+            code
+        }
         Command::Compound(compound) => execute_compound(compound, state),
         Command::FunctionDef { name, body } => {
             state.functions.insert(name.clone(), *body.clone());
@@ -1296,14 +1329,27 @@ fn execute_simple_with_mode(
         // Bash gives an assignment-only command the status of the last command
         // substitution it ran: `out=$(false); echo $?` prints 1.
         state.last_command_sub_status = None;
+        // Bash applies these redirections even without a command. Assignment
+        // values still take effect after an ordinary I/O failure, but fatal
+        // expansion errors stop the program before any assignment.
+        let redirects = setup_redirects(&cmd.redirects, state);
+        if state.abort_current_program {
+            return 1;
+        }
         let mut traced = Vec::new();
         for assign in &cmd.assignments {
             traced.push(execute_assignment(assign, state));
+            if let Some(code) = report_expansion_error(state) {
+                return code;
+            }
         }
         if state.shell_opts.xtrace {
             eprintln!("{}{}", xtrace_prefix(state), traced.join(" "));
         }
-        return state.last_command_sub_status.take().unwrap_or(0);
+        return match redirects {
+            Ok(_guard) => state.last_command_sub_status.take().unwrap_or(0),
+            Err(code) => code,
+        };
     }
 
     // Phase 5b: nushell-style `let NAME = EXPR`.
@@ -1311,7 +1357,9 @@ fn execute_simple_with_mode(
     // separate, bare word (no quoting). We access raw WordParts here so a
     // closure literal `{|x|...}` reaches build_value_from_words intact.
     if is_typed_let(&cmd.words) {
-        return execute_typed_let(&cmd.words, state);
+        return with_redirects(&cmd.redirects, state, |state| {
+            execute_typed_let(&cmd.words, state)
+        });
     }
 
     // Expand words. A `[[ ]]` conditional keeps one operand per word: the
@@ -1325,7 +1373,7 @@ fn execute_simple_with_mode(
         return code;
     }
     if expanded.is_empty() {
-        return 0;
+        return with_redirects(&cmd.redirects, state, |_| 0);
     }
 
     let cmd_name = &expanded[0];
@@ -1340,7 +1388,10 @@ fn execute_simple_with_mode(
         // A function call carries its redirections and its assignment prefix
         // exactly like a builtin does: `f 2>/dev/null` must silence everything
         // the body writes, and `V=x f` must expose V for the call only.
-        let saved_fds = setup_redirects(&cmd.redirects, state);
+        let _redirects = match setup_redirects(&cmd.redirects, state) {
+            Ok(guard) => guard,
+            Err(code) => return code,
+        };
         let saved_vars: Vec<(String, Option<String>)> = cmd
             .assignments
             .iter()
@@ -1368,7 +1419,6 @@ fn execute_simple_with_mode(
                 None => state.unset_var(&name),
             }
         }
-        restore_fds(saved_fds);
 
         // Handle return statement in function
         let return_code = if state.return_requested {
@@ -1387,6 +1437,10 @@ fn execute_simple_with_mode(
     // via RuntimeSignature, coerce each arg to a Value (best effort), run the
     // captured closure, then print the resulting value.
     if state.user_typed_fns.contains_key(cmd_name) {
+        let _redirects = match setup_redirects(&cmd.redirects, state) {
+            Ok(guard) => guard,
+            Err(code) => return code,
+        };
         let sig = state.user_signatures.get(cmd_name).cloned();
         if let Some(s) = &sig {
             if let Err(msg) = s.validate_args(args) {
@@ -1438,27 +1492,43 @@ fn execute_simple_with_mode(
 
     // Check for builtin
     if builtins::is_builtin(cmd_name) {
-        let saved_fds = setup_redirects(&cmd.redirects, state);
-        let saved_vars: Vec<(String, Option<String>)> = cmd
+        let mut redirects = match setup_redirects(&cmd.redirects, state) {
+            Ok(guard) => guard,
+            Err(code) => return code,
+        };
+        let saved_vars: Vec<(String, Option<String>, Option<std::ffi::OsString>)> = cmd
             .assignments
             .iter()
             .map(|a| {
                 let old = state.get_var(&a.name).map(|s| s.to_string());
+                let old_environment = std::env::var_os(&a.name);
                 let val = expand_word_to_string(&a.value, state);
                 state.set_var(&a.name, &val);
-                (a.name.clone(), old)
+                // Prefix assignments belong to the invoked command's exported
+                // environment even when set_var resolves into a function local.
+                crate::environment::set_env_checked(&a.name, &val);
+                (a.name.clone(), old, old_environment)
             })
             .collect();
 
-        let code = builtins::run_builtin(cmd_name, args, state);
+        let code = match report_expansion_error(state) {
+            Some(code) => code,
+            None => builtins::run_builtin(cmd_name, args, state),
+        };
 
-        for (name, old) in saved_vars {
+        for (name, old, old_environment) in saved_vars.into_iter().rev() {
             match old {
                 Some(v) => state.set_var(&name, &v),
                 None => state.unset_var(&name),
             }
+            match old_environment {
+                Some(value) => std::env::set_var(&name, value),
+                None => std::env::remove_var(&name),
+            }
         }
-        restore_fds(saved_fds);
+        if commits_exec_redirects(cmd_name, args) && code == 0 {
+            redirects.commit();
+        }
         return code;
     }
 
@@ -1473,7 +1543,9 @@ fn execute_simple_with_mode(
 
     // External command - fork and exec
     if !fork_external {
-        apply_redirects_in_child(&cmd.redirects, state);
+        if let Err(code) = apply_redirects_in_child(&cmd.redirects, state) {
+            return code;
+        }
 
         for assign in &cmd.assignments {
             let val = expand_word_to_string(&assign.value, state);
@@ -1503,7 +1575,9 @@ fn execute_simple_with_mode(
             let pid = nix::unistd::getpid();
             setpgid(pid, pid).ok();
 
-            apply_redirects_in_child(&cmd.redirects, state);
+            if let Err(code) = apply_redirects_in_child(&cmd.redirects, state) {
+                child_exit(code);
+            }
 
             for assign in &cmd.assignments {
                 let val = expand_word_to_string(&assign.value, state);
@@ -1545,6 +1619,35 @@ fn execute_simple_with_mode(
             shell_error(&format!("fork failed: {}", e));
             1
         }
+    }
+}
+
+/// `command` preserves exec's special redirection behavior, whereas the
+/// ordinary `builtin` wrapper has its own temporary redirection scope.
+fn commits_exec_redirects<'a>(mut name: &'a str, mut args: &'a [String]) -> bool {
+    loop {
+        if name == "exec" {
+            return true;
+        }
+        if name != "command" {
+            return false;
+        }
+        while let Some(option) = args.first() {
+            match option.as_str() {
+                "-v" | "-V" => return false,
+                "-p" => args = &args[1..],
+                "--" => {
+                    args = &args[1..];
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let Some((next, rest)) = args.split_first() else {
+            return false;
+        };
+        name = next;
+        args = rest;
     }
 }
 
@@ -1603,13 +1706,15 @@ fn with_redirects<F>(redirects: &[Redirect], state: &mut ShellState, f: F) -> i3
 where
     F: FnOnce(&mut ShellState) -> i32,
 {
-    let saved = setup_redirects(redirects, state);
-    let result = f(state);
-    restore_fds(saved);
-    result
+    let _redirects = match setup_redirects(redirects, state) {
+        Ok(guard) => guard,
+        Err(code) => return code,
+    };
+    f(state)
 }
 
 pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
+    state.last_failure_exempt = false;
     match cmd {
         CompoundCommand::BraceGroup { body, redirects } => {
             with_redirects(redirects, state, |state| execute_command_list(body, state))
@@ -1620,7 +1725,9 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                 let pid = nix::unistd::getpid();
                 setpgid(pid, pid).ok();
                 state.loop_depth = 0;
-                apply_redirects_in_child(redirects, state);
+                if let Err(code) = apply_redirects_in_child(redirects, state) {
+                    child_exit(code);
+                }
                 let code = execute_command_list(body, state);
                 child_exit(code);
             }
@@ -1651,7 +1758,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
 
             for (condition, body) in conditions {
                 let cond_code = execute_condition(condition, state);
-                if state.abort_current_program {
+                if control_flow_requested(state) {
                     return cond_code;
                 }
                 if cond_code == 0 {
@@ -1664,6 +1771,8 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             if !matched {
                 if let Some(else_body) = else_branch {
                     code = execute_command_list(else_body, state);
+                } else {
+                    state.last_failure_exempt = false;
                 }
             }
             code
@@ -1689,7 +1798,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                     state.set_var(var, w);
                     code = execute_command_list(body, state);
 
-                    if exit_requested() || state.abort_current_program || state.return_requested {
+                    if execution_unwind_requested(state) {
                         break;
                     }
 
@@ -1725,7 +1834,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                 }
 
                 let mut code = 0;
-                let _ = code;
+                let mut failure_exempt = false;
                 state.loop_depth += 1;
                 loop {
                     // Check condition
@@ -1737,6 +1846,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                         if let Some(error) = state.expansion_error.take() {
                             eprintln!("jsh: ((: {error}");
                             code = 1;
+                            failure_exempt = false;
                             break;
                         }
                         cond_str.parse::<i64>().unwrap_or(0) != 0
@@ -1748,8 +1858,9 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
 
                     // Execute body
                     code = execute_command_list(body, state);
+                    failure_exempt = state.last_failure_exempt;
 
-                    if exit_requested() || state.abort_current_program || state.return_requested {
+                    if execution_unwind_requested(state) {
                         break;
                     }
 
@@ -1769,12 +1880,13 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                         if let Some(error) = state.expansion_error.take() {
                             eprintln!("jsh: ((: {error}");
                             code = 1;
+                            failure_exempt = false;
                             break;
                         }
                     }
                 }
                 state.loop_depth -= 1;
-
+                state.last_failure_exempt = failure_exempt;
                 code
             })
         }
@@ -1784,18 +1896,31 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             redirects,
         } => with_redirects(redirects, state, |state| {
             let mut code = 0;
+            let mut failure_exempt = false;
             state.loop_depth += 1;
             loop {
                 let cond = execute_condition(condition, state);
-                if state.abort_current_program {
+                if execution_unwind_requested(state) {
                     code = cond;
                     break;
                 }
-                if cond != 0 {
+                if state.loop_break {
+                    state.loop_break = false;
+                    code = cond;
+                    failure_exempt = false;
                     break;
                 }
+                if cond != 0 {
+                    state.loop_continue = false;
+                    break;
+                }
+                if state.loop_continue {
+                    state.loop_continue = false;
+                    continue;
+                }
                 code = execute_command_list(body, state);
-                if exit_requested() || state.abort_current_program || state.return_requested {
+                failure_exempt = state.last_failure_exempt;
+                if execution_unwind_requested(state) {
                     break;
                 }
                 if state.loop_break {
@@ -1807,6 +1932,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                 }
             }
             state.loop_depth -= 1;
+            state.last_failure_exempt = failure_exempt;
             code
         }),
         CompoundCommand::Until {
@@ -1815,18 +1941,31 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             redirects,
         } => with_redirects(redirects, state, |state| {
             let mut code = 0;
+            let mut failure_exempt = false;
             state.loop_depth += 1;
             loop {
                 let cond = execute_condition(condition, state);
-                if state.abort_current_program {
+                if execution_unwind_requested(state) {
                     code = cond;
                     break;
                 }
-                if cond == 0 {
+                if state.loop_break {
+                    state.loop_break = false;
+                    code = cond;
+                    failure_exempt = false;
                     break;
                 }
+                if cond == 0 {
+                    state.loop_continue = false;
+                    break;
+                }
+                if state.loop_continue {
+                    state.loop_continue = false;
+                    continue;
+                }
                 code = execute_command_list(body, state);
-                if exit_requested() || state.abort_current_program || state.return_requested {
+                failure_exempt = state.last_failure_exempt;
+                if execution_unwind_requested(state) {
                     break;
                 }
                 if state.loop_break {
@@ -1838,6 +1977,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                 }
             }
             state.loop_depth -= 1;
+            state.last_failure_exempt = failure_exempt;
             code
         }),
         CompoundCommand::Case {
@@ -1861,8 +2001,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                         });
                     if hit {
                         last = execute_command_list(&arm.body, state);
-                        if exit_requested() || state.abort_current_program || state.return_requested
-                        {
+                        if control_flow_requested(state) {
                             return last;
                         }
                         match arm.terminator {
@@ -1934,10 +2073,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                                     state.set_var(var, selected);
                                     let code = execute_command_list(body, state);
 
-                                    if exit_requested()
-                                        || state.abort_current_program
-                                        || state.return_requested
-                                    {
+                                    if execution_unwind_requested(state) {
                                         break code;
                                     }
 
@@ -2079,7 +2215,19 @@ fn execute_command_list(cmds: &[CompleteCommand], state: &mut ShellState) -> i32
             return code;
         }
         if errexit_active(state) && code != 0 && !outcome.failure_exempt {
-            return code;
+            fire_err_trap(state);
+            state.last_failure_exempt = outcome.failure_exempt;
+            if control_flow_requested(state) {
+                return code;
+            }
+            // An ERR trap may intentionally disable errexit before returning.
+            if errexit_active(state) {
+                state.errexit_status = Some(code);
+                return code;
+            }
+            // The trap handled the failure and explicitly disabled errexit.
+            // A surrounding direct compound must not report it a second time.
+            state.last_failure_exempt = true;
         }
     }
     code
@@ -2108,10 +2256,144 @@ fn is_conditional_command(words: &[Word]) -> bool {
 
 struct SavedFd {
     original_fd: RawFd,
-    saved_fd: OwnedFd,
+    // None records an originally closed descriptor, which must be closed again.
+    saved_fd: Option<OwnedFd>,
+    original_flags: i32,
 }
 
-/// Helper to call dup2 with raw file descriptors
+#[derive(Default)]
+struct RedirectGuard {
+    saved: Vec<Rc<RefCell<SavedFd>>>,
+}
+
+thread_local! {
+    // Shell execution is single-threaded; forks inherit the currently active
+    // frames. Weak slots let nested functions move any ancestor's backup
+    // before a user redirect closes, replaces, or references that fd number.
+    static REDIRECT_BACKUPS: RefCell<Vec<Weak<RefCell<SavedFd>>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn protected_fd_reservations(reserved: &HashSet<RawFd>) -> HashSet<RawFd> {
+    let mut all = reserved.clone();
+    REDIRECT_BACKUPS.with(|registry| {
+        registry.borrow_mut().retain(|entry| {
+            if let Some(saved) = entry.upgrade() {
+                all.insert(saved.borrow().original_fd);
+                true
+            } else {
+                false
+            }
+        });
+    });
+    all
+}
+
+fn reserve_user_fd(fd: RawFd, reserved: &HashSet<RawFd>) -> io::Result<()> {
+    let mut all = protected_fd_reservations(reserved);
+    all.insert(fd);
+    REDIRECT_BACKUPS.with(|registry| {
+        for entry in registry.borrow().iter() {
+            if let Some(slot) = entry.upgrade() {
+                let mut saved = slot.borrow_mut();
+                if saved
+                    .saved_fd
+                    .as_ref()
+                    .is_some_and(|backup| backup.as_raw_fd() == fd)
+                {
+                    saved.saved_fd = Some(duplicate_private_fd(fd, &all)?);
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+impl RedirectGuard {
+    fn save(&mut self, fd: RawFd, reserved: &HashSet<RawFd>) -> io::Result<()> {
+        if fd < 0 {
+            return Err(io::Error::from_raw_os_error(nix::libc::EBADF));
+        }
+        if self
+            .saved
+            .iter()
+            .any(|saved| saved.borrow().original_fd == fd)
+        {
+            return Ok(());
+        }
+        let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+        let backup = if flags < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(nix::libc::EBADF) {
+                return Err(error);
+            }
+            None
+        } else {
+            Some(duplicate_private_fd(
+                fd,
+                &protected_fd_reservations(reserved),
+            )?)
+        };
+        let slot = Rc::new(RefCell::new(SavedFd {
+            original_fd: fd,
+            saved_fd: backup,
+            original_flags: flags.max(0),
+        }));
+        REDIRECT_BACKUPS.with(|registry| registry.borrow_mut().push(Rc::downgrade(&slot)));
+        self.saved.push(slot);
+        Ok(())
+    }
+
+    /// `exec` without a program makes its successful redirections permanent.
+    fn commit(&mut self) {
+        self.saved.clear();
+    }
+}
+
+impl Drop for RedirectGuard {
+    fn drop(&mut self) {
+        if !self.saved.is_empty() {
+            // Rust stdout is buffered even when its underlying descriptor is
+            // redirected. Drain it while the command's destination is active.
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
+        }
+        for slot in self.saved.drain(..).rev() {
+            let mut saved = slot.borrow_mut();
+            if let Some(backup) = saved.saved_fd.take() {
+                if dup2_raw(backup.as_raw_fd(), saved.original_fd).is_ok() {
+                    unsafe {
+                        nix::libc::fcntl(
+                            saved.original_fd,
+                            nix::libc::F_SETFD,
+                            saved.original_flags,
+                        );
+                    }
+                }
+            } else {
+                let _ = close(saved.original_fd);
+            }
+        }
+    }
+}
+
+fn duplicate_private_fd(fd: RawFd, reserved: &HashSet<RawFd>) -> io::Result<OwnedFd> {
+    let mut minimum = 10;
+    loop {
+        let raw = unsafe { nix::libc::fcntl(fd, nix::libc::F_DUPFD_CLOEXEC, minimum) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        if !reserved.contains(&raw) {
+            return Ok(owned);
+        }
+        minimum = raw
+            .checked_add(1)
+            .ok_or_else(|| io::Error::from_raw_os_error(nix::libc::EMFILE))?;
+    }
+}
+
+/// Helper to call dup2 with raw file descriptors.
 fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> nix::Result<()> {
     unsafe {
         match nix::libc::dup2(oldfd, newfd) {
@@ -2121,108 +2403,149 @@ fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> nix::Result<()> {
     }
 }
 
-/// Materialize here-doc / here-string content into a temp file and return a read
-/// fd positioned at the start. Avoids the pipe-buffer deadlock for large content.
-fn heredoc_fd(data: &str) -> Option<RawFd> {
+/// Materialize here-doc / here-string content into a private, immediately
+/// unlinked file. A pipe would deadlock before execution for a large body.
+fn heredoc_file(data: &str) -> io::Result<File> {
     use std::io::{Seek, SeekFrom};
-    let mut dir = std::env::temp_dir();
-    let pid = std::process::id();
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_HEREDOC: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    dir.push(format!("jsh-heredoc-{}-{}", pid, nanos));
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..128 {
+        let serial = NEXT_HEREDOC.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "jsh-heredoc-{}-{nanos}-{serial}",
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        // Fail before writing sensitive here-doc bytes if unlinking failed.
+        std::fs::remove_file(&path)?;
+        file.write_all(data.as_bytes())?;
+        file.seek(SeekFrom::Start(0))?;
+        return Ok(file);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "cannot allocate here-document",
+    ))
+}
 
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&dir)
-        .ok()?;
-    // Unlink immediately; the open fd keeps the file alive until closed.
-    std::fs::remove_file(&dir).ok();
-    file.write_all(data.as_bytes()).ok()?;
-    file.seek(SeekFrom::Start(0)).ok()?;
-    Some(file.into_raw_fd())
+fn open_output(path: &str, noclobber: bool) -> io::Result<File> {
+    if !noclobber {
+        return File::create(path);
+    }
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // Open without O_TRUNC/O_CREAT, then check the actual opened inode.
+            // Existing devices/FIFOs (including /dev/null) remain usable, while
+            // a symlink or racing rename cannot make us truncate a regular file.
+            let file = OpenOptions::new().write(true).open(path)?;
+            if file.metadata()?.is_file() {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "cannot overwrite existing file",
+                ))
+            } else {
+                Ok(file)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn redirect_file(file: File, targets: &[RawFd]) -> io::Result<()> {
+    let source = file.as_raw_fd();
+    for &fd in targets {
+        dup2_raw(source, fd).map_err(io::Error::from)?;
+        if source == fd {
+            // File::open uses CLOEXEC. dup2(fd, fd) leaves that flag intact,
+            // so reopening a closed stdio fd would otherwise disappear at exec.
+            if unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    if targets.contains(&source) {
+        // This descriptor is now a user redirection, not an owned temporary.
+        let _ = file.into_raw_fd();
+    }
+    Ok(())
+}
+
+fn duplicate_target(data: &str) -> io::Result<Option<RawFd>> {
+    if data == "-" {
+        return Ok(None);
+    }
+    if data.is_empty() || !data.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bad file descriptor",
+        ));
+    }
+    let fd = data
+        .parse::<RawFd>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad file descriptor"))?;
+    Ok(Some(fd))
 }
 
 fn apply_one_redirect(
     kind: &RedirectKind,
     fd: RawFd,
     data: &str,
-    _here_doc_opts: &Option<HereDocOptions>,
-) {
+    noclobber: bool,
+) -> io::Result<()> {
     match kind {
-        RedirectKind::Output => {
-            if let Ok(file) = File::create(data) {
-                let src = file.into_raw_fd();
-                dup2_raw(src, fd).ok();
-                if src != fd {
-                    close(src).ok();
-                }
-            }
-        }
-        RedirectKind::Append => {
-            if let Ok(file) = OpenOptions::new().create(true).append(true).open(data) {
-                let src = file.into_raw_fd();
-                dup2_raw(src, fd).ok();
-                if src != fd {
-                    close(src).ok();
-                }
-            }
-        }
-        RedirectKind::Input => {
-            if let Ok(file) = File::open(data) {
-                let src = file.into_raw_fd();
-                dup2_raw(src, fd).ok();
-                if src != fd {
-                    close(src).ok();
-                }
-            }
-        }
+        RedirectKind::Output | RedirectKind::Clobber => redirect_file(
+            open_output(data, noclobber && *kind != RedirectKind::Clobber)?,
+            &[fd],
+        ),
+        RedirectKind::Append => redirect_file(
+            OpenOptions::new().create(true).append(true).open(data)?,
+            &[fd],
+        ),
+        RedirectKind::Input => redirect_file(File::open(data)?, &[fd]),
         RedirectKind::HereString | RedirectKind::HereDoc => {
-            // Use a temp file rather than a pipe: a blocking write into a pipe with
-            // no reader deadlocks once the content exceeds the pipe buffer (~64KB).
-            if let Some(src) = heredoc_fd(data) {
-                dup2_raw(src, fd).ok();
-                close(src).ok();
-            }
+            redirect_file(heredoc_file(data)?, &[fd])
         }
         RedirectKind::DupOutput | RedirectKind::DupInput => {
-            if data == "-" {
-                close(fd).ok();
-            } else if let Ok(target_fd) = data.parse::<RawFd>() {
-                dup2_raw(target_fd, fd).ok();
-            }
-        }
-        RedirectKind::OutputAll => {
-            // &> redirects both stdout (1) and stderr (2) to the file
-            if let Ok(file) = File::create(data) {
-                let src = file.into_raw_fd();
-                dup2_raw(src, 1).ok(); // stdout
-                dup2_raw(src, 2).ok(); // stderr
-                if src != 1 && src != 2 {
-                    close(src).ok();
+            match duplicate_target(data)? {
+                None => {
+                    if let Err(error) = close(fd) {
+                        // Closing an already closed descriptor is legal.
+                        if error != Errno::EBADF {
+                            return Err(error.into());
+                        }
+                    }
                 }
+                Some(source) => dup2_raw(source, fd).map_err(io::Error::from)?,
             }
+            Ok(())
         }
-        RedirectKind::AppendAll => {
-            // &>> appends both stdout (1) and stderr (2) to the file
-            if let Ok(file) = OpenOptions::new().create(true).append(true).open(data) {
-                let src = file.into_raw_fd();
-                dup2_raw(src, 1).ok(); // stdout
-                dup2_raw(src, 2).ok(); // stderr
-                if src != 1 && src != 2 {
-                    close(src).ok();
-                }
-            }
-        }
+        RedirectKind::OutputAll => redirect_file(open_output(data, noclobber)?, &[1, 2]),
+        RedirectKind::AppendAll => redirect_file(
+            OpenOptions::new().create(true).append(true).open(data)?,
+            &[1, 2],
+        ),
     }
 }
 
 fn redirect_fd(redir: &Redirect) -> RawFd {
     match redir.kind {
         RedirectKind::Output
+        | RedirectKind::Clobber
         | RedirectKind::Append
         | RedirectKind::DupOutput
         | RedirectKind::OutputAll
@@ -2234,88 +2557,120 @@ fn redirect_fd(redir: &Redirect) -> RawFd {
     }
 }
 
-fn setup_redirects(redirects: &[Redirect], state: &mut ShellState) -> Vec<SavedFd> {
-    let mut saved = Vec::new();
-    for redir in redirects {
-        let data = if let Some(here_doc_opts) = &redir.here_doc {
-            if here_doc_opts.expand_vars {
-                expand_word_to_string(
-                    &crate::parser::parse_word_parts(&here_doc_opts.content),
-                    state,
-                )
-            } else {
-                here_doc_opts.content.clone()
-            }
-        } else {
-            expand_word_to_string(&redir.target, state)
-        };
+fn redirect_targets(redir: &Redirect) -> Vec<RawFd> {
+    if matches!(
+        redir.kind,
+        RedirectKind::OutputAll | RedirectKind::AppendAll
+    ) {
+        vec![1, 2]
+    } else {
+        vec![redirect_fd(redir)]
+    }
+}
 
-        // For OutputAll and AppendAll, we need to save both stdout and stderr
-        match redir.kind {
-            RedirectKind::OutputAll | RedirectKind::AppendAll => {
-                // Save both fd 1 (stdout) and fd 2 (stderr)
-                unsafe {
-                    if let Ok(sfd1) = nix::unistd::dup(BorrowedFd::borrow_raw(1)) {
-                        saved.push(SavedFd {
-                            original_fd: 1,
-                            saved_fd: sfd1,
-                        });
-                    }
-                    if let Ok(sfd2) = nix::unistd::dup(BorrowedFd::borrow_raw(2)) {
-                        saved.push(SavedFd {
-                            original_fd: 2,
-                            saved_fd: sfd2,
-                        });
-                    }
-                }
-                apply_one_redirect(&redir.kind, 1, &data, &redir.here_doc);
-            }
-            _ => {
-                let fd = redirect_fd(redir);
-                // Safe because fd is a valid file descriptor at this point
-                unsafe {
-                    if let Ok(sfd) = nix::unistd::dup(BorrowedFd::borrow_raw(fd)) {
-                        saved.push(SavedFd {
-                            original_fd: fd,
-                            saved_fd: sfd,
-                        });
-                    }
-                }
-                apply_one_redirect(&redir.kind, fd, &data, &redir.here_doc);
-            }
+fn redirect_error(data: &str, error: io::Error, state: &mut ShellState) -> i32 {
+    let message = format!("{data}: {error}");
+    // Respect earlier stderr redirects without panicking when stderr is closed.
+    let _ = writeln!(std::io::stderr(), "jsh: {message}");
+    state.set_error(message, 1);
+    1
+}
+
+fn expand_redirect(redir: &Redirect, state: &mut ShellState) -> Result<String, i32> {
+    if state.shell_opts.nounset {
+        if let Some(param) = nounset_violation(std::slice::from_ref(&redir.target), state) {
+            return Err(report_nounset(state, &param));
         }
     }
-    saved
-}
-
-fn restore_fds(saved: Vec<SavedFd>) {
-    for s in saved.into_iter().rev() {
-        dup2_raw(s.saved_fd.as_raw_fd(), s.original_fd).ok();
-        // OwnedFd will be dropped here and close the fd
-    }
-}
-
-fn apply_redirects_in_child(redirects: &[Redirect], state: &mut ShellState) {
-    for redir in redirects {
-        let fd = redirect_fd(redir);
-
-        // Use here-doc content if available, otherwise expand target
-        let data = if let Some(here_doc_opts) = &redir.here_doc {
-            // Optionally expand variables if requested
-            if here_doc_opts.expand_vars {
-                expand_word_to_string(
-                    &crate::parser::parse_word_parts(&here_doc_opts.content),
-                    state,
-                )
-            } else {
-                here_doc_opts.content.clone()
-            }
+    let data = if redir.kind == RedirectKind::HereString {
+        // No field splitting or pathname expansion; exactly one appended LF.
+        format!("{}\n", expand_word_to_string(&redir.target, state))
+    } else if let Some(options) = &redir.here_doc {
+        if options.expand_vars {
+            expand_word_to_string(&crate::parser::parse_word_parts(&options.content), state)
         } else {
-            expand_word_to_string(&redir.target, state)
-        };
-
-        apply_one_redirect(&redir.kind, fd, &data, &redir.here_doc);
+            options.content.clone()
+        }
+    } else {
+        let targets = expand_word(&redir.target, state);
+        if let Some(code) = report_expansion_error(state) {
+            return Err(code);
+        }
+        if targets.len() != 1 {
+            return Err(redirect_error(
+                "redirection",
+                io::Error::new(io::ErrorKind::InvalidInput, "ambiguous redirect"),
+                state,
+            ));
+        }
+        targets.into_iter().next().unwrap()
+    };
+    if let Some(code) = report_expansion_error(state) {
+        return Err(code);
     }
+    Ok(data)
+}
+
+fn setup_redirects(redirects: &[Redirect], state: &mut ShellState) -> Result<RedirectGuard, i32> {
+    let mut guard = RedirectGuard::default();
+    let mut reserved: HashSet<RawFd> = redirects.iter().flat_map(redirect_targets).collect();
+    if !redirects.is_empty() {
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+    }
+    for redir in redirects {
+        let data = expand_redirect(redir, state)?;
+        let result = (|| -> io::Result<()> {
+            if matches!(redir.kind, RedirectKind::DupOutput | RedirectKind::DupInput) {
+                if let Some(source) = duplicate_target(&data)? {
+                    reserved.insert(source);
+                    reserve_user_fd(source, &reserved)?;
+                }
+            }
+            for fd in redirect_targets(redir) {
+                reserve_user_fd(fd, &reserved)?;
+                guard.save(fd, &reserved)?;
+            }
+            apply_one_redirect(
+                &redir.kind,
+                redirect_fd(redir),
+                &data,
+                state.shell_opts.noclobber,
+            )
+        })();
+        if let Err(error) = result {
+            return Err(redirect_error(&data, error, state));
+        }
+    }
+    Ok(guard)
+}
+
+fn apply_redirects_in_child(redirects: &[Redirect], state: &mut ShellState) -> Result<(), i32> {
+    let mut reserved: HashSet<RawFd> = redirects.iter().flat_map(redirect_targets).collect();
+    for redir in redirects {
+        let data = expand_redirect(redir, state)?;
+        let result = (|| -> io::Result<()> {
+            if matches!(redir.kind, RedirectKind::DupOutput | RedirectKind::DupInput) {
+                if let Some(source) = duplicate_target(&data)? {
+                    reserved.insert(source);
+                    reserve_user_fd(source, &reserved)?;
+                }
+            }
+            for fd in redirect_targets(redir) {
+                reserve_user_fd(fd, &reserved)?;
+            }
+            apply_one_redirect(
+                &redir.kind,
+                redirect_fd(redir),
+                &data,
+                state.shell_opts.noclobber,
+            )
+        })();
+        if let Err(error) = result {
+            return Err(redirect_error(&data, error, state));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

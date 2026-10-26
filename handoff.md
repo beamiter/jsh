@@ -1,5 +1,29 @@
 # Engineering handoff
 
+## 2026-10-26 — execution, completion, persistence, and streaming
+
+Based on `1f0d5dab6501448870c9a884b3d2d4f7de10138d`. The current validation and
+behavior notes are in [the upgrade report](docs/UPGRADE_2026-10-26.md); older
+entries below are historical and do not describe current dependency pins or
+validation status.
+
+- Redirection errors stop execution; nested descriptor scopes restore correctly;
+  noclobber and `>|` work; here-doc bytes are preserved. Real process-replacing
+  `exec` handles option/environment/signal semantics and persistent redirects.
+- Nested compounds unwind on unhandled errexit. Eval/source and loop-condition
+  control flow retain their proper exit/return/break/continue behavior.
+- Completion preserves quoted paths and caller state with bounded metadata work.
+  Bookmark/frecency changes use locked read-modify-write transactions.
+- Field filters/chunks/windows stay lazy, deciding consumers short-circuit,
+  large integers retain their precision, and mixed sorting is transitive/stable.
+- 87 added tests. All-feature suite: 1,381 passed, 0 failed, 7 ignored. Core-only
+  suite: 1,280 passed, 0 failed, 3 ignored. Strict Clippy in both configurations,
+  formatting, docs, Release build, 78 benchmark smoke cases, and PTY checks pass.
+- Dependency pins and Cargo.lock are unchanged. Known Bash, malformed-NDJSON,
+  eager-closure, old-writer, and completion boundaries are documented explicitly.
+
+## Historical entries
+
 Updated: 2026-09-30 (refresh pending jagent tip hashes through sticky FF1A/1805/MAX-12 final align)
 
 ## 2026-09-30 (pending jagent tip refresh — sticky FF1A/1805/MAX-12 final align)

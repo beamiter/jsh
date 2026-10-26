@@ -189,6 +189,14 @@ pub(super) fn skip_wrapper_options(
 /// `>&`/`<&`, whose operand is a file descriptor.
 pub(super) fn is_redirect_target(before: &str) -> bool {
     let before = before.trim_end_matches([' ', '\t']);
+    // `>|` is one output-redirection operator. Let the quote-aware scan
+    // inspect its `>` just like ordinary output redirection; a quoted or
+    // escaped spelling still fails the scan below.
+    let before = if before.ends_with(">|") {
+        &before[..before.len() - 1]
+    } else {
+        before
+    };
     if before.ends_with('&') {
         return false;
     }
@@ -280,8 +288,11 @@ pub(super) fn active_command_segment_start(buf: &str) -> usize {
     let mut starts = vec![0usize];
     let mut quote = None;
     let mut escaped = false;
+    let mut output_redirect = false;
     let chars: Vec<(usize, char)> = buf.char_indices().collect();
     for (position, (index, ch)) in chars.iter().copied().enumerate() {
+        let follows_output_redirect = output_redirect;
+        output_redirect = false;
         if escaped {
             escaped = false;
             continue;
@@ -309,6 +320,8 @@ pub(super) fn active_command_segment_start(buf: &str) -> usize {
                 '`' => {
                     *starts.last_mut().unwrap() = index + ch.len_utf8();
                 }
+                '>' => output_redirect = true,
+                '|' if follows_output_redirect => {}
                 ';' | '\n' | '|' => {
                     *starts.last_mut().unwrap() = index + ch.len_utf8();
                 }
@@ -423,7 +436,7 @@ pub(super) fn extract_word_at(buf: &str) -> (String, usize) {
 pub(super) fn is_command_position(buf: &str, word_start: usize) -> bool {
     let before = buf[..word_start].trim_end_matches([' ', '\t']);
     if before.is_empty()
-        || before.ends_with('|')
+        || (before.ends_with('|') && !is_redirect_target(before))
         || before.ends_with("&&")
         || before.ends_with("||")
         || before.ends_with(';')
@@ -456,8 +469,17 @@ pub(super) fn unescape_shell_word(word: &str) -> String {
             Some('"') => match ch {
                 '"' => quote = None,
                 '\\' => {
-                    if let Some(next) = chars.next() {
-                        result.push(next);
+                    // Double quotes only consume escapes for these shell
+                    // syntax characters. A path such as "my\dir" still
+                    // contains the backslash before `d`.
+                    match chars.peek().copied() {
+                        Some('$' | '`' | '"' | '\\') => {
+                            result.push(chars.next().unwrap());
+                        }
+                        Some('\n') => {
+                            chars.next();
+                        }
+                        _ => result.push('\\'),
                     }
                 }
                 _ => result.push(ch),
@@ -471,6 +493,73 @@ pub(super) fn unescape_shell_word(word: &str) -> String {
                 }
                 _ => result.push(ch),
             },
+        }
+    }
+    result
+}
+
+/// Quoting at the end of a partially typed word. This also handles quotes
+/// opened partway through a path, such as `src/"release notes`.
+pub(super) fn trailing_quote_context(word: &str) -> Option<char> {
+    let mut quote = None;
+    let mut chars = word.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' if matches!(chars.peek(), Some('$' | '`' | '"' | '\\' | '\n')) => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            _ => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => {
+                    chars.next();
+                }
+                _ => {}
+            },
+        }
+    }
+    quote
+}
+
+/// Whether the first decoded character is an active path expansion. Quote
+/// removal alone cannot answer this: `'~user'` and `\$HOME` are literal
+/// names, while `"$HOME"` still expands its variable.
+pub(super) fn leading_path_expansion(word: &str) -> Option<char> {
+    let mut quote = None;
+    for (index, ch) in word.char_indices() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None | Some('"'), '$') => return Some('$'),
+            (None, '~') if index == 0 => return Some('~'),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Escape newly discovered filename data for the quoting context in which
+/// it will be inserted. Existing user-typed directory syntax is kept apart
+/// so a deliberate `$HOME/` remains expandable while a `$` in the basename
+/// never becomes shell syntax.
+pub(super) fn escape_in_quote(word: &str, quote: char) -> String {
+    let mut result = String::with_capacity(word.len());
+    for ch in word.chars() {
+        if quote == '\'' && ch == '\'' {
+            result.push_str("'\\''");
+        } else {
+            if quote == '"' && matches!(ch, '$' | '`' | '"' | '\\') {
+                result.push('\\');
+            }
+            result.push(ch);
         }
     }
     result
@@ -554,7 +643,10 @@ pub(super) fn quote_aware_words(segment: &str) -> Vec<&str> {
                 _ => {}
             },
             _ => match ch {
-                '\\' => escaped = true,
+                '\\' => {
+                    start.get_or_insert(index);
+                    escaped = true;
+                }
                 '\'' | '"' => {
                     quote = Some(ch);
                     start.get_or_insert(index);

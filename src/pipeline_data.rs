@@ -135,39 +135,43 @@ impl PipelineData {
     /// Streams print each value on its own line as they arrive so a long
     /// pipeline doesn't have to buffer everything before any output.
     pub fn write_to_stdout(self) -> io::Result<()> {
+        use std::os::fd::FromRawFd;
+        if matches!(&self, PipelineData::Empty)
+            || matches!(&self, PipelineData::Values(values) if values.is_empty())
+        {
+            return Ok(());
+        }
+        io::stdout().flush()?;
+        // Bind the buffer to this exact destination. The process-wide stdout
+        // buffer retains bytes after a failed flush (e.g. /dev/full); restoring
+        // fd 1 would otherwise leak those bytes into the next command's output.
+        let descriptor = unsafe { nix::libc::fcntl(1, nix::libc::F_DUPFD_CLOEXEC, 3) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let mut output = io::LineWriter::new(file);
         match self {
-            PipelineData::Empty => Ok(()),
-            PipelineData::Bytes(b) => {
-                let stdout = io::stdout();
-                let mut h = stdout.lock();
-                h.write_all(&b)
-            }
-            PipelineData::Values(vs) => {
-                if vs.is_empty() {
-                    return Ok(());
-                }
-                let stdout = io::stdout();
-                let mut h = stdout.lock();
-                if vs.len() == 1 {
-                    write!(h, "{}", vs[0])
-                } else if vs.iter().all(|v| v.is_record()) {
-                    write!(h, "{}", crate::value::render_table(&vs))
+            PipelineData::Empty => {}
+            PipelineData::Bytes(bytes) => output.write_all(&bytes)?,
+            PipelineData::Values(values) => {
+                if values.len() == 1 {
+                    write!(output, "{}", values[0])?;
+                } else if values.iter().all(|value| value.is_record()) {
+                    write!(output, "{}", crate::value::render_table(&values))?;
                 } else {
-                    for v in &vs {
-                        writeln!(h, "{}", v.to_display_string())?;
+                    for value in values {
+                        writeln!(output, "{}", value.to_display_string())?;
                     }
-                    Ok(())
                 }
             }
-            PipelineData::Stream(it) => {
-                let stdout = io::stdout();
-                let mut h = stdout.lock();
-                for v in it {
-                    writeln!(h, "{}", v.to_display_string())?;
+            PipelineData::Stream(values) => {
+                for value in values {
+                    writeln!(output, "{}", value.to_display_string())?;
                 }
-                Ok(())
             }
         }
+        output.flush()
     }
 }
 

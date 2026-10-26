@@ -147,6 +147,7 @@ pub fn highlight(buffer: &str, state: &mut ShellState) -> Vec<StyledSpan> {
                 }
             }
             Token::RedirectOut
+            | Token::RedirectClobber
             | Token::RedirectAppend
             | Token::RedirectIn
             | Token::HereDoc

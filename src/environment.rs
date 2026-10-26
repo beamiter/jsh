@@ -205,7 +205,7 @@ fn env_name_ok(name: &str) -> bool {
     !name.is_empty() && !name.contains('=') && !name.contains('\0')
 }
 
-fn set_env_checked(name: &str, value: &str) {
+pub(crate) fn set_env_checked(name: &str, value: &str) {
     if env_name_ok(name) && !value.contains('\0') {
         env::set_var(name, value);
     }
@@ -278,6 +278,12 @@ pub struct ShellState {
     /// Nesting depth for contexts where Bash ignores `errexit` (the tested
     /// operands of `&&`, `||`, `!`, and shell-condition command lists).
     pub errexit_suppression_depth: usize,
+    /// A non-exempt failure has requested unwinding the current program. This
+    /// survives nested loops/functions until the next independently run program.
+    pub errexit_status: Option<i32>,
+    /// The last directly executed compound inherited its status from an
+    /// exempt AND/OR/negation context. Simple command boundaries clear this.
+    pub last_failure_exempt: bool,
     // PIDs of process-substitution children awaiting non-blocking reaping.
     pub procsub_pids: Vec<i32>,
     pub jobs: JobTable,
@@ -410,6 +416,8 @@ impl ShellState {
             expansion_error: None,
             abort_current_program: false,
             errexit_suppression_depth: 0,
+            errexit_status: None,
+            last_failure_exempt: false,
             procsub_pids: Vec::new(),
             jobs: JobTable::new(),
             arrays: HashMap::new(),

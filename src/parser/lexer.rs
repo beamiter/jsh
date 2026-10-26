@@ -12,6 +12,7 @@ pub enum Token {
     Amp,               // &
     AmpBang,           // &!  (background + disown)
     RedirectOut,       // >
+    RedirectClobber,   // >|
     RedirectAppend,    // >>
     RedirectIn,        // <
     HereDoc,           // <<
@@ -35,6 +36,7 @@ pub enum Token {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedirectOp {
     Output,
+    Clobber,
     Append,
     Input,
     DupOutput, // N>&M  duplicate output fd
@@ -888,6 +890,10 @@ impl<'a> Lexer<'a> {
             Some('>') => {
                 self.next_char();
                 match self.peek_char() {
+                    Some('|') => {
+                        self.next_char();
+                        Token::RedirectClobber
+                    }
                     Some('>') => {
                         self.next_char();
                         Token::RedirectAppend
@@ -948,6 +954,10 @@ impl<'a> Lexer<'a> {
                         let fd: i32 = num_str.parse().unwrap_or(1);
                         self.next_char();
                         match self.peek_char() {
+                            Some('|') => {
+                                self.next_char();
+                                Token::RedirectFd(fd, RedirectOp::Clobber)
+                            }
                             Some('>') => {
                                 self.next_char();
                                 Token::RedirectFd(fd, RedirectOp::Append)

@@ -88,6 +88,53 @@ pub(crate) fn compare_int_float(integer: i64, float: f64) -> Option<std::cmp::Or
     }
 }
 
+/// Numeric projection shared by comparisons and exact aggregations. Integer
+/// strings and booleans retain their integral representation; explicitly
+/// floating-point input stays floating point.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NumericValue {
+    Int(i64),
+    Float(f64),
+}
+
+impl NumericValue {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        text.parse::<i64>()
+            .map(Self::Int)
+            .ok()
+            .or_else(|| text.parse::<f64>().ok().map(Self::Float))
+    }
+
+    pub(crate) fn as_f64(self) -> f64 {
+        match self {
+            Self::Int(number) => number as f64,
+            Self::Float(number) => number,
+        }
+    }
+
+    pub(crate) fn is_nan(self) -> bool {
+        matches!(self, Self::Float(number) if number.is_nan())
+    }
+
+    pub(crate) fn compare(self, other: Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => Some(a.cmp(&b)),
+            (Self::Int(a), Self::Float(b)) => compare_int_float(a, b),
+            (Self::Float(a), Self::Int(b)) => {
+                compare_int_float(b, a).map(std::cmp::Ordering::reverse)
+            }
+            (Self::Float(a), Self::Float(b)) => a.partial_cmp(&b),
+        }
+    }
+
+    fn sort_order(self, other: Self) -> std::cmp::Ordering {
+        // Relational comparisons remain unordered for NaN. Sorting needs a
+        // total order, so all NaNs form a stable group after other numbers.
+        self.compare(other)
+            .unwrap_or_else(|| self.is_nan().cmp(&other.is_nan()))
+    }
+}
+
 impl Value {
     /// Best-effort string projection for comparison/display.
     pub fn to_display_string(&self) -> String {
@@ -127,6 +174,34 @@ impl Value {
             Value::String(s) => s.parse::<f64>().ok(),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             _ => None,
+        }
+    }
+
+    pub(crate) fn as_number(&self) -> Option<NumericValue> {
+        match self {
+            Self::Int(number) => Some(NumericValue::Int(*number)),
+            Self::Float(number) => Some(NumericValue::Float(*number)),
+            Self::String(text) => NumericValue::parse(text),
+            Self::Bool(value) => Some(NumericValue::Int(i64::from(*value))),
+            _ => None,
+        }
+    }
+
+    /// Shared ordering for `sort` and `sort-by`: null, numeric values, then
+    /// other values by their display text. Fixed classes keep the comparison
+    /// transitive when numeric and nonnumeric strings are mixed.
+    pub(crate) fn compare_for_sort(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Null, Self::Null) => Ordering::Equal,
+            (Self::Null, _) => Ordering::Less,
+            (_, Self::Null) => Ordering::Greater,
+            _ => match (self.as_number(), other.as_number()) {
+                (Some(a), Some(b)) => a.sort_order(b),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => self.to_display_string().cmp(&other.to_display_string()),
+            },
         }
     }
 
@@ -328,5 +403,42 @@ mod tests {
         assert_eq!(Value::String("2.5".to_string()).as_f64(), Some(2.5));
         assert_eq!(Value::Bool(true).as_f64(), Some(1.0));
         assert_eq!(Value::Null.as_f64(), None);
+    }
+
+    #[test]
+    fn mixed_sort_order_is_antisymmetric_and_transitive() {
+        let values = [
+            Value::Null,
+            Value::Int(i64::MIN),
+            Value::Int(i64::MIN + 1),
+            Value::Int(9_007_199_254_740_993),
+            Value::Int(i64::MAX),
+            Value::Int(2),
+            Value::Int(10),
+            Value::Float(-1.5),
+            Value::Float(-0.0),
+            Value::Float(9_007_199_254_740_992.0),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NAN),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::String("9007199254740993".to_owned()),
+            Value::String("1x".to_owned()),
+            Value::String("!".to_owned()),
+            Value::String("NaN".to_owned()),
+            Value::List(vec![Value::Int(1)]),
+            Value::Record(IndexMap::new()),
+        ];
+        for a in &values {
+            for b in &values {
+                assert_eq!(a.compare_for_sort(b), b.compare_for_sort(a).reverse());
+                for c in &values {
+                    if a.compare_for_sort(b).is_le() && b.compare_for_sort(c).is_le() {
+                        assert!(a.compare_for_sort(c).is_le(), "{a:?}, {b:?}, {c:?}");
+                    }
+                }
+            }
+        }
     }
 }

@@ -1,6 +1,7 @@
 /// Directory bookmarks: named shortcuts to directories.
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -32,41 +33,9 @@ impl BookmarkDB {
     }
 
     fn load(&mut self) {
-        let content =
-            match crate::io_guard::read_private_text(&self.file_path, MAX_BOOKMARK_FILE_BYTES) {
-                Ok(content) => content,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                Err(error) => {
-                    warn_bookmark_io("load", &self.file_path, &error);
-                    return;
-                }
-            };
-        for line in content.lines().take(MAX_BOOKMARK_ENTRIES) {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some((name, path)) = line.split_once('|') {
-                if valid_bookmark_field(name) && valid_bookmark_field(path) && !name.contains('|') {
-                    self.bookmarks.insert(name.to_string(), path.to_string());
-                }
-            }
-        }
-    }
-
-    fn save(&self) {
-        let mut content = String::new();
-        let mut entries: Vec<_> = self.bookmarks.iter().collect();
-        entries.sort_by_key(|(k, _)| (*k).clone());
-        for (name, path) in entries {
-            content.push_str(&format!("{}|{}\n", name, path));
-        }
-        if let Err(error) = crate::io_guard::write_private_file_atomic(
-            &self.file_path,
-            content.as_bytes(),
-            MAX_BOOKMARK_FILE_BYTES,
-        ) {
-            warn_bookmark_io("save", &self.file_path, &error);
+        match read_bookmarks(&self.file_path) {
+            Ok(bookmarks) => self.bookmarks = bookmarks,
+            Err(error) => warn_bookmark_io("load", &self.file_path, &error),
         }
     }
 
@@ -77,16 +46,30 @@ impl BookmarkDB {
             );
             return false;
         }
-        if self.bookmarks.len() >= MAX_BOOKMARK_ENTRIES && !self.bookmarks.contains_key(name) {
-            eprintln!("jsh: bookmark database reached its entry limit");
-            return false;
+        match self.add_inner(name, path) {
+            Ok(()) => true,
+            Err(error) => {
+                warn_bookmark_io("save", &self.file_path, &error);
+                false
+            }
         }
-        let current_bytes = self
-            .bookmarks
+    }
+
+    fn add_inner(&mut self, name: &str, path: &str) -> io::Result<()> {
+        let _lock = crate::io_guard::lock_private_file(&self.file_path)?;
+        // Apply only this operation to the latest committed state. Merging a
+        // stale snapshot would otherwise resurrect another shell's removals.
+        let mut bookmarks = read_bookmarks(&self.file_path)?;
+        if bookmarks.len() >= MAX_BOOKMARK_ENTRIES && !bookmarks.contains_key(name) {
+            return Err(io::Error::other(
+                "bookmark database reached its entry limit",
+            ));
+        }
+        let current_bytes = bookmarks
             .iter()
             .map(|(name, path)| name.len().saturating_add(path.len()).saturating_add(2))
             .sum::<usize>();
-        let replaced_bytes = self.bookmarks.get(name).map_or(0, |old| {
+        let replaced_bytes = bookmarks.get(name).map_or(0, |old| {
             name.len().saturating_add(old.len()).saturating_add(2)
         });
         let projected = current_bytes
@@ -95,12 +78,12 @@ impl BookmarkDB {
             .saturating_add(path.len())
             .saturating_add(2);
         if projected > MAX_BOOKMARK_FILE_BYTES {
-            eprintln!("jsh: bookmark database reached its byte limit");
-            return false;
+            return Err(io::Error::other("bookmark database reached its byte limit"));
         }
-        self.bookmarks.insert(name.to_string(), path.to_string());
-        self.save();
-        true
+        bookmarks.insert(name.to_string(), path.to_string());
+        write_bookmarks(&self.file_path, &bookmarks)?;
+        self.bookmarks = bookmarks;
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&String> {
@@ -108,11 +91,26 @@ impl BookmarkDB {
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
-        let removed = self.bookmarks.remove(name).is_some();
-        if removed {
-            self.save();
+        match self.try_remove(name) {
+            Ok(removed) => removed,
+            Err(error) => {
+                warn_bookmark_io("remove", &self.file_path, &error);
+                false
+            }
         }
-        removed
+    }
+
+    /// Distinguish a missing bookmark from a persistence failure for callers
+    /// that report an exit status. The legacy boolean API remains available.
+    pub fn try_remove(&mut self, name: &str) -> io::Result<bool> {
+        let _lock = crate::io_guard::lock_private_file(&self.file_path)?;
+        let mut bookmarks = read_bookmarks(&self.file_path)?;
+        let removed = bookmarks.remove(name).is_some();
+        if removed {
+            write_bookmarks(&self.file_path, &bookmarks)?;
+        }
+        self.bookmarks = bookmarks;
+        Ok(removed)
     }
 
     pub fn list(&self) -> Vec<(&String, &String)> {
@@ -126,6 +124,35 @@ impl BookmarkDB {
         names.sort();
         names
     }
+}
+
+fn read_bookmarks(path: &Path) -> io::Result<HashMap<String, String>> {
+    let content = match crate::io_guard::read_private_text(path, MAX_BOOKMARK_FILE_BYTES) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    };
+    let mut bookmarks = HashMap::new();
+    for line in content.lines().take(MAX_BOOKMARK_ENTRIES) {
+        // Whitespace belongs to the name/path. Trimming the complete record
+        // corrupts valid directories whose names end in a space.
+        if let Some((name, path)) = line.split_once('|') {
+            if valid_bookmark_field(name) && valid_bookmark_field(path) {
+                bookmarks.insert(name.to_string(), path.to_string());
+            }
+        }
+    }
+    Ok(bookmarks)
+}
+
+fn write_bookmarks(path: &Path, bookmarks: &HashMap<String, String>) -> io::Result<()> {
+    let mut content = String::new();
+    let mut entries: Vec<_> = bookmarks.iter().collect();
+    entries.sort_unstable_by_key(|(name, _)| *name);
+    for (name, path) in entries {
+        content.push_str(&format!("{name}|{path}\n"));
+    }
+    crate::io_guard::write_private_file_atomic(path, content.as_bytes(), MAX_BOOKMARK_FILE_BYTES)
 }
 
 fn valid_bookmark_field(value: &str) -> bool {
@@ -150,6 +177,102 @@ pub fn get_bookmark_db() -> &'static Mutex<BookmarkDB> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn database(path: &Path) -> BookmarkDB {
+        let mut db = BookmarkDB {
+            bookmarks: HashMap::new(),
+            file_path: path.to_owned(),
+        };
+        db.load();
+        db
+    }
+
+    #[test]
+    fn independent_shells_preserve_additions_replacements_and_removals() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bookmarks");
+        let mut first = database(&path);
+        let mut second = database(&path);
+        assert!(first.add("first", "/one"));
+        assert!(second.add("second", "/two"));
+        assert_eq!(database(&path).names(), ["first", "second"]);
+
+        // A stale instance must be able to delete a peer's new bookmark.
+        assert!(first.try_remove("second").unwrap());
+        assert!(second.add("third", "/three"));
+        assert_eq!(database(&path).names(), ["first", "third"]);
+
+        assert!(first.add("first", "/updated"));
+        assert!(second.add("fourth", "/four"));
+        assert_eq!(database(&path).get("first").unwrap(), "/updated");
+        assert!(!second.try_remove("missing").unwrap());
+    }
+
+    #[test]
+    fn concurrent_bookmark_writers_do_not_lose_committed_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bookmarks");
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let mut db = database(path);
+                    barrier.wait();
+                    for item in 0..8 {
+                        assert!(db.add(&format!("writer-{writer}-{item}"), "/shared"));
+                    }
+                });
+            }
+        });
+        assert_eq!(database(&path).names().len(), 32);
+    }
+
+    #[test]
+    fn bookmark_roundtrip_preserves_spaces_and_delimiters_in_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bookmarks");
+        let mut db = database(&path);
+        assert!(db.add(" project ", "/tmp/project | notes "));
+        assert_eq!(
+            database(&path).get(" project ").map(String::as_str),
+            Some("/tmp/project | notes ")
+        );
+    }
+
+    #[test]
+    fn failed_bookmark_write_preserves_disk_and_in_memory_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bookmarks");
+        let mut db = database(&path);
+        assert!(db.add("existing", "/original"));
+        let contents = std::fs::read(&path).unwrap();
+        let lock = temp.path().join("bookmarks.lock");
+        std::fs::remove_file(&lock).unwrap();
+        let target = temp.path().join("outside");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&target, &lock).unwrap();
+        assert!(!db.add("new", "/new"));
+        assert!(db.try_remove("existing").is_err());
+        assert_eq!(db.get("existing").map(String::as_str), Some("/original"));
+        assert!(db.get("new").is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn unreadable_bookmark_data_is_not_replaced_with_a_partial_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bookmarks");
+        let mut db = database(&path);
+        assert!(db.add("existing", "/original"));
+        // An invalid UTF-8 file cannot be safely merged.
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(!db.add("new", "/new"));
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe]);
+        assert_eq!(db.names(), ["existing"]);
+    }
 
     #[test]
     fn unsafe_or_oversized_bookmark_records_are_not_loaded() {

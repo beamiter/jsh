@@ -3693,14 +3693,14 @@ mod tests {
         // An external child can reopen same-user descriptors through
         // /proc/$PPID/fd even though CLOEXEC kept them out of its own table.
         // It writes a structurally valid frame with a guessed nonce to every
-        // writable parent descriptor. Quoted `exec` arguments then exercise
-        // jsh's persistent same-process close path over every plausible fd,
+        // writable parent descriptor. Parsed `exec` redirections then exercise
+        // the persistent same-process close path over every plausible fd,
         // preventing the genuine final frame from being appended.
         let attack = format!(
             "/bin/sh -c 'payload=\"{escaped_frame}\"; for target in /proc/$PPID/fd/*; do fd=${{target##*/}}; test \"$fd\" -ge 3 2>/dev/null || continue; /usr/bin/printf \"%b\" \"$payload\" 2>/dev/null > \"$target\" || :; done'"
         );
         let closes = (3..=1024)
-            .map(|descriptor| format!("exec '{descriptor}>&-'"))
+            .map(|descriptor| format!("exec {descriptor}>&-"))
             .collect::<Vec<_>>()
             .join("; ");
         let command = format!("{attack}; {closes}; cd '{}'", actual.display());

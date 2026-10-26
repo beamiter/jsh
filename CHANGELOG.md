@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### 2026-10-26 — execution, interactive completion, shared state, and data streams
+
+- Propagate the first unhandled errexit through nested loops and compounds,
+  preserve conditional exemptions, and stop eval/source after exit or return.
+  Consume loop-condition break/continue locally and avoid reporting the same
+  handled compound failure twice. Completion and EXIT traps preserve the new
+  transient execution state.
+- Redirections now fail before command execution on I/O, descriptor, or
+  ambiguous-target errors. A scoped descriptor guard restores originally
+  closed descriptors and protects all active frames from nested descriptor
+  collisions. Assignment-only, typed-function, and typed-binding redirects
+  are honored. Delayed structured-output failures cannot spill buffered data
+  into the next command.
+- Enforce `noclobber` for regular output files and add `>|` / `N>|` overrides.
+  Here-documents retain blank lines, carriage returns, and trailing newlines;
+  private, unlinked backing files work even when standard input was closed.
+- Implement real process replacement for `exec`, including `-a`, `-c`, `-l`,
+  status 126/127, `execfail`, signal disposition restoration on failure, and
+  persistent redirection-only `exec`.
+- Preserve supported UTF-8 filenames through unquoted, single-quoted, and
+  double-quoted path completion; handle directory symlinks, assignment values,
+  and escaped tilde prefixes. Omit names containing non-UTF-8 bytes or hidden
+  terminal controls. Separate the scan/candidate limits and bound description work.
+- Programmable completion uses quote-aware words, a real function-return
+  context, and saved completion/status/control-flow state.
+- Serialize bookmark and directory-frecency mutations as locked read-modify-
+  write operations. Preserve concurrent additions, cumulative visits, and
+  deletions; report explicit write failures and retain bookmark whitespace.
+- Keep field predicates, chunks, and windows lazy; short-circuit any/all and
+  bounded emptiness inspection. Validate window/stride arguments and avoid
+  oversized capacity reservations and usize overflow.
+- Preserve large integers in sum/min/max, comparisons, and sorting. Integer
+  sums fail explicitly outside i64; mixed sorting has a transitive order and
+  equal values remain stable in both directions.
+
+### Earlier unreleased changes
+
 - Pure closure expressions cache parsed syntax and borrow argument/capture
   bindings. Integer operations and mixed integer/float comparisons avoid
   precision loss; typed integer overflow reports an error.

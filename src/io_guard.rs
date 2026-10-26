@@ -3,7 +3,8 @@
 //! choose limits, while this module guarantees no symlink/FIFO reads, no
 //! partial in-place persistence writes, and no unbounded `Command::output`.
 
-use std::fs::{self, OpenOptions};
+use nix::fcntl::{Flock, FlockArg};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -482,6 +483,93 @@ fn read_regular_file_with_policy(
         ));
     }
     Ok(bytes)
+}
+
+/// Hold this guard across the complete read/modify/atomic-replace operation.
+/// Locking the data file itself would be ineffective after its inode is
+/// replaced by a rename. A stable sidecar protects every updated writer; the
+/// directory lock also prevents cooperating peers from replacing that sidecar
+/// while another writer is opening it. Existing history/journal protocols are
+/// deliberately independent of this helper.
+pub(crate) struct PrivateFileLock {
+    _file: Flock<File>,
+    _directory: Flock<File>,
+}
+
+pub(crate) fn lock_private_file(path: &Path) -> io::Result<PrivateFileLock> {
+    lock_private_file_with_timeout(path, Duration::from_secs(2))
+}
+
+fn lock_private_file_with_timeout(path: &Path, timeout: Duration) -> io::Result<PrivateFileLock> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "persistence directory is not owned by the current user",
+        ));
+    }
+    let started = Instant::now();
+    let directory = lock_private_descriptor(directory, started, timeout)?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(SAFE_READ_FLAGS)
+        .mode(0o600)
+        .open(Path::new(&lock_path))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "persistence lock must be a single-link regular file owned by the current user",
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let file = lock_private_descriptor(file, started, timeout)?;
+    Ok(PrivateFileLock {
+        _file: file,
+        _directory: directory,
+    })
+}
+
+fn lock_private_descriptor(
+    mut file: File,
+    started: Instant,
+    timeout: Duration,
+) -> io::Result<Flock<File>> {
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(lock),
+            Err((returned, errno)) => {
+                file = returned;
+                if !matches!(errno, nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) {
+                    return Err(io::Error::from_raw_os_error(errno as i32));
+                }
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "timed out waiting for persistence lock",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10).min(remaining));
+            }
+        }
+    }
 }
 
 /// Atomically replace one private persistence file. Data is written to a
@@ -984,6 +1072,49 @@ mod tests {
         write_private_file_atomic(&path, b"second", 32).expect("replace link");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(read_private_file(&path, 32).unwrap(), b"second");
+    }
+
+    #[test]
+    fn private_persistence_lock_wait_is_bounded_and_sidecars_are_private() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state");
+        let first = lock_private_file(&path).unwrap();
+        assert_eq!(
+            fs::metadata(temp.path().join("state.lock")).unwrap().mode() & 0o777,
+            0o600
+        );
+        let started = Instant::now();
+        let result = lock_private_file_with_timeout(&path, Duration::from_millis(20));
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Replacing the sidecar does not bypass the directory guard.
+        fs::remove_file(temp.path().join("state.lock")).unwrap();
+        let result = lock_private_file_with_timeout(&path, Duration::ZERO);
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        drop(first);
+        assert!(lock_private_file_with_timeout(&path, Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn private_persistence_locks_reject_linked_and_special_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state");
+        let lock_path = temp.path().join("state.lock");
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"untouched").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+
+        symlink(&outside, &lock_path).unwrap();
+        assert!(lock_private_file(&path).is_err());
+        fs::remove_file(&lock_path).unwrap();
+        fs::hard_link(&outside, &lock_path).unwrap();
+        assert!(lock_private_file(&path).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+        assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o777, 0o644);
+
+        fs::remove_file(&lock_path).unwrap();
+        nix::unistd::mkfifo(&lock_path, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert!(lock_private_file(&path).is_err());
     }
 
     #[test]

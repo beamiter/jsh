@@ -4,7 +4,7 @@
 /// typed `Value`s through the pipeline without forking.
 use crate::environment::ShellState;
 use crate::pipeline_data::PipelineData;
-use crate::value::{render_table, ClosureData, Value};
+use crate::value::{render_table, ClosureData, NumericValue, Value};
 use indexmap::IndexMap;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -241,19 +241,26 @@ fn vb_where(
         }
         return Ok(PipelineData::Values(out));
     }
-    if args.len() < 3 {
+    if args.len() != 3 {
         eprintln!("Usage: where <field> <op> <value> | where {{|r| ...}}");
         return Err(1);
     }
-    let field = &args[0];
-    let op = &args[1];
-    let rhs = &args[2];
-    let vs = input.into_values()?;
-    let out: Vec<Value> = vs
-        .into_iter()
-        .filter(|v| v.get(field).map(|fv| compare(fv, op, rhs)).unwrap_or(false))
-        .collect();
-    Ok(PipelineData::Values(out))
+    let field = args[0].clone();
+    let op = args[1].clone();
+    let rhs = args[2].clone();
+    if !matches!(
+        op.as_str(),
+        "==" | "=" | "!=" | ">" | "-gt" | ">=" | "-ge" | "<" | "-lt" | "<=" | "-le" | "=~"
+    ) {
+        eprintln!("where: unknown comparison operator '{op}'");
+        return Err(1);
+    }
+    input.filter_values(move |value| {
+        value
+            .get(&field)
+            .map(|field_value| compare(field_value, &op, &rhs))
+            .unwrap_or(false)
+    })
 }
 
 fn vb_each(
@@ -630,7 +637,7 @@ fn vb_count(
 fn vb_math(
     input: PipelineData,
     args: &[String],
-    _state: &mut ShellState,
+    state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
     if args.is_empty() {
         eprintln!("Usage: math <op> [field]  (aggregations: sum|avg|min|max|stddev|median|product;  per-element: abs|ceil|floor|round|sqrt|log|log2|log10)");
@@ -682,24 +689,54 @@ fn vb_math(
     let mut nums = input
         .into_value_iter()?
         .filter_map(|value| match field {
-            Some(field) => value.get(field).and_then(Value::as_f64),
-            None => value.as_f64(),
+            Some(field) => value.get(field).and_then(Value::as_number),
+            None => value.as_number(),
         })
         .peekable();
     if nums.peek().is_none() {
         eprintln!("math: no numeric values");
         return Err(1);
     }
+    if matches!(op, "sum" | "min" | "max") {
+        let result = if op == "sum" {
+            numeric_sum(nums).map_err(|message| {
+                eprintln!("{message}");
+                state.set_error(message.to_owned(), 1);
+                1
+            })?
+        } else {
+            // Keep the established treatment of NaN as absent in extrema and
+            // retain the infinity seed when every numeric value is NaN.
+            let mut selected = NumericValue::Float(if op == "min" {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            });
+            for value in nums {
+                if value.compare(selected).is_some_and(|order| {
+                    if op == "min" {
+                        order.is_lt()
+                    } else {
+                        order.is_gt()
+                    }
+                }) {
+                    selected = value;
+                }
+            }
+            selected
+        };
+        return Ok(PipelineData::Values(vec![numeric_math_result(result)]));
+    }
+    // The remaining statistics keep their established floating-point
+    // algorithms. Exact summation/extrema above do not force that projection.
+    let nums = nums.map(NumericValue::as_f64);
     let r = match op {
-        "sum" => nums.sum::<f64>(),
         "avg" | "mean" => {
             let (sum, count) = nums.fold((0.0, 0usize), |(sum, count), value| {
                 (sum + value, count + 1)
             });
             sum / count as f64
         }
-        "min" => nums.fold(f64::INFINITY, f64::min),
-        "max" => nums.fold(f64::NEG_INFINITY, f64::max),
         "product" => nums.product::<f64>(),
         "median" => {
             let mut sorted: Vec<f64> = nums.collect();
@@ -727,12 +764,49 @@ fn vb_math(
             return Err(1);
         }
     };
-    let out = if r.fract() == 0.0 && r.is_finite() && r.abs() < 1e16 {
-        Value::Int(r as i64)
-    } else {
-        Value::Float(r)
-    };
+    let out = numeric_math_result(NumericValue::Float(r));
     Ok(PipelineData::Values(vec![out]))
+}
+
+fn numeric_sum(values: impl Iterator<Item = NumericValue>) -> Result<NumericValue, &'static str> {
+    let mut integer_total = 0_i128;
+    let mut float_total = None;
+    for value in values {
+        if let Some(total) = &mut float_total {
+            *total += value.as_f64();
+            continue;
+        }
+        match value {
+            NumericValue::Int(number) => {
+                integer_total = integer_total
+                    .checked_add(i128::from(number))
+                    .ok_or("math sum: integer accumulator overflow")?;
+            }
+            NumericValue::Float(number) => {
+                float_total = Some(integer_total as f64 + number);
+            }
+        }
+    }
+    match float_total {
+        Some(total) => Ok(NumericValue::Float(total)),
+        // A wider integer accumulator permits cancellation of intermediate
+        // out-of-i64 totals. Only the final exact result must fit Value::Int.
+        None => i64::try_from(integer_total)
+            .map(NumericValue::Int)
+            .map_err(|_| "math sum: integer result is outside the i64 range"),
+    }
+}
+
+fn numeric_math_result(value: NumericValue) -> Value {
+    match value {
+        NumericValue::Int(number) => Value::Int(number),
+        NumericValue::Float(number)
+            if number.fract() == 0.0 && number.is_finite() && number.abs() < 1e16 =>
+        {
+            Value::Int(number as i64)
+        }
+        NumericValue::Float(number) => Value::Float(number),
+    }
 }
 
 fn vb_from_csv(
@@ -1338,27 +1412,17 @@ fn is_truthy(v: &Value) -> bool {
 
 fn compare(v: &Value, op: &str, rhs: &str) -> bool {
     let lhs_str = v.to_display_string();
-    let lhs_num = v.as_f64();
-    let rhs_num = rhs.parse::<f64>().ok();
+    let order = match (v.as_number(), NumericValue::parse(rhs)) {
+        (Some(left), Some(right)) => left.compare(right),
+        _ => Some(lhs_str.as_str().cmp(rhs)),
+    };
     match op {
         "==" | "=" => lhs_str == rhs,
         "!=" => lhs_str != rhs,
-        ">" | "-gt" => match (lhs_num, rhs_num) {
-            (Some(l), Some(r)) => l > r,
-            _ => lhs_str.as_str() > rhs,
-        },
-        ">=" | "-ge" => match (lhs_num, rhs_num) {
-            (Some(l), Some(r)) => l >= r,
-            _ => lhs_str.as_str() >= rhs,
-        },
-        "<" | "-lt" => match (lhs_num, rhs_num) {
-            (Some(l), Some(r)) => l < r,
-            _ => lhs_str.as_str() < rhs,
-        },
-        "<=" | "-le" => match (lhs_num, rhs_num) {
-            (Some(l), Some(r)) => l <= r,
-            _ => lhs_str.as_str() <= rhs,
-        },
+        ">" | "-gt" => order.is_some_and(std::cmp::Ordering::is_gt),
+        ">=" | "-ge" => order.is_some_and(std::cmp::Ordering::is_ge),
+        "<" | "-lt" => order.is_some_and(std::cmp::Ordering::is_lt),
+        "<=" | "-le" => order.is_some_and(std::cmp::Ordering::is_le),
         "=~" => lhs_str.contains(rhs),
         _ => false,
     }
@@ -1370,12 +1434,7 @@ fn compare_opt(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
-        (Some(va), Some(vb)) => {
-            if let (Some(na), Some(nb)) = (va.as_f64(), vb.as_f64()) {
-                return na.partial_cmp(&nb).unwrap_or(Ordering::Equal);
-            }
-            va.to_display_string().cmp(&vb.to_display_string())
-        }
+        (Some(va), Some(vb)) => va.compare_for_sort(vb),
     }
 }
 
@@ -2724,8 +2783,7 @@ fn vb_any(
             return Err(1);
         }
     };
-    let vs = input.into_values()?;
-    for v in vs {
+    for v in input.into_value_iter()? {
         let r = crate::executor::apply_closure(&closure, std::slice::from_ref(&v), state)?;
         if is_truthy(&r) {
             return Ok(PipelineData::Values(vec![Value::Bool(true)]));
@@ -2746,8 +2804,7 @@ fn vb_all(
             return Err(1);
         }
     };
-    let vs = input.into_values()?;
-    for v in vs {
+    for v in input.into_value_iter()? {
         let r = crate::executor::apply_closure(&closure, std::slice::from_ref(&v), state)?;
         if !is_truthy(&r) {
             return Ok(PipelineData::Values(vec![Value::Bool(false)]));
@@ -2761,18 +2818,23 @@ fn vb_is_empty(
     _args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let vs = input.into_values()?;
-    let empty = match vs.as_slice() {
-        [] => true,
-        [v] => match v {
-            Value::Null => true,
-            Value::String(s) => s.is_empty(),
-            Value::List(x) => x.is_empty(),
-            Value::Record(m) => m.is_empty(),
-            Value::Binary(b) => b.is_empty(),
-            _ => false,
-        },
-        _ => false,
+    let mut values = input.into_value_iter()?;
+    let empty = match values.next() {
+        None => true,
+        Some(value) => {
+            let empty_value = match value {
+                Value::Null => true,
+                Value::String(s) => s.is_empty(),
+                Value::List(x) => x.is_empty(),
+                Value::Record(m) => m.is_empty(),
+                Value::Binary(b) => b.is_empty(),
+                _ => false,
+            };
+            // A nonempty first value already decides the result. For an empty
+            // value, only one lookahead is needed: multi-value input is nonempty
+            // even when every individual row is Null or an empty container.
+            empty_value && values.next().is_none()
+        }
     };
     Ok(PipelineData::Values(vec![Value::Bool(empty)]))
 }
@@ -3310,25 +3372,6 @@ fn vb_shuffle(
 // Phase 11a — sort / to-csv / chunks / window / split-by
 // ---------------------------------------------------------------------------
 
-fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    // Numeric comparison when both look like numbers.
-    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
-        return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
-    }
-    // Boolean: false < true.
-    if let (Value::Bool(x), Value::Bool(y)) = (a, b) {
-        return x.cmp(y);
-    }
-    // Null sorts before everything else.
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
-        _ => a.to_display_string().cmp(&b.to_display_string()),
-    }
-}
-
 /// `sort [-r|--reverse]` — sort the pipeline values. Use `sort-by <field>`
 /// for record-keyed sorting (already exists).
 fn vb_sort(
@@ -3338,10 +3381,14 @@ fn vb_sort(
 ) -> Result<PipelineData, i32> {
     let reverse = args.iter().any(|a| a == "-r" || a == "--reverse");
     let mut vs = input.into_values()?;
-    vs.sort_by(compare_values);
-    if reverse {
-        vs.reverse();
-    }
+    vs.sort_by(|a, b| {
+        let order = a.compare_for_sort(b);
+        if reverse {
+            order.reverse()
+        } else {
+            order
+        }
+    });
     Ok(PipelineData::Values(vs))
 }
 
@@ -3400,14 +3447,42 @@ fn vb_chunks(
     args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let size: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    if size == 0 {
-        eprintln!("chunks: size must be a positive integer");
+    let [size] = args else {
+        eprintln!("chunks: expected one positive integer size");
         return Err(1);
+    };
+    let size = positive_group_size("chunks", "size", size)?;
+    let streaming = input.is_stream();
+    let mut source = input.into_value_iter()?.fuse();
+    let chunks = std::iter::from_fn(move || {
+        let first = source.next()?;
+        // Grow only for rows that actually arrive. Reserving from the user
+        // size (or an infinite iterator's size_hint) could overflow capacity.
+        let mut chunk = vec![first];
+        for _ in 1..size {
+            match source.next() {
+                Some(value) => chunk.push(value),
+                None => break,
+            }
+        }
+        Some(Value::List(chunk))
+    });
+    if streaming {
+        Ok(PipelineData::Stream(Box::new(chunks)))
+    } else {
+        Ok(PipelineData::Values(chunks.collect()))
     }
-    let vs = input.into_values()?;
-    let out: Vec<Value> = vs.chunks(size).map(|c| Value::List(c.to_vec())).collect();
-    Ok(PipelineData::Values(out))
+}
+
+fn positive_group_size(command: &str, argument: &str, value: &str) -> Result<usize, i32> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| {
+            eprintln!("{command}: {argument} must be a positive integer");
+            1
+        })
 }
 
 /// `window <size> [--stride N]` — sliding window of `size` over the input.
@@ -3417,36 +3492,79 @@ fn vb_window(
     args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
-    let mut size: usize = 0;
-    let mut stride: usize = 1;
+    let mut size = None;
+    let mut stride = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--stride" | "-s" => {
+                if stride.is_some() {
+                    eprintln!("window: stride may only be specified once");
+                    return Err(1);
+                }
                 i += 1;
-                stride = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+                let Some(value) = args.get(i) else {
+                    eprintln!("window: stride requires a positive integer");
+                    return Err(1);
+                };
+                stride = Some(positive_group_size("window", "stride", value)?);
             }
             other => {
-                size = other.parse().unwrap_or(size);
+                if size.is_some() {
+                    eprintln!("window: expected one size and optional --stride N");
+                    return Err(1);
+                }
+                size = Some(positive_group_size("window", "size", other)?);
             }
         }
         i += 1;
     }
-    if size == 0 {
-        eprintln!("window: size must be a positive integer");
+    let Some(size) = size else {
+        eprintln!("window: expected a positive integer size");
         return Err(1);
+    };
+    let stride = stride.unwrap_or(1);
+    let streaming = input.is_stream();
+    let mut source = input.into_value_iter()?.fuse();
+    let mut buffer = std::collections::VecDeque::new();
+    let mut started = false;
+    let mut finished = false;
+    let windows = std::iter::from_fn(move || {
+        if finished {
+            return None;
+        }
+        if started {
+            buffer.drain(..stride.min(buffer.len()));
+            // When windows do not overlap, skip the intervening input without
+            // retaining it. Subtraction avoids overflowing start + size or
+            // start + stride for user-supplied usize::MAX boundaries.
+            let gap = stride.saturating_sub(size);
+            if gap > 0 && source.nth(gap - 1).is_none() {
+                finished = true;
+                return None;
+            }
+        }
+        started = true;
+        while buffer.len() < size {
+            match source.next() {
+                Some(value) => buffer.push_back(value),
+                None => {
+                    finished = true;
+                    buffer.clear();
+                    return None;
+                }
+            }
+        }
+        // The current window must own its values: overlapping windows may be
+        // retained downstream. The iterator itself keeps only one window and
+        // advances on the next request, never after yielding this one.
+        Some(Value::List(buffer.iter().cloned().collect()))
+    });
+    if streaming {
+        Ok(PipelineData::Stream(Box::new(windows)))
+    } else {
+        Ok(PipelineData::Values(windows.collect()))
     }
-    if stride == 0 {
-        stride = 1;
-    }
-    let vs = input.into_values()?;
-    let mut out = Vec::new();
-    let mut start = 0;
-    while start + size <= vs.len() {
-        out.push(Value::List(vs[start..start + size].to_vec()));
-        start += stride;
-    }
-    Ok(PipelineData::Values(out))
 }
 
 /// `split-by <field>` — group records by `field` value, producing a Record
@@ -3524,15 +3642,14 @@ const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 
 fn b64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for c in chunks.by_ref() {
+    let (chunks, rem) = input.as_chunks::<3>();
+    for c in chunks {
         let n = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32);
         out.push(B64_TABLE[((n >> 18) & 0x3F) as usize] as char);
         out.push(B64_TABLE[((n >> 12) & 0x3F) as usize] as char);
         out.push(B64_TABLE[((n >> 6) & 0x3F) as usize] as char);
         out.push(B64_TABLE[(n & 0x3F) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = (rem[0] as u32) << 16;
@@ -3606,7 +3723,7 @@ fn hex_decode(input: &str) -> Result<Vec<u8>, String> {
         }
     };
     let mut out = Vec::with_capacity(clean.len() / 2);
-    for pair in clean.chunks_exact(2) {
+    for pair in clean.as_chunks::<2>().0 {
         out.push((from_hex(pair[0])? << 4) | from_hex(pair[1])?);
     }
     Ok(out)

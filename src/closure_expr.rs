@@ -818,16 +818,9 @@ fn eval<'a>(
                 Cmp::Eq => lv == rv,
                 Cmp::Ne => lv != rv,
                 Cmp::Lt | Cmp::Gt | Cmp::Le | Cmp::Ge => {
-                    let order = match (&lv, &rv) {
-                        (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
-                        (Value::Int(a), Value::Float(b)) => crate::value::compare_int_float(*a, *b),
-                        (Value::Float(a), Value::Int(b)) => {
-                            crate::value::compare_int_float(*b, *a).map(std::cmp::Ordering::reverse)
-                        }
-                        _ => match (lv.as_f64(), rv.as_f64()) {
-                            (Some(a), Some(b)) => a.partial_cmp(&b),
-                            _ => Some(lv.to_display_string().cmp(&rv.to_display_string())),
-                        },
+                    let order = match (lv.as_number(), rv.as_number()) {
+                        (Some(a), Some(b)) => a.compare(b),
+                        _ => Some(lv.to_display_string().cmp(&rv.to_display_string())),
                     };
                     match op {
                         Cmp::Lt => order.is_some_and(std::cmp::Ordering::is_lt),

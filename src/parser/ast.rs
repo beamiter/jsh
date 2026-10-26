@@ -79,6 +79,7 @@ pub enum RedirectTarget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RedirectKind {
     Output,
+    Clobber, // >| overrides noclobber
     Append,
     Input,
     HereDoc, // << (still used for identification)

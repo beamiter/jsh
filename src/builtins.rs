@@ -1161,17 +1161,7 @@ fn builtin_eval(args: &[String], state: &mut ShellState) -> i32 {
 
     // Parse and execute the input
     match parser::parse(&input) {
-        Ok(commands) => {
-            let mut last = 0;
-            for cmd in &commands {
-                last = crate::executor::execute_complete_command(cmd, state);
-                // Early return doesn't stop eval loop (unlike source)
-                if state.loop_break || state.loop_continue {
-                    break;
-                }
-            }
-            last
-        }
+        Ok(commands) => crate::executor::execute_program(&commands, state),
         Err(e) => {
             eprintln!("jsh: eval: parse error: {}", e);
             2
@@ -2457,146 +2447,109 @@ fn builtin_shift(args: &[String], state: &mut ShellState) -> i32 {
     0
 }
 
-fn builtin_exec(args: &[String], _state: &mut ShellState) -> i32 {
-    use nix::unistd::close;
-    use std::fs::{File, OpenOptions};
-    use std::os::unix::io::{IntoRawFd, RawFd};
-
-    fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> Result<(), String> {
-        unsafe {
-            match nix::libc::dup2(oldfd, newfd) {
-                -1 => Err("dup2 failed".to_string()),
-                _ => Ok(()),
+fn builtin_exec(args: &[String], state: &mut ShellState) -> i32 {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    let mut index = 0;
+    let mut clear_environment = false;
+    let mut login = false;
+    let mut arg0 = None;
+    while let Some(option) = args.get(index) {
+        if option == "--" {
+            index += 1;
+            break;
+        }
+        if !option.starts_with('-') || option == "-" {
+            break;
+        }
+        let mut flags = option[1..].chars();
+        while let Some(flag) = flags.next() {
+            match flag {
+                'c' => clear_environment = true,
+                'l' => login = true,
+                'a' => {
+                    let attached = flags.as_str();
+                    if attached.is_empty() {
+                        index += 1;
+                        let Some(name) = args.get(index) else {
+                            eprintln!("jsh: exec: -a requires an argument");
+                            return 2;
+                        };
+                        arg0 = Some(name.clone());
+                    } else {
+                        arg0 = Some(attached.to_string());
+                    }
+                    break;
+                }
+                _ => {
+                    eprintln!("jsh: exec: invalid option: {option}");
+                    return 2;
+                }
             }
         }
+        index += 1;
     }
-
-    if args.is_empty() {
+    let Some(program) = args.get(index) else {
+        // The executor commits this command's redirections on success.
         return 0;
+    };
+    let mut command = std::process::Command::new(program);
+    command.args(&args[index + 1..]);
+    let name = arg0.as_deref().unwrap_or(program);
+    if login {
+        command.arg0(format!("-{name}"));
+    } else if arg0.is_some() {
+        command.arg0(name);
     }
-
-    // Simple implementation of exec FD redirection
-    // Format: exec FD<file, exec FD>file, exec FD>&FD2, etc.
-
-    for arg in args {
-        // Parse FD redirection: "3<file", "1>file", "2>&1", "{fd}>&-", etc.
-        let (fd_str, redirect_type, target) = if let Some(pos) = arg.find('<') {
-            let fd = &arg[..pos];
-            let target = &arg[pos + 1..];
-            (fd, "<", target)
-        } else if let Some(pos) = arg.find('>') {
-            let fd = &arg[..pos];
-            if pos + 1 < arg.len() && arg.chars().nth(pos + 1) == Some('>') {
-                // >> redirect
-                let target = &arg[pos + 2..];
-                (fd, ">>", target)
-            } else if pos + 1 < arg.len() && arg.chars().nth(pos + 1) == Some('&') {
-                // >& redirect
-                let target = &arg[pos + 2..];
-                (fd, ">&", target)
-            } else {
-                // > redirect
-                let target = &arg[pos + 1..];
-                (fd, ">", target)
-            }
-        } else {
-            continue;
-        };
-
-        // Parse the FD number (handle {fd} format)
-        let fd_clean = fd_str.trim_matches(|c| c == '{' || c == '}');
-        let fd: i32 = match fd_clean.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                eprintln!("jsh: exec: invalid file descriptor: {}", fd_str);
-                return 1;
-            }
-        };
-
-        // Execute the redirection
-        match redirect_type {
-            "<" => {
-                // Input redirection: open for reading
-                match File::open(target) {
-                    Ok(file) => {
-                        let src_fd = file.into_raw_fd();
-                        if dup2_raw(src_fd, fd).is_err() {
-                            eprintln!("jsh: exec: dup2 failed");
-                            return 1;
-                        }
-                        if src_fd != fd {
-                            close(src_fd).ok();
-                        }
-                    }
-                    Err(_) => {
-                        eprintln!("jsh: exec: cannot open {} for reading", target);
-                        return 1;
-                    }
-                }
-            }
-            ">" => {
-                // Output redirection: open for writing
-                match File::create(target) {
-                    Ok(file) => {
-                        let src_fd = file.into_raw_fd();
-                        if dup2_raw(src_fd, fd).is_err() {
-                            eprintln!("jsh: exec: dup2 failed");
-                            return 1;
-                        }
-                        if src_fd != fd {
-                            close(src_fd).ok();
-                        }
-                    }
-                    Err(_) => {
-                        eprintln!("jsh: exec: cannot open {} for writing", target);
-                        return 1;
-                    }
-                }
-            }
-            ">>" => {
-                // Append redirection
-                match OpenOptions::new().create(true).append(true).open(target) {
-                    Ok(file) => {
-                        let src_fd = file.into_raw_fd();
-                        if dup2_raw(src_fd, fd).is_err() {
-                            eprintln!("jsh: exec: dup2 failed");
-                            return 1;
-                        }
-                        if src_fd != fd {
-                            close(src_fd).ok();
-                        }
-                    }
-                    Err(_) => {
-                        eprintln!("jsh: exec: cannot open {} for appending", target);
-                        return 1;
-                    }
-                }
-            }
-            ">&" => {
-                if target == "-" {
-                    // Close FD
-                    close(fd).ok();
-                } else {
-                    // Duplicate FD
-                    match target.parse::<i32>() {
-                        Ok(target_fd) => {
-                            if dup2_raw(target_fd, fd).is_err() {
-                                eprintln!("jsh: exec: dup2 failed");
-                                return 1;
-                            }
-                        }
-                        Err(_) => {
-                            eprintln!("jsh: exec: invalid target FD: {}", target);
-                            return 1;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+    if clear_environment {
+        command.env_clear();
     }
-
-    0
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // Caught handlers reset at exec, but ignored job-control/SIGPIPE handlers
+    // do not. Give the replacement the same defaults as an ordinary child,
+    // and restore the exact prior dispositions if exec fails and we continue.
+    use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
+    let default = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    let saved: Vec<_> = [
+        Signal::SIGINT,
+        Signal::SIGHUP,
+        Signal::SIGTERM,
+        Signal::SIGTSTP,
+        Signal::SIGTTIN,
+        Signal::SIGTTOU,
+        Signal::SIGPIPE,
+        Signal::SIGCHLD,
+    ]
+    .into_iter()
+    .filter_map(|sig| {
+        unsafe { signal::sigaction(sig, &default) }
+            .ok()
+            .map(|old| (sig, old))
+    })
+    .collect();
+    let error = command.exec();
+    for (sig, old) in saved {
+        let _ = unsafe { signal::sigaction(sig, &old) };
+    }
+    let status = if error.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    };
+    eprintln!("jsh: exec: {program}: {error}");
+    if !state.interactive
+        && !state
+            .shell_opts
+            .shopt_opts
+            .get("execfail")
+            .copied()
+            .unwrap_or(false)
+    {
+        EXIT_CODE.store(status, std::sync::atomic::Ordering::SeqCst);
+        EXIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    status
 }
 
 fn builtin_pushd(args: &[String], state: &mut ShellState) -> i32 {
@@ -3246,15 +3199,24 @@ fn builtin_z(args: &[String], state: &mut ShellState) -> i32 {
         }
 
         if args.len() == 2 && args[0] == "-x" {
-            z_db.remove(&args[1]);
-            return 0;
+            return match z_db.try_remove(&args[1]) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("jsh: z: could not persist removal: {error}");
+                    1
+                }
+            };
         }
 
         if args.len() == 1 && args[0] == "-c" {
-            if let Ok(cwd) = env::current_dir() {
-                z_db.remove(&cwd.to_string_lossy());
-            }
-            return 0;
+            let result = env::current_dir().and_then(|cwd| z_db.try_remove(&cwd.to_string_lossy()));
+            return match result {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("jsh: z: could not persist removal: {error}");
+                    1
+                }
+            };
         }
     }
 
@@ -4083,12 +4045,19 @@ fn builtin_bookmark(args: &[String], state: &mut ShellState) -> i32 {
                 }
             };
             if let Ok(mut db) = crate::bookmarks::get_bookmark_db().lock() {
-                if db.remove(name) {
-                    println!("Removed bookmark '{}'", name);
-                    0
-                } else {
-                    eprintln!("jsh: bookmark '{}' not found", name);
-                    1
+                match db.try_remove(name) {
+                    Ok(true) => {
+                        println!("Removed bookmark '{}'", name);
+                        0
+                    }
+                    Ok(false) => {
+                        eprintln!("jsh: bookmark '{}' not found", name);
+                        1
+                    }
+                    Err(error) => {
+                        eprintln!("jsh: bookmark: could not persist removal: {error}");
+                        1
+                    }
                 }
             } else {
                 1

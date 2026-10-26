@@ -351,8 +351,9 @@ impl<'a> Parser<'a> {
         let mut resume = input.len();
         let mut found_delimiter = false;
 
-        for line in remaining.lines() {
-            let line_len = line.len();
+        for segment in remaining.split_inclusive('\n') {
+            let line = segment.strip_suffix('\n').unwrap_or(segment);
+            let line_len = segment.len();
             let trimmed = if strip_tabs {
                 line.trim_start_matches('\t')
             } else {
@@ -360,16 +361,16 @@ impl<'a> Parser<'a> {
             };
 
             if trimmed == delimiter {
-                resume = (body_start + line_start + line_len + 1).min(input.len());
+                resume = (body_start + line_start + line_len).min(input.len());
                 found_delimiter = true;
                 break;
             }
 
-            if !content.is_empty() {
+            content.push_str(trimmed);
+            if segment.ends_with('\n') {
                 content.push('\n');
             }
-            content.push_str(trimmed);
-            line_start += line_len + 1;
+            line_start += line_len;
         }
 
         if !found_delimiter {
@@ -412,6 +413,7 @@ impl<'a> Parser<'a> {
         matches!(
             self.current.token,
             Token::RedirectOut
+                | Token::RedirectClobber
                 | Token::RedirectAppend
                 | Token::RedirectIn
                 | Token::HereDoc
@@ -428,6 +430,7 @@ impl<'a> Parser<'a> {
         let is_heredoc_strip = self.current.token == Token::HereDocStrip;
         let (fd, kind, is_here_doc) = match &self.current.token {
             Token::RedirectOut => (None, RedirectKind::Output, false),
+            Token::RedirectClobber => (None, RedirectKind::Clobber, false),
             Token::RedirectAppend => (None, RedirectKind::Append, false),
             Token::RedirectIn => (None, RedirectKind::Input, false),
             Token::HereString => (None, RedirectKind::HereString, true),
@@ -439,6 +442,7 @@ impl<'a> Parser<'a> {
                 let fd = Some(*n);
                 let kind = match op {
                     RedirectOp::Output => RedirectKind::Output,
+                    RedirectOp::Clobber => RedirectKind::Clobber,
                     RedirectOp::Append => RedirectKind::Append,
                     RedirectOp::Input => RedirectKind::Input,
                     RedirectOp::DupOutput => RedirectKind::DupOutput,

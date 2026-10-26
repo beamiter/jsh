@@ -327,7 +327,7 @@ fn fallback_usage(name: &str) -> Option<&'static str> {
         "compgen" => "compgen [-abcdfv] [-A action] [-W words] [-G glob] [prefix]",
         "disown" => "disown [-a] [%N]",
         "shopt" => "shopt [-su] opt...",
-        "exec" => "exec cmd [args...]",
+        "exec" => "exec [-cl] [-a name] [--] [command [args...]]",
         "hash" => "hash [-r]",
         "z" => "z [query]",
         "bookmark" => "bookmark <add|go|ls|rm> [name]",
@@ -343,6 +343,7 @@ fn fallback_detail(name: &str) -> Option<&'static str> {
     Some(match name {
         "cd" => "Use `cd -` to return to the previous directory.",
         "exit" => "Without N, exits with the most recent command status.",
+        "exec" => "Replace the current process, preserving its PID. Without a command, keep redirections in the shell. -c clears the environment, -a sets argv[0], -l prefixes argv[0] with '-'.",
         "export" => "Use -n to remove the export attribute without deleting the value.",
         "echo" => "Use -n to omit the newline and -e to interpret escapes.",
         "unalias" => "Use -a to remove all aliases.",

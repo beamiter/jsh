@@ -1,0 +1,81 @@
+{
+  "profile": "debug, rustc 1.99.1, same Linux host, five fresh processes per variant; peak RSS from wait4",
+  "baseline": "1f0d5dab6501448870c9a884b3d2d4f7de10138d",
+  "cases": {
+    "field_filter_take_5": {
+      "command": "range 0..100000 | wrap n | where n -ge 50 | take 5 | to-json",
+      "baseline": {
+        "median_ms": 165.11,
+        "median_max_rss_kib": 59172,
+        "runs_ms": [
+          149.91,
+          171.716,
+          145.074,
+          169.105,
+          165.11
+        ]
+      },
+      "upgraded": {
+        "median_ms": 7.117,
+        "median_max_rss_kib": 13644,
+        "runs_ms": [
+          8.34,
+          7.361,
+          7.117,
+          6.524,
+          6.397
+        ]
+      }
+    },
+    "window_take_2": {
+      "command": "range 0..20000 | window 8 --stride 2 | take 2 | to-json",
+      "baseline": {
+        "median_ms": 15.772,
+        "median_max_rss_kib": 18968,
+        "runs_ms": [
+          17.046,
+          15.772,
+          14.371,
+          14.963,
+          15.832
+        ]
+      },
+      "upgraded": {
+        "median_ms": 8.825,
+        "median_max_rss_kib": 13780,
+        "runs_ms": [
+          10.815,
+          7.47,
+          11.951,
+          8.534,
+          8.825
+        ]
+      }
+    },
+    "chunks_take_2": {
+      "command": "range 0..100000 | chunks 8 | take 2 | to-json",
+      "baseline": {
+        "median_ms": 26.657,
+        "median_max_rss_kib": 26248,
+        "runs_ms": [
+          23.272,
+          27.876,
+          46.986,
+          26.657,
+          23.258
+        ]
+      },
+      "upgraded": {
+        "median_ms": 7.65,
+        "median_max_rss_kib": 13656,
+        "runs_ms": [
+          8.387,
+          6.56,
+          7.65,
+          6.782,
+          9.768
+        ]
+      }
+    }
+  }
+}
