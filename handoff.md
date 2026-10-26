@@ -1049,3 +1049,17 @@ shellcheck -s sh scripts/install-jsh.sh scripts/jsh-remote.sh
 ./scripts/test-install-jsh.sh
 ./scripts/test-jsh-remote.sh
 ```
+
+## 2026-10-27 — request-bound Agent completion
+
+Pinned jagent f269c3c6. The model loop now captures its request identity before
+transport and uses checked success/failure APIs; stale callbacks cannot offer
+retry or consume the current turn. Protocol failures retain the existing bounded
+retry policy, interrupt handling, explicit proposal review and execution path.
+No persistent wire format or prompt/decoder policy changed.
+
+Validation: Rust 1.99.1 Agent tests 47 passed, 4 ignored; Rust 1.89.0 locked
+check passed. Rust 1.86 is blocked by pre-existing lockfile dependencies:
+serde-saphyr 2.0 requires 1.89; annotate-snippets/encoding_rs require 1.88.
+The shared consumer lifecycle suite covers delayed, duplicate, cross-session,
+restored and concurrent-retry callbacks. No live-provider requests were made.
