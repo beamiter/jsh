@@ -966,6 +966,16 @@ measurements, not whole-shell startup or cross-shell rankings.
   `from-ndjson` currently skips invalid JSON lines; it does not provide a strict
   malformed-line error mode. `avg`, `product`, and statistical formulas use
   floating-point arithmetic.
+- YAML conversion uses serde-saphyr with bounded parsing and optional
+  include/property expansion disabled. Field order, ordinary `<<` keys, and
+  non-finite-number-to-null conversion are preserved. Some mixed-type mapping
+  keys with identical text (such as boolean `true` and string `'true'`) are now
+  rejected, explicit `!!timestamp` tags are unsupported, and nesting is limited
+  to 32 levels so parsing stays within a normal worker thread's stack. Duplicate
+  field names after conversion are errors; YAML quoting in field names derived
+  from complex/tagged keys may differ from the previous parser. Uncommon global
+  tags follow the new parser's type inference. Completion offers no candidates
+  for a document that fails parsing.
 - Descriptor duplication and closure (`N>&M`, `N<&M`, `N>&-`) are supported;
   descriptor-moving forms such as `N>&M-` remain unsupported and return an error.
 - Arithmetic variables accept numeric strings and radix prefixes; recursively

@@ -2325,10 +2325,7 @@ fn structured_fields(content: &str, format: &str) -> Option<Vec<(String, String)
             let first = content.lines().find(|line| !line.trim().is_empty())?;
             serde_json::from_str(first).ok()?
         }
-        "yaml" | "yml" => {
-            let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).ok()?;
-            serde_json::to_value(parsed).ok()?
-        }
+        "yaml" | "yml" => crate::yaml::from_slice(content.as_bytes()).ok()?,
         "toml" => {
             // The same conversion `from-toml` itself uses, so a field named
             // here is the field that pipeline would carry.
@@ -3034,7 +3031,7 @@ fn complete_kube_names(prefix: &str, kind: KubeName, state: &ShellState) -> Vec<
 }
 
 fn parse_kubeconfig_names(content: &str, kind: KubeName, prefix: &str) -> Vec<Completion> {
-    let Ok(document) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content) else {
+    let Ok(document) = crate::yaml::from_slice(content.as_bytes()) else {
         return Vec::new();
     };
     let current = document
@@ -3044,10 +3041,7 @@ fn parse_kubeconfig_names(content: &str, kind: KubeName, prefix: &str) -> Vec<Co
     // Namespaces are not a top-level list: each context names the one it
     // defaults to, and those are the namespaces this machine knows about.
     if kind == KubeName::Namespace {
-        let Some(contexts) = document
-            .get("contexts")
-            .and_then(|value| value.as_sequence())
-        else {
+        let Some(contexts) = document.get("contexts").and_then(|value| value.as_array()) else {
             return Vec::new();
         };
         let mut seen = std::collections::HashSet::new();
@@ -3078,7 +3072,7 @@ fn parse_kubeconfig_names(content: &str, kind: KubeName, prefix: &str) -> Vec<Co
         KubeName::User => ("users", "user"),
         KubeName::Namespace => unreachable!(),
     };
-    let Some(entries) = document.get(section).and_then(|value| value.as_sequence()) else {
+    let Some(entries) = document.get(section).and_then(|value| value.as_array()) else {
         return Vec::new();
     };
     entries
@@ -3117,19 +3111,15 @@ fn compose_services_from_path(path: &Path, prefix: &str) -> Vec<Completion> {
     else {
         return Vec::new();
     };
-    let Ok(document) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content) else {
+    let Ok(document) = crate::yaml::from_slice_string_keys_only(content.as_bytes()) else {
         return Vec::new();
     };
-    let Some(services) = document
-        .get("services")
-        .and_then(|value| value.as_mapping())
-    else {
+    let Some(services) = document.get("services").and_then(|value| value.as_object()) else {
         return Vec::new();
     };
     services
         .iter()
         .filter_map(|(name, definition)| {
-            let name = name.as_str()?;
             if !name.starts_with(prefix) {
                 return None;
             }
@@ -6442,6 +6432,44 @@ mod tests {
     }
 
     #[test]
+    fn compose_yaml_preserves_order_tags_and_string_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("compose.yaml");
+        fs::write(
+            &path,
+            "x-image: &image nginx:1.27\n\
+             services: !services\n\
+             \x20 on: !service\n\
+             \x20   image: *image\n\
+             \x20 off:\n\
+             \x20   build: !path ./worker\n\
+             \x20 7: {}\n\
+             \x20 true: {}\n\
+             \x20 '7': {}\n\
+             \x20 !service tagged: {}\n",
+        )
+        .unwrap();
+        crate::yaml::from_slice_string_keys_only(&fs::read(&path).unwrap())
+            .expect("valid Compose YAML must remain readable");
+
+        let services = compose_services_from_path(&path, "");
+        let texts: Vec<&str> = services.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["on", "off", "7", "tagged"]);
+        assert_eq!(services[0].description.as_deref(), Some("nginx:1.27"));
+        assert_eq!(services[1].description.as_deref(), Some("build ./worker"));
+
+        fs::write(&path, "services:\n  'true': {}\n").unwrap();
+        let services = compose_services_from_path(&path, "");
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].text, "true");
+
+        // The parser currently rejects a bool key and its quoted spelling
+        // together as duplicates; unsupported YAML must yield no suggestions.
+        fs::write(&path, "services:\n  true: {}\n  'true': {}\n").unwrap();
+        assert!(compose_services_from_path(&path, "").is_empty());
+    }
+
+    #[test]
     fn kubeconfig_names_come_from_the_file_and_mark_the_current_context() {
         let config = "apiVersion: v1\n\
             current-context: prod\n\
@@ -6482,6 +6510,31 @@ mod tests {
         );
         assert_eq!(parse_kubeconfig_names(config, KubeName::User, "").len(), 1);
         assert!(parse_kubeconfig_names("not: [valid", KubeName::Context, "").is_empty());
+    }
+
+    #[test]
+    fn kubeconfig_yaml_preserves_tags_string_names_and_namespace_deduplication() {
+        let config = "!kube\n\
+            current-context: !context on\n\
+            contexts:\n\
+            - name: !context on\n\
+            \x20 context: {namespace: !namespace off}\n\
+            - name: later\n\
+            \x20 context: {namespace: off}\n\
+            - name: 42\n\
+            \x20 context: {namespace: 7}\n\
+            - name: !!str true\n\
+            \x20 context: {namespace: 'null'}\n";
+
+        let contexts = parse_kubeconfig_names(config, KubeName::Context, "");
+        let texts: Vec<&str> = contexts.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["on", "later", "true"]);
+        assert_eq!(contexts[0].description.as_deref(), Some("current context"));
+
+        let namespaces = parse_kubeconfig_names(config, KubeName::Namespace, "");
+        let texts: Vec<&str> = namespaces.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["off", "null"]);
+        assert_eq!(namespaces[0].description.as_deref(), Some("default for on"));
     }
 
     #[test]
@@ -7135,6 +7188,21 @@ mod tests {
         // Malformed input and unknown formats yield nothing at all.
         assert!(structured_fields("{not json", "json").is_none());
         assert!(structured_fields("anything", "xlsx").is_none());
+    }
+
+    #[test]
+    fn structured_yaml_fields_follow_runtime_key_and_tag_conversion() {
+        let content = "zeta: !label example\non: off\n42: [1, 2]\ntruth: true\n";
+        let fields = structured_fields(content, "yaml").unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("zeta".to_string(), "string".to_string()),
+                ("on".to_string(), "string".to_string()),
+                ("42".to_string(), "list".to_string()),
+                ("truth".to_string(), "bool".to_string()),
+            ]
+        );
     }
 
     #[test]

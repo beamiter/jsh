@@ -22,10 +22,11 @@ ignore = []
 # supply-chain one, and denying them here would only produce unactionable noise.
 multiple-versions = "allow"
 deny = [
-    # The crate this gate was added for. It is abandoned upstream and can never
-    # be patched, so it must not come back through a transitive dependency
-    # either. anvil, forge, ember and frost all ship serde_yaml_ng.
-    { crate = "serde_yaml", use-instead = "serde_yaml_ng" },
+    # Both Serde frontends retain the unmaintained unsafe-libyaml parser
+    # (RUSTSEC-2024-0449). Prevent this chain from returning transitively too.
+    { crate = "serde_yaml", use-instead = "serde-saphyr" },
+    { crate = "serde_yaml_ng", use-instead = "serde-saphyr" },
+    { crate = "unsafe-libyaml", use-instead = "serde-saphyr" },
 ]
 
 [sources]

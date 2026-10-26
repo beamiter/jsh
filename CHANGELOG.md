@@ -36,6 +36,18 @@
 - Preserve large integers in sum/min/max, comparisons, and sorting. Integer
   sums fail explicitly outside i64; mixed sorting has a transitive order and
   equal values remain stable in both directions.
+- Install minisign and ShellCheck explicitly in the installer CI job so
+  signed installer and remote-deployment acceptance tests run on fresh runners.
+- Compile the helper parent-death syscall only on Linux/Android, restoring
+  macOS source compatibility while retaining portable isolation and cleanup.
+- Update rustls to 0.23.46, rustls-webpki to 0.103.16, and webpki-roots to 1.0.10
+  for the current TLS and certificate advisories. Replace serde_yaml_ng and its
+  unmaintained unsafe-libyaml dependency with serde-saphyr 2; keep optional
+  include/property expansion disabled and reject the old YAML dependency chain
+  in cargo-deny without adding advisory exceptions.
+- Keep the concurrent bookmark regression strict about all 32 committed names,
+  while allowing bounded retries for the production lock's documented timeout
+  on a busy filesystem. Other I/O failures now include their underlying error.
 
 ### Earlier unreleased changes
 

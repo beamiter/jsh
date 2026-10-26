@@ -5,75 +5,75 @@
     "field_filter_take_5": {
       "command": "range 0..100000 | wrap n | where n -ge 50 | take 5 | to-json",
       "baseline": {
-        "median_ms": 165.11,
-        "median_max_rss_kib": 59172,
+        "median_ms": 150.495,
+        "median_max_rss_kib": 58824,
         "runs_ms": [
-          149.91,
-          171.716,
-          145.074,
-          169.105,
-          165.11
+          157.535,
+          149.869,
+          178.912,
+          150.495,
+          147.59
         ]
       },
       "upgraded": {
-        "median_ms": 7.117,
-        "median_max_rss_kib": 13644,
+        "median_ms": 7.382,
+        "median_max_rss_kib": 15492,
         "runs_ms": [
-          8.34,
-          7.361,
-          7.117,
-          6.524,
-          6.397
+          7.738,
+          7.874,
+          7.382,
+          6.858,
+          6.622
         ]
       }
     },
     "window_take_2": {
       "command": "range 0..20000 | window 8 --stride 2 | take 2 | to-json",
       "baseline": {
-        "median_ms": 15.772,
-        "median_max_rss_kib": 18968,
+        "median_ms": 15.587,
+        "median_max_rss_kib": 18532,
         "runs_ms": [
-          17.046,
-          15.772,
-          14.371,
-          14.963,
-          15.832
+          15.142,
+          15.817,
+          15.414,
+          16.486,
+          15.587
         ]
       },
       "upgraded": {
-        "median_ms": 8.825,
-        "median_max_rss_kib": 13780,
+        "median_ms": 7.081,
+        "median_max_rss_kib": 15292,
         "runs_ms": [
-          10.815,
-          7.47,
-          11.951,
-          8.534,
-          8.825
+          9.194,
+          6.949,
+          7.007,
+          7.081,
+          7.159
         ]
       }
     },
     "chunks_take_2": {
       "command": "range 0..100000 | chunks 8 | take 2 | to-json",
       "baseline": {
-        "median_ms": 26.657,
-        "median_max_rss_kib": 26248,
+        "median_ms": 23.263,
+        "median_max_rss_kib": 25772,
         "runs_ms": [
-          23.272,
-          27.876,
-          46.986,
-          26.657,
-          23.258
+          21.91,
+          24.788,
+          23.263,
+          26.623,
+          22.512
         ]
       },
       "upgraded": {
-        "median_ms": 7.65,
-        "median_max_rss_kib": 13656,
+        "median_ms": 7.361,
+        "median_max_rss_kib": 15204,
         "runs_ms": [
-          8.387,
-          6.56,
-          7.65,
-          6.782,
-          9.768
+          7.902,
+          7.427,
+          7.361,
+          6.809,
+          7.324
         ]
       }
     }

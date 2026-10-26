@@ -16,10 +16,11 @@ validation status.
   Bookmark/frecency changes use locked read-modify-write transactions.
 - Field filters/chunks/windows stay lazy, deciding consumers short-circuit,
   large integers retain their precision, and mixed sorting is transitive/stable.
-- 87 added tests. All-feature suite: 1,381 passed, 0 failed, 7 ignored. Core-only
-  suite: 1,280 passed, 0 failed, 3 ignored. Strict Clippy in both configurations,
+- 104 added tests. All-feature suite: 1,398 passed, 0 failed, 7 ignored. Core-only
+  suite: 1,297 passed, 0 failed, 3 ignored. Strict Clippy in both configurations,
   formatting, docs, Release build, 78 benchmark smoke cases, and PTY checks pass.
-- Dependency pins and Cargo.lock are unchanged. Known Bash, malformed-NDJSON,
+- CI follow-up updates the TLS/YAML dependency chain, supplies installer-test
+  prerequisites, and gates Linux-only helper APIs. Known Bash, malformed-NDJSON,
   eager-closure, old-writer, and completion boundaries are documented explicitly.
 
 ## Historical entries

@@ -49,4 +49,5 @@ pub mod value;
 pub mod value_builtins;
 pub mod wire_json;
 pub mod workflows;
+pub(crate) mod yaml;
 pub mod zjump;

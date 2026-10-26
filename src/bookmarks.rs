@@ -220,13 +220,33 @@ mod tests {
                 scope.spawn(move || {
                     let mut db = database(path);
                     barrier.wait();
+                    // A busy runner can legitimately exhaust one acquisition's
+                    // two-second budget while another writer is syncing files.
+                    // Test committed data, not filesystem scheduling: retry
+                    // only contention, with one bounded budget for this writer.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
                     for item in 0..8 {
-                        assert!(db.add(&format!("writer-{writer}-{item}"), "/shared"));
+                        let name = format!("writer-{writer}-{item}");
+                        loop {
+                            match db.add_inner(&name, "/shared") {
+                                Ok(()) => break,
+                                Err(error)
+                                    if error.kind() == io::ErrorKind::WouldBlock
+                                        && std::time::Instant::now() < deadline =>
+                                {
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                }
+                                Err(error) => panic!("writer {writer}, item {item}: {error:?}"),
+                            }
+                        }
                     }
                 });
             }
         });
-        assert_eq!(database(&path).names().len(), 32);
+        let expected: Vec<_> = (0..4)
+            .flat_map(|writer| (0..8).map(move |item| format!("writer-{writer}-{item}")))
+            .collect();
+        assert_eq!(database(&path).names(), expected);
     }
 
     #[test]

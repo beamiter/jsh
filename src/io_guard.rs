@@ -738,7 +738,9 @@ pub(crate) struct BoundedCommand<'a> {
     /// still holding whatever single-flight slot it was given, until its own
     /// timeout expires; killing the process group ends it now.
     pub cancel: Option<&'a (dyn Fn() -> bool + Sync)>,
-    /// Ask the kernel to `SIGKILL` the child if this process dies.
+    /// On Linux/Android, ask the kernel to `SIGKILL` the child if this process dies.
+    /// Other platforms retain process-group/session isolation and parent-driven
+    /// cancellation, timeout, and output-limit cleanup, but have no prctl hook.
     ///
     /// Every kill path here needs a live parent to run it, so a shell that is
     /// itself `SIGKILL`ed would otherwise orphan a helper that keeps holding a
@@ -799,6 +801,7 @@ pub(crate) fn bounded_command_session(
         // leaving a descendant holding one of the capture pipes open.
         command.process_group(0);
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if die_with_parent {
         // SAFETY: runs between fork and exec in the child. prctl is a single
         // async-signal-safe syscall and touches no allocator or lock, which is
@@ -812,6 +815,8 @@ pub(crate) fn bounded_command_session(
             });
         }
     }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = die_with_parent;
     let mut child = command.spawn()?;
 
     // Scoped so the writer is joined on every exit path, including the kills

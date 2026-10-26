@@ -200,6 +200,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install script test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends minisign shellcheck
+
       - name: Shellcheck shipped scripts
         # Intentional remote-shell quoting is documented at its source, so the
         # default ShellCheck severity can remain a release gate.

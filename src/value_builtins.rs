@@ -950,12 +950,10 @@ fn vb_from_yaml(
             return Err(1);
         }
     };
-    // serde_yaml_ng deserializes into serde_json::Value first (lossy-typed but JSON-compatible).
-    let yval: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&bytes).map_err(|e| {
+    let jval = crate::yaml::from_slice(&bytes).map_err(|e| {
         eprintln!("from-yaml: {}", e);
         1
     })?;
-    let jval = yaml_to_json(yval);
     let v = Value::from_json(jval);
     let out = match v {
         Value::List(items) => items,
@@ -975,7 +973,7 @@ fn vb_to_yaml(
     } else {
         Value::List(vs).to_json()
     };
-    let s = serde_yaml_ng::to_string(&jval).map_err(|e| {
+    let s = serde_saphyr::to_string(&jval).map_err(|e| {
         eprintln!("to-yaml: {}", e);
         1
     })?;
@@ -1193,42 +1191,6 @@ fn xml_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-fn yaml_to_json(y: serde_yaml_ng::Value) -> serde_json::Value {
-    use serde_yaml_ng::Value as Y;
-    match y {
-        Y::Null => serde_json::Value::Null,
-        Y::Bool(b) => serde_json::Value::Bool(b),
-        Y::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_json::Value::Number(i.into())
-            } else if let Some(f) = n.as_f64() {
-                serde_json::Number::from_f64(f)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
-            } else {
-                serde_json::Value::Null
-            }
-        }
-        Y::String(s) => serde_json::Value::String(s),
-        Y::Sequence(seq) => serde_json::Value::Array(seq.into_iter().map(yaml_to_json).collect()),
-        Y::Mapping(map) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in map {
-                let key = match k {
-                    Y::String(s) => s,
-                    other => serde_yaml_ng::to_string(&other)
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string(),
-                };
-                obj.insert(key, yaml_to_json(v));
-            }
-            serde_json::Value::Object(obj)
-        }
-        Y::Tagged(t) => yaml_to_json(t.value),
-    }
 }
 
 pub(crate) fn toml_to_json(t: toml::Value) -> serde_json::Value {
