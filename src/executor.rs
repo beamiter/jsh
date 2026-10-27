@@ -8,7 +8,7 @@ use crate::traps;
 
 use nix::errno::Errno;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{close, execvp, fork, pipe, setpgid, tcsetpgrp, ForkResult, Pid};
+use nix::unistd::{close, execvp, pipe, setpgid, tcsetpgrp, ForkResult, Pid};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -511,7 +511,7 @@ fn execute_complete_command_outcome(
     state.inline_closures.clear();
     if cmd.background {
         // Fork for background execution
-        match unsafe { fork() } {
+        match unsafe { signal::fork_for_reset() } {
             Ok(ForkResult::Child) => {
                 traps::enter_subshell(state);
                 signal::reset_child_signals();
@@ -1009,7 +1009,7 @@ fn execute_untimed_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 
         state
             .fork_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        match unsafe { fork() } {
+        match unsafe { signal::fork_for_reset() } {
             Ok(ForkResult::Child) => {
                 traps::enter_subshell(state);
                 signal::reset_child_signals();
@@ -1935,7 +1935,7 @@ fn execute_simple_body(
         return code;
     }
 
-    match unsafe { fork() } {
+    match unsafe { signal::fork_for_reset() } {
         Ok(ForkResult::Child) => {
             signal::reset_child_signals();
             let pid = nix::unistd::getpid();
@@ -2089,7 +2089,7 @@ pub fn spawn_external(argv: &[String], state: &mut ShellState) -> i32 {
     let Some(cmd_name) = argv.first() else {
         return 0;
     };
-    match unsafe { fork() } {
+    match unsafe { signal::fork_for_reset() } {
         Ok(ForkResult::Child) => {
             signal::reset_child_signals();
             let pid = nix::unistd::getpid();
@@ -2146,36 +2146,38 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
         CompoundCommand::BraceGroup { body, redirects } => {
             with_redirects(redirects, state, |state| execute_command_list(body, state))
         }
-        CompoundCommand::Subshell { body, redirects } => match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                traps::enter_subshell(state);
-                signal::reset_child_signals();
-                let pid = nix::unistd::getpid();
-                setpgid(pid, pid).ok();
-                state.loop_depth = 0;
-                if let Err(code) = apply_redirects_in_child(redirects, state) {
-                    child_exit(code);
-                }
-                let code = execute_command_list(body, state);
-                exit_subshell(state, code);
-            }
-            Ok(ForkResult::Parent { child }) => {
-                setpgid(child, child).ok();
-                signal::set_foreground_pgid(Some(child.as_raw()));
-                let code = if state.interactive {
-                    wait_for_fg(child, state)
-                } else {
-                    match waitpid(child, None) {
-                        Ok(WaitStatus::Exited(_, code)) => code,
-                        Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
-                        _ => 1,
+        CompoundCommand::Subshell { body, redirects } => {
+            match unsafe { signal::fork_for_reset() } {
+                Ok(ForkResult::Child) => {
+                    traps::enter_subshell(state);
+                    signal::reset_child_signals();
+                    let pid = nix::unistd::getpid();
+                    setpgid(pid, pid).ok();
+                    state.loop_depth = 0;
+                    if let Err(code) = apply_redirects_in_child(redirects, state) {
+                        child_exit(code);
                     }
-                };
-                signal::set_foreground_pgid(None);
-                code
+                    let code = execute_command_list(body, state);
+                    exit_subshell(state, code);
+                }
+                Ok(ForkResult::Parent { child }) => {
+                    setpgid(child, child).ok();
+                    signal::set_foreground_pgid(Some(child.as_raw()));
+                    let code = if state.interactive {
+                        wait_for_fg(child, state)
+                    } else {
+                        match waitpid(child, None) {
+                            Ok(WaitStatus::Exited(_, code)) => code,
+                            Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                            _ => 1,
+                        }
+                    };
+                    signal::set_foreground_pgid(None);
+                    code
+                }
+                Err(_) => 1,
             }
-            Err(_) => 1,
-        },
+        }
         CompoundCommand::If {
             conditions,
             else_branch,
@@ -2645,7 +2647,7 @@ fn start_coprocess(name: &str, command: &Command, state: &mut ShellState) -> i32
     };
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
-    match unsafe { fork() } {
+    match unsafe { signal::fork_for_reset() } {
         Ok(ForkResult::Child) => {
             traps::enter_subshell(state);
             signal::reset_child_signals();

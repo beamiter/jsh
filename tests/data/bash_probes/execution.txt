@@ -409,3 +409,46 @@ set -E; trap 'echo err' ERR; (false); echo e
 printf 'g() { echo "${FUNCNAME[*]} | ${BASH_SOURCE[*]} | ${BASH_LINENO[*]}"; }\n' > lib.sh; . ./lib.sh; f() { g; }; f
 ### x_return_trap_not_inherited
 trap 'echo ret' RETURN; f() { :; }; f; : > empty.sh; . ./empty.sh; echo after
+### y_trap_in_function_context
+f() { trap 'echo "in trap: ${FUNCNAME[*]} $LINENO"' USR1; kill -USR1 $$; echo after; }; f; trap - USR1
+### y_exit_in_function_with_exit_trap
+trap 'echo "exit trap ${FUNCNAME[*]} $?"' EXIT; f() { exit 5; }; f; echo no
+### y_errexit_err_trap_function
+set -e; trap 'echo "err $? ${FUNCNAME[*]}"' ERR; f() { false; echo no; }; f; echo no2
+### y_break_in_subshell
+for i in 1 2; do (break); echo $i; done 2>/dev/null
+### y_signal_during_trap
+pid=$$; trap 'echo usr2' USR2; trap 'echo usr1-start; kill -USR2 $pid; echo usr1-end' USR1; kill -USR1 $$; echo done
+### y_trap_loop_break
+for i in 1 2 3; do trap 'echo t$i' USR1; kill -USR1 $$; done; trap - USR1
+### y_debug_in_trap_not_fired
+trap 'echo dbg' DEBUG; trap 'echo usr1' USR1; kill -USR1 $$; trap - DEBUG USR1
+### y_return_in_source_status
+printf 'false\nreturn\n' > rr.sh; . ./rr.sh; echo "st=$?"
+### y_lineno_in_function_defined_in_eval
+eval 'f() {
+echo "f $LINENO"
+}'
+f
+echo $LINENO
+### y_funcname_after_error
+f() { g; }; g() { return 1; }; f; echo "[${FUNCNAME[*]}] ${#FUNCNAME[@]}"
+### y_time_in_function
+f() { TIMEFORMAT=x; time true; }; f 2>&1
+### y_select_break_status
+printf '1\n' | { select x in a; do break; done; echo "st=$? x=$x"; } 2>/dev/null
+### y_coproc_redirect_close
+coproc cat; exec {COPROC[1]}>&-; read -r l <&${COPROC[0]}; echo "st=$? [$l]"
+### y_local_dash_nested
+f() { local -; set -e; g; }; g() { local -; set +e; set -u; }; f; echo "$-" | tr -d hBc
+### y_err_in_while_body_function
+trap 'echo err' ERR; f() { return 1; }; i=0; while [ $i -lt 2 ]; do i=$((i+1)); f; done; echo end
+### y_and_or_trap_order
+trap 'echo trapped' USR1; kill -USR1 $$ && echo next
+### y_pipefail_err
+set -o pipefail; trap 'echo err $?' ERR; false | true; echo end
+### y_nested_cmdsub_lineno
+x=$(echo $LINENO); echo $x
+y=$(
+echo $LINENO
+); echo $y

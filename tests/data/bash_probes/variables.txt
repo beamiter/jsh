@@ -612,3 +612,105 @@ v=a/b/c; echo ${v//\//_} ${v//"/"/-}
 v=aXbXc; echo ${v//X} ${v/X}
 ### y_tilde_in_array
 a=(~ ~/x); echo ${a[@]} | sed "s|$HOME|H|g"
+### z_readonly_in_function_global
+f() { readonly RX=1; }; f; echo $RX; RX=2; echo after
+### z_unset_local_declare_p
+f() { local x=1; unset x; declare -p x; echo st=$?; }; x=g; f
+### z_source_sets_global_from_function
+printf 'sv=1\nsarr=(a b)\n' > s.sh; f() { . ./s.sh; }; f; echo $sv ${sarr[1]}
+### z_source_declare_in_function_local
+printf 'declare -A sm=([k]=v)\n' > s.sh; f() { . ./s.sh; echo "in:${sm[k]}"; }; f; echo "out:[${sm[k]}]"
+### z_local_after_global_same_line
+x=1; f() { local x=2; x=3; echo $x; }; f; echo $x
+### z_declare_i_in_loop
+declare -i total=0; for n in 1 2 3; do total+=n*2; done; echo $total
+### z_array_from_glob_sorted
+touch c a b; arr=(*); echo "${arr[@]}"
+### z_assoc_in_function_global_modify
+declare -A cfg=([a]=1); set_cfg() { cfg[$1]=$2; }; set_cfg b 2; echo ${#cfg[@]} ${cfg[b]}
+### z_nested_array_func_args
+f() { local -a list=("$@"); echo ${#list[@]} "${list[1]}"; }; f "a b" c "d e"
+### z_indirect_array_all
+arr=(x y); ref='arr[@]'; echo "${!ref}"
+### z_param_length_array_elem_unset
+a=(1); echo "[${#a[5]}]"
+### z_quoted_star_empty_ifs
+set -- a b; IFS=; echo "$*"; x="$*"; echo $x
+### z_unquoted_at_empty_ifs
+set -- "a b" c; IFS=; printf '[%s]' $@; echo; printf '[%s]' $*; echo
+### z_ifs_unset_star_join
+set -- a b; unset IFS; echo "$*"
+### z_default_assign_array_elem
+a=(); : ${a[2]:=z}; echo ${!a[@]} ${a[2]}
+### z_seconds_integer_math
+SECONDS=10; echo $((SECONDS >= 10))
+### z_declare_p_function_local_array
+f() { local -a la=(1 "2 3"); declare -p la; }; f
+### z_export_function_scope_restored_env
+export V=outer; f() { local V=inner; sh -c 'echo c:$V'; }; f; sh -c 'echo c2:$V'
+### z_unset_exported_removes_env
+export U=1; unset U; sh -c 'echo "[$U]"'
+### z_export_n_in_function_global
+export N=1; f() { export -n N; }; f; sh -c 'echo "[$N]"'; echo $N
+### z_temp_env_read_builtin_restores
+x=orig; x=temp read y <<< "v"; echo $x $y
+### z_case_conversion_pattern_each
+a=(apple banana); echo "${a[@]^}" "${a[@]^^[an]}"
+### z_replace_in_array_quoted_spaces
+a=("a b" "c b"); printf '[%s]' "${a[@]// /_}"; echo
+### z_substring_on_array_elem
+a=(hello world); echo ${a[1]:1:3}
+### z_length_of_positional
+set -- abc de; echo ${#1} ${#2}
+### z_dollar_hash_in_function
+f() { echo $#; }; f a b c; set -- x; f
+### w_indirect_default
+unset t; ref=t; echo "${!ref:-dflt}"; t=set; echo "${!ref:-dflt}"
+### w_nameref_keys
+arr=([3]=a [9]=b); declare -n r=arr; echo ${!r[@]} ${#r[@]} ${r[-1]}
+### w_assoc_elem_length
+declare -A m=([k]=hello); echo ${#m[k]} ${m[k]:1:2} ${m[k]^^}
+### w_nameref_elem
+arr=(a b c); declare -n e='arr[1]'; echo $e; e=Z; echo ${arr[*]}
+### w_declare_p_nameref_elem
+arr=(a b); declare -n e='arr[1]'; declare -p e
+### w_unset_nameref_elem
+arr=(a b c); declare -n e='arr[1]'; unset e; echo ${!arr[@]}
+### w_local_inherit_I
+x=outer; f() { local -I x; echo "[$x]"; }; f
+### w_declare_g_array_in_function
+f() { declare -ga GA=(1 2); }; f; echo ${GA[1]}
+### w_export_assoc
+declare -A m=([a]=1); export m; env | grep -c '^m='; echo ${m[a]}
+### w_readonly_assoc_elem
+declare -A m=([a]=1); readonly m; m[b]=2; echo after
+### w_integer_assoc
+declare -Ai m; m[x]=2*3; echo ${m[x]}
+### w_upper_assoc
+declare -Au m; m[x]=abc; echo ${m[x]}
+### w_param_star_quoted_empty
+set --; printf '[%s]' "$*"; echo; printf '[%s]' "$@"; echo
+### w_array_star_quoted_empty
+a=(); printf '[%s]' "${a[*]}"; echo
+### w_unset_middle_then_slice
+a=(0 1 2 3 4); unset 'a[2]'; echo "${a[@]:1:3}"
+### w_negative_index_unset
+a=(1 2 3); unset 'a[-1]'; echo ${a[@]} ${#a[@]}
+### w_arr_assign_negative_out_of_range
+a=(1); a[-3]=x; echo after
+### w_compound_key_arith
+i=1; a=([i+1]=x [i*5]=y); echo ${!a[@]}
+### w_assoc_compound_append_existing
+declare -A m=([a]=1 [b]=2); m+=([a]=9); echo ${m[a]} ${m[b]} ${#m[@]}
+### w_compound_reassign_resets
+a=(1 2 3); a=(x); echo ${#a[@]}
+### w_scalar_assign_to_array_elem0
+a=(1 2 3); a=new; echo ${a[@]}
+### w_func_local_array_from_args
+f() { local arr=("$@"); echo ${#arr[@]}; }; f a "b c" d
+### w_declare_without_value_keeps
+x=5; declare x; echo $x; f() { local x; echo "[${x-unset}]"; }; f
+### w_local_twice_same_scope
+f() { local a=1; local a; echo $a; local a=2; echo $a; }; f
+### w_readonly_dash_f
+f() { :; }; readonly -f f; echo st=$?

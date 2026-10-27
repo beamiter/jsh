@@ -473,3 +473,49 @@ true --help; echo $?; false x; echo $?; : a b c; echo $?
 command; echo st=$?; builtin; echo st=$?; builtin nosuch; echo st=$?
 ### type_alias_quote
 shopt -s expand_aliases; alias q="it's"; type q; command -v q
+### type_fn_case_extglob
+f() { case $1 in a|b) echo ab;; *.txt) echo txt;; esac; }; type f
+### type_fn_redirects
+f() { echo a >out 2>&1; cat <in >>log; echo b >&2; exec 3>&-; }; type f
+### type_fn_nested_loops
+f() { for i in 1 2; do while true; do break 2; done; done; until false; do return 3; done; }; type f
+### type_fn_heredoc
+f() { cat <<EOF
+line $x
+EOF
+}; type f
+### type_fn_quotes
+f() { echo "a b" 'c d' "x\"y" '$z' "${arr[@]}" "$#" ${v:-d}; }; type f
+### type_fn_pipeline_neg
+f() { ! grep -q x file | wc -l && echo ok || echo no; }; type f
+### type_fn_subshell_bg
+f() { ( cd /; ls ) & wait; }; type f
+### type_fn_arith
+f() { (( i = 1 + 2 )); for ((j=0; j<3; j++)); do :; done; echo $(( j * 2 )); }; type f
+### type_fn_cond
+f() { [[ -n $a && $b == x* || ! -d $c ]] && [[ $s =~ ^[a-z]+$ ]]; }; type f
+### type_fn_assign
+f() { local a=1 b; a+=x; arr=(1 2 "3 4"); arr[5]=y; declare -A m; export E=1; }; type f
+### type_fn_if_elif
+f() { if [ "$1" = a ]; then echo a; elif [ "$1" = b ]; then echo b; elif [ "$1" = c ]; then echo c; else echo z; fi; }; type f
+### type_fn_brace_redirect
+f() { { echo a; echo b; } 2>/dev/null | sort; }; type f
+### type_fn_empty_body_stmt
+f() { :; }; type f; g() { true; false; }; type g
+### script_arg_parser
+usage() { echo "usage"; }; parse() { local OPTIND opt verbose=0 out=; while getopts ":vo:h" opt; do case $opt in v) verbose=$((verbose+1));; o) out=$OPTARG;; h) usage; return 0;; :) echo "missing arg for -$OPTARG"; return 2;; \?) echo "bad option -$OPTARG"; return 2;; esac; done; shift $((OPTIND-1)); echo "v=$verbose out=$out rest=$*"; }; parse -vv -o file a b; parse -x; parse -o; parse -h
+### script_csv_loop
+printf 'name,age\nann,30\nbob,25\n' > data.csv; { read -r header; while IFS=, read -r name age; do printf '%-5s|%3d\n' "$name" "$age"; done; } < data.csv
+### script_read_kv
+while IFS='=' read -r key value; do [[ -z $key || $key == \#* ]] && continue; printf '%s -> [%s]\n' "$key" "$value"; done <<'EOF'
+# comment
+a=1
+b = two words
+c==eq
+EOF
+### script_printf_table
+printf -v line '%*s' 10 ''; echo "${line// /-}"; printf '%-6s%6s\n' a 1 bb 22; printf '%q ' "x y" z; echo
+### script_umask_subshell
+umask 022; (umask 077; umask); umask
+### script_test_file_checks
+touch f; mkdir d; [ -f f -a -d d ] && echo both; [ ! -e nope ] && echo noexist; [[ -s f ]] || echo empty; echo x > f; [[ -s f ]] && echo nonempty

@@ -387,6 +387,37 @@ pub fn install_noninteractive_signals() {
 /// A signal the user ignored with `trap '' SIG` stays ignored: bash passes
 /// SIG_IGN on to every child, which is what lets `trap '' HUP` protect the
 /// programs a script starts.
+/// The signal mask the shell runs with, captured before the first fork that
+/// blocks signals, so children can return to it.
+static NORMAL_MASK: std::sync::OnceLock<SigSet> = std::sync::OnceLock::new();
+
+fn normal_mask() -> &'static SigSet {
+    NORMAL_MASK.get_or_init(|| SigSet::thread_get_mask().unwrap_or_else(|_| SigSet::empty()))
+}
+
+/// `fork()` with every signal blocked across the call, for a child that
+/// calls [`reset_child_signals`] before running anything.
+///
+/// Between fork and that reset the child still has the shell's handlers,
+/// which only latch a flag for the executor. A signal sent to the new PID in
+/// that window (`sleep 5 & kill $!`) was absorbed by them and then lost when
+/// the child exec'd its program. Blocked, the signal stays pending until the
+/// reset installs the default disposition and restores the mask, and is then
+/// delivered as intended. The parent's mask is restored before this returns.
+///
+/// # Safety
+/// The same as [`nix::unistd::fork`]; the child must call
+/// [`reset_child_signals`], which unblocks signals again.
+pub unsafe fn fork_for_reset() -> nix::Result<nix::unistd::ForkResult> {
+    let normal = normal_mask();
+    let _ = signal::pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&SigSet::all()), None);
+    let forked = unsafe { nix::unistd::fork() };
+    if !matches!(forked, Ok(nix::unistd::ForkResult::Child)) {
+        let _ = signal::pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(normal), None);
+    }
+    forked
+}
+
 pub fn reset_child_signals() {
     let ignored = USER_IGNORED.load(Ordering::SeqCst);
     unsafe {
@@ -410,4 +441,7 @@ pub fn reset_child_signals() {
             signal::sigaction(sig, action).ok();
         }
     }
+    // A child forked by fork_for_reset still has every signal blocked;
+    // anything that arrived meanwhile is delivered now, by default action.
+    let _ = signal::pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(normal_mask()), None);
 }
