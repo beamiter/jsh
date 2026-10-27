@@ -61,18 +61,18 @@ fn zero_timeout_checks_readiness_without_consuming_or_assigning() {
     assert_eq!(finish_promptly(child).stdout, b"1:<old>");
 
     for value in ["0", "-0", "+0.0"] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_jsh"))
+        // Fill and close the pipe before jsh starts. Writing after spawn raced
+        // the readiness check itself: on a loaded machine `read -t 0` could
+        // run first, correctly report "not ready" (1), and fail the test.
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"untouched\n").unwrap();
+        drop(writer);
+        let child = Command::new(env!("CARGO_BIN_EXE_jsh"))
             .args(["--norc", "-c", &format!(
                 r#"value=old; read -t '{value}' value; printf '%s:<%s>' "$?" "$value"; /usr/bin/cat"#
             )])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .stdin(reader).stdout(Stdio::piped()).stderr(Stdio::piped())
             .spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"untouched\n")
-            .unwrap();
         assert_eq!(finish_promptly(child).stdout, b"0:<old>untouched\n");
     }
 }
