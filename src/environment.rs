@@ -820,6 +820,12 @@ impl ShellState {
         self.arrays.contains_key(name) || self.assoc_arrays.contains_key(name)
     }
 
+    /// True for an associative array, whose subscripts are string keys rather
+    /// than arithmetic expressions (`m[k]` names the key `k`, not `$k`'s value).
+    pub fn is_assoc_array(&self, name: &str) -> bool {
+        self.assoc_arrays.contains_key(name)
+    }
+
     /// Push a new local variable scope (for function entry)
     pub fn push_local_scope(&mut self) {
         self.local_vars_stack.push(HashMap::new());

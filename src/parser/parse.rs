@@ -163,6 +163,61 @@ fn split_for_header(s: &str) -> Vec<String> {
     parts
 }
 
+/// How the source text after an opening `((` ends.
+#[derive(Debug, PartialEq, Eq)]
+enum DoubleParenEnd {
+    /// The expression is the first `len` bytes, and `))` follows it.
+    Arithmetic(usize),
+    /// The inner `(` closes without a `)` right behind it, so bash reads the
+    /// `((` as two nested subshells: `((cd /tmp && ls) | wc -l)`.
+    Subshells,
+    /// The input ends inside the expression.
+    Incomplete,
+}
+
+/// Find the end of the text after `((` the way bash's `parse_arith_cmd` does:
+/// follow parenthesis depth to the `)` that closes the inner `(`, then require
+/// a second `)` immediately after it. Quotes, backquotes and backslash escapes
+/// hide parentheses; `$(...)` and `$((...))` simply nest.
+fn scan_double_paren(src: &str) -> DoubleParenEnd {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            quote @ (b'\'' | b'`') => match bytes[i + 1..].iter().position(|&b| b == quote) {
+                Some(offset) => i += offset + 1,
+                None => return DoubleParenEnd::Incomplete,
+            },
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return DoubleParenEnd::Incomplete;
+                }
+            }
+            b'(' => depth += 1,
+            b')' if depth > 0 => depth -= 1,
+            b')' => {
+                return if bytes.get(i + 1) == Some(&b')') {
+                    DoubleParenEnd::Arithmetic(i)
+                } else {
+                    DoubleParenEnd::Subshells
+                };
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    DoubleParenEnd::Incomplete
+}
+
 /// Split the body of an array literal (`arr=(...)`) into element words. Quoting
 /// is honored, so `("a b" c)` is two elements and not three, and `#` starting a
 /// word begins a comment as it does in bash.
@@ -663,8 +718,9 @@ impl<'a> Parser<'a> {
     fn parse_compound_command(&mut self) -> Result<Command, ParseError> {
         match &self.current.token {
             Token::LParen => {
-                // Check if it's (( )) or ( )
-                if let Token::LParen = self.peek() {
+                // Only touching parentheses open an arithmetic command, as in
+                // bash: `( (cmd) )` is two subshells.
+                if self.at_double_paren() {
                     self.parse_arithmetic_command()
                 } else {
                     self.parse_subshell()
@@ -821,36 +877,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_c_style_for(&mut self) -> Result<Command, ParseError> {
-        self.advance(); // consume first (
-        self.advance(); // consume second (
-
-        // Slice the raw header text between (( and )) directly from the source.
-        // This preserves arithmetic operators (<, >, ++, ...) that the lexer would
-        // otherwise split into separate tokens, and handles `;;` (lexed as
-        // DoubleSemi) in headers like `for ((;;))`.
-        let content_start = self.current.span.0;
-        let content_end;
-        let mut depth = 0i32;
-        loop {
-            if self.current.token == Token::Eof {
-                return Err(ParseError::Incomplete);
-            }
-            if self.current.token == Token::RParen && depth == 0 && *self.peek() == Token::RParen {
-                content_end = self.current.span.0;
-                self.advance(); // consume first )
-                self.advance(); // consume second )
-                break;
-            }
-            match self.current.token {
-                Token::LParen => depth += 1,
-                Token::RParen => depth -= 1,
-                _ => {}
-            }
-            self.advance();
-        }
-
-        let raw = self.input.get(content_start..content_end).unwrap_or("");
-        let parts = split_for_header(raw);
+        // The header is read from the source text, so `;;` in `for ((;;))` and
+        // operators such as `<=` never pass through the shell lexer.
+        let Some(raw) = self.read_double_paren_body()? else {
+            return Err(ParseError::Unexpected(
+                "expected `))' to close the arithmetic for header".into(),
+            ));
+        };
+        let parts = split_for_header(&raw);
         let init = parts.first().cloned().unwrap_or_default();
         let condition = parts.get(1).cloned().unwrap_or_default();
         let update = parts.get(2).cloned().unwrap_or_default();
@@ -1058,71 +1092,47 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_arithmetic_command(&mut self) -> Result<Command, ParseError> {
-        self.advance(); // consume first (
-        self.advance(); // consume second (
-
-        // Read tokens until we find ))
-        let mut expr_tokens = Vec::new();
-        let mut paren_depth = 0;
-
-        loop {
-            match &self.current.token {
-                Token::RParen => {
-                    if paren_depth == 0 {
-                        // Check if next is also RParen
-                        if let Token::RParen = self.peek() {
-                            self.advance(); // consume first )
-                            self.advance(); // consume second )
-                            break;
-                        } else {
-                            paren_depth -= 1;
-                            expr_tokens.push(format!("{:?}", self.current.token));
-                            self.advance();
-                        }
-                    } else {
-                        paren_depth -= 1;
-                        expr_tokens.push(format!("{:?}", self.current.token));
-                        self.advance();
-                    }
-                }
-                Token::LParen => {
-                    paren_depth += 1;
-                    expr_tokens.push(format!("{:?}", self.current.token));
-                    self.advance();
-                }
-                Token::Eof => {
-                    return Err(ParseError::Incomplete);
-                }
-                Token::Word(w) => {
-                    expr_tokens.push(w.clone());
-                    self.advance();
-                }
-                Token::Newline => {
-                    self.skip_newlines();
-                }
-                other => {
-                    // For operators like &&, ||, |, etc., convert to string
-                    expr_tokens.push(match other {
-                        Token::And => "&&".to_string(),
-                        Token::Or => "||".to_string(),
-                        Token::Pipe => "|".to_string(),
-                        Token::Semi => ";".to_string(),
-                        Token::RedirectOut => ">".to_string(),
-                        Token::RedirectAppend => ">>".to_string(),
-                        Token::RedirectIn => "<".to_string(),
-                        _ => format!("{:?}", other),
-                    });
-                    self.advance();
-                }
-            }
-        }
-
-        let expr = expr_tokens.join(" ");
+        let Some(expr) = self.read_double_paren_body()? else {
+            return self.parse_subshell();
+        };
         let redirects = self.parse_optional_redirects()?;
         Ok(Command::Compound(CompoundCommand::Arithmetic {
             expr,
             redirects,
         }))
+    }
+
+    /// Is the current `(` immediately followed by another `(`?
+    fn at_double_paren(&mut self) -> bool {
+        if self.current.token != Token::LParen || *self.peek() != Token::LParen {
+            return false;
+        }
+        let end = self.current.span.1;
+        self.peeked.as_ref().is_some_and(|next| next.span.0 == end)
+    }
+
+    /// With `((` as the current and peeked tokens, take the text up to the
+    /// matching `))` verbatim from the source and resume lexing after it. The
+    /// shell lexer must never see that text: it would turn `<=`, `>=`, `<<=`
+    /// and `>>=` into redirections or a here-doc. `None` (nothing consumed)
+    /// means the parentheses close as nested subshells instead.
+    fn read_double_paren_body(&mut self) -> Result<Option<String>, ParseError> {
+        self.peek();
+        let start = self
+            .peeked
+            .as_ref()
+            .map_or(self.current.span.1, |next| next.span.1);
+        match scan_double_paren(&self.input[start..]) {
+            DoubleParenEnd::Arithmetic(len) => {
+                let body = self.input[start..start + len].to_string();
+                self.peeked = None;
+                self.lexer.set_pos(start + len + 2);
+                self.advance();
+                Ok(Some(body))
+            }
+            DoubleParenEnd::Subshells => Ok(None),
+            DoubleParenEnd::Incomplete => Err(ParseError::Incomplete),
+        }
     }
 
     fn parse_optional_redirects(&mut self) -> Result<Vec<Redirect>, ParseError> {
@@ -1538,14 +1548,131 @@ fn parse_assignment(w: &str, parser: &mut Parser) -> Result<Assignment, ParseErr
     })
 }
 
-/// Parse a raw word string into WordPart components.
-/// Crude heuristic to keep `let u = {"name":"bob"}` from being eaten by bash
-/// brace expansion: if the contents include a `"` or an unquoted `:`, treat
-/// the `{...}` as an opaque literal. Bash brace expansion never legitimately
-/// contains a `"`, and `:` only appears in parameter substitution which is
-/// inside `${...}`, not `{...}`.
-fn looks_like_json_object(content: &str) -> bool {
-    content.contains('"') || content.contains(':')
+/// Brace groups nested deeper than this are left as literal text. Expanding
+/// nested alternatives recurses once per level, and a group that does not
+/// expand is rescanned from its inner `{`; the bound keeps a hostile word from
+/// exhausting the stack or taking quadratic time. Real words nest a few levels.
+const MAX_BRACE_NESTING: usize = 64;
+
+/// The text of a `{...}` word segment, up to its matching `}`.
+struct BraceBody {
+    /// Text between the braces.
+    content: String,
+    /// The deepest nesting of brace groups, counting this one as 1.
+    max_depth: usize,
+    /// Byte offsets in `content` of the commas that separate alternatives:
+    /// those outside quotes, escapes, `${...}`, `$(...)` and nested braces.
+    commas: Vec<usize>,
+    /// Whether `content` has a `:` at that same level. Brace alternatives
+    /// never need one there, but a JSON object such as `{"name":"bob"}` does,
+    /// and jsh keeps those words intact for its structured commands.
+    top_level_colon: bool,
+}
+
+/// Scan a brace body the way bash's `brace_gobbler` does, starting just after
+/// the `{`. Returns `None` when nothing closes it.
+fn scan_brace_body(mut chars: std::iter::Peekable<std::str::Chars<'_>>) -> Option<BraceBody> {
+    let mut body = BraceBody {
+        content: String::new(),
+        max_depth: 1,
+        commas: Vec::new(),
+        top_level_colon: false,
+    };
+    let mut depth = 1usize;
+    while let Some(c) = chars.next() {
+        let content = &mut body.content;
+        match c {
+            '\\' => {
+                content.push(c);
+                content.push(chars.next()?);
+            }
+            '\'' | '`' => {
+                content.push(c);
+                loop {
+                    let c2 = chars.next()?;
+                    content.push(c2);
+                    if c2 == c {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                content.push(c);
+                loop {
+                    let c2 = chars.next()?;
+                    content.push(c2);
+                    if c2 == '\\' {
+                        content.push(chars.next()?);
+                    } else if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '$' if matches!(chars.peek(), Some('{' | '(')) => {
+                // `${x:-a,b}` and `$(echo a,b)` are single alternatives.
+                let open = chars.next()?;
+                let close = if open == '{' { '}' } else { ')' };
+                content.push(c);
+                content.push(open);
+                let mut nesting = 1usize;
+                while nesting > 0 {
+                    let c2 = chars.next()?;
+                    content.push(c2);
+                    if c2 == open {
+                        nesting += 1;
+                    } else if c2 == close {
+                        nesting -= 1;
+                    }
+                }
+            }
+            '{' => {
+                depth += 1;
+                body.max_depth = body.max_depth.max(depth);
+                content.push(c);
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(body);
+                }
+                content.push(c);
+            }
+            ',' if depth == 1 => {
+                body.commas.push(content.len());
+                content.push(c);
+            }
+            ':' if depth == 1 => {
+                body.top_level_colon = true;
+                content.push(c);
+            }
+            _ => content.push(c),
+        }
+    }
+    None
+}
+
+/// The alternatives of a comma brace expansion, each parsed as a word of its
+/// own so it keeps its quoting and can nest further braces: `{a,'b,c'}`,
+/// `x{a,b{1,2},c}y`, `a{,b}`.
+fn brace_alternatives(brace: &BraceBody) -> Vec<Word> {
+    // An empty alternative has no parts at all, so a word left with nothing
+    // else disappears like any empty unquoted word (`{,}` is no words, as in
+    // bash) while `a{,b}` still yields `a`.
+    let alternative = |text: &str| {
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            parse_word_parts(text)
+        }
+    };
+    let mut alternatives = Vec::with_capacity(brace.commas.len() + 1);
+    let mut start = 0;
+    for &comma in &brace.commas {
+        alternatives.push(alternative(&brace.content[start..comma]));
+        start = comma + 1;
+    }
+    alternatives.push(alternative(&brace.content[start..]));
+    alternatives
 }
 
 /// Detect `{|p1 p2 ...| body}` and split into (params, body_src).
@@ -2197,55 +2324,36 @@ pub fn parse_word_parts(raw: &str) -> Word {
                 }
             }
             '{' => {
-                // Try brace expansion: {a,b,c} or {1..10}
+                // Brace expansion: `{a,b,c}` or a sequence such as `{1..10}`.
+                // Any other `{` is literal text and parsing carries on inside
+                // it, so `{a{b,c}}` still expands its inner pair and `{$x}`
+                // still expands `$x`, as in bash.
+                chars.next(); // consume '{'
+                let Some(brace) = scan_brace_body(chars.clone()) else {
+                    literal.push('{');
+                    continue;
+                };
+                let part = if let Some(range) = parse_brace_range(&brace.content) {
+                    range
+                } else if brace.top_level_colon || brace.max_depth > MAX_BRACE_NESTING {
+                    // A JSON object (`let u = {"name":"bob"}`) stays opaque,
+                    // and so does a group nested beyond the expansion bound.
+                    literal.push('{');
+                    literal.push_str(&brace.content);
+                    literal.push('}');
+                    chars.nth(brace.content.chars().count());
+                    continue;
+                } else if !brace.commas.is_empty() {
+                    WordPart::BraceExpansion(brace_alternatives(&brace))
+                } else {
+                    literal.push('{');
+                    continue;
+                };
                 if !literal.is_empty() {
                     parts.push(WordPart::Literal(std::mem::take(&mut literal)));
                 }
-                chars.next(); // consume '{'
-                let mut content = String::new();
-                let mut depth = 1;
-                let mut found_close = false;
-                let save = chars.clone();
-                while let Some(&c2) = chars.peek() {
-                    if c2 == '{' {
-                        depth += 1;
-                    }
-                    if c2 == '}' {
-                        depth -= 1;
-                        if depth == 0 {
-                            chars.next();
-                            found_close = true;
-                            break;
-                        }
-                    }
-                    content.push(c2);
-                    chars.next();
-                }
-                if !found_close {
-                    // No closing brace - treat as literal
-                    literal.push('{');
-                    literal.push_str(&content);
-                    chars = save;
-                    // Consume all characters we already consumed from save
-                    for _ in 0..content.len() {
-                        chars.next();
-                    }
-                    continue;
-                }
-                // Check if it's a range: start..end[..step]
-                if let Some(range) = parse_brace_range(&content) {
-                    parts.push(range);
-                } else if content.contains(',') && !looks_like_json_object(&content) {
-                    // Comma-separated brace expansion: {a,b,c}
-                    let items: Vec<Vec<WordPart>> =
-                        content.split(',').map(parse_word_parts).collect();
-                    parts.push(WordPart::BraceExpansion(items));
-                } else {
-                    // Not a valid brace expansion (or it's a JSON object) — keep literal.
-                    literal.push('{');
-                    literal.push_str(&content);
-                    literal.push('}');
-                }
+                parts.push(part);
+                chars.nth(brace.content.chars().count()); // the body and its `}`
             }
             _ => {
                 literal.push(c);
@@ -2266,6 +2374,18 @@ pub fn parse_word_parts(raw: &str) -> Word {
 }
 
 fn parse_word_parts_inner(input: &str) -> Vec<WordPart> {
+    parse_double_quoted_body(input, false)
+}
+
+/// Parse arithmetic text (`$((...))`, `((...))`, a `for ((...))` clause or an
+/// array subscript) for the expansion bash performs before evaluating it:
+/// the text expands as if inside double quotes, except that unescaped double
+/// quotes are dropped rather than kept, so `$(( "1" + 2 ))` is 3.
+pub fn parse_arithmetic_parts(expr: &str) -> Vec<WordPart> {
+    parse_double_quoted_body(expr, true)
+}
+
+fn parse_double_quoted_body(input: &str, arithmetic: bool) -> Vec<WordPart> {
     let mut parts = Vec::new();
     let mut chars = input.chars().peekable();
     let mut literal = String::new();
@@ -2364,6 +2484,8 @@ fn parse_word_parts_inner(input: &str) -> Vec<WordPart> {
                 }
                 _ => literal.push('$'),
             }
+        } else if arithmetic && c == '"' {
+            chars.next();
         } else {
             literal.push(c);
             chars.next();
@@ -2464,28 +2586,214 @@ fn decode_ansi_c(s: &str) -> String {
     out
 }
 
+/// A sequence expression `{x..y}` or `{x..y..step}`. Both ends must be
+/// integers or both single letters, and a step must be an integer; anything
+/// else is no sequence, and bash leaves it as literal text (`{1..x}`).
 fn parse_brace_range(content: &str) -> Option<WordPart> {
     let parts: Vec<&str> = content.split("..").collect();
-    if parts.len() == 2 {
-        Some(WordPart::BraceRange {
-            start: parts[0].to_string(),
-            end: parts[1].to_string(),
-            step: None,
-        })
-    } else if parts.len() == 3 {
-        Some(WordPart::BraceRange {
-            start: parts[0].to_string(),
-            end: parts[1].to_string(),
-            step: Some(parts[2].to_string()),
-        })
-    } else {
-        None
+    let (start, end, step) = match parts.as_slice() {
+        [start, end] => (*start, *end, None),
+        [start, end, step] => (*start, *end, Some(*step)),
+        _ => return None,
+    };
+    let is_integer = |text: &str| text.parse::<i64>().is_ok();
+    let is_letter = |text: &str| text.len() == 1 && text.as_bytes()[0].is_ascii_alphabetic();
+    let ends_match = (is_integer(start) && is_integer(end)) || (is_letter(start) && is_letter(end));
+    if !ends_match || step.is_some_and(|step| !is_integer(step)) {
+        return None;
     }
+    Some(WordPart::BraceRange {
+        start: start.to_string(),
+        end: end.to_string(),
+        step: step.map(str::to_string),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, parse_word_parts, WordPart};
+    use super::{
+        parse, parse_arithmetic_parts, parse_word_parts, scan_double_paren, Command,
+        CompoundCommand, DoubleParenEnd, WordPart,
+    };
+
+    /// The single command of a one-command program.
+    fn only_command(src: &str) -> Command {
+        let mut program = parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        assert_eq!(program.len(), 1, "{src}");
+        let list = program.remove(0).list;
+        assert!(list.rest.is_empty(), "{src}");
+        let mut commands = list.first.commands;
+        assert_eq!(commands.len(), 1, "{src}");
+        commands.remove(0)
+    }
+
+    #[test]
+    fn double_paren_scan_finds_the_matching_close() {
+        assert_eq!(
+            scan_double_paren("x<=3)) && y"),
+            DoubleParenEnd::Arithmetic(4)
+        );
+        assert_eq!(
+            scan_double_paren(" (1+2) * 3 ))"),
+            DoubleParenEnd::Arithmetic(11)
+        );
+        assert_eq!(
+            scan_double_paren("$((1)) + $(echo ')')))"),
+            DoubleParenEnd::Arithmetic(20)
+        );
+        assert_eq!(
+            scan_double_paren("echo hi) | cat)"),
+            DoubleParenEnd::Subshells
+        );
+        assert_eq!(scan_double_paren("x ) )"), DoubleParenEnd::Subshells);
+        assert_eq!(scan_double_paren("x = (1"), DoubleParenEnd::Incomplete);
+        assert_eq!(scan_double_paren("\"))"), DoubleParenEnd::Incomplete);
+    }
+
+    #[test]
+    fn arithmetic_command_text_bypasses_the_shell_lexer() {
+        for (src, expr) in [
+            ("((i>=3))", "i>=3"),
+            ("((x<<=2, y>>=1))", "x<<=2, y>>=1"),
+            ("(( $1 <= 1 ))", " $1 <= 1 "),
+            ("((\n  x = 1\n))", "\n  x = 1\n"),
+        ] {
+            match only_command(src) {
+                Command::Compound(CompoundCommand::Arithmetic { expr: got, .. }) => {
+                    assert_eq!(got, expr, "{src}")
+                }
+                other => panic!("{src}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn double_parens_that_do_not_close_together_are_subshells() {
+        for src in ["((echo hi) | cat)", "( (echo hi) )", "( (1+2) )"] {
+            match only_command(src) {
+                Command::Compound(CompoundCommand::Subshell { .. }) => {}
+                other => panic!("{src}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn arithmetic_for_header_keeps_operators() {
+        match only_command("for ((i=1; i<=64; i<<=1)); do :; done") {
+            Command::Compound(CompoundCommand::CStyleFor {
+                init,
+                condition,
+                update,
+                ..
+            }) => assert_eq!(
+                (init, condition, update),
+                ("i=1".into(), "i<=64".into(), "i<<=1".into())
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse("for ((i=0; i<3; i++) ); do :; done"),
+            Err(super::ParseError::Unexpected(_))
+        ));
+        assert!(super::is_incomplete("for ((i=0;\n"));
+        assert!(super::is_incomplete("((x = 1 +\n"));
+    }
+
+    #[test]
+    fn arithmetic_text_drops_bare_double_quotes_only() {
+        assert_eq!(
+            parse_arithmetic_parts(r#""1" + $x"#),
+            vec![
+                WordPart::Literal("1 + ".into()),
+                WordPart::Variable("x".into())
+            ]
+        );
+        assert_eq!(
+            parse_arithmetic_parts(r#"\"1\" + '2'"#),
+            vec![WordPart::Literal(r#""1" + '2'"#.into())]
+        );
+    }
+
+    #[test]
+    fn brace_alternatives_split_on_top_level_commas() {
+        let literal = |s: &str| vec![WordPart::Literal(s.into())];
+        assert_eq!(
+            parse_word_parts("{a,{b,c}}"),
+            vec![WordPart::BraceExpansion(vec![
+                literal("a"),
+                vec![WordPart::BraceExpansion(vec![literal("b"), literal("c")])],
+            ])]
+        );
+        assert_eq!(
+            parse_word_parts("{a,'b,c'}"),
+            vec![WordPart::BraceExpansion(vec![
+                literal("a"),
+                vec![WordPart::SingleQuoted("b,c".into())],
+            ])]
+        );
+        assert_eq!(
+            parse_word_parts("a{,b}"),
+            vec![
+                WordPart::Literal("a".into()),
+                WordPart::BraceExpansion(vec![vec![], literal("b")]),
+            ]
+        );
+        // Only the inner pair expands; the outer braces are text.
+        assert_eq!(
+            parse_word_parts("{a{b,c}}"),
+            vec![
+                WordPart::Literal("{a".into()),
+                WordPart::BraceExpansion(vec![literal("b"), literal("c")]),
+                WordPart::Literal("}".into()),
+            ]
+        );
+        // JSON objects stay opaque, quotes and all.
+        assert_eq!(
+            parse_word_parts(r#"{"a":1,"b":2}"#),
+            literal(r#"{"a":1,"b":2}"#)
+        );
+    }
+
+    /// Groups nested past `MAX_BRACE_NESTING` stay text instead of recursing.
+    #[test]
+    fn brace_nesting_is_bounded() {
+        let nested = |depth: usize| format!("{}b{}", "{a,".repeat(depth), "}".repeat(depth));
+        assert!(matches!(
+            parse_word_parts(&nested(super::MAX_BRACE_NESTING)).as_slice(),
+            [WordPart::BraceExpansion(_)]
+        ));
+        let deep = nested(super::MAX_BRACE_NESTING + 1);
+        assert_eq!(
+            parse_word_parts(&deep),
+            vec![WordPart::Literal(deep.clone())]
+        );
+    }
+
+    #[test]
+    fn invalid_sequences_stay_literal() {
+        for word in [
+            "{1..x}",
+            "{a..5}",
+            "{1..3..x}",
+            "{..3}",
+            "{1...3}",
+            "{1..2..3..4}",
+        ] {
+            assert_eq!(
+                parse_word_parts(word),
+                vec![WordPart::Literal(word.into())],
+                "{word}"
+            );
+        }
+        assert!(matches!(
+            parse_word_parts("{-2..2}").as_slice(),
+            [WordPart::BraceRange { .. }]
+        ));
+        assert!(matches!(
+            parse_word_parts("{a..j..3}").as_slice(),
+            [WordPart::BraceRange { .. }]
+        ));
+    }
 
     #[test]
     fn command_substitution_keeps_nested_quoted_subshells() {

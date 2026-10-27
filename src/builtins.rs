@@ -45,6 +45,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "break",
     "continue",
     "shift",
+    "let",
     "set",
     "local",
     "jobs",
@@ -149,6 +150,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "break" => builtin_loop_control("break", args, state),
         "continue" => builtin_loop_control("continue", args, state),
         "shift" => builtin_shift(args, state),
+        "let" => builtin_let(args, state),
         "exec" => builtin_exec(args, state),
         "help" => builtin_help(args, state),
         "history" => builtin_history(state),
@@ -2437,6 +2439,40 @@ fn builtin_printf(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// Bash `let`: evaluate each argument as an arithmetic expression. The status
+/// is 0 when the last value is non-zero and 1 otherwise; an expression that
+/// fails reports an error and returns 1 without evaluating the rest.
+///
+/// The arguments were already expanded as ordinary words, so they are not
+/// expanded again. jsh's typed `let NAME = EXPR` binding never reaches here:
+/// the executor intercepts it before word expansion.
+fn builtin_let(args: &[String], state: &mut ShellState) -> i32 {
+    let args = match args.first() {
+        Some(first) if first == "--" => &args[1..],
+        _ => args,
+    };
+    if args.is_empty() {
+        eprintln!("jsh: let: expression expected");
+        return 1;
+    }
+    let mut last = 0;
+    for expression in args {
+        match crate::expand::evaluate_arithmetic_text(expression, state) {
+            Ok(value) => last = value,
+            Err(message) => {
+                eprintln!("jsh: let: {message}");
+                // `set -u` rejecting an unset variable is fatal, as it is in
+                // any expansion; other failures just make `let` return 1.
+                if state.expansion_error.take().is_some() && !state.interactive {
+                    state.abort_current_program = true;
+                }
+                return 1;
+            }
+        }
+    }
+    i32::from(last == 0)
 }
 
 fn builtin_shift(args: &[String], state: &mut ShellState) -> i32 {

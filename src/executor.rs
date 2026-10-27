@@ -344,7 +344,7 @@ fn nounset_violation(words: &[Word], state: &ShellState) -> Option<String> {
     words.iter().find_map(|w| scan(w, state))
 }
 
-fn unset_parameter(name: &str, state: &ShellState) -> Option<String> {
+pub(crate) fn unset_parameter(name: &str, state: &ShellState) -> Option<String> {
     let first = name.chars().next()?;
     if first.is_ascii_digit() {
         // `$0` is always set; `$12` is unset when there are fewer than 12 args.
@@ -399,6 +399,29 @@ fn xtrace_quote(word: &str) -> String {
 fn xtrace_line(state: &ShellState, words: &[String]) {
     let line: Vec<String> = words.iter().map(|w| xtrace_quote(w)).collect();
     eprintln!("{}{}", xtrace_prefix(state), line.join(" "));
+}
+
+/// Evaluate a `((...))` command or one clause of a `for ((...))` header.
+///
+/// A malformed or failing expression reports `((: ...` and yields status 1,
+/// and the script carries on, as in bash. A failure while *expanding* the text
+/// (`(( $((1/0)) ))`, `${x:?}`) is an ordinary expansion error, which aborts.
+fn run_arith_clause(expr: &str, state: &mut ShellState) -> Result<i64, i32> {
+    let Some(text) = crate::expand::expand_arithmetic_text(expr, state) else {
+        return Err(report_expansion_error(state).unwrap_or(1));
+    };
+    if state.shell_opts.xtrace {
+        eprintln!("{}(( {text} ))", xtrace_prefix(state));
+    }
+    crate::expand::evaluate_arithmetic_text(&text, state).map_err(|message| {
+        // An unbound variable under `set -u` comes back as an expansion
+        // error, which is fatal here too.
+        if let Some(code) = report_expansion_error(state) {
+            return code;
+        }
+        eprintln!("jsh: ((: {message}");
+        1
+    })
 }
 
 fn report_expansion_error(state: &mut ShellState) -> Option<i32> {
@@ -901,9 +924,13 @@ fn execute_assignment(assign: &Assignment, state: &mut ShellState) -> String {
         }
         trace
     } else if let Some(ref index) = assign.index {
-        // Indexed assignment: arr[idx]=value
+        // Indexed assignment: arr[idx]=value. Bash expands the value first,
+        // then resolves the subscript (an arithmetic index unless the array
+        // is associative): `i=0; a[i+1]=$((i=7))` stores 7 at index 8.
         let value = expand_word_to_string(&assign.value, state);
-        state.set_array_element(&assign.name, index, &value);
+        if let Some(key) = crate::expand::resolve_array_subscript(&assign.name, index, state) {
+            state.set_array_element(&assign.name, &key, &value);
+        }
         format!("{}[{}]={}", assign.name, index, xtrace_quote(&value))
     } else if assign.append {
         // String append: var+=value
@@ -1865,12 +1892,14 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             redirects,
         } => {
             with_redirects(redirects, state, |state| {
-                // Execute init expression
+                // A header clause that fails to evaluate ends the loop with
+                // status 1, but bash does not apply errexit to that failure:
+                // `set -e; for ((i=0; i<1/0; i++)) ...; echo after` reaches
+                // `echo`. Hence the exemption on each failure below.
                 if !init.is_empty() {
-                    let _ = crate::expand::expand_arithmetic(init, state);
-                    if let Some(error) = state.expansion_error.take() {
-                        eprintln!("jsh: ((: {error}");
-                        return 1;
+                    if let Err(code) = run_arith_clause(init, state) {
+                        state.last_failure_exempt = true;
+                        return code;
                     }
                 }
 
@@ -1883,14 +1912,14 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                         // Empty condition means infinite loop (like for ((;;)))
                         true
                     } else {
-                        let cond_str = crate::expand::expand_arithmetic(condition, state);
-                        if let Some(error) = state.expansion_error.take() {
-                            eprintln!("jsh: ((: {error}");
-                            code = 1;
-                            failure_exempt = false;
-                            break;
+                        match run_arith_clause(condition, state) {
+                            Ok(value) => value != 0,
+                            Err(status) => {
+                                code = status;
+                                failure_exempt = true;
+                                break;
+                            }
                         }
-                        cond_str.parse::<i64>().unwrap_or(0) != 0
                     };
 
                     if !cond_result {
@@ -1917,11 +1946,9 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
 
                     // Execute update expression
                     if !update.is_empty() {
-                        let _ = crate::expand::expand_arithmetic(update, state);
-                        if let Some(error) = state.expansion_error.take() {
-                            eprintln!("jsh: ((: {error}");
-                            code = 1;
-                            failure_exempt = false;
+                        if let Err(status) = run_arith_clause(update, state) {
+                            code = status;
+                            failure_exempt = true;
                             break;
                         }
                     }
@@ -2145,22 +2172,11 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
         }
         CompoundCommand::Arithmetic { expr, redirects } => {
             with_redirects(redirects, state, |state| {
-                // Evaluate the arithmetic expression
-                let result_str = crate::expand::expand_arithmetic(expr, state);
-                if let Some(error) = state.expansion_error.take() {
-                    eprintln!("jsh: ((: {error}");
-                    return 1;
-                }
-                if let Ok(result) = result_str.parse::<i64>() {
-                    // In bash, (( expr )) returns 0 if expr != 0, and 1 if expr == 0
-                    // This is the opposite of C - expressions are checked for truthiness
-                    if result != 0 {
-                        0
-                    } else {
-                        1
-                    }
-                } else {
-                    1
+                // In bash, (( expr )) returns 0 if expr != 0, and 1 if expr == 0
+                // This is the opposite of C - expressions are checked for truthiness
+                match run_arith_clause(expr, state) {
+                    Ok(value) => i32::from(value == 0),
+                    Err(status) => status,
                 }
             })
         }

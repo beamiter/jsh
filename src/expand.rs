@@ -432,16 +432,16 @@ fn element_values(var_name: &str, state: &ShellState) -> Vec<String> {
 }
 
 /// One element of `var_name[subscript]`, treating a scalar as a one-element
-/// array so that `${x[0]}` on `x=abc` yields `abc` the way bash does.
-fn subscript_element(var_name: &str, subscript: &str, state: &ShellState) -> Option<String> {
+/// array so that `${x[0]}` on `x=abc` yields `abc` the way bash does. The
+/// subscript is expanded and, for an indexed array, evaluated arithmetically
+/// (`${a[i+1]}`); a failure leaves an expansion error and yields `None`.
+fn subscript_element(var_name: &str, subscript: &str, state: &mut ShellState) -> Option<String> {
+    let key = resolve_array_subscript(var_name, subscript, state)?;
     if state.is_array(var_name) {
-        return state.get_array_element(var_name, subscript);
+        return state.get_array_element(var_name, &key);
     }
     let value = state.get_var(var_name)?;
-    match subscript.trim().parse::<usize>() {
-        Ok(0) => Some(value.to_string()),
-        _ => None,
-    }
+    (key == "0").then(|| value.to_string())
 }
 
 /// Split `arr[@]` / `arr[*]` into (name, subscript) when the name has elements
@@ -893,9 +893,7 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
 
             // ${arr[idx]} - single element access
             if after_bracket.is_empty() && state.is_array(var_name) {
-                return state
-                    .get_array_element(var_name, subscript_part)
-                    .unwrap_or_default();
+                return subscript_element(var_name, subscript_part, state).unwrap_or_default();
             }
             // `x=abc` behaves like `x=(abc)`: `${x[0]}` is the value and every
             // other index is unset. Real scripts index scalars defensively
@@ -1069,7 +1067,8 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
                     .chain(std::iter::once(val.len()))
                     .collect();
                 let count = boundaries.len() - 1;
-                let offset: i64 = offset_text.trim().parse().unwrap_or(0);
+                // Offset and length are arithmetic expressions: `${s:1+1:2}`.
+                let offset = substring_bound(offset_text, state);
                 let start = if offset < 0 {
                     (count as i64).saturating_add(offset).max(0) as usize
                 } else {
@@ -1077,7 +1076,7 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
                 };
                 let end = match length_text {
                     Some(l) => {
-                        let len: i64 = l.trim().parse().unwrap_or(count as i64);
+                        let len = substring_bound(l, state);
                         if len < 0 {
                             (count as i64).saturating_add(len).max(start as i64) as usize
                         } else {
@@ -1099,6 +1098,19 @@ fn expand_parameter(name: &str, state: &mut ShellState) -> String {
         return v.to_display_string();
     }
     String::new()
+}
+
+/// Evaluate a `${var:offset:length}` bound, which bash treats as arithmetic.
+/// A failure leaves an expansion error, and the bound reads as 0.
+fn substring_bound(text: &str, state: &mut ShellState) -> i64 {
+    match eval_arithmetic(text, state) {
+        Ok(value) => value,
+        Err(ArithFailure::Expansion) => 0,
+        Err(ArithFailure::Eval(message)) => {
+            state.expansion_error = Some(message);
+            0
+        }
+    }
 }
 
 /// Byte offset where a `${...}` body stops being the parameter name and starts
@@ -1302,18 +1314,21 @@ fn expand_brace_range(start: &str, end: &str, step: Option<&str>) -> Vec<String>
     if let (Ok(s), Ok(e)) = (start.parse::<i64>(), end.parse::<i64>()) {
         // `saturating_abs`: `{1..9..-9223372036854775808}` would panic on a
         // plain `abs()`, and a brace range must never be able to kill the shell.
+        // Bash reads a zero step as 1.
         let step_abs = step
             .and_then(|s| s.parse::<i64>().ok().map(|v| v.saturating_abs()))
-            .unwrap_or(1);
-        if step_abs == 0 {
-            return vec![];
-        }
+            .unwrap_or(1)
+            .max(1);
         let step_val = if s <= e { step_abs } else { -step_abs };
 
-        // Check for zero-padding
+        // An end written with a leading zero (`08`, `-05`) pads every term to
+        // the wider end's length, sign included: `{-05..3}` is `-05 ... 003`.
         let pad_width = start.len().max(end.len());
-        let needs_pad =
-            (start.starts_with('0') && start.len() > 1) || (end.starts_with('0') && end.len() > 1);
+        let zero_padded = |text: &str| {
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            digits.len() > 1 && digits.starts_with('0')
+        };
+        let needs_pad = zero_padded(start) || zero_padded(end);
 
         let mut results = Vec::new();
         let mut i = s;
@@ -1326,7 +1341,7 @@ fn expand_brace_range(start: &str, end: &str, step: Option<&str>) -> Vec<String>
                 break;
             }
             if needs_pad {
-                results.push(format!("{:0>width$}", i, width = pad_width));
+                results.push(format!("{:0width$}", i, width = pad_width));
             } else {
                 results.push(i.to_string());
             }
@@ -1349,10 +1364,8 @@ fn expand_brace_range(start: &str, end: &str, step: Option<&str>) -> Vec<String>
         // `abs()` and a huge positive step panicked on the `i += step_val` below.
         let step_abs = step
             .and_then(|s| s.parse::<i32>().ok().map(|v| v.saturating_abs()))
-            .unwrap_or(1);
-        if step_abs == 0 {
-            return vec![];
-        }
+            .unwrap_or(1)
+            .max(1);
         let step_val = if s <= e { step_abs } else { -step_abs };
 
         let mut results = Vec::new();
@@ -1560,336 +1573,423 @@ fn expand_process_sub(cmd: &str, kind: &ProcessSubKind, state: &mut ShellState) 
     }
 }
 
-/// Evaluate shell arithmetic using fixed-width, wrapping integer semantics.
-/// Explicit wrapping keeps debug and release behavior identical, including
-/// extreme shift counts and the signed minimum divided by minus one.
+/// Evaluate `$((...))` to its decimal text. On failure the diagnostic is left
+/// in `state.expansion_error`, as for any other expansion error, and `"0"`
+/// stands in for the value.
 pub fn expand_arithmetic(expr: &str, state: &mut ShellState) -> String {
-    let tokens = tokenize_arith(expr);
-    if tokens.is_empty() {
-        return "0".into();
-    }
-    let mut pos = 0;
-    let result = eval_arith_expr(&tokens, &mut pos, state, true).and_then(|value| {
-        if pos != tokens.len() {
-            Err("unexpected token in arithmetic expression".into())
-        } else {
-            Ok(value)
-        }
-    });
-    match result {
-        Ok(n) => n.to_string(),
-        Err(error) => {
-            state.expansion_error = Some(format!("{expr}: {error}"));
+    match eval_arithmetic(expr, state) {
+        Ok(value) => value.to_string(),
+        Err(ArithFailure::Expansion) => "0".into(),
+        Err(ArithFailure::Eval(message)) => {
+            state.expansion_error = Some(message);
             "0".into()
         }
     }
 }
 
-fn parse_arith_integer(text: &str) -> Result<i64, String> {
-    let (radix, digits) =
-        if let Some(digits) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-            (16, digits)
-        } else if text.starts_with('0') && text.len() > 1 {
-            (8, text)
+/// Why an arithmetic evaluation produced no value.
+#[derive(Debug)]
+enum ArithFailure {
+    /// Expanding the text before evaluation failed (`${x:?}`, a failing
+    /// nested `$((...))`). The diagnostic is left in `state.expansion_error`
+    /// so the caller reports it like any other expansion error — which bash
+    /// treats as fatal even inside `((...))`.
+    Expansion,
+    /// The expression is malformed or failed while evaluating. The message
+    /// names the offending text the way bash does (`1/0: division by 0`).
+    Eval(String),
+}
+
+/// Expand and evaluate arithmetic text the way `$((...))`, `((...))` and
+/// `for ((...))` do: [`expand_arithmetic_text`], then
+/// [`evaluate_arithmetic_text`].
+fn eval_arithmetic(expr: &str, state: &mut ShellState) -> Result<i64, ArithFailure> {
+    let text = expand_arithmetic_text(expr, state).ok_or(ArithFailure::Expansion)?;
+    evaluate_arithmetic_text(&text, state).map_err(ArithFailure::Eval)
+}
+
+/// Evaluate text that has already been through word expansion, such as the
+/// arguments of `let`. Integers are 64-bit and wrap on overflow; `&&`, `||`
+/// and `?:` evaluate only the operands they select.
+///
+/// Bash makes one failure fatal rather than a mere failed expression: an
+/// unbound variable under `set -u`. Its diagnostic is also left in
+/// `state.expansion_error`, so callers can stop the way they do for any
+/// expansion error.
+pub fn evaluate_arithmetic_text(text: &str, state: &mut ShellState) -> Result<i64, String> {
+    eval_arith_text(text, state).map_err(|error| {
+        let message = error.to_string();
+        if error.0.fatal {
+            state.expansion_error = Some(message.clone());
+        }
+        message
+    })
+}
+
+/// Resolve the subscript of `name[subscript]` written outside arithmetic — in
+/// `${name[...]}` or `name[...]=value` — to the key it addresses.
+///
+/// For an associative array the expanded subscript *is* the key. Any other
+/// name is (or becomes) an indexed array, whose subscript is an arithmetic
+/// expression: `${a[i+1]}`, `a[n-1]=x` and `${a[$((1+1))]}` all work, and the
+/// result is the index in decimal. Failures are expansion errors: the
+/// diagnostic is left in `state.expansion_error` and `None` is returned.
+pub(crate) fn resolve_array_subscript(
+    name: &str,
+    subscript: &str,
+    state: &mut ShellState,
+) -> Option<String> {
+    if state.is_assoc_array(name) {
+        let key = expand_param_operand(subscript, state);
+        return state.expansion_error.is_none().then_some(key);
+    }
+    match eval_arithmetic(subscript, state) {
+        Ok(index) => Some(index.to_string()),
+        Err(ArithFailure::Expansion) => None,
+        Err(ArithFailure::Eval(message)) => {
+            state.expansion_error = Some(message);
+            None
+        }
+    }
+}
+
+/// How deeply arithmetic evaluation may nest. Parenthesised groups, chains of
+/// unary operators, `?:`, assignment chains, `**`, variables whose values are
+/// expressions in their own right, and `$((...))` inside the text all count.
+/// Bash stops recursive variable evaluation at 1024 levels with "expression
+/// recursion level exceeded" (`x=x; $((x))`); the same budget, shared by every
+/// form of nesting, keeps hostile input from overflowing the stack.
+const MAX_ARITH_DEPTH: usize = 1024;
+
+thread_local! {
+    /// Current nesting depth of arithmetic evaluation on this thread. It lives
+    /// outside the evaluator because nesting crosses word expansion: an inner
+    /// `$((...))` is evaluated by a fresh call from `expand_arithmetic_text`.
+    static ARITH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One level of arithmetic nesting, released when dropped.
+struct ArithDepth;
+
+impl ArithDepth {
+    fn enter() -> Result<Self, ArithError> {
+        ARITH_DEPTH.with(|depth| {
+            if depth.get() >= MAX_ARITH_DEPTH {
+                return Err(ArithError::from("expression recursion level exceeded"));
+            }
+            depth.set(depth.get() + 1);
+            Ok(ArithDepth)
+        })
+    }
+}
+
+impl Drop for ArithDepth {
+    fn drop(&mut self) {
+        ARITH_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+/// Bash's expansion of arithmetic text before evaluating it.
+///
+/// Parameters, command substitutions and nested `$((...))` expand as inside
+/// double quotes, and unquoted double quotes are removed (`$(( "1" + 2 ))` is
+/// 3). So `$x` splices text (`x='1+2'; $(($x*2))` is 5) while a bare `x` is
+/// later evaluated as a sub-expression of its own (`$((x*2))` is 6). `None`
+/// means an expansion failed and left its diagnostic in
+/// `state.expansion_error`; bash treats that as fatal even inside `((...))`.
+pub fn expand_arithmetic_text<'a>(
+    expr: &'a str,
+    state: &mut ShellState,
+) -> Option<std::borrow::Cow<'a, str>> {
+    // Nearly all arithmetic is plain text (`i<10`, `n++`); skip the parse.
+    if !expr.contains(['$', '`', '"', '\\']) {
+        return Some(std::borrow::Cow::Borrowed(expr));
+    }
+    let _depth = match ArithDepth::enter() {
+        Ok(depth) => depth,
+        Err(error) => {
+            state.expansion_error = Some(error.within(expr).to_string());
+            return None;
+        }
+    };
+    let mut text = String::with_capacity(expr.len());
+    for part in crate::parser::parse::parse_arithmetic_parts(expr) {
+        // Word expansion leaves `set -u` to the executor, which skips
+        // arithmetic text; check the references spliced in here.
+        if let WordPart::Variable(name) = &part {
+            if state.shell_opts.nounset {
+                if let Some(param) = crate::executor::unset_parameter(name, state) {
+                    state.expansion_error = Some(format!("{param}: unbound variable"));
+                    return None;
+                }
+            }
+        }
+        let piece = expand_part(&part, state);
+        if state.expansion_error.is_some() {
+            return None;
+        }
+        text.push_str(&piece);
+    }
+    Some(std::borrow::Cow::Owned(text))
+}
+
+/// A failed evaluation: the message, and the text bash names in front of it.
+/// That is the innermost text being evaluated when evaluation failed — a
+/// variable's value that is itself an expression reports against the value
+/// (`x=08; $((x))` fails with `08: value too great for base`).
+///
+/// Boxed so every `Result` handed up the recursive evaluator is one word: in
+/// debug builds those slots make up much of the stack each nesting level
+/// costs, and nesting is allowed to reach `MAX_ARITH_DEPTH`.
+#[derive(Debug)]
+struct ArithError(Box<ArithErrorDetail>);
+
+#[derive(Debug)]
+struct ArithErrorDetail {
+    expression: Option<String>,
+    message: String,
+    /// Set for an unbound variable under `set -u`, which bash treats as a
+    /// fatal expansion error instead of a failed expression.
+    fatal: bool,
+}
+
+type ArithResult<T = i64> = Result<T, ArithError>;
+
+impl ArithError {
+    /// `message`, reported against the text `expression`.
+    fn at(expression: &str, message: impl Into<String>) -> Self {
+        ArithError(Box::new(ArithErrorDetail {
+            expression: Some(expression.trim().to_string()),
+            message: message.into(),
+            fatal: false,
+        }))
+    }
+
+    /// `set -u` rejecting a reference to the unset variable `name`.
+    fn unbound(name: &str) -> Self {
+        let mut error = ArithError::at(name, "unbound variable");
+        error.0.fatal = true;
+        error
+    }
+
+    /// Report against `expression` unless an inner evaluation already named
+    /// its own text.
+    fn within(mut self, expression: &str) -> Self {
+        if self.0.expression.is_none() {
+            self.0.expression = Some(expression.trim().to_string());
+        }
+        self
+    }
+}
+
+impl From<&str> for ArithError {
+    fn from(message: &str) -> Self {
+        ArithError::from(message.to_string())
+    }
+}
+
+impl From<String> for ArithError {
+    fn from(message: String) -> Self {
+        ArithError(Box::new(ArithErrorDetail {
+            expression: None,
+            message,
+            fatal: false,
+        }))
+    }
+}
+
+impl std::fmt::Display for ArithError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0.expression {
+            Some(expression) => write!(f, "{expression}: {}", self.0.message),
+            None => f.write_str(&self.0.message),
+        }
+    }
+}
+
+/// Parse and evaluate expanded arithmetic text.
+fn eval_arith_text(text: &str, state: &mut ShellState) -> ArithResult {
+    let tokens = tokenize_arith(text);
+    // `$(( ))`, `(( ))` and an empty or blank variable all count as 0.
+    if tokens.is_empty() {
+        return Ok(0);
+    }
+    let mut parser = ArithParser {
+        tokens: &tokens,
+        pos: 0,
+        state,
+    };
+    let result = parser.comma(true).and_then(|value| {
+        if parser.pos < tokens.len() {
+            Err(parser.trailing_error())
         } else {
-            (10, text)
-        };
-    if digits.is_empty() {
-        return Err(format!("invalid arithmetic integer: {text}"));
+            Ok(value)
+        }
+    });
+    result.map_err(|error| error.within(text))
+}
+
+/// Parse an integer constant: decimal, `0x` hexadecimal, leading-zero octal,
+/// or bash's `base#digits` for bases 2 through 64. Digits run 0-9, a-z, A-Z,
+/// `@`, `_`; up to base 36 letters are case-insensitive. Values wrap at 64
+/// bits like the operators do. This follows bash's `strlong`, error messages
+/// included.
+fn parse_arith_literal(text: &str) -> Result<i64, String> {
+    let bytes = text.as_bytes();
+    let mut base = 10u64;
+    let mut explicit_base = false;
+    let mut i = 0;
+    if bytes.first() == Some(&b'0') {
+        if bytes.len() == 1 {
+            return Ok(0);
+        }
+        if matches!(bytes[1], b'x' | b'X') {
+            base = 16;
+            i = 2;
+        } else {
+            base = 8;
+            i = 1;
+        }
+        explicit_base = true;
     }
     let mut value = 0u64;
-    for ch in digits.chars() {
-        let digit = ch
-            .to_digit(radix)
-            .ok_or_else(|| format!("invalid arithmetic integer: {text}"))?;
-        value = value.wrapping_mul(radix as u64).wrapping_add(digit as u64);
+    while i < bytes.len() {
+        let c = bytes[i];
+        i += 1;
+        if c == b'#' {
+            if explicit_base {
+                return Err("invalid number".into());
+            }
+            if !(2..=64).contains(&value) {
+                return Err("invalid arithmetic base".into());
+            }
+            base = value;
+            value = 0;
+            explicit_base = true;
+            if !bytes.get(i).copied().is_some_and(is_arith_digit) {
+                return Err("invalid integer constant".into());
+            }
+            continue;
+        }
+        let digit = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'z' => c - b'a' + 10,
+            b'A'..=b'Z' if base <= 36 => c - b'A' + 10,
+            b'A'..=b'Z' => c - b'A' + 36,
+            b'@' => 62,
+            b'_' => 63,
+            _ => return Err("invalid number".into()),
+        };
+        if u64::from(digit) >= base {
+            return Err("value too great for base".into());
+        }
+        value = value.wrapping_mul(base).wrapping_add(u64::from(digit));
     }
     Ok(value as i64)
 }
 
-fn tokenize_arith(expr: &str) -> Vec<ArithToken> {
-    let mut tokens = Vec::new();
-    let mut chars = expr.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        match c {
-            ' ' | '\t' | '\n' => {
-                chars.next();
-            }
-            '\\' => {
-                chars.next();
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                } else {
-                    tokens.push(ArithToken::Invalid("invalid arithmetic escape".into()));
-                }
-            }
-            '0'..='9' => {
-                let mut n = String::new();
-                // Handle hex (0x), octal (0) prefixes
-                if c == '0' {
-                    n.push(c);
-                    chars.next();
-                    match chars.peek() {
-                        Some(&'x') | Some(&'X') => {
-                            n.push('x');
-                            chars.next();
-                            while let Some(&d) = chars.peek() {
-                                if d.is_ascii_hexdigit() {
-                                    n.push(d);
-                                    chars.next();
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                        _ => {
-                            while let Some(&d) = chars.peek() {
-                                if d.is_ascii_digit() {
-                                    n.push(d);
-                                    chars.next();
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    while let Some(&d) = chars.peek() {
-                        if d.is_ascii_digit() {
-                            n.push(d);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                tokens.push(match parse_arith_integer(&n) {
-                    Ok(value) => ArithToken::Num(value),
-                    Err(error) => ArithToken::Invalid(error),
-                });
-            }
-            'a'..='z' | 'A'..='Z' | '_' => {
-                let mut name = String::new();
-                while let Some(&c2) = chars.peek() {
-                    if c2.is_alphanumeric() || c2 == '_' {
-                        name.push(c2);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                tokens.push(ArithToken::Ident(name));
-            }
-            '$' => {
-                chars.next();
-                let mut name = String::new();
-                while let Some(&c2) = chars.peek() {
-                    if c2.is_alphanumeric() || c2 == '_' {
-                        name.push(c2);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                if name.is_empty() {
-                    tokens.push(ArithToken::Invalid(
-                        "expected arithmetic variable after '$'".into(),
-                    ));
-                } else {
-                    tokens.push(ArithToken::Ident(name));
-                }
-            }
-            '+' => {
-                chars.next();
-                match chars.peek() {
-                    Some(&'+') => {
-                        chars.next();
-                        tokens.push(ArithToken::Increment);
-                    }
-                    Some(&'=') => {
-                        chars.next();
-                        tokens.push(ArithToken::PlusAssign);
-                    }
-                    _ => tokens.push(ArithToken::Plus),
-                }
-            }
-            '-' => {
-                chars.next();
-                match chars.peek() {
-                    Some(&'-') => {
-                        chars.next();
-                        tokens.push(ArithToken::Decrement);
-                    }
-                    Some(&'=') => {
-                        chars.next();
-                        tokens.push(ArithToken::MinusAssign);
-                    }
-                    _ => tokens.push(ArithToken::Minus),
-                }
-            }
-            '*' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(ArithToken::StarAssign);
-                } else {
-                    tokens.push(ArithToken::Star);
-                }
-            }
-            '/' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(ArithToken::SlashAssign);
-                } else {
-                    tokens.push(ArithToken::Slash);
-                }
-            }
-            '%' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(ArithToken::PercentAssign);
-                } else {
-                    tokens.push(ArithToken::Percent);
-                }
-            }
-            '(' => {
-                chars.next();
-                tokens.push(ArithToken::LParen);
-            }
-            ')' => {
-                chars.next();
-                tokens.push(ArithToken::RParen);
-            }
-            '?' => {
-                chars.next();
-                tokens.push(ArithToken::Question);
-            }
-            ':' => {
-                chars.next();
-                tokens.push(ArithToken::Colon);
-            }
-            '~' => {
-                chars.next();
-                tokens.push(ArithToken::BitNot);
-            }
-            ',' => {
-                chars.next();
-                tokens.push(ArithToken::Comma);
-            }
-            '&' => {
-                chars.next();
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                    tokens.push(ArithToken::LogicalAnd);
-                } else {
-                    tokens.push(ArithToken::BitAnd);
-                }
-            }
-            '|' => {
-                chars.next();
-                if chars.peek() == Some(&'|') {
-                    chars.next();
-                    tokens.push(ArithToken::LogicalOr);
-                } else {
-                    tokens.push(ArithToken::BitOr);
-                }
-            }
-            '^' => {
-                chars.next();
-                tokens.push(ArithToken::BitXor);
-            }
-            '<' => {
-                chars.next();
-                match chars.peek() {
-                    Some(&'=') => {
-                        chars.next();
-                        tokens.push(ArithToken::Le);
-                    }
-                    Some(&'<') => {
-                        chars.next();
-                        tokens.push(ArithToken::LShift);
-                    }
-                    _ => tokens.push(ArithToken::Lt),
-                }
-            }
-            '>' => {
-                chars.next();
-                match chars.peek() {
-                    Some(&'=') => {
-                        chars.next();
-                        tokens.push(ArithToken::Ge);
-                    }
-                    Some(&'>') => {
-                        chars.next();
-                        tokens.push(ArithToken::RShift);
-                    }
-                    _ => tokens.push(ArithToken::Gt),
-                }
-            }
-            '=' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(ArithToken::Eq);
-                } else {
-                    tokens.push(ArithToken::Assign);
-                }
-            }
-            '!' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(ArithToken::Ne);
-                } else {
-                    tokens.push(ArithToken::Not);
-                }
-            }
-            _ => {
-                chars.next();
-                tokens.push(ArithToken::Invalid(format!(
-                    "invalid arithmetic character: {c}"
-                )));
-            }
-        }
-    }
-    tokens
+/// Characters that may follow `base#` in an integer constant.
+fn is_arith_digit(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'@' || c == b'_'
 }
 
-#[derive(Debug, Clone)]
-enum ArithToken {
-    Num(i64),
-    Invalid(String),
-    Ident(String),
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Percent,
-    Increment,
-    Decrement,
-    Assign,
-    PlusAssign,
-    MinusAssign,
-    StarAssign,
-    SlashAssign,
-    PercentAssign,
-    BitAnd,
-    BitOr,
-    BitXor,
-    BitNot,
-    LShift,
-    RShift,
-    LogicalAnd,
-    LogicalOr,
-    Not,
+/// The integer a variable's text holds when it is a plain constant with an
+/// optional sign and surrounding blanks — the common case, decided without
+/// building an expression. `None` means the text has to be evaluated as an
+/// expression of its own.
+fn plain_integer_value(text: &str) -> Option<ArithResult> {
+    let trimmed = text.trim_matches([' ', '\t', '\n']);
+    let (negative, digits) = match trimmed.as_bytes().first() {
+        None => return Some(Ok(0)),
+        Some(b'-') => (true, &trimmed[1..]),
+        Some(b'+') => (false, &trimmed[1..]),
+        Some(_) => (false, trimmed),
+    };
+    let bytes = digits.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_digit)
+        || !bytes.iter().all(|&c| is_arith_digit(c) || c == b'#')
+    {
+        return None;
+    }
+    Some(
+        parse_arith_literal(digits)
+            .map(|value| {
+                if negative {
+                    value.wrapping_neg()
+                } else {
+                    value
+                }
+            })
+            .map_err(|message| ArithError::at(trimmed, message)),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryOp {
+    Power,
+    Mul,
+    Div,
+    Rem,
+    Add,
+    Sub,
+    Shl,
+    Shr,
     Lt,
     Le,
     Gt,
     Ge,
     Eq,
     Ne,
+    BitAnd,
+    BitXor,
+    BitOr,
+    LogicalAnd,
+    LogicalOr,
+}
+
+impl BinaryOp {
+    /// Binding strength from bash's precedence table; higher binds tighter.
+    fn precedence(self) -> u8 {
+        match self {
+            BinaryOp::LogicalOr => 1,
+            BinaryOp::LogicalAnd => 2,
+            BinaryOp::BitOr => 3,
+            BinaryOp::BitXor => 4,
+            BinaryOp::BitAnd => 5,
+            BinaryOp::Eq | BinaryOp::Ne => 6,
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => 7,
+            BinaryOp::Shl | BinaryOp::Shr => 8,
+            BinaryOp::Add | BinaryOp::Sub => 9,
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => 10,
+            BinaryOp::Power => 11,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArithToken {
+    Num(i64),
+    /// A malformed integer constant or subscript: its text and the problem.
+    /// Like bash, the error is raised when the parser reaches it, even inside
+    /// a skipped branch.
+    BadLiteral {
+        text: String,
+        message: String,
+    },
+    /// A character that is no part of arithmetic syntax (`@`, `'`, `$`).
+    BadChar,
+    /// A variable or array element: the name and the unevaluated subscript.
+    Var(String, Option<String>),
+    /// A binary operator; `+` and `-` double as the unary operators.
+    Binary(BinaryOp),
+    /// `=` (`None`) or a compound assignment such as `+=` or `<<=`.
+    Assign(Option<BinaryOp>),
+    /// `++` (1) or `--` (-1) before an operand.
+    Prefix(i64),
+    /// `++` (1) or `--` (-1) after an operand.
+    Postfix(i64),
+    Not,
+    BitNot,
     Question,
     Colon,
     Comma,
@@ -1897,492 +1997,527 @@ enum ArithToken {
     RParen,
 }
 
-fn eval_arith_expr(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let val = eval_arith_assign(tokens, pos, state, evaluate)?;
-    if *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::Comma)) {
-        *pos += 1;
-        return eval_arith_expr(tokens, pos, state, evaluate);
+fn tokenize_arith(text: &str) -> Vec<ArithToken> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        let (token, width) = match c {
+            b' ' | b'\t' | b'\n' => {
+                i += 1;
+                continue;
+            }
+            b'\\' if next == Some(b'\n') => {
+                i += 2;
+                continue;
+            }
+            b'0'..=b'9' => {
+                // Bash reads the longest run of constant characters and only
+                // then validates it, so `12abc` is one bad constant.
+                let len = bytes[i..]
+                    .iter()
+                    .take_while(|&&b| is_arith_digit(b) || b == b'#')
+                    .count();
+                let token = match parse_arith_literal(&text[i..i + len]) {
+                    Ok(value) => ArithToken::Num(value),
+                    Err(message) => ArithToken::BadLiteral {
+                        text: text[i..i + len].to_string(),
+                        message,
+                    },
+                };
+                (token, len)
+            }
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                let name_len = bytes[i..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                    .count();
+                let name = text[i..i + name_len].to_string();
+                if bytes.get(i + name_len) != Some(&b'[') {
+                    (ArithToken::Var(name, None), name_len)
+                } else {
+                    let open = i + name_len;
+                    match closing_bracket(&bytes[open..]) {
+                        Some(close) => (
+                            ArithToken::Var(name, Some(text[open + 1..open + close].to_string())),
+                            name_len + close + 1,
+                        ),
+                        None => (
+                            ArithToken::BadLiteral {
+                                text: text[i..].trim_end().to_string(),
+                                message: "bad array subscript".into(),
+                            },
+                            bytes.len() - i,
+                        ),
+                    }
+                }
+            }
+            b'+' | b'-' => {
+                let (op, delta) = if c == b'+' {
+                    (BinaryOp::Add, 1)
+                } else {
+                    (BinaryOp::Sub, -1)
+                };
+                if next == Some(c) {
+                    // Bash's reading of a doubled sign: after a variable it is
+                    // a postfix step; before a name a prefix step; otherwise
+                    // two signs, so `--5` is 5 and `1--1` is 2.
+                    if matches!(tokens.last(), Some(ArithToken::Var(..))) {
+                        (ArithToken::Postfix(delta), 2)
+                    } else if starts_with_name(&bytes[i + 2..]) {
+                        (ArithToken::Prefix(delta), 2)
+                    } else {
+                        (ArithToken::Binary(op), 1)
+                    }
+                } else if next == Some(b'=') {
+                    (ArithToken::Assign(Some(op)), 2)
+                } else {
+                    (ArithToken::Binary(op), 1)
+                }
+            }
+            b'*' => match next {
+                Some(b'*') => (ArithToken::Binary(BinaryOp::Power), 2),
+                Some(b'=') => (ArithToken::Assign(Some(BinaryOp::Mul)), 2),
+                _ => (ArithToken::Binary(BinaryOp::Mul), 1),
+            },
+            b'/' | b'%' | b'&' | b'^' | b'|' => {
+                let op = match c {
+                    b'/' => BinaryOp::Div,
+                    b'%' => BinaryOp::Rem,
+                    b'&' => BinaryOp::BitAnd,
+                    b'^' => BinaryOp::BitXor,
+                    _ => BinaryOp::BitOr,
+                };
+                match next {
+                    Some(b'&') if c == b'&' => (ArithToken::Binary(BinaryOp::LogicalAnd), 2),
+                    Some(b'|') if c == b'|' => (ArithToken::Binary(BinaryOp::LogicalOr), 2),
+                    Some(b'=') => (ArithToken::Assign(Some(op)), 2),
+                    _ => (ArithToken::Binary(op), 1),
+                }
+            }
+            b'<' | b'>' => {
+                let (shift, strict, or_equal) = if c == b'<' {
+                    (BinaryOp::Shl, BinaryOp::Lt, BinaryOp::Le)
+                } else {
+                    (BinaryOp::Shr, BinaryOp::Gt, BinaryOp::Ge)
+                };
+                match next {
+                    Some(n) if n == c => {
+                        if bytes.get(i + 2) == Some(&b'=') {
+                            (ArithToken::Assign(Some(shift)), 3)
+                        } else {
+                            (ArithToken::Binary(shift), 2)
+                        }
+                    }
+                    Some(b'=') => (ArithToken::Binary(or_equal), 2),
+                    _ => (ArithToken::Binary(strict), 1),
+                }
+            }
+            b'=' => match next {
+                Some(b'=') => (ArithToken::Binary(BinaryOp::Eq), 2),
+                _ => (ArithToken::Assign(None), 1),
+            },
+            b'!' => match next {
+                Some(b'=') => (ArithToken::Binary(BinaryOp::Ne), 2),
+                _ => (ArithToken::Not, 1),
+            },
+            b'~' => (ArithToken::BitNot, 1),
+            b'?' => (ArithToken::Question, 1),
+            b':' => (ArithToken::Colon, 1),
+            b',' => (ArithToken::Comma, 1),
+            b'(' => (ArithToken::LParen, 1),
+            b')' => (ArithToken::RParen, 1),
+            _ => {
+                let width = text[i..].chars().next().map_or(1, char::len_utf8);
+                (ArithToken::BadChar, width)
+            }
+        };
+        tokens.push(token);
+        i += width;
     }
-    Ok(val)
+    tokens
 }
 
-fn eval_arith_assign(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let save_pos = *pos;
-    if let Some(ArithToken::Ident(name)) = tokens.get(*pos) {
-        let name = name.clone();
-        *pos += 1;
-        match tokens.get(*pos) {
-            Some(ArithToken::Assign) => {
-                *pos += 1;
-                let val = eval_arith_assign(tokens, pos, state, evaluate)?;
-                if evaluate {
-                    state.set_var(&name, &val.to_string());
+/// Offset of the `]` closing the `[` at the start of `bytes`, counting nested
+/// brackets (`a[b[1]]`).
+fn closing_bracket(bytes: &[u8]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
                 }
-                return Ok(val);
-            }
-            Some(ArithToken::PlusAssign) => {
-                *pos += 1;
-                let cur = if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                };
-                let val = cur.wrapping_add(eval_arith_assign(tokens, pos, state, evaluate)?);
-                if evaluate {
-                    state.set_var(&name, &val.to_string());
-                }
-                return Ok(val);
-            }
-            Some(ArithToken::MinusAssign) => {
-                *pos += 1;
-                let cur = if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                };
-                let val = cur.wrapping_sub(eval_arith_assign(tokens, pos, state, evaluate)?);
-                if evaluate {
-                    state.set_var(&name, &val.to_string());
-                }
-                return Ok(val);
-            }
-            Some(ArithToken::StarAssign) => {
-                *pos += 1;
-                let cur = if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                };
-                let val = cur.wrapping_mul(eval_arith_assign(tokens, pos, state, evaluate)?);
-                if evaluate {
-                    state.set_var(&name, &val.to_string());
-                }
-                return Ok(val);
-            }
-            Some(ArithToken::SlashAssign) => {
-                *pos += 1;
-                let cur = if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                };
-                let rhs = eval_arith_assign(tokens, pos, state, evaluate)?;
-                if evaluate && rhs == 0 {
-                    return Err("division by zero".into());
-                }
-                let val = if evaluate { cur.wrapping_div(rhs) } else { 0 };
-                if evaluate {
-                    state.set_var(&name, &val.to_string());
-                }
-                return Ok(val);
-            }
-            Some(ArithToken::PercentAssign) => {
-                *pos += 1;
-                let cur = if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                };
-                let rhs = eval_arith_assign(tokens, pos, state, evaluate)?;
-                if evaluate && rhs == 0 {
-                    return Err("division by zero".into());
-                }
-                let val = if evaluate { cur.wrapping_rem(rhs) } else { 0 };
-                if evaluate {
-                    state.set_var(&name, &val.to_string());
-                }
-                return Ok(val);
             }
             _ => {}
         }
     }
-    *pos = save_pos;
-    eval_arith_ternary(tokens, pos, state, evaluate)
+    None
 }
 
-fn eval_arith_ternary(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let cond = eval_arith_logical_or(tokens, pos, state, evaluate)?;
-    if matches!(tokens.get(*pos), Some(ArithToken::Question)) {
-        *pos += 1;
-        let true_val = eval_arith_expr(tokens, pos, state, evaluate && cond != 0)?;
-        if !matches!(tokens.get(*pos), Some(ArithToken::Colon)) {
-            return Err("missing ':' in conditional expression".into());
-        }
-        *pos += 1;
-        let false_val = eval_arith_ternary(tokens, pos, state, evaluate && cond == 0)?;
-        return Ok(if cond != 0 { true_val } else { false_val });
-    }
-    Ok(cond)
+/// Does a variable name start here, after optional blanks?
+fn starts_with_name(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n'))
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
 }
 
-fn eval_arith_logical_or(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_logical_and(tokens, pos, state, evaluate)?;
-    while matches!(tokens.get(*pos), Some(ArithToken::LogicalOr)) {
-        *pos += 1;
-        let right = eval_arith_logical_and(tokens, pos, state, evaluate && left == 0)?;
-        left = i64::from(left != 0 || right != 0);
-    }
-    Ok(left)
-}
-
-fn eval_arith_logical_and(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_bitwise_or(tokens, pos, state, evaluate)?;
-    while matches!(tokens.get(*pos), Some(ArithToken::LogicalAnd)) {
-        *pos += 1;
-        let right = eval_arith_bitwise_or(tokens, pos, state, evaluate && left != 0)?;
-        left = i64::from(left != 0 && right != 0);
-    }
-    Ok(left)
-}
-
-fn eval_arith_bitwise_or(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_bitwise_xor(tokens, pos, state, evaluate)?;
-    while *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::BitOr)) {
-        *pos += 1;
-        left |= eval_arith_bitwise_xor(tokens, pos, state, evaluate)?;
-    }
-    Ok(left)
-}
-
-fn eval_arith_bitwise_xor(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_bitwise_and(tokens, pos, state, evaluate)?;
-    while *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::BitXor)) {
-        *pos += 1;
-        left ^= eval_arith_bitwise_and(tokens, pos, state, evaluate)?;
-    }
-    Ok(left)
-}
-
-fn eval_arith_bitwise_and(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_equality(tokens, pos, state, evaluate)?;
-    while *pos < tokens.len() && matches!(tokens.get(*pos), Some(ArithToken::BitAnd)) {
-        *pos += 1;
-        left &= eval_arith_equality(tokens, pos, state, evaluate)?;
-    }
-    Ok(left)
-}
-
-fn eval_arith_equality(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_relational(tokens, pos, state, evaluate)?;
-    loop {
-        let equal = match tokens.get(*pos) {
-            Some(ArithToken::Eq) => true,
-            Some(ArithToken::Ne) => false,
-            _ => break,
-        };
-        *pos += 1;
-        let right = eval_arith_relational(tokens, pos, state, evaluate)?;
-        left = i64::from((left == right) == equal);
-    }
-    Ok(left)
-}
-
-fn eval_arith_relational(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_shift(tokens, pos, state, evaluate)?;
-    while let Some(operator @ (ArithToken::Lt | ArithToken::Le | ArithToken::Gt | ArithToken::Ge)) =
-        tokens.get(*pos)
-    {
-        *pos += 1;
-        let right = eval_arith_shift(tokens, pos, state, evaluate)?;
-        left = i64::from(match operator {
-            ArithToken::Lt => left < right,
-            ArithToken::Le => left <= right,
-            ArithToken::Gt => left > right,
-            ArithToken::Ge => left >= right,
-            _ => unreachable!(),
-        });
-    }
-    Ok(left)
-}
-
-fn eval_arith_shift(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_additive(tokens, pos, state, evaluate)?;
-    while *pos < tokens.len() {
-        match tokens.get(*pos) {
-            Some(ArithToken::LShift) => {
-                *pos += 1;
-                left = left.wrapping_shl(eval_arith_additive(tokens, pos, state, evaluate)? as u32);
+/// Apply a binary operator with bash's 64-bit wrapping semantics. `evaluate`
+/// is false inside a skipped branch, where division by zero is not an error.
+fn apply_binary(op: BinaryOp, left: i64, right: i64, evaluate: bool) -> ArithResult {
+    Ok(match op {
+        BinaryOp::Power => {
+            // Bash rejects a negative exponent even in a skipped branch.
+            if right < 0 {
+                return Err("exponent less than 0".into());
             }
-            Some(ArithToken::RShift) => {
-                *pos += 1;
-                left = left.wrapping_shr(eval_arith_additive(tokens, pos, state, evaluate)? as u32);
+            wrapping_pow(left, right as u64)
+        }
+        BinaryOp::Mul => left.wrapping_mul(right),
+        BinaryOp::Div | BinaryOp::Rem if right == 0 => {
+            if evaluate {
+                return Err("division by 0".into());
             }
-            _ => break,
+            0
         }
-    }
-    Ok(left)
-}
-
-fn eval_arith_additive(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_term(tokens, pos, state, evaluate)?;
-    while *pos < tokens.len() {
-        match tokens.get(*pos) {
-            Some(ArithToken::Plus) => {
-                *pos += 1;
-                left = left.wrapping_add(eval_arith_term(tokens, pos, state, evaluate)?);
-            }
-            Some(ArithToken::Minus) => {
-                *pos += 1;
-                left = left.wrapping_sub(eval_arith_term(tokens, pos, state, evaluate)?);
-            }
-            _ => break,
-        }
-    }
-    Ok(left)
-}
-
-fn eval_arith_term(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    let mut left = eval_arith_unary(tokens, pos, state, evaluate)?;
-    while *pos < tokens.len() {
-        match tokens.get(*pos) {
-            Some(ArithToken::Star) => {
-                *pos += 1;
-                left = left.wrapping_mul(eval_arith_unary(tokens, pos, state, evaluate)?);
-            }
-            Some(ArithToken::Slash) => {
-                *pos += 1;
-                let r = eval_arith_unary(tokens, pos, state, evaluate)?;
-                if evaluate && r == 0 {
-                    return Err("division by zero".into());
-                }
-                left = if evaluate { left.wrapping_div(r) } else { 0 };
-            }
-            Some(ArithToken::Percent) => {
-                *pos += 1;
-                let r = eval_arith_unary(tokens, pos, state, evaluate)?;
-                if evaluate && r == 0 {
-                    return Err("division by zero".into());
-                }
-                left = if evaluate { left.wrapping_rem(r) } else { 0 };
-            }
-            _ => break,
-        }
-    }
-    Ok(left)
-}
-
-fn eval_arith_unary(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    match tokens.get(*pos) {
-        Some(ArithToken::Minus) => {
-            *pos += 1;
-            Ok(eval_arith_unary(tokens, pos, state, evaluate)?.wrapping_neg())
-        }
-        Some(ArithToken::Plus) => {
-            *pos += 1;
-            eval_arith_unary(tokens, pos, state, evaluate)
-        }
-        Some(ArithToken::Not) => {
-            *pos += 1;
-            let v = eval_arith_unary(tokens, pos, state, evaluate)?;
-            Ok(if v == 0 { 1 } else { 0 })
-        }
-        Some(ArithToken::BitNot) => {
-            *pos += 1;
-            Ok(!eval_arith_unary(tokens, pos, state, evaluate)?)
-        }
-        Some(ArithToken::Increment) => {
-            *pos += 1;
-            if let Some(ArithToken::Ident(name)) = tokens.get(*pos) {
-                let name = name.clone();
-                *pos += 1;
-                let val = (if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                })
-                .wrapping_add(1);
-                if evaluate {
-                    state.set_var(&name, &val.to_string());
-                }
-                Ok(val)
-            } else {
-                Err("increment or decrement requires a variable".into())
-            }
-        }
-        Some(ArithToken::Decrement) => {
-            *pos += 1;
-            if let Some(ArithToken::Ident(name)) = tokens.get(*pos) {
-                let name = name.clone();
-                *pos += 1;
-                let val = (if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                })
-                .wrapping_sub(1);
-                if evaluate {
-                    state.set_var(&name, &val.to_string());
-                }
-                Ok(val)
-            } else {
-                Err("increment or decrement requires a variable".into())
-            }
-        }
-        _ => eval_arith_postfix(tokens, pos, state, evaluate),
-    }
-}
-
-fn eval_arith_postfix(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    if let Some(ArithToken::Ident(name)) = tokens.get(*pos) {
-        let name = name.clone();
-        *pos += 1;
-        match tokens.get(*pos) {
-            Some(ArithToken::Increment) => {
-                *pos += 1;
-                let val = if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                };
-                if evaluate {
-                    state.set_var(&name, &val.wrapping_add(1).to_string());
-                }
-                return Ok(val);
-            }
-            Some(ArithToken::Decrement) => {
-                *pos += 1;
-                let val = if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                };
-                if evaluate {
-                    state.set_var(&name, &val.wrapping_sub(1).to_string());
-                }
-                return Ok(val);
-            }
-            _ => {
-                return Ok(if evaluate {
-                    get_var_value(&name, state)?
-                } else {
-                    0i64
-                })
-            }
-        }
-    }
-    eval_arith_primary(tokens, pos, state, evaluate)
-}
-
-fn eval_arith_primary(
-    tokens: &[ArithToken],
-    pos: &mut usize,
-    state: &mut ShellState,
-    evaluate: bool,
-) -> Result<i64, String> {
-    match tokens.get(*pos) {
-        Some(ArithToken::Num(n)) => {
-            let n = *n;
-            *pos += 1;
-            Ok(n)
-        }
-        Some(ArithToken::LParen) => {
-            *pos += 1;
-            let v = eval_arith_expr(tokens, pos, state, evaluate)?;
-            if !matches!(tokens.get(*pos), Some(ArithToken::RParen)) {
-                return Err("missing ')' in arithmetic expression".into());
-            }
-            *pos += 1;
-            Ok(v)
-        }
-        Some(ArithToken::Invalid(message)) => Err(message.clone()),
-        _ => Err("expected arithmetic operand".into()),
-    }
-}
-
-/// Numeric values share literal radix/bit-pattern rules. General recursive
-/// arithmetic values remain unsupported, rather than recursing without a bound.
-fn get_var_value(name: &str, state: &ShellState) -> Result<i64, String> {
-    let value = state.get_var(name).unwrap_or("0").trim();
-    if value.is_empty() {
-        return Ok(0);
-    }
-    let (negative, value) = if let Some(value) = value.strip_prefix('-') {
-        (true, value)
-    } else {
-        (false, value.strip_prefix('+').unwrap_or(value))
-    };
-    parse_arith_integer(value).map(|number| {
-        if negative {
-            number.wrapping_neg()
-        } else {
-            number
-        }
+        BinaryOp::Div => left.wrapping_div(right),
+        BinaryOp::Rem => left.wrapping_rem(right),
+        BinaryOp::Add => left.wrapping_add(right),
+        BinaryOp::Sub => left.wrapping_sub(right),
+        // The count is masked to the operand width, as bash does on x86-64.
+        BinaryOp::Shl => left.wrapping_shl(right as u32),
+        BinaryOp::Shr => left.wrapping_shr(right as u32),
+        BinaryOp::Lt => i64::from(left < right),
+        BinaryOp::Le => i64::from(left <= right),
+        BinaryOp::Gt => i64::from(left > right),
+        BinaryOp::Ge => i64::from(left >= right),
+        BinaryOp::Eq => i64::from(left == right),
+        BinaryOp::Ne => i64::from(left != right),
+        BinaryOp::BitAnd => left & right,
+        BinaryOp::BitXor => left ^ right,
+        BinaryOp::BitOr => left | right,
+        BinaryOp::LogicalAnd => i64::from(left != 0 && right != 0),
+        BinaryOp::LogicalOr => i64::from(left != 0 || right != 0),
     })
+}
+
+/// Exponentiation by squaring with wrapping multiplication; at most 64 rounds
+/// whatever the exponent.
+fn wrapping_pow(mut base: i64, mut exponent: u64) -> i64 {
+    let mut result = 1i64;
+    while exponent != 0 {
+        if exponent & 1 == 1 {
+            result = result.wrapping_mul(base);
+        }
+        exponent >>= 1;
+        base = base.wrapping_mul(base);
+    }
+    result
+}
+
+/// A variable or array element an expression reads or assigns, with its
+/// subscript already resolved to the key it addresses.
+struct ArithTarget<'t> {
+    name: &'t str,
+    key: Option<String>,
+}
+
+/// What a variable holds, as far as arithmetic is concerned.
+enum ArithValue {
+    Number(i64),
+    /// Text that has to be evaluated as an expression of its own.
+    Expression(String),
+}
+
+/// Recursive-descent evaluator over arithmetic tokens. Evaluation happens
+/// during parsing; `evaluate` is false inside a branch that `&&`, `||` or `?:`
+/// skip, so the branch is still parsed (and syntax errors still surface) but
+/// reads, assignments and division checks do not happen.
+///
+/// Every path that can recurse without bound takes an `ArithDepth`, and work
+/// that does not recurse lives in helpers off the recursive path, keeping the
+/// stack each nesting level costs small.
+struct ArithParser<'t, 's> {
+    tokens: &'t [ArithToken],
+    pos: usize,
+    state: &'s mut ShellState,
+}
+
+impl<'t> ArithParser<'t, '_> {
+    fn eat(&mut self, token: &ArithToken) -> bool {
+        if self.tokens.get(self.pos) == Some(token) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `expr, expr, ...` — the value of the last.
+    fn comma(&mut self, evaluate: bool) -> ArithResult {
+        let mut value = self.assignment(evaluate)?;
+        while self.eat(&ArithToken::Comma) {
+            value = self.assignment(evaluate)?;
+        }
+        Ok(value)
+    }
+
+    /// `lvalue = expr` and `lvalue op= expr` (right-associative), or a
+    /// conditional expression.
+    fn assignment(&mut self, evaluate: bool) -> ArithResult {
+        let tokens = self.tokens;
+        let (Some(ArithToken::Var(name, subscript)), Some(&ArithToken::Assign(op))) =
+            (tokens.get(self.pos), tokens.get(self.pos + 1))
+        else {
+            return self.ternary(evaluate);
+        };
+        self.pos += 2;
+        let _depth = ArithDepth::enter()?;
+        // Bash resolves the target and reads its old value before the right
+        // side runs: `x=1; ((x += x++))` leaves 2.
+        let target = self.target(name, subscript.as_deref(), evaluate)?;
+        let current = match op {
+            Some(_) if evaluate => self.read(&target)?,
+            _ => 0,
+        };
+        let right = self.assignment(evaluate)?;
+        let value = match op {
+            Some(op) => apply_binary(op, current, right, evaluate)?,
+            None => right,
+        };
+        if evaluate {
+            self.write(&target, value);
+        }
+        Ok(value)
+    }
+
+    /// `cond ? expr : cond-expr`; only the selected branch is evaluated.
+    fn ternary(&mut self, evaluate: bool) -> ArithResult {
+        let condition = self.binary(1, evaluate)?;
+        if !self.eat(&ArithToken::Question) {
+            return Ok(condition);
+        }
+        let _depth = ArithDepth::enter()?;
+        let when_true = self.comma(evaluate && condition != 0)?;
+        if !self.eat(&ArithToken::Colon) {
+            return Err("`:' expected for conditional expression".into());
+        }
+        let when_false = self.ternary(evaluate && condition == 0)?;
+        Ok(if condition != 0 {
+            when_true
+        } else {
+            when_false
+        })
+    }
+
+    /// Binary operators by precedence climbing. Every operator is
+    /// left-associative except `**`; `&&` and `||` short-circuit.
+    fn binary(&mut self, min_precedence: u8, evaluate: bool) -> ArithResult {
+        let mut left = self.unary(evaluate)?;
+        while let Some(&ArithToken::Binary(op)) = self.tokens.get(self.pos) {
+            let precedence = op.precedence();
+            if precedence < min_precedence {
+                break;
+            }
+            self.pos += 1;
+            let (right_precedence, right_evaluates) = match op {
+                BinaryOp::Power => (precedence, evaluate),
+                BinaryOp::LogicalAnd => (precedence + 1, evaluate && left != 0),
+                BinaryOp::LogicalOr => (precedence + 1, evaluate && left == 0),
+                _ => (precedence + 1, evaluate),
+            };
+            let right = {
+                let _depth = ArithDepth::enter()?;
+                self.binary(right_precedence, right_evaluates)?
+            };
+            left = apply_binary(op, left, right, evaluate)?;
+        }
+        Ok(left)
+    }
+
+    /// Prefix operators. They bind tighter than `**`, so `-2**2` is 4.
+    fn unary(&mut self, evaluate: bool) -> ArithResult {
+        let apply: fn(i64) -> i64 = match self.tokens.get(self.pos) {
+            Some(ArithToken::Binary(BinaryOp::Sub)) => i64::wrapping_neg,
+            Some(ArithToken::Binary(BinaryOp::Add)) => |value| value,
+            Some(ArithToken::Not) => |value| i64::from(value == 0),
+            Some(ArithToken::BitNot) => |value| !value,
+            Some(&ArithToken::Prefix(delta)) => return self.prefix_step(delta, evaluate),
+            _ => return self.operand(evaluate),
+        };
+        self.pos += 1;
+        let _depth = ArithDepth::enter()?;
+        Ok(apply(self.unary(evaluate)?))
+    }
+
+    /// A constant, a parenthesised expression, or a variable.
+    fn operand(&mut self, evaluate: bool) -> ArithResult {
+        match self.tokens.get(self.pos) {
+            Some(&ArithToken::Num(value)) => {
+                self.pos += 1;
+                Ok(value)
+            }
+            Some(ArithToken::LParen) => {
+                self.pos += 1;
+                let _depth = ArithDepth::enter()?;
+                let value = self.comma(evaluate)?;
+                if self.eat(&ArithToken::RParen) {
+                    Ok(value)
+                } else if self.pos < self.tokens.len() {
+                    Err(self.trailing_error())
+                } else {
+                    Err("missing `)'".into())
+                }
+            }
+            Some(ArithToken::Var(..)) => self.variable(evaluate),
+            _ => Err(self.operand_error()),
+        }
+    }
+
+    /// `++name` / `--name`: step the variable, yielding the new value.
+    fn prefix_step(&mut self, delta: i64, evaluate: bool) -> ArithResult {
+        self.pos += 1;
+        let tokens = self.tokens;
+        let Some(ArithToken::Var(name, subscript)) = tokens.get(self.pos) else {
+            return Err(self.operand_error());
+        };
+        self.pos += 1;
+        let target = self.target(name, subscript.as_deref(), evaluate)?;
+        if !evaluate {
+            return Ok(0);
+        }
+        let value = self.read(&target)?.wrapping_add(delta);
+        self.write(&target, value);
+        Ok(value)
+    }
+
+    /// A variable operand, with an optional postfix `++`/`--` that yields the
+    /// old value.
+    fn variable(&mut self, evaluate: bool) -> ArithResult {
+        let tokens = self.tokens;
+        let Some(ArithToken::Var(name, subscript)) = tokens.get(self.pos) else {
+            return Err(self.operand_error());
+        };
+        self.pos += 1;
+        let target = self.target(name, subscript.as_deref(), evaluate)?;
+        let step = match tokens.get(self.pos) {
+            Some(&ArithToken::Postfix(delta)) => {
+                self.pos += 1;
+                Some(delta)
+            }
+            _ => None,
+        };
+        if !evaluate {
+            return Ok(0);
+        }
+        let value = self.read(&target)?;
+        if let Some(delta) = step {
+            self.write(&target, value.wrapping_add(delta));
+        }
+        Ok(value)
+    }
+
+    /// The error for a token found where an operand belongs.
+    fn operand_error(&self) -> ArithError {
+        match self.tokens.get(self.pos) {
+            Some(ArithToken::BadLiteral { text, message }) => ArithError::at(text, message.clone()),
+            _ => "syntax error: operand expected".into(),
+        }
+    }
+
+    /// The error for a token left over where an operator or the end belongs.
+    fn trailing_error(&self) -> ArithError {
+        match self.tokens.get(self.pos) {
+            Some(ArithToken::BadChar) => "syntax error: invalid arithmetic operator".into(),
+            _ => "syntax error in expression".into(),
+        }
+    }
+
+    /// Resolve `name` or `name[subscript]`. An indexed subscript is itself an
+    /// arithmetic expression; an associative one is the key text. Inside a
+    /// skipped branch the subscript is not evaluated at all, as in bash
+    /// (`0 && a[i++]` leaves `i` alone).
+    fn target(
+        &mut self,
+        name: &'t str,
+        subscript: Option<&'t str>,
+        evaluate: bool,
+    ) -> ArithResult<ArithTarget<'t>> {
+        let key = match subscript {
+            Some(subscript) if evaluate => {
+                if subscript.is_empty() || subscript == "@" || subscript == "*" {
+                    let reference = format!("{name}[{subscript}]");
+                    return Err(ArithError::at(&reference, "bad array subscript"));
+                }
+                if self.state.is_assoc_array(name) {
+                    Some(subscript.to_string())
+                } else {
+                    let _depth = ArithDepth::enter()?;
+                    Some(eval_arith_text(subscript, self.state)?.to_string())
+                }
+            }
+            _ => None,
+        };
+        Ok(ArithTarget { name, key })
+    }
+
+    /// The numeric value of a variable or element. Unset and empty count as 0;
+    /// text that is not a plain integer is evaluated as an expression in its
+    /// own right, so `a=b; b=3; $((a+1))` is 4 and `a='b=5'; $((a))` assigns.
+    fn read(&mut self, target: &ArithTarget<'_>) -> ArithResult {
+        match self.lookup(target)? {
+            ArithValue::Number(value) => Ok(value),
+            ArithValue::Expression(text) => {
+                let _depth = ArithDepth::enter().map_err(|error| error.within(target.name))?;
+                eval_arith_text(&text, self.state)
+            }
+        }
+    }
+
+    fn lookup(&self, target: &ArithTarget<'_>) -> ArithResult<ArithValue> {
+        let state = &*self.state;
+        let text = match &target.key {
+            Some(key) => state.get_array_element(target.name, key).or_else(|| {
+                // A scalar is a one-element array: `x=5; $((x[0]))` is 5.
+                (key == "0" && !state.is_array(target.name))
+                    .then(|| state.get_var(target.name).map(str::to_string))
+                    .flatten()
+            }),
+            // An array named without a subscript means its element 0.
+            None if state.is_array(target.name) => state.get_array_element(target.name, "0"),
+            None => match state.get_var(target.name) {
+                Some(value) => match plain_integer_value(value) {
+                    Some(result) => return result.map(ArithValue::Number),
+                    None => Some(value.to_string()),
+                },
+                None if state.shell_opts.nounset => return Err(ArithError::unbound(target.name)),
+                None => None,
+            },
+        };
+        let Some(text) = text else {
+            return Ok(ArithValue::Number(0));
+        };
+        match plain_integer_value(&text) {
+            Some(result) => result.map(ArithValue::Number),
+            None => Ok(ArithValue::Expression(text)),
+        }
+    }
+
+    fn write(&mut self, target: &ArithTarget<'_>, value: i64) {
+        let value = value.to_string();
+        match &target.key {
+            Some(key) => self.state.set_array_element(target.name, key, &value),
+            None if self.state.is_array(target.name) => {
+                self.state.set_array_element(target.name, "0", &value)
+            }
+            None => self.state.set_var(target.name, &value),
+        }
+    }
 }
 
 /// Does this field contain a glob metacharacter that quoting left eligible?
@@ -2691,9 +2826,138 @@ mod tests {
             expand_brace_range("e", "a", None),
             vec!["e", "d", "c", "b", "a"]
         );
+        // Bash reads a zero step as 1: `{1..3..0}` is `1 2 3`.
+        assert_eq!(expand_brace_range("1", "3", Some("0")), vec!["1", "2", "3"]);
+        assert_eq!(expand_brace_range("a", "c", Some("0")), vec!["a", "b", "c"]);
+    }
+
+    /// Zero-padded ends pad every term to the wider end, sign included.
+    #[test]
+    fn brace_ranges_pad_like_bash() {
         assert_eq!(
-            expand_brace_range("1", "5", Some("0")),
-            Vec::<String>::new()
+            expand_brace_range("08", "11", None),
+            vec!["08", "09", "10", "11"]
         );
+        assert_eq!(
+            expand_brace_range("-05", "1", None),
+            vec!["-05", "-04", "-03", "-02", "-01", "000", "001"]
+        );
+        assert_eq!(
+            expand_brace_range("-1", "02", None),
+            vec!["-1", "00", "01", "02"]
+        );
+        assert_eq!(expand_brace_range("-2", "0", None), vec!["-2", "-1", "0"]);
+    }
+
+    #[test]
+    fn arithmetic_constants_follow_bash() {
+        for (text, value) in [
+            ("0", 0),
+            ("017", 15),
+            ("0x1F", 31),
+            ("0X1f", 31),
+            ("0x", 0),
+            ("2#101", 5),
+            ("36#z", 35),
+            ("36#Z", 35),
+            ("64#z", 35),
+            ("64#Z", 61),
+            ("64#@", 62),
+            ("64#_", 63),
+            ("10#010", 10),
+            ("9223372036854775808", i64::MIN),
+            ("0xffffffffffffffff", -1),
+        ] {
+            assert_eq!(parse_arith_literal(text), Ok(value), "{text}");
+        }
+        for (text, message) in [
+            ("08", "value too great for base"),
+            ("1e3", "value too great for base"),
+            ("2#102", "value too great for base"),
+            ("0x1G", "value too great for base"),
+            ("65#1", "invalid arithmetic base"),
+            ("1#1", "invalid arithmetic base"),
+            ("16#", "invalid integer constant"),
+            ("2##1", "invalid integer constant"),
+            ("0#5", "invalid number"),
+            ("2#1#1", "invalid number"),
+        ] {
+            assert_eq!(parse_arith_literal(text), Err(message.into()), "{text}");
+        }
+    }
+
+    /// A doubled sign is a postfix step after a variable, a prefix step before
+    /// a name, and otherwise two signs: bash reads `--5` as 5 and `1--1` as 2.
+    #[test]
+    fn doubled_signs_tokenize_like_bash() {
+        use ArithToken::{Assign, Binary, Num, Postfix, Prefix, Var};
+        let var = |name: &str| Var(name.into(), None);
+        assert_eq!(tokenize_arith("x++"), [var("x"), Postfix(1)]);
+        assert_eq!(tokenize_arith("x ++"), [var("x"), Postfix(1)]);
+        assert_eq!(tokenize_arith("-- x"), [Prefix(-1), var("x")]);
+        assert_eq!(
+            tokenize_arith("--5"),
+            [Binary(BinaryOp::Sub), Binary(BinaryOp::Sub), Num(5)]
+        );
+        assert_eq!(
+            tokenize_arith("1--1"),
+            [Num(1), Binary(BinaryOp::Sub), Binary(BinaryOp::Sub), Num(1)]
+        );
+        assert_eq!(
+            tokenize_arith("a+++b"),
+            [var("a"), Postfix(1), Binary(BinaryOp::Add), var("b")]
+        );
+        assert_eq!(
+            tokenize_arith("a[i+1]--"),
+            [Var("a".into(), Some("i+1".into())), Postfix(-1)]
+        );
+        assert_eq!(
+            tokenize_arith("x<<=2**3"),
+            [
+                var("x"),
+                Assign(Some(BinaryOp::Shl)),
+                Num(2),
+                Binary(BinaryOp::Power),
+                Num(3)
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_tokens_are_kept_for_the_parser_to_report() {
+        assert_eq!(
+            tokenize_arith("a[1 + 2"),
+            [ArithToken::BadLiteral {
+                text: "a[1 + 2".into(),
+                message: "bad array subscript".into(),
+            }]
+        );
+        assert_eq!(
+            tokenize_arith("1 @ é"),
+            [ArithToken::Num(1), ArithToken::BadChar, ArithToken::BadChar]
+        );
+    }
+
+    #[test]
+    fn plain_integer_values_skip_expression_evaluation() {
+        let value = |text: &str| plain_integer_value(text).map(|result| result.ok());
+        assert_eq!(value(""), Some(Some(0)));
+        assert_eq!(value(" 42 "), Some(Some(42)));
+        assert_eq!(value("-010"), Some(Some(-8)));
+        assert_eq!(value("+0x10"), Some(Some(16)));
+        assert_eq!(value("08"), Some(None));
+        assert_eq!(value("1+2"), None);
+        assert_eq!(value("b"), None);
+        assert_eq!(value("- 3"), None);
+    }
+
+    #[test]
+    fn wrapping_pow_wraps_like_repeated_multiplication() {
+        assert_eq!(wrapping_pow(2, 10), 1024);
+        assert_eq!(wrapping_pow(2, 63), i64::MIN);
+        assert_eq!(wrapping_pow(2, 64), 0);
+        assert_eq!(wrapping_pow(3, 40), 3i64.wrapping_pow(40));
+        assert_eq!(wrapping_pow(-1, u64::MAX), -1);
+        assert_eq!(wrapping_pow(0, 0), 1);
     }
 }

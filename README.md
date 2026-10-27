@@ -326,10 +326,16 @@ Parameter default and alternate words are evaluated only when selected, so
 String lengths (`${#value}`) and substring offsets (`${value:1:2}`) count
 Unicode characters, including for strings containing Chinese or emoji.
 Integer arithmetic wraps at 64 bits, including boundary additions, shifts,
-increments and division of the minimum signed integer by `-1`.
+increments, `**` and division of the minimum signed integer by `-1`.
 Arithmetic `&&`, `||`, and `?:` only evaluate the selected operands; skipped
 branches cannot change variables or cause division-by-zero errors. Malformed
 arithmetic reports a failure instead of silently substituting zero.
+As in Bash, `$((...))`, `((...))`, `for ((...))` and array subscripts expand
+`$var`, `$(...)` and nested `$((...))` in their text before evaluating it, a
+variable whose value is itself an expression is evaluated recursively (up to
+1024 levels), constants accept `base#digits` for bases 2 to 64, and `let`
+evaluates each argument. `let NAME = EXPR`, with a bare `=`, remains jsh's
+typed binding.
 
 `printf` supports field flags, width and precision, dynamic `*` fields, and
 `%s`, `%b`, `%c`, `%d`, `%i`, `%u`, `%o`, `%x`, `%X`, `%f`, `%F`, `%e`, `%E`,
@@ -1019,9 +1025,6 @@ measurements, not whole-shell startup or cross-shell rankings.
   for a document that fails parsing.
 - Descriptor duplication and closure (`N>&M`, `N<&M`, `N>&-`) are supported;
   descriptor-moving forms such as `N>&M-` remain unsupported and return an error.
-- Arithmetic variables accept numeric strings and radix prefixes; recursively
-  evaluating a variable's contents as another arithmetic expression is not
-  implemented.
 - HTTP and AI features are available only in builds with the `ai` Cargo feature.
 
 Please include the smallest reproducing command, expected status, actual status,
