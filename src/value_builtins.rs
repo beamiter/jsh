@@ -167,11 +167,26 @@ fn vb_from_json(
 /// Phase 15b — streaming NDJSON parser. Parses one JSON value per line
 /// lazily, so `from-ndjson big.jsonl | take 5 | ...` doesn't need to
 /// touch every line of the file.
+///
+/// Blank lines are skipped. By default a malformed line is skipped too, which
+/// suits log files with occasional junk; `--strict` instead ends the stream
+/// at that line and fails the pipeline, naming the line number, so a damaged
+/// export cannot pass as a shorter, complete one.
 fn vb_from_ndjson(
     input: PipelineData,
-    _args: &[String],
+    args: &[String],
     _state: &mut ShellState,
 ) -> Result<PipelineData, i32> {
+    let mut strict = false;
+    for arg in args {
+        match arg.as_str() {
+            "--strict" => strict = true,
+            other => {
+                eprintln!("from-ndjson: unknown option '{other}' (usage: from-ndjson [--strict])");
+                return Err(2);
+            }
+        }
+    }
     let bytes: Vec<u8> = match input {
         PipelineData::Empty => Vec::new(),
         PipelineData::Bytes(b) => b,
@@ -187,22 +202,66 @@ fn vb_from_ndjson(
             .join("\n")
             .into_bytes(),
     };
-    let s = String::from_utf8_lossy(&bytes).into_owned();
-    // Owned String → owned iterator (deferred parse, line-by-line).
-    let it = s.into_bytes();
-    let s = unsafe { String::from_utf8_unchecked(it) };
-    // Split now (cheap) and parse lazily.
-    let lines: Vec<String> = s
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.to_string())
-        .collect();
-    let iter = lines.into_iter().filter_map(|line| {
-        serde_json::from_str::<serde_json::Value>(&line)
-            .ok()
-            .map(Value::from_json)
-    });
-    Ok(PipelineData::Stream(Box::new(iter)))
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    };
+    Ok(PipelineData::Stream(Box::new(NdjsonLines {
+        text,
+        offset: 0,
+        line_number: 0,
+        strict,
+        finished: false,
+    })))
+}
+
+/// Lazily parses the lines of one owned buffer, without a second copy of each
+/// line or of the line index.
+struct NdjsonLines {
+    text: String,
+    offset: usize,
+    line_number: usize,
+    strict: bool,
+    finished: bool,
+}
+
+impl Iterator for NdjsonLines {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Value> {
+        while !self.finished && self.offset < self.text.len() {
+            let rest = &self.text[self.offset..];
+            let (line, advance) = match rest.find('\n') {
+                Some(end) => (&rest[..end], end + 1),
+                None => (rest, rest.len()),
+            };
+            self.offset += advance;
+            self.line_number += 1;
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => return Some(Value::from_json(value)),
+                Err(error) if self.strict => {
+                    self.finished = true;
+                    // serde positions are relative to this one line; report the
+                    // input's line number and serde's column within it.
+                    let detail = error.to_string();
+                    let detail = detail
+                        .rsplit_once(" at line ")
+                        .map_or(detail.as_str(), |(detail, _)| detail);
+                    crate::pipeline_data::record_stream_failure(format!(
+                        "from-ndjson: line {}, column {}: invalid JSON: {detail}",
+                        self.line_number,
+                        error.column()
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        None
+    }
 }
 
 fn vb_to_json(
@@ -231,10 +290,16 @@ fn vb_where(
 ) -> Result<PipelineData, i32> {
     // Closure form: `where {|r| ...}` or `where $f` where f is a Value::Closure.
     if let Some(closure) = lookup_closure(args.first(), state) {
+        let input = match lazy_closure_stage(input, &closure, ClosureStageMode::Filter, state)? {
+            Ok(stream) => return Ok(stream),
+            Err(input) => input,
+        };
         let vs = input.into_values()?;
         let mut out = Vec::with_capacity(vs.len());
+        state.last_error = None;
         for v in vs {
-            let result = crate::executor::apply_closure(&closure, std::slice::from_ref(&v), state)?;
+            let result = crate::executor::apply_closure(&closure, std::slice::from_ref(&v), state)
+                .inspect_err(|_| report_closure_failure(state))?;
             if is_truthy(&result) {
                 out.push(v);
             }
@@ -290,16 +355,128 @@ fn vb_each(
             return Err(1);
         }
     };
+    let mode = ClosureStageMode::Map { keep_empty };
+    let input = match lazy_closure_stage(input, &closure, mode, state)? {
+        Ok(stream) => return Ok(stream),
+        Err(input) => input,
+    };
     let vs = input.into_values()?;
     let mut out = Vec::with_capacity(vs.len());
+    state.last_error = None;
     for v in vs {
-        let r = crate::executor::apply_closure(&closure, std::slice::from_ref(&v), state)?;
+        let r = crate::executor::apply_closure(&closure, std::slice::from_ref(&v), state)
+            .inspect_err(|_| report_closure_failure(state))?;
         if !keep_empty && matches!(r, Value::Null) {
             continue;
         }
         out.push(r);
     }
     Ok(PipelineData::Values(out))
+}
+
+/// Route a failed closure's message to whoever reports this pipeline, the same
+/// way a lazy stage's failure travels. It used to be dropped: `each {|x| $x /
+/// 0}` exited 1 without saying why. Inside `try` the closure runner claims it
+/// as the caught error instead of printing it.
+fn report_closure_failure(state: &ShellState) {
+    let message = match &state.last_error {
+        Some(Value::Record(record)) => record.get("msg").map(Value::to_display_string),
+        _ => None,
+    };
+    if let Some(message) = message {
+        crate::pipeline_data::record_stream_failure(message);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClosureStageMode {
+    /// `where`: keep the rows for which the closure is truthy.
+    Filter,
+    /// `each`: yield the closure's results, dropping Null unless asked not to.
+    Map { keep_empty: bool },
+}
+
+/// Apply a closure to a stream lazily when that is observably the same as the
+/// eager loop: the input is already a stream and the body is a pure expression.
+///
+/// A pure expression reads only its parameters and captures, never shell
+/// state, so evaluating it as rows are pulled cannot reorder side effects;
+/// `range 0..10000000 | where {|n| $n % 7 == 0} | take 3` then evaluates
+/// 15 rows instead of ten million and retains none of them. Every other case
+/// returns the input untouched (`Err`) for the established eager path, which
+/// still runs shell-command bodies one row at a time in order.
+///
+/// A closure error ends the stream and is recorded as a stream failure: rows
+/// before the failing one have already gone downstream, and the consumer that
+/// drains the stream reports the error and fails the pipeline.
+fn lazy_closure_stage(
+    input: PipelineData,
+    closure: &Arc<ClosureData>,
+    mode: ClosureStageMode,
+    state: &mut ShellState,
+) -> Result<Result<PipelineData, PipelineData>, i32> {
+    if !input.is_stream() {
+        return Ok(Err(input));
+    }
+    let expression = match crate::closure_expr::compile(&closure.body_src) {
+        Ok(Some(expression)) => expression,
+        Ok(None) => return Ok(Err(input)),
+        Err(message) => {
+            eprintln!("jsh: {message}");
+            state.set_error(message, 1);
+            return Err(1);
+        }
+    };
+    let PipelineData::Stream(source) = input else {
+        unreachable!("checked is_stream above");
+    };
+    Ok(Ok(PipelineData::Stream(Box::new(ClosureStage {
+        source,
+        closure: Arc::clone(closure),
+        expression,
+        mode,
+        finished: false,
+    }))))
+}
+
+struct ClosureStage {
+    source: crate::pipeline_data::ValueStream,
+    closure: Arc<ClosureData>,
+    expression: crate::closure_expr::CompiledExpr,
+    mode: ClosureStageMode,
+    /// Set after a failure so no further row is pulled or evaluated.
+    finished: bool,
+}
+
+impl Iterator for ClosureStage {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Value> {
+        if self.finished {
+            return None;
+        }
+        loop {
+            let row = self.source.next()?;
+            let closure = &self.closure;
+            let result = self
+                .expression
+                .evaluate_with(|name| closure.lookup(std::slice::from_ref(&row), name));
+            match (result, self.mode) {
+                (Ok(keep), ClosureStageMode::Filter) => {
+                    if is_truthy(&keep) {
+                        return Some(row);
+                    }
+                }
+                (Ok(Value::Null), ClosureStageMode::Map { keep_empty: false }) => {}
+                (Ok(mapped), ClosureStageMode::Map { .. }) => return Some(mapped),
+                (Err(message), _) => {
+                    self.finished = true;
+                    crate::pipeline_data::record_stream_failure(message);
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 /// Phase 16b — parallel `each`. Runs the closure body on a worker pool while

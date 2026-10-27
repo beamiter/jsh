@@ -290,7 +290,7 @@ const SIGS: &[Signature] = &[
         input: Type::Stream,
         output: Type::Stream,
         params: &[],
-        desc: "Parse NDJSON lazily (one JSON value per line) as a value stream.",
+        desc: "Parse NDJSON lazily (one JSON value per line) as a value stream. --strict fails on a malformed line instead of skipping it.",
     },
     Signature {
         name: "to-json",

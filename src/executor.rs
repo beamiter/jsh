@@ -534,6 +534,7 @@ fn is_value_aware_command(cmd: &Command) -> bool {
 fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
     use crate::pipeline_data::PipelineData;
     const MAX_VALUE_PIPE_INPUT_BYTES: usize = 64 * 1024 * 1024;
+    crate::pipeline_data::clear_stream_failure();
 
     // If our own stdin is a pipe (not a tty), the user is feeding bytes into
     // the first value-aware stage. Read them eagerly. (Phase 5a is non-streaming.)
@@ -602,7 +603,15 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
         }
         match f(data, args, state) {
             Ok(out) => data = out,
-            Err(code) => return code,
+            Err(code) => {
+                // A lazy upstream stage that failed explains why this stage
+                // saw a truncated input; nothing else has reported it.
+                if let Some(message) = crate::pipeline_data::take_stream_failure() {
+                    eprintln!("jsh: {message}");
+                    state.set_error(message, code);
+                }
+                return code;
+            }
         }
         // Last command should print to stdout
         if i == cmds.len() - 1 {
@@ -1096,12 +1105,27 @@ pub fn apply_closure(
                             return Err(2);
                         }
                     }
-                    data = f(data, extra_args, state)?;
+                    data = match f(data, extra_args, state) {
+                        Ok(data) => data,
+                        Err(code) => {
+                            // Surface a lazy stage's failure as this closure's
+                            // error, which `try` can catch, instead of leaving
+                            // it pending for an unrelated pipeline to report.
+                            if let Some(message) = crate::pipeline_data::take_stream_failure() {
+                                state.set_error(message, code);
+                            }
+                            return Err(code);
+                        }
+                    };
                 }
                 let data = match data {
                     PipelineData::Stream(it) => PipelineData::Values(it.collect()),
                     other => other,
                 };
+                if let Some(message) = crate::pipeline_data::take_stream_failure() {
+                    state.set_error(message, 1);
+                    return Err(1);
+                }
                 last = match data {
                     PipelineData::Values(mut vs) if vs.len() == 1 => vs.remove(0),
                     PipelineData::Values(vs) => Value::List(vs),

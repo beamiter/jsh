@@ -6,9 +6,49 @@
 /// incrementally; legacy code paths transparently `collect()` via
 /// `into_values()`.
 use crate::value::Value;
+use std::cell::RefCell;
 use std::io::{self, Write};
 
 pub type ValueStream = Box<dyn Iterator<Item = Value> + Send>;
+
+thread_local! {
+    /// Why a lazy stage ended its stream early, until a consumer reports it.
+    ///
+    /// Stream items are plain values with no error variant, so a stage that fails
+    /// while producing rows (a closure error at row N, a malformed line under
+    /// `from-ndjson --strict`) ends its iterator and leaves the reason here. Code
+    /// that drains a stream checks this before trusting what it collected, so a
+    /// truncated input never passes for a complete one. Pipeline runners clear it
+    /// on entry, so a failure from an abandoned pipeline cannot leak into the next.
+    ///
+    /// It is per thread: a pipeline's stages are built and drained on the thread
+    /// running that pipeline (`par-each` workers receive owned chunks, never a
+    /// stream), and unrelated pipelines on other threads, such as concurrent
+    /// tests, cannot observe each other's failures.
+    static STREAM_FAILURE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Record why a lazy stage stopped. The first failure wins: every later stage
+/// only sees the truncated stream that failure left behind.
+pub(crate) fn record_stream_failure(message: String) {
+    STREAM_FAILURE.with(|slot| {
+        slot.borrow_mut().get_or_insert(message);
+    });
+}
+
+/// Claim the pending failure, if any, so exactly one place reports it.
+pub(crate) fn take_stream_failure() -> Option<String> {
+    STREAM_FAILURE.with(|slot| slot.borrow_mut().take())
+}
+
+fn stream_failure_pending() -> bool {
+    STREAM_FAILURE.with(|slot| slot.borrow().is_some())
+}
+
+/// Forget a failure that an earlier, abandoned pipeline left unreported.
+pub(crate) fn clear_stream_failure() {
+    take_stream_failure();
+}
 
 pub enum PipelineData {
     Empty,
@@ -37,7 +77,16 @@ impl PipelineData {
         match self {
             PipelineData::Empty => Ok(Vec::new()),
             PipelineData::Values(v) => Ok(v),
-            PipelineData::Stream(it) => Ok(it.collect()),
+            PipelineData::Stream(it) => {
+                let values: Vec<Value> = it.collect();
+                // A stage that failed ended the stream early. Computing over the
+                // remainder would present partial input as complete, so fail and
+                // leave the message pending for whoever reports this pipeline.
+                if stream_failure_pending() {
+                    return Err(1);
+                }
+                Ok(values)
+            }
             PipelineData::Bytes(b) => {
                 let s = String::from_utf8_lossy(&b);
                 let s = s.trim();
@@ -136,6 +185,11 @@ impl PipelineData {
     /// pipeline doesn't have to buffer everything before any output.
     pub fn write_to_stdout(self) -> io::Result<()> {
         use std::os::fd::FromRawFd;
+        // A result computed from a truncated stream (a count, a saved file, a
+        // rendered table) must not be presented as the pipeline's answer.
+        if let Some(message) = take_stream_failure() {
+            return Err(io::Error::other(message));
+        }
         if matches!(&self, PipelineData::Empty)
             || matches!(&self, PipelineData::Values(values) if values.is_empty())
         {
@@ -175,6 +229,12 @@ impl PipelineData {
             PipelineData::Stream(values) => {
                 for value in values {
                     writeln!(output, "{}", value.to_display_string())?;
+                }
+                // Rows before a failing one are already out, as with any
+                // stream; the failure still decides the pipeline's status.
+                if let Some(message) = take_stream_failure() {
+                    output.flush()?;
+                    return Err(io::Error::other(message));
                 }
             }
         }

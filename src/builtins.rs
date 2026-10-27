@@ -357,6 +357,7 @@ fn run_value_builtin_in_fork(
     use crate::pipeline_data::PipelineData;
     use std::io::Write;
     const MAX_VALUE_PIPE_INPUT_BYTES: usize = 64 * 1024 * 1024;
+    crate::pipeline_data::clear_stream_failure();
     let mut buf = Vec::new();
     if !std::io::stdin().is_terminal() {
         buf = match crate::io_guard::read_to_end_bounded(
@@ -401,6 +402,10 @@ fn run_value_builtin_in_fork(
                 PipelineData::Stream(it) => PipelineData::Values(it.collect()),
                 other => other,
             };
+            if let Some(message) = crate::pipeline_data::take_stream_failure() {
+                eprintln!("jsh: {message}");
+                return 1;
+            }
             match out {
                 PipelineData::Empty => {}
                 PipelineData::Bytes(b) => sink.extend_from_slice(&b),
@@ -416,7 +421,12 @@ fn run_value_builtin_in_fork(
             let _ = std::io::stdout().lock().write_all(&sink);
             0
         }
-        Err(c) => c,
+        Err(c) => {
+            if let Some(message) = crate::pipeline_data::take_stream_failure() {
+                eprintln!("jsh: {message}");
+            }
+            c
+        }
     }
 }
 
