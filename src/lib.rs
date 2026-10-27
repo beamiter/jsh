@@ -37,6 +37,7 @@ mod printf;
 pub mod probe;
 pub mod prompt;
 pub mod session;
+pub mod shadowing;
 pub mod shell;
 pub mod signal;
 pub mod signature;

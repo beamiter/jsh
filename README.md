@@ -192,12 +192,13 @@ and 128 nesting/evaluation levels.
 `par-each` shares that parsed expression across workers and preserves input
 order and the same parameter/capture binding rules as `each`.
 
-Text pipelines also support zero-based field templates and preserve blank
-lines when collapsing adjacent duplicates:
+Text pipelines also support zero-based field templates, and the line-based
+`uniq` builtin preserves blank lines when collapsing adjacent duplicates (an
+installed `uniq` program takes precedence; `builtin uniq` selects the builtin):
 
 ```sh
 printf 'Ada 36\nLin 28\n' | jsh -c 'map "{1}: {0}"'
-printf '\n\nalpha\nalpha\n' | jsh -c 'uniq -c'
+printf '\n\nalpha\nalpha\n' | jsh -c 'builtin uniq -c'
 ```
 
 Check whether the surrounding environment can provide startup compatibility,
@@ -210,6 +211,46 @@ jsh doctor --json
 jsh doctor --strict                 # exit 1 when any warning is present
 jsh doctor --rcfile ./team.jshrc    # inspect an explicit startup file
 ```
+
+## Builtins that share a name with a system program
+
+A few jsh builtins carry the name of a program most systems install. jsh runs
+the builtin only for its own forms; every other invocation runs the program
+found on `PATH` with the same arguments, stdin, stdout, stderr, and exit
+status, so `printf 'b\na\n' | sort`, `sort -t: -k2 file`, `date +%F`, and
+`uniq -d` behave exactly as they do in Bash.
+
+| Name | The jsh builtin runs for | For example, the program runs for |
+|------|--------------------------|-----------------------------------|
+| `sort` | typed input | `sort file`, `cmd \| sort -u`, `ls -l \| sort -k5n` |
+| `date` | `date now`, `date format FMT`, typed input | `date`, `date +%s`, `date -u -d @0` |
+| `split` | `split row SEP`, `split column SEP ...`, typed input | `split -l 100 file part_` |
+| `last` | typed input; `last [N]` over piped or redirected text | `last`, `last -n 5`, `last root` |
+| `zip` | `zip '[json list]'`, typed input | `zip -r out.zip dir` |
+| `merge` | `merge '{json}'`, typed input | RCS `merge mine base theirs` |
+| `rename` | typed input | `rename .htm .html *.htm` |
+| `http` | `http get\|post\|put\|delete URL ...`, typed input (`ai` builds only) | HTTPie: `http GET example.org` |
+| `sum` | numeric arguments: `sum 1 2 3` | `sum file`, `cmd \| sum` |
+| `uniq` | nothing; the builtin is a fallback | every invocation |
+| `context` | `context list\|show\|last-failed\|summary\|help` | ConTeXt: `context paper.tex` |
+| `open` (macOS) | one file operand | `open .`, `open -a App`, `open https://...` |
+
+*Typed input* means the command is piped directly from a jsh value command
+that runs as a builtin, such as `from-json`, `open data.json`, `range`, or
+`where` (commands inside a loop, brace group, or function in that stage are
+ordinary shell code and do not count).
+Text never counts, wherever it comes from: an external command, a classic
+builtin, a file, here-doc or here-string redirection, or the `to-*`
+serializers. `ls` and `ps` count as the system programs here, so `ls | sort`
+sorts names, while `ls | where ...` still gets the structured listing. Thus
+`from-json | sort` sorts values and `cat data.json | sort` sorts lines.
+
+- `command sort` always runs the program; `builtin sort` always runs the builtin.
+- When no program of that name is installed, the builtin keeps its behavior.
+- `type` and `command -v` report what an ordinary invocation runs, and
+  `help NAME` documents each command's rule.
+- The decision is made before any input is read, so the program reads its
+  stdin directly and streams.
 
 ## Command line
 

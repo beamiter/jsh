@@ -4184,6 +4184,12 @@ fn build_command_candidates(state: &mut ShellState) -> Vec<Completion> {
             ),
             None => command.summary().to_string(),
         };
+        // Ordinary invocations of a name like `sort` run the system program
+        // (see crate::shadowing), so the description must not claim otherwise.
+        let description = match crate::shadowing::get(command.name) {
+            Some(shadow) => format!("{description} Otherwise the system {}.", shadow.name),
+            None => description,
+        };
         completions.push(Completion {
             text: command.name.to_string(),
             display: command.name.to_string(),

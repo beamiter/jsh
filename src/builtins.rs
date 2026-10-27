@@ -274,7 +274,9 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
                 return 0;
             }
             let cmd_name = &args[0];
-            if is_builtin(cmd_name) {
+            // `command sort` is how a user asks for the system program that a
+            // structured builtin shadows; genuine shell builtins stay builtins.
+            if is_builtin(cmd_name) && crate::shadowing::system_program(cmd_name).is_none() {
                 run_builtin(cmd_name, &args[1..], state)
             } else {
                 // Hand the already-expanded argv straight to exec. Re-joining
@@ -829,7 +831,10 @@ fn builtin_unalias(args: &[String], state: &mut ShellState) -> i32 {
 fn builtin_type(args: &[String], state: &mut ShellState) -> i32 {
     let mut ret = 0;
     for arg in args {
-        if is_builtin(arg) {
+        // A builtin that shadows an installed program (`sort`, `date`, ...)
+        // yields to it for ordinary use, so report the program; `help NAME`
+        // documents when the structured builtin runs instead.
+        if is_builtin(arg) && crate::shadowing::system_program(arg).is_none() {
             println!("{} is a shell builtin", arg);
         } else if state.aliases.contains_key(arg) {
             println!("{} is aliased to '{}'", arg, state.aliases[arg]);
@@ -921,7 +926,7 @@ fn command_describe(names: &[String], verbose: bool, state: &ShellState) -> i32 
             Some((name.clone(), format!("{} is a shell keyword", name)))
         } else if state.functions.contains_key(name) {
             Some((name.clone(), format!("{} is a function", name)))
-        } else if is_builtin(name) {
+        } else if is_builtin(name) && crate::shadowing::system_program(name).is_none() {
             Some((name.clone(), format!("{} is a shell builtin", name)))
         } else {
             find_in_path(name).map(|path| (path.clone(), format!("{} is {}", name, path)))
@@ -4358,6 +4363,11 @@ fn builtin_help(args: &[String], state: &ShellState) -> i32 {
             }
             if let Some(detail) = command.detail() {
                 println!("\n{detail}");
+            }
+        }
+        if !as_record {
+            if let Some(note) = command.shadow_note() {
+                println!("\n{note}");
             }
         }
         return 0;

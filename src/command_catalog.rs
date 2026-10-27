@@ -79,6 +79,13 @@ impl CommandInfo {
         fallback_detail(self.canonical_name)
     }
 
+    /// When this builtin shares its name with a system program, the help
+    /// paragraph saying which invocations run the builtin and which the
+    /// program (see [`crate::shadowing`]).
+    pub fn shadow_note(self) -> Option<String> {
+        crate::shadowing::get(self.name).map(|shadow| shadow.help_note())
+    }
+
     /// One stable machine-readable help schema shared by both execution paths.
     pub fn help_record(self) -> crate::value::Value {
         use crate::value::Value;
@@ -104,6 +111,9 @@ impl CommandInfo {
         }
         if let Some(detail) = self.detail() {
             record.insert("detail".to_string(), Value::String(detail.to_string()));
+        }
+        if let Some(shadow) = crate::shadowing::get(self.name) {
+            record.insert("shadows".to_string(), shadow.to_record());
         }
         if let Some(signature) = self.signature() {
             record.insert("signature".to_string(), signature.to_record());

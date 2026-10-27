@@ -24,21 +24,23 @@ fn run(script: &str, input: &str) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+// A system `uniq` takes precedence over the line-based builtin (see
+// src/shadowing.rs); `builtin uniq` keeps exercising the builtin itself.
 #[test]
 fn uniq_preserves_empty_runs_at_start_middle_and_end() {
-    assert_eq!(run("uniq", "\n\na\na\n\nb\n\n\n"), "\na\n\nb\n\n");
+    assert_eq!(run("builtin uniq", "\n\na\na\n\nb\n\n\n"), "\na\n\nb\n\n");
     assert_eq!(
-        run("uniq -c", "\n\na\na\n\nb\n\n\n"),
+        run("builtin uniq -c", "\n\na\na\n\nb\n\n\n"),
         "2 \n2 a\n1 \n1 b\n2 \n"
     );
 }
 
 #[test]
 fn uniq_distinguishes_empty_input_from_one_empty_line() {
-    assert_eq!(run("uniq", ""), "");
-    assert_eq!(run("uniq -c", ""), "");
-    assert_eq!(run("uniq", "\n"), "\n");
-    assert_eq!(run("uniq -c", "\n"), "1 \n");
+    assert_eq!(run("builtin uniq", ""), "");
+    assert_eq!(run("builtin uniq -c", ""), "");
+    assert_eq!(run("builtin uniq", "\n"), "\n");
+    assert_eq!(run("builtin uniq -c", "\n"), "1 \n");
 }
 
 #[test]

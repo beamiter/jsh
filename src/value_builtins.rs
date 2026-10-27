@@ -4756,6 +4756,18 @@ fn vb_help(
         return Ok(PipelineData::Bytes(rsig.render_help().into_bytes()));
     }
     if let Some(command) = crate::command_catalog::get(name) {
+        // A builtin that shadows a system program documents when it yields,
+        // set off by exactly one blank line like the classic `help` prints it.
+        let with_shadow_note = |mut help: String| {
+            if let Some(note) = command.shadow_note() {
+                if !help.ends_with("\n\n") {
+                    help.push('\n');
+                }
+                help.push_str(&note);
+                help.push('\n');
+            }
+            help
+        };
         if as_record {
             Ok(PipelineData::Values(vec![command.help_record()]))
         } else if let Some(signature) = command.signature() {
@@ -4766,7 +4778,7 @@ fn vb_help(
                     command.name, command.canonical_name
                 ));
             }
-            Ok(PipelineData::Bytes(help.into_bytes()))
+            Ok(PipelineData::Bytes(with_shadow_note(help).into_bytes()))
         } else {
             let alias = if command.name == command.canonical_name {
                 String::new()
@@ -4782,14 +4794,14 @@ fn vb_help(
                 .map(|detail| format!("\n{detail}\n"))
                 .unwrap_or_default();
             Ok(PipelineData::Bytes(
-                format!(
+                with_shadow_note(format!(
                     "{}{}\n  {}\n{}{}",
                     command.name,
                     alias,
                     command.summary(),
                     usage,
                     detail
-                )
+                ))
                 .into_bytes(),
             ))
         }

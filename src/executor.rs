@@ -649,7 +649,11 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
 
     // Phase 5a: if every command is a value-aware builtin with no redirects /
     // assignments / etc., run the whole pipeline in-process without forking.
-    if cmds.iter().all(is_value_aware_command) {
+    // A stage that would run the system program of the same name (`date +%s |
+    // ...`) needs a process, so such a pipeline takes the forked route.
+    if cmds.iter().all(is_value_aware_command)
+        && crate::shadowing::value_pipeline_runs_builtins(cmds, state)
+    {
         let code = execute_value_pipeline(cmds, state);
         state.pipestatus = vec![code];
         state.set_array("PIPESTATUS", vec![code.to_string()]);
@@ -672,6 +676,9 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
     let mut child_pids: Vec<Pid> = Vec::new();
     let mut pgid = Pid::from_raw(0);
     let mut last_in_shell: Option<i32> = None;
+    // What each stage's stdin carries; shadowing builtins such as `sort` only
+    // take typed values from an upstream value stage (see shadowing.rs).
+    let mut stage_origin = crate::shadowing::stdin_origin();
 
     for (i, cmd) in cmds.iter().enumerate() {
         let is_last = i == cmds.len() - 1;
@@ -699,7 +706,10 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
                 dup2_raw(fd, 0).ok();
                 close(fd).ok();
             }
+            let origin = crate::shadowing::stage_input_origin(cmd, stage_origin, state);
+            let saved_origin = crate::shadowing::set_stdin_origin(origin);
             let code = execute_command(cmd, state);
+            crate::shadowing::set_stdin_origin(saved_origin);
             if let Some(sfd) = saved_stdin {
                 dup2_raw(sfd.as_raw_fd(), 0).ok();
             }
@@ -732,6 +742,8 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
                     close(fd).ok();
                 }
 
+                let origin = crate::shadowing::stage_input_origin(cmd, stage_origin, state);
+                crate::shadowing::set_stdin_origin(origin);
                 let code = execute_command_in_pipeline_child(cmd, state);
                 child_exit(code);
             }
@@ -754,6 +766,7 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
                     close(fd).ok();
                 }
                 prev_read_fd = read_fd;
+                stage_origin = crate::shadowing::stage_output_origin(cmd, stage_origin, state);
             }
             Err(e) => {
                 if !use_lastpipe {
@@ -1490,8 +1503,12 @@ fn execute_simple_with_mode(
         }
     }
 
-    // Check for builtin
-    if builtins::is_builtin(cmd_name) {
+    // Check for builtin. A builtin that shadows a system program (`sort`,
+    // `date`, ...) yields to it unless this invocation is jsh's own form; the
+    // command then continues below as an ordinary external command.
+    if builtins::is_builtin(cmd_name)
+        && !crate::shadowing::runs_system_program(cmd_name, args, &cmd.redirects)
+    {
         let mut redirects = match setup_redirects(&cmd.redirects, state) {
             Ok(guard) => guard,
             Err(code) => return code,
