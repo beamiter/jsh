@@ -1,0 +1,411 @@
+### break_n
+for i in 1 2; do for j in 1 2; do echo $i$j; break 2; done; done
+### continue_n
+for i in 1 2; do for j in 1 2; do continue 2; echo no; done; echo no2; done; echo done
+### break_n_too_large
+for i in 1 2; do for j in 1 2; do echo $i$j; break 5; done; done; echo after
+### break_zero
+for i in 1; do break 0; done; echo st=$?
+### break_invalid
+for i in 1; do break x; done 2>/dev/null; echo st=$?
+### continue_n_while
+i=0; while ((i<3)); do ((i++)); for j in 1 2; do continue 2; done; echo no; done; echo $i
+### break_in_function_loop
+f() { break; }; for i in 1 2; do f; echo $i; done 2>/dev/null
+### trap_exit
+trap 'echo bye' EXIT; echo hi
+### trap_exit_status
+trap 'echo "exit=$?"' EXIT; exit 3
+### trap_exit_subshell
+(trap 'echo sub-exit' EXIT; echo in-sub); echo after
+### trap_err
+trap 'echo err' ERR; false; echo after
+### trap_err_func_noE
+trap 'echo err' ERR; f() { false; echo in; }; f; echo out
+### trap_err_func_fails_noE
+trap 'echo err' ERR; f() { false; }; f; echo out
+### trap_err_func_E
+set -E; trap 'echo err' ERR; f() { false; echo in; }; f; echo out
+### trap_err_subshell_noE
+trap 'echo err' ERR; (false); echo out
+### trap_err_cmdsub_E
+set -E; trap 'echo err' ERR; x=$(false; echo z); echo out $x
+### trap_err_lineno
+trap 'echo "err at $LINENO"' ERR
+true
+false
+### trap_return
+f() { trap 'echo ret' RETURN; :; }; f; echo after
+### trap_return_global
+trap 'echo ret' RETURN; f() { :; }; f; echo after
+### trap_return_source
+echo 'echo in-src' > s.sh; trap 'echo ret' RETURN; . ./s.sh; echo after
+### trap_return_T
+set -T; trap 'echo ret' RETURN; f() { :; }; f; echo after
+### trap_debug
+trap 'echo dbg' DEBUG; x=1; echo hi
+### trap_debug_bash_command
+trap 'echo "cmd=$BASH_COMMAND"' DEBUG; true; echo x
+### trap_debug_func_noT
+trap 'echo "d:$BASH_COMMAND"' DEBUG; f() { echo infunc; }; f
+### trap_debug_func_T
+set -T; trap 'echo "d:$BASH_COMMAND"' DEBUG; f() { echo infunc; }; f
+### trap_debug_off
+trap 'echo d' DEBUG; trap - DEBUG; echo plain
+### trap_p
+trap 'echo x' EXIT; trap -p EXIT; trap - EXIT
+### trap_p_all
+trap 'echo x' EXIT; trap 'echo y' USR1; trap -p; trap - EXIT
+### trap_print_quote
+trap "echo 'quoted'" EXIT; trap -p EXIT; trap - EXIT
+### trap_l_contains
+trap -l | grep -c 'SIGUSR1'
+### trap_int
+trap 'echo int' INT; kill -INT $$; echo after
+### trap_usr1
+trap 'echo usr1' USR1; kill -USR1 $$; echo after
+### trap_term
+trap 'echo term' TERM; kill -TERM $$; echo after
+### trap_hup
+trap 'echo hup' HUP; kill -HUP $$; echo after
+### trap_usr1_during_sleep
+trap 'echo got-usr1' USR1; (sleep 0.2; kill -USR1 $$) & sleep 1; echo after-sleep; wait
+### trap_ignore_inherited
+trap '' USR1; bash -c 'kill -USR1 $$; echo child-survived'
+### trap_reset_in_subshell
+trap 'echo parent' USR1; (kill -USR1 $BASHPID; echo sub-alive) ; echo parent-alive
+### trap_reset_default
+trap 'echo x' USR1; trap - USR1; (kill -USR1 $BASHPID); echo st=$?
+### trap_numeric
+trap 'echo ten' 10; kill -USR1 $$; echo after
+### trap_sig_prefix
+trap 'echo sig' SIGUSR2; kill -USR2 $$; echo after
+### trap_cleanup_pattern
+cleanup() { echo cleaning; }; trap cleanup EXIT INT TERM; echo working
+### lineno
+echo $LINENO
+echo $LINENO
+### lineno_func
+f() {
+  echo $LINENO
+}
+f
+### lineno_multiline_cmd
+echo a \
+  $LINENO
+### lineno_after_heredoc
+cat <<EOF >/dev/null
+x
+y
+EOF
+echo $LINENO
+### funcname
+f() { echo "${FUNCNAME[0]}"; }; f
+### funcname_stack
+g() { echo "${FUNCNAME[@]}"; }; f() { g; }; f
+### funcname_outside
+echo "[${FUNCNAME[0]}]" ${#FUNCNAME[@]}
+### funcname_restored
+f() { :; }; f; echo "[${FUNCNAME[*]}]"
+### bash_lineno
+f() { echo "${BASH_LINENO[0]}"; }
+f
+### caller
+f() { caller 0 | cut -d' ' -f2; }; f
+### caller_noarg
+f() { caller; }; f
+### caller_toplevel
+caller; echo st=$?
+### underscore
+echo a b c >/dev/null; echo "$_"
+### underscore_after_assignment
+x=1; echo "$_" | wc -c
+### time_keyword
+time true 2>/dev/null; echo st=$?
+### time_timeformat
+TIMEFORMAT='T=%R'; { time sleep 0.1; } 2>&1 | sed 's/[0-9.]*$//'
+### time_pipeline_status
+time false | true; echo st=$?
+### time_posix
+time -p true 2>&1 | head -1 | cut -c1-4
+### fd_named
+exec {fd}>out.txt; echo hi >&$fd; exec {fd}>&-; cat out.txt
+### fd_named_read
+echo data > in.txt; exec {rfd}<in.txt; read -r l <&$rfd; echo $l; exec {rfd}<&-
+### fd_named_number
+exec {fd}>out.txt; [[ $fd -ge 10 ]] && echo ge10
+### fd_move
+exec 3>out.txt; exec 4>&3-; echo moved >&4; exec 4>&-; cat out.txt; { echo x >&3; } 2>/dev/null || echo fd3-closed
+### fd_move_cmd
+echo moved 3>out2.txt 4>&3- >&4; cat out2.txt
+### fd_move_input
+echo inp > i.txt; exec 5<i.txt; exec 6<&5-; read -r l <&6; echo $l
+### fd_close_stdout_error
+(echo x >&-) 2>/dev/null; echo st=$?
+### redirect_both_group
+{ echo out; echo err >&2; } &>both.txt; /usr/bin/sort both.txt
+### redirect_err_to_out_order
+{ echo e >&2; } 2>&1 >/dev/null | cat
+### select_noninteractive
+echo 1 | { select x in a b; do echo $x; break; done; } 2>/dev/null
+### select_ps3
+echo 2 | { PS3='pick: '; select x in a b; do echo "$x $REPLY"; break; done; } 2>&1
+### select_invalid_then_eof
+printf '9\n' | { select x in a b; do echo "[$x] $REPLY"; break; done; } 2>/dev/null
+### coproc_basic
+coproc cat; echo hi >&${COPROC[1]}; exec {COPROC[1]}>&-; read -r l <&${COPROC[0]}; echo $l
+### coproc_named
+coproc UP { tr a-z A-Z; }; echo abc >&${UP[1]}; exec {UP[1]}>&-; read -r l <&${UP[0]}; echo $l; wait
+### local_dash
+f() { local -; set -e; }; f; [[ $- == *e* ]] && echo leaked || echo restored
+### local_dash_noglob
+f() { local -; set -f; echo *; }; touch zz; f; echo *
+### return_outside
+return 2>/dev/null; echo st=$?
+### exit_in_func
+f() { exit 4; }; f; echo not-reached
+### function_redirect_def
+f() { echo inside; } > fout.txt; f; cat fout.txt
+### errexit_func
+set -e; f() { false; echo no; }; f; echo no2
+### errexit_cmdsub_assign
+set -e; x=$(false); echo not-reached
+### errexit_and_or
+set -e; false && true; echo survived
+### pipefail_status
+set -o pipefail; (exit 2) | (exit 3) | true; echo $?
+### subshell_exit_code
+(exit 42); echo $?
+### background_wait_status
+(exit 9) & wait $!; echo $?
+### source_return_value
+printf 'return 5\n' > r.sh; . ./r.sh; echo $?
+### source_positional
+printf 'echo "$1-$2"\n' > p.sh; . ./p.sh x y
+### eval_return
+f() { eval 'return 3'; echo no; }; f; echo $?
+### nested_function_def
+outer() { inner() { echo in; }; }; outer; inner
+### command_not_found_handle
+command_not_found_handle() { echo "cnf: $1"; return 127; }; nosuchcmd_zz; echo st=$?
+### exec_redirect_persist
+exec 3>pr.txt; echo one >&3; echo two >&3; exec 3>&-; cat pr.txt
+### shopt_lastpipe
+shopt -s lastpipe; echo v | read x; echo "[$x]"
+### x_err_group
+trap 'echo err' ERR; { false; }; echo a
+### x_err_group_continue
+trap 'echo err' ERR; { false; echo x; }; echo a
+### x_err_if_body
+trap 'echo err' ERR; if true; then false; fi; echo b
+### x_err_pipeline
+trap 'echo err' ERR; false | true; true | false; echo c
+### x_err_subshell
+trap 'echo err' ERR; (false); echo e
+### x_err_arith_cond
+trap 'echo err' ERR; (( 0 )); [[ -z x ]]; echo f
+### x_err_for_while
+trap 'echo err' ERR; for i in 1; do false; done; while false; do :; done; echo g
+### x_err_negations
+trap 'echo err' ERR; ! true; false && true; true && false; echo i
+### x_err_func_and
+trap 'echo err' ERR; f() { false; }; f && echo yes; echo j
+### x_err_func_hidden
+trap 'echo err' ERR; f() { trap -p ERR; echo inf; }; f; trap -p ERR
+### x_err_set_in_func_persists
+trap 'echo err' ERR; f() { trap 'echo ferr' ERR; false; }; f; false
+### x_err_E_func_twice
+set -E; trap 'echo err' ERR; f() { false; }; f; echo k
+### x_err_cmdsub_status
+trap 'echo err $?' ERR; x=$(exit 3); echo l
+### x_err_eval_twice
+trap 'echo err' ERR; eval false; echo m
+### x_err_case
+trap 'echo err' ERR; case x in x) false;; esac; echo n
+### x_debug_compounds
+trap 'echo "d:$BASH_COMMAND"' DEBUG; for i in 1 2; do :; done; case x in x) :;; esac; ((1)); f() { echo in f; }; f; x=$(echo cs); echo "$x" >/dev/null; { echo grp; }; if true; then :; fi; while false; do :; done; a=1 b=2; echo   "spaced   arg"  2>&1
+### x_debug_cmdsub
+trap 'echo dbg' DEBUG; echo $(echo cs)
+### x_debug_pipeline
+trap 'echo "d:$BASH_COMMAND"' DEBUG; true | cat
+### x_debug_lineno
+trap 'echo "d:$BASH_COMMAND $LINENO"' DEBUG; f() { echo infunc; }
+ f
+### x_debug_set_in_func
+f() { trap 'echo "fd:$BASH_COMMAND"' DEBUG; echo a; }; f; echo b; trap - DEBUG
+### x_debug_status
+trap 'echo dbg $?' DEBUG; false; echo x
+### x_debug_T_func
+set -T; trap 'echo "d:$BASH_COMMAND"' DEBUG; f() { echo infunc; }; f
+### x_return_status
+f() { trap 'echo "ret $?"' RETURN; return 3; }; f; echo "st=$?"
+### x_return_source_inside
+echo 'trap "echo src-ret" RETURN; echo body' > rs.sh; . ./rs.sh; echo after
+### x_lineno_many
+echo a \
+  $LINENO
+echo $LINENO; true &&
+echo $LINENO
+f() {
+  echo "f $LINENO"
+}
+f
+for i in $LINENO; do echo "for $i $LINENO"; done
+eval "echo eval \$LINENO
+echo eval2 \$LINENO"
+echo "multi
+line $LINENO"
+echo after $LINENO
+(
+echo sub $LINENO
+)
+cat <<END
+hd $LINENO
+END
+echo end $LINENO
+### x_lineno_err
+trap 'echo "err at $LINENO"' ERR
+true
+false
+false; echo x
+f() {
+  false
+  return 0
+}
+f
+### x_lineno_assignment_continuation
+x=1 \
+  y=2
+echo "after $LINENO"
+### x_callstack_c
+h() { echo "h ${BASH_LINENO[*]} ${FUNCNAME[*]} ${BASH_SOURCE[*]}"; caller; caller 0; }
+h
+k() { h; }
+k
+echo "${BASH_LINENO[@]} ${FUNCNAME[@]}" ${#BASH_LINENO[@]}
+### x_callstack_source
+printf 'echo "in s2 [${FUNCNAME[*]}] [${BASH_SOURCE[*]}] [${BASH_LINENO[*]}] $LINENO"\ncaller; echo cst=$?\n' > s2.sh; . ./s2.sh; f() { echo "${BASH_SOURCE[*]}"; }; f
+### x_caller_errors
+f() { caller x; echo st=$?; caller 5; echo st=$?; caller 0 0; echo st=$?; }; f 2>/dev/null
+### x_underscore_cases
+true; echo "[$_]"; ls / >/dev/null; echo "[$_]"; f() { echo in "$_"; }; f arg1 arg2 >/dev/null; echo "[$_]"; echo "a b" >/dev/null; echo "[$_]"; for i in 1 2; do :; done; echo "[$_]"; { echo x y; } >/dev/null; echo "[$_]"; x=$(echo q r); echo "[$_]"
+### x_underscore_eval
+true x; eval "echo ev: \$_"; echo "e2: $_"
+### x_bash_command
+echo "$BASH_COMMAND"
+### x_bash_command_err
+trap 'echo "failed: $BASH_COMMAND"' ERR; false arg
+### x_trap_print_all
+trap "echo a" INT TERM 10 SIGHUP; trap "" QUIT; trap; echo ---; trap -p INT QUIT; echo ---; trap -p USR2; echo st=$?
+### x_trap_print_special
+trap "echo e" EXIT; trap "echo r" RETURN; trap "echo d" DEBUG; trap "echo er" ERR; trap -p; trap - DEBUG
+### x_trap_subshell_display
+trap "echo hi" INT; echo "$(trap -p INT)"; (trap -p INT); (trap "echo z" USR1; trap -p)
+### x_trap_invalid
+trap "echo x" FOO; echo st=$?; trap "echo x" 99; echo st=$?; trap -p EXIT FOO; echo st=$?
+### x_trap_kill_accepted
+trap "echo x" KILL; echo st=$?
+### x_trap_reset_forms
+trap -- "echo dd" INT; trap -p INT; trap INT; trap -p INT; trap 10; echo st=$?; trap "echo a" usr1; trap -p; trap "echo a" sigint; trap -p INT
+### x_trap_zero
+trap 0; trap "echo zero" 0; trap -p
+### x_trap_l
+trap -l
+### x_trap_bad_option
+trap -x 2>/dev/null; echo st=$?
+### x_trap_int_cleanup
+cleanup() { echo "cleaning $1"; }; trap 'cleanup int' INT; trap 'cleanup exit' EXIT; kill -INT $$; echo continuing
+### x_trap_term_continue
+trap 'echo caught' TERM; kill -TERM $$; kill -TERM $$; echo alive
+### x_trap_status_preserved
+trap 'false' USR1; true; kill -USR1 $$; echo "st=$?"
+### x_trap_exit_in_trap
+trap 'echo bye; exit 7' USR1; kill -USR1 $$; echo not-reached
+### x_trap_subshell_exit
+(trap 'echo sub-exit $?' EXIT; exit 4); echo "after $?"
+### x_trap_cmdsub_exit
+x=$(trap 'echo cs-exit' EXIT; echo hi); echo "[$x]"
+### x_trap_ignore_child
+trap '' TERM; sh -c 'kill -TERM $$; echo child-alive'; echo parent-alive
+### x_trap_wait_interrupted
+pid=$$; trap 'echo got' USR1; sleep 5 & p=$!; (sleep 0.3; kill -USR1 $pid) & wait $p; echo "st=$?"; kill $p; wait $p; echo "st2=$?"
+### x_trap_foreground_waits
+pid=$$; trap 'echo got' USR1; (sleep 0.2; kill -USR1 $pid) & sleep 0.6; echo "st=$?"; wait
+### x_break_errors
+for i in 1 2; do for j in a b; do break 0; echo after-break; done; echo outer$i; done; echo st=$?
+### x_break_huge
+for i in 1 2; do break 99999999999999999999; done; echo st=$?
+### x_break_space_plus
+for i in 1 2; do break " 2"; done; for i in 1 2; do break +1; echo x; done; echo st=$?
+### x_break_too_many
+for i in 1; do break 1 2; echo inloop; done; echo st=$?
+### x_break_outside
+break; echo st=$?; continue 2; echo st=$?
+### x_continue_beyond
+for i in 1 2; do for j in a b; do echo $i$j; continue 5; done; done; echo st=$?
+### x_break_select
+printf '1\n2\n' | { select x in a b; do for i in 1; do break 2; done; echo no; done; echo out; } 2>/dev/null
+### x_break_while_cond
+i=0; while i=$((i+1)); [ $i -lt 5 ] && { [ $i -eq 3 ] && break; true; }; do echo $i; done; echo end
+### x_select_full
+printf '1\n\n3\nfoo\n2\n' | { select x in a b; do echo "[$x] [$REPLY]"; done; echo st=$?; } 2>&1
+### x_select_eof
+printf '' | { select x in a b; do echo "[$x]"; done; echo "st=$? [$x] [$REPLY]"; } 2>&1
+### x_select_columns
+printf '1\n' | { PS3="> "; select x in a b c d e f g h i j k l; do echo $x; break; done; } 2>&1
+### x_select_reply_reset
+printf '1\n2\n' | { select x in a b; do echo "$x"; REPLY=; done; } 2>&1
+### x_time_formats
+TIMEFORMAT=$'%%|%3|x'; { time true; } 2>/dev/null; TIMEFORMAT='a%%b%'; { time true; } 2>&1; TIMEFORMAT=''; time true; echo done
+### x_time_negated
+TIMEFORMAT='T'; { time ! false; echo st=$?; ! time false; echo st=$?; } 2>&1
+### x_time_compound
+TIMEFORMAT='t'; { time { sleep 0; }; time (true); time for i in 1; do :; done; time; echo st=$?; } 2>&1
+### x_time_and
+TIMEFORMAT='T'; { true && time false; echo st=$?; time true | true; echo st=$?; } 2>&1
+### x_time_word
+time=5; echo $time; echo time
+### x_time_shape
+{ time true; } 2>&1 | sed 's/[0-9]/N/g'; { time -p true; } 2>&1 | sed 's/[0-9]/N/g'
+### x_fd_var_builtin_vs_external
+/bin/true {fd}>x.txt; echo "ext[$fd]"; true {g}>y.txt; echo "bi[$g]"
+### x_fd_var_function
+f() { echo inf >&$h; }; f {h}>z.txt; echo "fn[$h]"; cat z.txt
+### x_fd_var_multi
+exec {a}>a.txt {b}>b.txt; echo $a $b; exec {a}>&- {b}>&-; echo x >&$a || echo closed
+### x_fd_var_close_unset
+exec {fd}<&- 2>/dev/null; echo st=$?
+### x_fd_var_dup
+exec 3>o.txt; exec {n}>&3; echo $n; echo viaN >&$n; cat o.txt
+### x_fd_var_array
+arr=(); exec {arr[2]}>z.txt; echo "${arr[2]}"
+### x_fd_closed_write
+exec 3>o.txt; exec 3>&-; { echo y >&3; } 2>/dev/null; echo st=$?
+### x_fd_move_restores
+exec 3>keep.txt; echo moved 4>&3- >&4; echo still >&3; cat keep.txt
+### x_echo_closed
+echo hi >&- 2>/dev/null; echo st=$?
+### x_coproc_vars
+coproc cat; echo "$COPROC_PID" | grep -c '^[0-9]*$'; echo ${#COPROC[@]}
+### x_coproc_compound
+coproc { echo one; }; read -r l <&${COPROC[0]}; echo $l; wait $COPROC_PID; echo st=$?
+### x_coproc_named_pid
+coproc MY { echo two; }; read -r l <&"${MY[0]}"; echo $l; echo ${MY_PID:+pid}
+### x_coproc_bang
+coproc tr a b; echo aaa >&${COPROC[1]}; exec {COPROC[1]}>&-; cat <&${COPROC[0]}
+### x_local_dash_errexit_restored_after_error
+f() { local -; set -u; echo in; }; f; echo "$-" | grep -c u
+### x_local_dash_outside
+local - 2>/dev/null; echo st=$?
+### x_cnf_args
+command_not_found_handle() { echo "cnf: $*"; return 3; }; nosuch_zz a b; echo st=$?
+### x_cnf_slash
+command_not_found_handle() { echo "cnf: $*"; }; ./nosuch_zz 2>/dev/null; echo st=$?
+### x_cnf_subshell
+command_not_found_handle() { x=changed; echo "cnf"; }; x=orig; nosuch_zz; echo $x
+### x_trap_err_subshell_E
+set -E; trap 'echo err' ERR; (false); echo e
+### x_funcname_nested_source
+printf 'g() { echo "${FUNCNAME[*]} | ${BASH_SOURCE[*]} | ${BASH_LINENO[*]}"; }\n' > lib.sh; . ./lib.sh; f() { g; }; f
+### x_return_trap_not_inherited
+trap 'echo ret' RETURN; f() { :; }; f; : > empty.sh; . ./empty.sh; echo after

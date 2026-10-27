@@ -1,0 +1,151 @@
+### sort_pipe_text
+printf 'b\na\nc\n' | sort
+### sort_file
+printf 'b\na\nc\n' > s.txt; sort s.txt
+### sort_reverse
+printf 'b\na\nc\n' | sort -r
+### sort_numeric
+printf '10\n9\n100\n' | sort -n
+### sort_numeric_reverse
+printf '10\n9\n100\n' | sort -rn
+### sort_unique
+printf 'b\na\nb\n' | sort -u
+### sort_key
+printf 'x:2\ny:1\n' | sort -t: -k2
+### sort_human
+printf '1K\n2M\n3G\n512\n' | sort -h
+### sort_version
+printf 'v1.10\nv1.2\nv1.9\n' | sort -V
+### sort_output_file
+printf 'b\na\n' > in.txt; sort -o out.txt in.txt; cat out.txt
+### sort_multiple_files
+printf 'b\n' > f1; printf 'a\n' > f2; sort f1 f2
+### sort_check
+printf 'a\nb\n' | sort -c && echo sorted
+### sort_ignore_case
+printf 'b\nA\nc\n' | sort -f
+### sort_after_du
+mkdir -p d1 d2; printf 'xxxxxxxxxx' > d1/f; du -s d1 d2 | sort -n | awk '{print $2}'
+### sort_empty_input
+printf '' | sort; echo st=$?
+### sort_stdin_dash
+printf 'b\na\n' | sort -
+### sort_missing_file
+sort /nonexistent-file 2>/dev/null; echo st=$?
+### sort_in_middle_of_pipeline
+printf 'b\na\nb\n' | sort | uniq -c | awk '{print $1 $2}'
+### uniq_d
+printf 'a\na\nb\n' | uniq -d
+### uniq_u
+printf 'a\na\nb\n' | uniq -u
+### uniq_i
+printf 'a\nA\nb\n' | uniq -i
+### uniq_c
+printf 'a\na\nb\n' | uniq -c
+### uniq_file
+printf 'a\na\nb\n' > u.txt; uniq u.txt
+### uniq_f
+printf '1 a\n2 a\n3 b\n' | uniq -f 1
+### uniq_D
+printf 'a\na\nb\n' | uniq -D
+### date_bare_format
+[[ $(date) =~ [0-9]{4} ]] && echo has-year
+### date_plus_format
+date -d @0 -u +%Y-%m-%d
+### date_plus_simple
+[[ $(date +%Y) =~ ^20[0-9][0-9]$ ]] && echo year
+### date_utc
+date -u -d @86400 +%H:%M
+### date_iso
+date -u -d @0 -I
+### date_rfc
+date -u -d @0 -R
+### date_s
+[[ $(date +%s) =~ ^[0-9]+$ ]] && echo epoch
+### date_d_string
+date -u -d '2020-01-02 03:04:05' +%s
+### date_reference_file
+touch -d '2001-02-03 04:05:06' ref; TZ=UTC date -r ref +%F
+### sum_file
+printf 'hello\n' > h.txt; sum h.txt
+### sum_stdin
+printf 'hello\n' | sum
+### split_lines
+printf '1\n2\n3\n' > sp.txt; split -l 1 sp.txt part_; ls part_* | tr '\n' ' '; echo; cat part_ab
+### split_bytes
+printf 'abcdef' > b.txt; split -b 2 b.txt bp_; cat bp_ab; echo
+### last_n
+last -n 1 >/dev/null 2>&1; echo ran
+### zip_help
+zip -h >/dev/null 2>&1; echo st=$?
+### ls_bare_works
+touch lsfile; ls
+### ps_bare_works
+ps -o pid= -p $$ | tr -d ' ' | grep -c .
+### command_sort_bypass
+printf 'b\na\n' | command sort
+### sort_ls_pipe
+touch b a c; ls | sort -r
+### sort_ls_long
+touch a b; ls -l | sort -k9 | awk 'NF>2{print $9}'
+### sort_heredoc
+sort <<EOF
+b
+a
+EOF
+### sort_herestring
+sort <<< $'b\na'
+### sort_lastpipe
+shopt -s lastpipe; printf 'b\na\n' | sort
+### sort_brace_group
+printf 'b\na\n' | { sort; }
+### sort_cmdsub
+x=$(printf 'b\na\n' | sort); echo "$x"
+### sort_after_function
+f() { printf 'b\na\n'; }; f | sort
+### sort_output_redirect
+printf 'b\na\n' | sort > o; cat o
+### sort_pipefail
+set -o pipefail; printf 'b\n' | sort /nonexistent 2>/dev/null; echo st=$?
+### sort_pipestatus
+printf 'b\na\n' | sort -c 2>/dev/null; echo "${PIPESTATUS[@]}"
+### sort_in_if
+if printf 'b\na\n' | sort -c 2>/dev/null; then echo y; else echo n; fi
+### sort_env_prefix
+LC_ALL=C sort <<< $'b\nB\na'
+### sort_twice
+printf 'b\na\nc\n' | sort | sort -r
+### sort_json_text_from_cat
+printf '[3,\n1]\n' > j.json; cat j.json | sort
+### date_stdin_not_consumed
+printf 'hello\n' | { date -u -d @0 +%Y; cat; }
+### date_tz_prefix
+TZ=UTC date -d @0 +%H
+### command_date
+command date -u -d @0 +%Y
+### type_sort
+type sort
+### command_v_sort
+command -v sort; command -V uniq
+### uniq_big_stream
+yes | head -c 70000000 | uniq -c
+### sum_s_stdin
+printf 'hello\n' | sum -s
+### split_numeric_suffix
+printf '1\n2\n3\n' > f; split -l 2 -d f x; cat x01
+### zip_create
+printf 'a' > a.txt; zip -q out.zip a.txt; echo st=$?; unzip -p out.zip a.txt
+### last_bare
+last >/dev/null 2>&1; echo st=$?
+### uniq_missing_file
+uniq /nonexistent 2>/dev/null; echo st=$?
+### date_bad_option
+date --bogus 2>/dev/null; echo st=$?
+### last_in_loop
+printf 'a\nb\n' | while read x; do last >/dev/null 2>&1; echo $x; done
+### sort_in_loop
+printf 'a\nb\n' | while read x; do sort /dev/null; echo $x; done
+### date_in_loop
+printf 'a\nb\n' | while read x; do date >/dev/null; echo $x; done
+### uniq_in_function
+f() { uniq -c; }; printf 'a\na\n' | f

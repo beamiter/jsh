@@ -1,0 +1,614 @@
+### random_digits
+[[ $RANDOM =~ ^[0-9]+$ ]] && echo ok
+### random_range
+for i in 1 2 3 4 5 6 7 8 9 10; do r=$RANDOM; ((r>=0 && r<=32767)) || echo bad; done; echo range-ok
+### random_seed_repeat
+RANDOM=42; a=$RANDOM$RANDOM; RANDOM=42; b=$RANDOM$RANDOM; [[ $a == $b ]] && echo same
+### random_differs
+a=$RANDOM$RANDOM$RANDOM; b=$RANDOM$RANDOM$RANDOM; [[ $a != $b ]] && echo differ
+### random_unset
+unset RANDOM; RANDOM=5; echo $RANDOM
+### srandom
+[[ $SRANDOM =~ ^[0-9]+$ ]] && echo ok
+### seconds_assign
+SECONDS=5; echo $SECONDS
+### seconds_advances
+SECONDS=0; sleep 1.1; echo $SECONDS
+### epochseconds
+[[ $EPOCHSECONDS =~ ^[0-9]{10}$ ]] && echo ok
+### epochrealtime
+[[ $EPOCHREALTIME =~ ^[0-9]{10}\.[0-9]{6}$ ]] && echo ok
+### bashpid
+[[ $BASHPID == $$ ]] && echo same; (x=$BASHPID; [[ $x != $$ ]] && echo sub-differs)
+### ppid
+[[ $PPID =~ ^[0-9]+$ ]] && echo ok
+### uid
+[[ $UID =~ ^[0-9]+$ && $EUID =~ ^[0-9]+$ ]] && echo ok; [[ $UID == $(id -u) ]] && echo match
+### uid_readonly
+UID=5 2>/dev/null; echo st=$?
+### hostname_var
+[[ $HOSTNAME == $(hostname) ]] && echo ok
+### ostype
+[[ -n $OSTYPE && -n $HOSTTYPE && -n $MACHTYPE ]] && echo ok
+### shlvl
+[[ $SHLVL =~ ^[0-9]+$ ]] && echo ok
+### param_upper
+v=hello; echo ${v^^} ${v^} ${v,,} ${v~} ${v~~}
+### param_lower
+v=HeLLo; echo ${v,,} ${v,}
+### param_case_pattern
+v=hello; echo ${v^^[lo]} ${v^[h]}
+### param_prefix_names
+abc1=1; abc2=2; echo ${!abc*}
+### param_prefix_names_at
+abc1=1; abc2=2; for n in "${!abc@}"; do echo $n; done
+### param_atQ
+v="a b'c"; echo ${v@Q}
+### param_atQ_array
+arr=(a 'b c'); echo ${arr[@]@Q}
+### param_atE
+v='a\tb'; echo "${v@E}"
+### param_atU
+v=abc; echo ${v@U} ${v@L} ${v@u}
+### param_atA
+v=abc; echo ${v@A}
+### param_atA_array
+arr=(x y); echo ${arr[@]@A}
+### param_ata
+declare -i n=1; declare -a arr=(1); declare -A m=([k]=v); echo ${n@a} ${arr@a} ${m@a}
+### param_atP
+v='\u'; [[ -n ${v@P} ]] && echo ok
+### param_atK
+declare -A m=([k]=v); echo ${m[@]@K}
+### param_default_unset_vs_empty
+unset u; e=; echo "[${u-d1}][${e-d2}][${u:-d3}][${e:-d4}]"
+### param_assign_default
+unset x; echo ${x:=dflt}; echo $x
+### param_error
+unset x; (echo ${x:?missing}) 2>/dev/null; echo st=$?
+### param_alt
+x=1; echo ${x:+alt}; unset x; echo "[${x:+alt}]"
+### param_len_unicode
+v=héllo; echo ${#v}
+### param_indirect
+a=b; b=val; echo ${!a}
+### param_indirect_array
+arr=(x y z); ref='arr[1]'; echo ${!ref}
+### param_substr_neg
+v=abcdef; echo ${v: -2} ${v:1:2} ${v: -3:2} ${v:2}
+### param_substr_neglen
+v=abcdef; echo ${v:1:-2}
+### param_positional_slice
+set -- a b c d; echo ${@:2} ${@:2:2} ${@: -1} ${*:1:1}
+### param_positional_pattern
+set -- apple banana; echo "${@/a/A}" "${@^}"
+### array_unset_elem
+arr=(a b c); unset 'arr[1]'; echo ${arr[@]} ${!arr[@]} ${#arr[@]}
+### array_sparse
+arr=([2]=x [5]=y); echo ${!arr[@]} ${arr[5]} ${#arr[@]}
+### array_sparse_append
+arr=([5]=a); arr+=(b); echo ${!arr[@]}
+### array_neg_index
+arr=(a b c); echo ${arr[-1]} ${arr[-2]}
+### array_neg_assign
+arr=(a b c); arr[-1]=Z; echo ${arr[@]}
+### array_slice
+arr=(a b c d e); echo ${arr[@]:1:2} ${arr[@]: -2}
+### array_slice_sparse
+arr=([1]=a [5]=b [9]=c); echo ${arr[@]:2}
+### array_pattern_each
+arr=(a b c); echo "${arr[@]/#/x-}" "${arr[@]/%/-y}"
+### array_upper_each
+arr=(ab cd); echo "${arr[@]^^}"
+### array_trim_each
+arr=(a.txt b.txt); echo "${arr[@]%.txt}"
+### array_len_elem
+arr=(abc de); echo ${#arr[0]} ${#arr[1]} ${#arr}
+### array_scalar_as_elem0
+s=hello; echo ${s[0]} ${#s[@]}
+### array_elem_append
+arr=(a b); arr[1]+=x; echo ${arr[@]}
+### array_append_indexed
+arr=(a); arr+=([5]=z); echo ${!arr[@]}
+### array_compound_assign_index
+declare -a a=([0]=x [3]=y); echo ${#a[@]} ${a[3]}
+### array_assoc
+declare -A m; m[x]=1; m[y]=2; echo ${m[x]} ${m[y]} ${#m[@]}
+### array_assoc_literal
+declare -A m=([k1]=v1 [k2]=v2); echo ${m[k2]}
+### array_assoc_keys_sorted
+declare -A m=([b]=2 [a]=1); for k in $(printf '%s\n' "${!m[@]}" | /usr/bin/sort); do echo $k=${m[$k]}; done
+### array_assoc_unset
+declare -A m=([a]=1 [b]=2); unset 'm[a]'; echo ${#m[@]} ${m[b]}
+### array_assoc_key_spaces
+declare -A m; m["a b"]=1; key="a b"; echo ${m[$key]}
+### array_assoc_append
+declare -A m=([a]=1); m+=([b]=2); m[a]+=0; echo ${m[a]} ${m[b]}
+### array_local_scope
+f() { local -a arr=(1 2); echo in ${#arr[@]}; }; arr=(x); f; echo out ${#arr[@]} ${arr[0]}
+### array_local_assoc
+f() { local -A m=([k]=v); echo ${m[k]}; }; f; echo "[${m[k]}]"
+### array_in_function_global
+f() { garr=(1 2 3); }; f; echo ${#garr[@]}
+### declare_p_scalar
+x=1; declare -p x
+### declare_p_array
+arr=(a 'b c'); declare -p arr
+### declare_p_assoc_single
+declare -A m=([k]=v); declare -p m
+### declare_p_attrs
+declare -ix n=5; declare -p n
+### declare_p_missing
+declare -p nosuchvar; echo st=$?
+### declare_i
+declare -i n; n=1+2; echo $n; n+=5; echo $n
+### declare_i_invalid
+declare -i n; n=abc; echo $n
+### declare_l_u
+declare -l lo=HeLLo; declare -u up=HeLLo; echo $lo $up; lo=ABC; echo $lo
+### declare_c
+declare -c cap=hELLO; echo $cap
+### declare_r
+declare -r ro=1; (ro=2) 2>/dev/null; echo st=$?
+### declare_r_message
+declare -r ro=1; ro=2; echo after
+### readonly_cmd
+readonly R=1; R=2 2>/dev/null; echo $R
+### readonly_p
+readonly R1=1; readonly -p | grep -c R1
+### readonly_unset
+readonly R=1; unset R 2>/dev/null; echo st=$? $R
+### readonly_function_local
+readonly G=1; f() { local G=2; }; f 2>/dev/null; echo st=$?
+### declare_n
+x=1; declare -n ref=x; ref=5; echo $x $ref
+### local_n
+f() { local -n r=$1; r=changed; }; v=orig; f v; echo $v
+### nameref_array
+arr=(1 2); declare -n r=arr; r[2]=3; echo ${arr[@]} ${#r[@]}
+### declare_g
+f() { declare -g G=global; }; f; echo $G
+### declare_x
+declare -x EXPORTED=yes; env | grep -c '^EXPORTED=yes'
+### declare_plus_x
+export E=1; declare +x E; env | grep -c '^E=' ; echo $E
+### local_unset_value
+x=global; f() { local x; echo "[${x-unset}]"; }; f
+### local_scope
+x=outer; f() { local x=inner; g; }; g() { echo $x; }; f; echo $x
+### local_outside_function
+local x=1 2>/dev/null; echo st=$?
+### unset_func
+f() { :; }; unset -f f; type f 2>/dev/null || echo gone
+### unset_var_then_func
+f() { :; }; unset f; type -t f
+### unset_v
+x=1; unset -v x; echo "[$x]"
+### unset_local_reveals_global
+x=g; f() { local x=l; unset x; echo "[$x]"; }; f
+### export_n
+export E=1; export -n E; env | grep -c '^E=' ; echo $E
+### export_p_format
+export ZZZ=1; export -p | grep ZZZ
+### tilde_plus
+cd /tmp; echo ~+
+### tilde_minus
+cd /tmp; cd /; echo ~-
+### tilde_user
+[[ ~root == /root ]] && echo root-home
+### nocaseglob
+touch ABC.txt; shopt -s nocaseglob; echo abc.*
+### nocasematch
+shopt -s nocasematch; [[ ABC == abc ]] && echo nocase; case ABC in abc) echo case-nocase;; esac
+### string_index_arith
+s=hello; echo ${s:$((1+1)):2}
+### ifs_unset_default
+unset IFS; x="a  b"; set -- $x; echo $#
+### ifs_join_star
+arr=(a b c); IFS=,; echo "${arr[*]}"
+### ifs_empty_no_split
+IFS=; x="a b"; set -- $x; echo $#
+### scope_function_sets_new_global
+f() { x=1; }; f; echo "[$x]"
+### scope_dynamic_callee_sets_caller_local
+f() { local y=1; g; echo "f sees [$y]"; }; g() { y=2; z=3; }; f; echo "[$y] [$z]"
+### scope_local_shadow_restored
+x=g; f() { local x=l; x=changed; }; f; echo $x
+### scope_nested_local_visible_to_callee
+f() { local v=fv; g; }; g() { echo "g sees $v"; }; f; echo "[$v]"
+### scope_local_then_global_assign_in_sub
+f() { local a=1; ( a=2 ); echo $a; }; f
+### scope_export_in_function
+f() { export FX=1; }; f; env | grep -c '^FX=1'
+### scope_local_export
+f() { local -x LX=1; env | grep -c '^LX=1'; }; f; env | grep -c '^LX=' 
+### scope_array_set_in_function_global
+f() { ga=(1 2); ga+=(3); }; f; echo ${ga[@]}
+### scope_assoc_declare_in_function_is_local
+f() { declare -A m=([k]=v); }; f; echo "[${m[k]}]"
+### scope_readonly_in_function_aborts
+declare -r ro=1; f() { ro=2; echo in-f; }; f; echo after
+### scope_readonly_assignment_aborts_line
+readonly R=1; R=2; echo "after $R"
+### scope_loop_var_in_function_global
+f() { for i in 1 2 3; do :; done; }; f; echo $i
+### scope_read_in_function_global
+f() { read -r line <<< "text"; }; f; echo $line
+### x_scope_recursion_locals
+f() { local n=$1; if ((n > 0)); then f $((n-1)); fi; echo "n=$n"; }; f 3
+### x_scope_nested_shadow
+x=g; a() { local x=a; b; echo "a:$x"; }; b() { local x=b; c; echo "b:$x"; }; c() { x=c; }; a; echo "top:$x"
+### x_scope_unset_in_callee_reveals_global
+x=g; f() { local x=l; g; echo "f:[$x]"; }; g() { unset x; echo "g:[$x]"; }; f; echo "top:[$x]"
+### x_scope_unset_own_local_then_assign
+x=g; f() { local x=l; unset x; echo "1:[${x-U}]"; x=new; echo "2:[$x]"; }; f; echo "top:[$x]"
+### x_scope_local_array_restored
+arr=(1 2 3); f() { local -a arr=(x); arr+=(y); echo "${arr[@]}"; }; f; echo "${arr[@]}"
+### x_scope_local_assoc_restored
+declare -A m=([k]=g); f() { local -A m=([k]=l); echo ${m[k]}; }; f; echo ${m[k]}
+### x_scope_prefix_function
+f() { echo "f:$z"; z=changed; g; }; g() { echo "g:$z"; }; z=0; z=5 f; echo "top:$z"
+### x_scope_prefix_local_inherit
+f() { local z; echo "[$z]"; }; z=5 f
+### x_scope_prefix_unset_reveals
+g() { unset z; echo "[${z-U}]"; }; z=0; z=5 g
+### x_scope_prefix_builtin
+IFS=: read -r a b c <<< "1:2:3"; echo "$a $b $c"; echo "[$IFS]" | od -c | head -1
+### x_scope_prefix_export_child
+f() { sh -c 'echo child:$W'; }; W=7 f; echo "[$W]"
+### x_scope_declare_g_shadowed
+x=g; f() { local x=l; declare -g x=G; echo "f:$x"; }; f; echo "top:$x"
+### x_scope_readonly_local
+f() { local -r r=1; r=2; echo after; }; f; echo top
+### x_scope_readonly_caller_local
+f() { local -r r=1; g; }; g() { r=2; echo in-g; }; f; echo top
+### x_scope_subshell_no_leak
+x=1; (x=2; y=3); echo "$x [$y]"; f() { x=9; }; (f); echo $x
+### x_scope_loop_local
+f() { local i; for i in a b; do :; done; echo "f:$i"; }; i=g; f; echo "top:$i"
+### x_scope_read_local
+f() { local v; read -r v <<< inner; echo "f:$v"; }; v=outer; f; echo "top:$v"
+### x_scope_return_via_global
+get() { result="computed $1"; }; get x; echo "$result"
+### x_scope_nameref_array_assign
+f() { local -n ref=$1; ref=(1 2 3); }; f out; echo "${out[@]} ${#out[@]}"
+### x_scope_local_dash
+f() { local -; set -e; echo in; }; f; echo after
+### x_scope_command_sub_sees_locals
+f() { local v=inner; echo "$(echo $v)"; }; f
+### x_scope_declare_in_function_local
+f() { declare d=1; typeset t=2; }; f; echo "[$d][$t]"
+### x_scope_export_local
+f() { local L=1; export L; sh -c 'echo c:$L'; }; f; sh -c 'echo after:[$L]'
+### x_scope_unset_global_from_function
+G=1; f() { unset G; }; f; echo "[${G-unset}]"
+### x_array_append_multi
+a=(1); a+=(2 3); a+=("4 5"); printf '[%s]' "${a[@]}"; echo
+### x_array_empty_quoted_no_args
+a=(); set -- "${a[@]}"; echo $#; set -- "${a[*]}"; echo $#; set -- "${u[@]}"; echo $#
+### x_array_star_ifs
+a=(x y z); IFS=-; echo "${a[*]}"; echo "${a[@]}"; IFS=; echo "${a[*]}"
+### x_array_assoc_order_many
+declare -A m; for k in apple banana cherry date elderberry fig grape; do m[$k]=1; done; echo "${!m[@]}"
+### x_array_assoc_order_numeric
+declare -A m=([10]=a [2]=b [33]=c [1]=d); echo "${!m[@]}" "${m[@]}"
+### x_array_assoc_declare_p_many
+declare -A m=([one]=1 [two]=2 [three]=3); declare -p m
+### x_array_keys_quoted
+a=([3]=x [7]=y); for k in "${!a[@]}"; do echo "k=$k"; done; echo "${!a[*]}"
+### x_array_unset_whole_and_at
+a=(1 2); unset a; echo "[${a[@]}] ${#a[@]}"; b=(1 2); unset 'b[@]'; echo "[${b[@]}]"
+### x_array_arith_index
+i=2; a=(); a[i+1]=x; a[$((i*2))]=y; echo "${!a[@]}"; echo ${a[i+1]} ${a[$i+2]}
+### x_array_neg_sparse
+a=([2]=x [5]=y); echo ${a[-1]} "[${a[-2]}]" ${a[-4]}
+### x_array_copy
+a=("a b" c); b=("${a[@]}"); echo ${#b[@]} "${b[0]}"
+### x_array_self_append
+a=(1 2); a=("${a[@]}" 3); echo "${a[@]}"
+### x_array_declare_p_after_ops
+a=(x y z); unset 'a[1]'; a[5]=q; a+=(r); declare -p a
+### x_array_scalar_to_array
+s=hello; s[2]=x; declare -p s
+### x_array_iterate_indices
+a=(p q r); for i in "${!a[@]}"; do echo "$i=${a[i]}"; done
+### x_array_length_after_unset
+a=(1 2 3 4); unset 'a[0]' 'a[2]'; echo ${#a[@]} ${!a[@]}
+### x_array_assoc_kv_pairs
+declare -A m=(k1 v1 k2 v2); echo ${m[k1]} ${m[k2]}
+### x_array_assoc_special_keys
+declare -A m; m["a b"]=1; m[*]=2; m["@"]=3; declare -p m
+### x_array_elem_in_arith
+a=(5 6); echo $(( a[0] + a[1] ))
+### x_array_assign_glob_element
+touch f1 f2; a=(f*); echo ${#a[@]}; b=([0]=f*); echo "${b[0]}"
+### x_array_compound_split
+v="a b"; a=($v "$v"); echo ${#a[@]}
+### x_array_readonly
+readonly -a ra=(1 2); ra[0]=x; echo after
+### x_array_readonly_append
+a=(1); readonly a; a+=(2); echo after
+### x_param_replace_forms
+v=hello.world.txt; echo ${v/./-} ${v//./-} ${v/#hello/HI} ${v/%txt/md} ${v/o*o/X}
+### x_param_replace_class
+v=education; echo ${v//[aeiou]/} ${v//[!aeiou]/_}
+### x_param_patsub_amp
+v=abc; echo "${v/b/[&]}" "${v//?/<&>}" "${v/b/\&}"
+### x_param_strip_forms
+p=/usr/local/lib/libfoo.so.1; echo ${p#*/} ${p##*/} ${p%/*} ${p%%/*}X ${p%.*} ${p%%.*}
+### x_param_strip_quoted_pattern
+v='*ab*'; echo "${v#"*"}" "${v%\*}" "${v#*}"
+### x_param_default_cmdsub
+unset x; echo ${x:-$(echo computed)}
+### x_param_assign_quoted
+unset x; : "${x:="a b"}"; echo "[$x]"
+### x_param_hash_forms
+set -- a b c; echo ${#} ${##} ${#@} ${#*}
+### x_param_last_arg
+set -- a b c; echo ${!#} ${@: -1} ${*: -1:1}
+### x_param_positional_quoted_slice
+set -- "a b" "c d" e; printf '[%s]' "${@:2}"; echo; printf '[%s]' "${@:1:2}"; echo
+### x_param_q_empty
+e=; echo "[${e@Q}]" "[${nope@Q}]"
+### x_param_case_unicode
+v=ÉCOLE; echo ${v,,} ${v,}; w=éa; echo ${w^^} ${w^}
+### x_param_toggle
+v=HeLLo; echo ${v~~} ${v~}
+### x_param_len_multibyte
+v=日本語; echo ${#v}
+### x_param_nested_default
+unset x y; echo ${x:-${y:-z}}
+### x_param_default_quoted_word
+unset x; set -- ${x-"a b"} c; echo $#
+### x_param_alt_quoted
+y="p q"; x=1; set -- "${x:+"$y"}"; echo $# "$1"
+### x_param_array_suffix_each
+a=(a b); echo "${a[@]/%/.bak}"
+### x_param_substr_arith
+s=abcdef; echo ${s:1+1:2} ${s: -3:-1} ${s:0:${#s}-1} ${s:(-2)}
+### x_param_substr_out_of_range
+s=abc; echo "[${s:5}]" "[${s: -5}]" "[${s:1:10}]"
+### x_param_indirect_chain
+a=b; b=c; c=val; echo ${!a} ${!b}
+### x_param_indirect_positional
+set -- x y z; n=2; echo ${!n}
+### x_param_error_message
+unset x; (echo ${x:?custom msg}) 2>&1 | grep -o 'x: custom msg'; echo after
+### x_param_star_ifs_join_assign
+set -- a b c; IFS=,; x="$*"; y=$*; echo "$x" "$y"
+### x_param_at_in_assignment
+set -- a b c; x=$@; echo "$x"
+### x_ifs_custom_split
+s="a,b,,c"; IFS=,; set -- $s; echo $#; for f; do echo "[$f]"; done
+### x_ifs_trailing_nonws
+s="a,b,"; IFS=,; set -- $s; echo $#
+### x_ifs_mixed_ws
+s=" a , b "; IFS=" ,"; set -- $s; echo $#; printf '[%s]' "$@"; echo
+### x_ifs_newline
+s=$'l1\nl2 x\nl3'; IFS=$'\n'; set -- $s; echo $#; echo "$2"
+### x_ifs_read_array
+IFS=, read -ra parts <<< "x,y,z"; echo ${#parts[@]} ${parts[1]}
+### x_special_pid_subshell
+p=$$; (echo $(( $$ == p ))); echo $(( BASHPID == $$ ))
+### x_special_bashpid_cmdsub
+a=$(echo $BASHPID); [[ $a != $$ ]] && echo differs
+### x_special_random_seed_exact
+RANDOM=42; echo $RANDOM $RANDOM $RANDOM; RANDOM=1; echo $RANDOM
+### x_special_seconds_assign_large
+SECONDS=100; echo $SECONDS
+### x_special_euid_readonly
+EUID=5 2>/dev/null; echo st=$?
+### x_special_ppid_value
+[[ $PPID == $(ps -o ppid= -p $$ | tr -d ' ') ]] && echo ppid-ok
+### x_special_shlvl_value
+echo $SHLVL; bash -c 'echo $SHLVL' 2>/dev/null
+### x_special_random_in_arith
+RANDOM=7; echo $(( RANDOM % 100 ))
+### x_special_dollar_dash
+set -u; echo $- | grep -c u
+### x_declare_i_expr
+typeset -i x=5*2; echo $x; x+=2*3; echo $x; x="x+1"; echo $x
+### x_declare_u_append
+declare -u u=ab; u+=cd; echo $u; declare -c c=abc; c+=DEF; echo $c
+### x_declare_p_unset_decl
+declare -i n; declare -p n; declare -a a; declare -p a; declare -A m; declare -p m
+### x_declare_p_empty_arrays
+declare -a a=(); declare -A m=(); declare -p a m
+### x_declare_p_local
+f() { local -i n=3; local s="x y"; declare -p n s; }; f
+### x_declare_p_quoting
+v='a"b$c`d\e'; declare -p v; w=$'tab\there'; declare -p w
+### x_declare_x_grep
+export ZZ1=1; declare -x | grep ZZ1; declare -px ZZ1
+### x_declare_plus_i
+declare -i n=5; declare +i n; n=1+1; echo $n
+### x_declare_readonly_errors
+declare -r R=1; declare R=2; echo st=$?; declare +r R; echo st=$?; R=3; echo after
+### x_declare_n_chain
+a=1; declare -n r1=a; declare -n r2=r1; r2=9; echo $a $r1 $r2
+### x_declare_n_unset
+x=5; declare -n r=x; unset r; echo "[${x-unset}]"; declare -p r
+### x_declare_n_unset_n
+x=5; declare -n r=x; unset -n r; echo "[$x]"; declare -p r 2>/dev/null; echo st=$?
+### x_declare_n_indirect
+x=5; declare -n r=x; echo ${!r}
+### x_declare_n_for_loop
+a=1 b=2; declare -n v; for v in a b; do echo "$v"; done
+### x_declare_n_self
+declare -n s=s; echo st=$?
+### x_declare_f_listing
+f() { :; }; g() { :; }; declare -F; declare -F f; declare -f nope; echo st=$?
+### x_declare_invalid_name
+declare 1x=2; echo st=$?; declare a-b; echo st=$?
+### x_declare_multiple
+declare a=1 b=2 c; echo "$a $b [${c-unset}]"
+### x_declare_convert_errors
+declare -A m; declare -a m; echo st=$?; declare -a ix=(1); declare -A ix; echo st=$?
+### x_declare_scalar_to_assoc
+x=1; declare -A x; declare -p x
+### x_export_multiple
+export A=1 B=2 C; env | grep -E '^(A|B|C)=' | /usr/bin/sort; declare -p C
+### x_export_unexported_not_in_env
+x=1; sh -c 'echo "[$x]"'; export x; sh -c 'echo "[$x]"'
+### x_export_later_assignment
+export Y; Y=2; sh -c 'echo $Y'
+### x_export_prefix_external
+X=1 sh -c 'echo $X'; echo "[$X]"
+### x_export_prefix_overrides_exported
+export E=1; E=2 sh -c 'echo $E'; echo $E
+### x_export_local_x
+f() { local -x LX=1; sh -c 'echo $LX'; }; f; sh -c 'echo "[$LX]"'
+### x_export_n_keeps_value
+export Q=1; export -n Q; echo $Q; sh -c 'echo "[$Q]"'
+### x_readonly_p_format
+readonly R1=1; readonly -a RA=(1); readonly -p | grep -E 'R1|RA'
+### x_readonly_name_only
+X=5; readonly X; X=6; echo after
+### x_unset_function_fallback
+f() { echo f; }; unset f; f 2>/dev/null || echo gone
+### x_unset_v_keeps_function
+f() { echo fn; }; unset -v f; f
+### x_unset_multiple
+a=1 b=2; unset a b; echo "[${a-u}][${b-u}]"
+### x_unset_invalid
+unset 'a-b'; echo st=$?; unset -v 'a-b'; echo st=$?
+### x_unset_assoc_key_spaces
+declare -A m=(["a b"]=1 [c]=2); unset 'm[a b]'; echo ${#m[@]} ${!m[@]}
+### x_local_outside_error
+local x=1; echo st=$?
+### x_tilde_assign
+x=~/a; echo $x | sed "s|$HOME|H|"; y=a:~/b; echo $y | sed "s|$HOME|H|"
+### x_tilde_declare
+declare d=~/x; echo $d | sed "s|$HOME|H|"; f() { local l=~/y; echo $l | sed "s|$HOME|H|"; }; f
+### x_tilde_no_expand_quoted
+echo "~" '~' ~x 2>/dev/null
+### x_tilde_plus_minus_unset
+unset OLDPWD; echo ~-
+### x_nocaseglob_multi
+touch Abc.TXT abd.txt; shopt -s nocaseglob; echo a*.txt
+### x_case_quoted_pattern
+x='*'; case abc in "$x") echo literal;; *) echo glob;; esac; case '*' in "$x") echo lit2;; esac
+### x_case_var_pattern
+p='a*'; case abc in $p) echo matched;; esac
+### x_allexport
+set -a; AE=1; sh -c 'echo $AE'
+### x_integer_array
+declare -ai ia=(1+1 2*3); echo ${ia[@]}; ia+=(4+4); echo ${ia[@]}
+### x_lowercase_array
+declare -l -a la=(AbC DEF); echo ${la[@]}
+### x_assignment_status_cmdsub
+x=$(exit 3); echo $?
+### x_readonly_prefix_command
+readonly R=1; R=2 echo ran; echo st=$?
+### x_prefix_assign_function_restore_unset
+f() { echo "in:$P"; }; P=1 f; echo "[${P-unset}]"
+### x_nested_param_in_index
+a=(x y z); i=1; echo ${a[${i}+1]} ${a[$((i))]}
+### y_counter_global
+count=0; inc() { count=$((count+1)); }; for i in 1 2 3; do inc; done; echo $count
+### y_while_read_append
+lines=(); add() { lines+=("$1"); }; while read -r l; do add "$l"; done <<< $'a b\nc'; echo ${#lines[@]} "${lines[0]}"
+### y_getopts_local_optind
+f() { local OPTIND opt; while getopts "ab:" opt; do echo "$opt ${OPTARG-}"; done; }; f -a -b x; f -b y
+### y_local_ifs
+f() { local IFS=,; echo "$*"; }; f a b c; echo "[$IFS]" | od -An -c | head -1
+### y_declare_gA
+f() { declare -gA G=([k]=v); }; f; echo ${G[k]}
+### y_local_sparse
+f() { local -a arr; arr[3]=x; echo ${#arr[@]} ${!arr[@]}; }; f
+### y_printf_v_scope
+f() { printf -v out '%s-%s' a b; }; f; echo $out; g() { local out; printf -v out x; }; g; echo $out
+### y_eval_in_function
+f() { eval "ex=1"; eval 'earr=(1 2 3)'; }; f; echo $ex ${#earr[@]}
+### y_append_scalar
+x=5; x+=3; echo $x; declare -i i=0; i+=1; i+=1; echo $i
+### y_assoc_append_value
+declare -A m=([k]=a); m[k]+=b; m[new]+=c; echo ${m[k]} ${m[new]}
+### y_declare_a_then_append
+declare -a arr; arr+=(x); arr+=(y); echo ${#arr[@]} ${arr[1]}
+### y_shift_in_function
+f() { shift; echo "$@"; }; set -- top args; f a b c; echo "$@"
+### y_local_multi_default
+f() { local x=$1 y=${2:-def}; echo "$x $y"; }; f one; f one two
+### y_declare_x_in_function
+f() { declare -x DX=1; sh -c 'echo c:$DX'; }; f; echo "[${DX-unset}]"
+### y_nounset_defaults
+set -u; echo "[${undefined:-}]" "[${undefined-}]"; f() { local x; echo "${x:-d}"; }; f; echo ok
+### y_nounset_empty_array
+set -u; arr=(); echo "[${arr[@]}]" ${#arr[@]}; echo ok
+### y_nounset_array_element
+set -u; a=(1); echo ${a[3]}; echo after
+### y_readonly_local_scope_end
+f() { local -r q=1; }; f; q=2; echo $q
+### y_unset_global_elem_in_function
+a=(1 2 3); f() { unset 'a[1]'; }; f; echo ${a[@]} ${!a[@]}
+### y_assoc_iterate_sorted
+declare -A m=([z]=1 [a]=2 [m]=3); for k in "${!m[@]}"; do echo "$k=${m[$k]}"; done | /usr/bin/sort
+### y_star_unquoted_ifs
+a=(x y); IFS=:; echo ${a[*]}; b="1:2"; echo $b; set -- $b; echo $#
+### y_cmdsub_array
+a=( $(echo "1 2" "3") ); echo ${#a[@]}; b=( "$(echo "1 2")" ); echo ${#b[@]}
+### y_quoted_default_array
+a=(); echo "${a[@]:-x}" "${a[@]+set}"; b=(1); echo "${b[@]+set}"
+### y_declare_p_newline
+x=$'a\nb'; declare -p x; echo "${x@Q}"
+### y_at_E
+x='a\tb\x41'; printf '%s\n' "${x@E}"
+### y_star_slice_quoted
+a=(p q r); IFS=,; echo "${a[*]:1}"
+### y_positional_slice_short
+set -- a; echo "[${@:2:1}]" "[${*:3}]"
+### y_positional_ten
+set -- 1 2 3 4 5 6 7 8 9 ten eleven; echo ${10} ${11} $10
+### y_length_star
+a=(1 2 3); echo ${#a[*]} ${#a}
+### y_funcname_scope_local_array_cleanup
+f() { local -a tmp=(1 2); }; f; echo "[${tmp[@]}]" ${#tmp[@]}
+### y_global_array_from_nested
+outer() { inner; }; inner() { res=(a b); }; outer; echo ${res[1]}
+### y_nameref_assoc
+declare -A m; f() { local -n ref=$1; ref[key]=val; }; f m; echo ${m[key]}
+### y_nameref_to_local_of_caller
+f() { local v=1; g v; echo $v; }; g() { local -n r=$1; r=2; }; f
+### y_dynamic_unset_scope
+x=global; a() { local x=a; b; echo "a:$x"; }; b() { unset x; x=fromb; }; a; echo "top:$x"
+### y_temp_env_cmd_builtin_export
+X=1 export Y=2; echo "[$X] $Y"
+### y_array_in_double_quotes_concat
+a=(1 2); echo "x${a[@]}y"; set -- "x${a[@]}y"; echo $#
+### y_empty_string_elements
+a=("" x ""); echo ${#a[@]}; set -- ${a[@]}; echo $#; set -- "${a[@]}"; echo $#
+### y_ifs_whitespace_mix_tab
+IFS=$' \t'; s=$'a\t\tb  c'; set -- $s; echo $#
+### y_ifs_default_restore
+IFS=,; unset IFS; s="a b"; set -- $s; echo $#
+### y_ifs_local_in_function_restored
+f() { local IFS=:; set -- $1; echo $#; }; f "a:b:c"; s="x y"; set -- $s; echo $#
+### y_assignment_word_split_not
+v="a   b"; x=$v; echo "$x"; local_like() { local y=$v; echo "$y"; }; local_like; declare z=$v; echo "$z"
+### y_declare_glob_no_expand
+touch g1 g2; declare g=g*; echo "$g"; export E=g*; echo "$E"
+### y_readonly_in_subshell_status
+readonly R=1; (R=2); echo st=$?
+### y_unset_readonly_array_elem
+readonly -a ra=(1 2); unset 'ra[0]'; echo st=$? ${ra[@]}
+### y_declare_i_readonly_combo
+declare -ir IR=3*3; echo $IR; IR=1; echo after
+### y_export_array_no_env
+export arr=(1 2) 2>/dev/null; env | grep -c '^arr=' ; echo ${arr[1]}
+### y_seconds_unset_normal
+unset SECONDS; SECONDS=5; sleep 1; echo $SECONDS
+### y_random_local_shadow
+f() { local RANDOM=5; echo $RANDOM; }; f
+### y_case_nocasematch_bracket
+shopt -s nocasematch; case ABC in [a-c]bc) echo m1;; esac; case X in "x") echo m2;; esac
+### y_case_escape
+case 'a*' in a\*) echo esc;; esac; case 'ab' in a\*) echo wrong;; *) echo nomatch;; esac
+### y_param_pattern_var_unquoted
+p='*.txt'; f=a.txt; echo ${f%$p}X "${f%"$p"}"
+### y_param_replace_slash_in_var
+v=a/b/c; echo ${v//\//_} ${v//"/"/-}
+### y_param_replace_empty_rep
+v=aXbXc; echo ${v//X} ${v/X}
+### y_tilde_in_array
+a=(~ ~/x); echo ${a[@]} | sed "s|$HOME|H|g"

@@ -1,0 +1,2 @@
+# Probes whose jsh output deliberately or currently differs from bash.
+# Format: NAME  reason

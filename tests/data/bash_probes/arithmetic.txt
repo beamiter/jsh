@@ -1,0 +1,341 @@
+### arith_pow
+echo $((2**10)) $((10%3)) $((-7/2)) $((-7%2))
+### arith_pow_assoc
+echo $((2**3**2)) $((-2**2)) $((2**0)) $((0**0))
+### arith_pow_neg
+echo $((2**-1)); echo st=$?
+### arith_pow_wrap
+echo $((2**63)) $((2**64)) $((3**40))
+### arith_bases
+echo $((0x1F)) $((8#17)) $((2#101)) $((017)) $((36#z))
+### arith_bases_64
+echo $((64#_)) $((64#@)) $((64#Z)) $((64#z)) $((16#ff)) $((16#FF)) $((10#010))
+### arith_base_invalid
+echo $((2#102)); echo st=$?
+### arith_base_out_of_range
+echo $((65#1)); echo st=$?
+### arith_octal_var
+x=010; echo $((x)) $((x+1))
+### arith_recursive
+a=b; b=3; echo $((a+1))
+### arith_recursive_expr
+x='1+2'; echo $((x*2)) $(($x*2))
+### arith_recursive_chain
+x=y; y=z; z=7; echo $((x)) $((x*x))
+### arith_recursive_loop
+x=x; echo $((x)); echo st=$?
+### arith_recursive_assign
+a='b=5'; echo $((a)) $b
+### arith_let
+let x=5*2 y=x+1; echo $x $y
+### arith_let_status
+let 0; echo $?; let 1; echo $?; let "a = 0" "b = 3"; echo $? $a $b
+### arith_let_incr
+i=1; let i++ i+=10; echo $i
+### arith_let_quoted_spaces
+let "v = 2 * (3 + 4)"; echo $v
+### arith_assign_ops
+x=10; ((x<<=2, x|=1)); echo $x
+### arith_assign_ops_all
+x=5; ((x<<=1)); a=$x; ((x>>=2)); b=$x; ((x&=3)); c=$x; ((x^=7)); d=$x; ((x|=8)); e=$x; echo $a $b $c $d $e
+### arith_array
+arr=(1 2 3); echo $((arr[1]+arr[2]))
+### arith_array_assign
+arr=(1 2 3); ((arr[0]+=10)); echo ${arr[0]}
+### arith_array_new
+((nums[3]=7)); echo ${nums[3]} ${#nums[@]}
+### arith_array_index_expr
+arr=(10 20 30); i=1; echo $((arr[i+1])) $((arr[i]++)) ${arr[1]}
+### arith_assoc
+declare -A m; m[k]=5; echo $((m[k]*2)); ((m[k]++)); echo ${m[k]}
+### arith_dollar_positional
+set -- 4 5; echo $(( $1 + $2 )) $(( $# * 10 ))
+### arith_dollar_braces
+s=hello; echo $(( ${#s} * 2 ))
+### arith_cmdsub_inside
+echo $(( $(echo 3) + 4 ))
+### arith_nested_arith
+echo $(( $((1+2)) * 3 ))
+### arith_double_quotes
+echo $(( "1" + 2 ))
+### arith_func_recursion
+fact() { (( $1 <= 1 )) && echo 1 && return; echo $(( $1 * $(fact $(( $1 - 1 ))) )); }; fact 5
+### arith_cmd_relational
+i=5; ((i>=3)) && echo ge; ((i<=3)) || echo notle; ((i<10 && i>2)) && echo range
+### arith_cmd_shift_assign
+x=1; ((x<<=3)); echo $x; ((x>>=1)); echo $x
+### arith_until_loop
+i=0; until ((i>=3)); do ((i++)); done; echo $i
+### arith_while_postinc
+i=0; while ((i++ < 3)); do echo -n $i; done; echo
+### arith_cfor_basic
+for ((i=0;i<3;i++)); do echo -n $i; done; echo
+### arith_cfor_array_len
+arr=(5 6 7); for ((i=0;i<${#arr[@]};i++)); do echo -n ${arr[i]}; done; echo
+### arith_cfor_multi
+for ((i=0, j=10; i<j; i+=3, j-=3)); do echo $i $j; done
+### arith_cfor_empty
+n=0; for ((;;)); do ((n++)); ((n>=3)) && break; done; echo $n
+### arith_cfor_relational_le
+for ((i=1; i<=3; i++)); do echo -n $i; done; echo
+### arith_cfor_spaces_newlines
+for (( i = 0 ;
+       i < 2 ;
+       i++ )); do echo $i; done
+### arith_cmd_multiline
+((
+  x = 3 + 4
+)); echo $x
+### arith_status
+((0)); echo $?; ((5)); echo $?; ((-1)); echo $?
+### arith_ternary_nested
+x=5; echo $((x>3 ? x>4 ? 2 : 1 : 0))
+### arith_comma
+echo $((a=1, b=2, a+b))
+### arith_postdec
+n=5; echo $(( n-- )) $n
+### arith_bitops
+echo $(( 7 & 3 | 8 ^ 1 )) $(( ~5 )) $(( 1 << 62 )) $(( -16 >> 2 ))
+### arith_mixed_literals
+echo $(( 017 + 0x10 ))
+### arith_div_zero
+echo $((1/0)); echo st=$?
+### arith_div_zero_cmd
+((1/0)); echo st=$?
+### arith_unset_var
+unset q; echo $((q+1))
+### arith_empty_var
+e=; echo $((e+1))
+### arith_spaces_var
+s=' 42 '; echo $((s+1))
+### arith_negative_var
+n=-3; echo $((n*2)) $((-n))
+### arith_paren_expr
+echo $(( (1+2)*(3+4) ))
+### arith_not
+echo $(( !0 )) $(( !5 )) $(( !!7 ))
+### arith_equality_chain
+echo $(( 1 == 1 )) $(( 2 != 2 )) $(( 3 < 4 == 1 ))
+### arith_invalid_char
+echo $(( 1 @ 2 )); echo st=$?
+### arith_assign_return_value
+echo $(( x = 4 * 2 )) $x
+### arith_increment_array_elem_in_loop
+counts=(0 0 0); for i in 0 1 1 2 2 2; do ((counts[i]++)); done; echo ${counts[@]}
+### arith_integer_overflow_literal
+echo $(( 9223372036854775807 + 1 ))
+### arith_in_index
+arr=(a b c d); echo ${arr[1+2]} ${arr[$((1+1))]}
+### arith_substring_offset
+s=hello; echo ${s:1+1:2} ${s:$((1+1)):2}
+### brace_nested
+echo {a,{b,c}}
+### brace_nested_deep
+echo x{a,b{1,2},c}y
+### brace_seq_in_list
+echo {a,{1..3}}
+### brace_quoted_comma
+echo {a,'b,c'}
+### brace_empty_alternative
+echo a{,b}
+### brace_seq_padding
+echo {08..11} {-2..2}
+### brace_seq_letters_step
+echo {a..j..3}
+### x_double_sign
+echo $((--5)) $((++5)) $((1--1)) $((1---1)) $(( - -1 ))
+### x_postfix_after_var
+a=1; echo $((a+++1)) $a; b=5; echo $((b---1)) $b
+### x_single_quote_error
+echo $(( '1' + 2 )); echo st=$?
+### x_dollar_in_value_error
+x=\$y; y=3; echo $((x)); echo st=$?
+### x_let_dollar_text
+y=3; let "x=\$y"; echo $? $x
+### x_let_error_status
+let 1/0; echo st=$?
+### x_let_stops_at_error
+let x=1/0 y=2; echo $? $y
+### x_let_no_args
+let; echo st=$?
+### x_let_dashdash
+let -- x=3; echo $? $x
+### x_let_syntax_error
+let "1 +"; echo st=$?; echo after
+### x_cfor_div_zero
+for ((i=0; i<1/0; i++)); do :; done; echo st=$?
+### x_cfor_init_error
+for ((i=0/0; i<1; i++)); do :; done; echo st=$?
+### x_cfor_nested_arith_fatal
+for ((i=0; i<$((1/0)); i++)); do :; done; echo st=$?
+### x_cmd_nested_arith_fatal
+(( $((1/0)) )); echo st=$?
+### x_skip_branch_exponent_error
+echo $((0 && 2**-1)); echo st=$?
+### x_skip_branch_div_ok
+echo $((0 && 1/0)) st=$?
+### x_skip_branch_bad_literal
+echo $((0 && 08)); echo st=$?
+### x_skip_branch_subscript
+x=0; a=(1 2); echo $((0 && a[x++])) $x
+### x_literal_errors
+for e in '0x' '16#' '0#5' '1#1' '08' '0x1G' '1e3' '12abc' '2#' '64#@_' '36#Zz' '37#Zz'; do echo "$e => $(( e ))"; done 2>/dev/null; echo done
+### x_literal_each
+echo $((0x)); echo $((16#)); echo after
+### x_assign_non_variable
+echo $(( (x) = 3 )); echo st=$?
+### x_assoc_spaces_key
+declare -A m; m[k]=1; (( m[ k ]++ )); echo ${m[k]} ${m[" k "]}
+### x_assoc_dollar_key
+declare -A m; k=foo; (( m[$k]+=2 )); echo ${m[foo]}
+### x_array_scalar_forms
+a=(1 2 3); echo $((a)) $((a[0])) $((a[5]))
+### x_array_dollar_index
+a=(1 2 3); i=1; echo $((a[i]+a[$i]))
+### x_assoc_mixed
+declare -A m=([a]=5 [b]=6); k=b; echo $((m[a]+m[$k]+m[b]))
+### x_scalar_as_array
+x=5; echo $((x[0])) $((x[1]))
+### x_multiline_dollar
+echo $(( 1 +
+2 ))
+### x_array_assign_expr_index
+arr=(); arr[2+3]=x; echo ${arr[5]}
+### x_assoc_assign_literal_key
+declare -A m; m[1+2]=x; echo ${m[1+2]} ${m[3]}
+### x_array_assign_var_index
+i=2; a[i]=x; echo ${a[2]}
+### x_array_subscript_side_effect
+a=(x y z); echo ${a[i=1]} $i
+### x_unclosed_subscript
+echo $(( a[1 )); echo st=$?
+### x_pow_var
+x=3; echo $(( x ** 2 )) $(( 2 ** x ** 2 ))
+### x_ternary_comma
+echo $(( 1 ? 2 : 3 , 5 ))
+### x_empty_expr
+echo $((  )); (( )); echo $?
+### x_value_expr_spaces
+x=" 1 + 2 "; echo $((x))
+### x_value_two_numbers
+x="1 2"; echo $((x)); echo st=$?
+### x_assign_then_read
+x=3; echo $((x=x+1, x))
+### x_compound_assign_order
+x=1; (( x += x++ )); echo $x
+### x_indirect_postinc
+b=7; a="b"; echo $(( a++ )) $a $b
+### x_expr_value_postinc
+a="1+1"; echo $(( a++ )); echo st=$? $a
+### x_value_leading_space_octal_error
+x=" 08"; echo $((x)); echo st=$?
+### x_value_0x
+x="0x"; echo $((x))
+### x_value_trailing_space_preinc
+x="3 "; echo $((++x))
+### x_array_postinc_compound
+i=0; a=(5 6); echo $(( a[i++] += 10 )) $i ${a[*]}
+### x_scalar_to_array_elem
+a=(1 2 3); ((a=9)); echo ${a[@]}
+### x_assign_new_elem
+echo $((a[1]=5)); echo ${a[1]}
+### x_spaced_subscript
+arr=(10 20); echo $(( arr[ 1 ] ))
+### x_ternary_missing_operand
+echo $(( 1 ? : 2 )); echo st=$?
+### x_nested_subshells
+((echo hi) | cat)
+### x_spaced_subshells
+( (echo hi) )
+### x_nested_subshell_seq
+((echo a); (echo b))
+### x_dparen_paren_expr
+(( (1+2) * 3 )); echo $?
+### x_dparen_quotes
+(( "1" + 2 == 3 )) && echo yes
+### x_dparen_cmdsub
+(( $(echo 2) * 3 == 6 )) && echo yes
+### x_dparen_redirect
+((x = 5)) > /dev/null; echo $x
+### x_dparen_heredoc_like
+x=1; ((x<<=4)); echo $x; y=256; ((y>>=4)); echo $y
+### x_dparen_le_in_if
+n=3; if (( n <= 3 )); then echo le; fi; if (( n >= 4 )); then echo ge; else echo lt; fi
+### x_while_dparen_ge
+i=10; while ((i >= 8)); do echo $i; ((i--)); done
+### x_cfor_ge
+for ((i=3; i>=1; i--)); do echo -n $i; done; echo
+### x_cfor_shift_assign
+for ((i=1; i<=64; i<<=1)); do echo -n "$i "; done; echo
+### x_cfor_dollar_expansion
+n=3; for ((i=0; i<$n; i++)); do echo -n $i; done; echo
+### x_cfor_in_function_args
+f() { for ((i=$1; i<=$2; i++)); do echo -n $i; done; echo; }; f 2 5
+### x_cfor_empty_cond_expansion
+e=; n=0; for ((;$e;)); do ((n++)); ((n>2)) && break; done; echo $n
+### x_dparen_empty_expansion
+e=; (($e)); echo $?
+### x_set_e_dparen_zero
+set -e; ((0)); echo after
+### x_func_dparen_le
+f() { (( $1 <= 1 )) && echo small || echo big; }; f 0; f 5
+### x_substring_expr_bounds
+s=abcdef; echo ${s:1+1} ${s: -2} ${s:(-3):2} ${s:0:2*2}
+### x_substring_var_bounds
+s=abcdef; o=2; l=3; echo ${s:o:l} ${s:$o:$l}
+### x_index_param_len
+a=(aa bbb c); i=1; echo ${#a[i]} ${#a[i+1]}
+### x_assoc_param_dollar_key
+declare -A m; m[a]=1; k=a; echo ${m[$k]}; m[$k]=2; echo ${m[a]}
+### x_index_expr_assign
+a=(x y z); i=1; a[i+1]=Q; echo ${a[@]}
+### x_array_negative_index_arith
+a=(1 2 3); echo $((a[-1]))
+### x_let_typed_form_kept
+let x = 5; echo $x
+### x_bases_more
+echo $((2#1111)) $((8#777)) $((16#dead)) $((36#ZZ)) $((62#Z)) $((64#10))
+### x_hex_upper
+echo $((0XfF)) $((0x7fffffffffffffff))
+### x_comma_assign_chain
+echo $((a=b=c=4)) $a $b $c
+### x_not_and_bitnot_chain
+echo $((!!5)) $((~~5)) $((-~5)) $((~-5))
+### x_shift_negative
+echo $((1 << -1)) $((8 >> -1))
+### x_modulo_negative
+echo $((-7 % 3)) $((7 % -3)) $((-7 / 3))
+### x_compound_div_zero
+x=5; ((x /= 0)); echo st=$? x=$x
+### x_compound_mod_zero
+x=5; echo $((x %= 0)); echo st=$?
+### x_brace_letters
+echo {a..e..2} {z..a..10} {1..10..3} {10..1..-3} {-05..3}
+### x_brace_pad_mixed
+echo {001..3} {1..003} {-1..02}
+### x_brace_invalid_ranges
+echo {1..x} {a..5} {1..3..x} {..3} {1...3} {1..2..3..4} {1..99999999999999999999}
+### x_brace_step_zero
+echo {1..3..0} {a..c..0}
+### x_brace_literal_forms
+x=1; echo {a} {'a'} {$x} {$x,b} {} {,}
+### x_brace_inner_only
+echo {a{b,c}}
+### x_brace_escaped_comma
+echo {a,b\,c} {"a,b",c} {a,"b"}
+### x_brace_cmdsub_comma
+echo {a,$(echo b,c)}
+### x_brace_param_comma
+x=1; echo {a,${x:-b,c}}
+### x_brace_product
+echo {a,b}{1,2}
+### x_brace_unclosed
+echo {a,b x{a,b}{ }{a,b}
+### x_brace_quoted_range
+echo {'1'..3}
+### x_brace_json_kept
+echo {"name":"bob","n":1}
+### x_brace_multiple_empty
+echo a{,,}b
+### x_brace_glob_alternative
+touch zz1 zz2; echo {zz*,'zz*'}
