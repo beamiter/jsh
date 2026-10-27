@@ -116,17 +116,19 @@ fn parse_options(kind: DeclKind, args: &[String]) -> Result<(DeclOptions, usize)
             i += 1;
             break;
         }
+        // A lone `-` is `local -`, whose option-scoping belongs to the
+        // executor; accept it here so it never declares a variable named `-`.
+        // (It must be checked before the option split below, which stops at
+        // any one-character argument.)
+        if arg == "-" {
+            i += 1;
+            continue;
+        }
         let (turn_on, letters) = match arg.as_bytes().first() {
             Some(b'-') if arg.len() > 1 => (true, &arg[1..]),
             Some(b'+') if arg.len() > 1 => (false, &arg[1..]),
             _ => break,
         };
-        // A lone `-` is `local -`, whose option-scoping belongs to the
-        // executor; accept it here so it never declares a variable named `-`.
-        if arg == "-" {
-            i += 1;
-            continue;
-        }
         let mut case_on = 0;
         for letter in letters.chars() {
             if !allowed.contains(letter) {

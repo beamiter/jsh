@@ -2546,3 +2546,14 @@ fn declare_f_prints_functions_through_the_ast_printer() {
         0,
     );
 }
+
+#[test]
+fn local_dash_is_accepted_and_scopes_options() {
+    // `local -` used to be rejected as an invalid identifier.
+    check(
+        r#"f() { local -; set -e; g; }; g() { local -; set +e; set -u; }; f; echo "[$-]" | tr -d hBc"#,
+        "[]\n",
+        0,
+    );
+    check("f() { local - x=1; echo $x; }; f", "1\n", 0);
+}
