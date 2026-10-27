@@ -187,11 +187,11 @@ pub fn run_script(path: &Path, args: &[String]) -> i32 {
     // sourced or executed; jsh only set it while sourcing. With it unset,
     // `SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"` — the idiom
     // nearly every setup script opens with — saw `dirname ""`, resolved to the
-    // *caller's* cwd, and silently read files from the wrong directory.
-    state.set_array(
-        "BASH_SOURCE",
-        vec![script_path.to_string_lossy().into_owned()],
-    );
+    // *caller's* cwd, and silently read files from the wrong directory. The
+    // script is bash's `main` frame, under every function it calls.
+    state.push_call_frame(crate::callstack::CallFrame::main_script(
+        &script_path.to_string_lossy(),
+    ));
     let status = match read_script_interruptibly(&script_path) {
         Ok(content) => {
             let source = match content.strip_prefix("#!") {
@@ -329,7 +329,7 @@ fn expand_history(line: &str, history: &crate::history::History) -> Option<Strin
     Some(result)
 }
 
-fn run_exit_trap(state: &mut ShellState) -> i32 {
+pub(crate) fn run_exit_trap(state: &mut ShellState) -> i32 {
     let incoming_status = state.last_exit_code;
     let prior_exit_requested = builtins::EXIT_REQUESTED.swap(false, Ordering::SeqCst);
     let prior_exit_code = builtins::EXIT_CODE.load(Ordering::SeqCst);
@@ -338,19 +338,22 @@ fn run_exit_trap(state: &mut ShellState) -> i32 {
     let prior_failure_exempt = std::mem::replace(&mut state.last_failure_exempt, false);
     if let Some(cmd) = state.traps.get("EXIT").cloned() {
         if let Ok(commands) = parser::parse(&cmd) {
-            for c in &commands {
-                executor::execute_complete_command(c, state);
-                if builtins::EXIT_REQUESTED.load(Ordering::SeqCst)
-                    || signal::pending_status().is_some()
-                {
-                    break;
-                }
-            }
+            // Like any trap action, it leaves BASH_COMMAND alone, and its
+            // lines continue from the last command that ran.
+            state.trap_runtime.running += 1;
+            let nested_offset = state.call_stack.nested_line_offset();
+            state.call_stack.line_offset = nested_offset;
+            executor::execute_trap_commands(&commands, state);
+            state.trap_runtime.running -= 1;
         }
     }
     let trap_requested_exit = builtins::EXIT_REQUESTED.load(Ordering::SeqCst);
+    // `set -e` stopping the trap ends the shell with the failing status.
+    let trap_errexit = state.errexit_status;
     let requested_status = if trap_requested_exit {
         builtins::EXIT_CODE.load(Ordering::SeqCst)
+    } else if let Some(status) = trap_errexit {
+        status
     } else if prior_exit_requested {
         prior_exit_code
     } else {
@@ -447,6 +450,8 @@ impl Shell {
         builtins::reset_exit_request();
         signal::reset_pending_signals();
         signal::install_shell_signals();
+        // A restored session's signal traps take effect again.
+        crate::traps::rearm_restored_traps(&mut self.state);
 
         // Check if stdin is a TTY for interactive mode
         // Use libc::isatty directly to catch deleted/invalid ptys that a
@@ -515,6 +520,12 @@ impl Shell {
         osc::report_cwd_iterm2();
 
         loop {
+            // Trapped signals that arrived while the prompt was up.
+            crate::traps::run_pending_traps(&mut self.state);
+            if builtins::EXIT_REQUESTED.load(Ordering::SeqCst) {
+                self.state.last_exit_code = builtins::EXIT_CODE.load(Ordering::SeqCst);
+                break;
+            }
             // Check background jobs
             self.state.jobs.check_background();
             self.state

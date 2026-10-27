@@ -15,8 +15,8 @@
 
 use super::ast::{
     Assignment, CaseArm, CaseTerminator, Command, CompleteCommand, CompoundCommand, Connector,
-    InterpPart, PathSeg, Pipeline, ProcessSubKind, Redirect, RedirectKind, SimpleCommand, Word,
-    WordPart,
+    InterpPart, PathSeg, Pipeline, ProcessSubKind, Redirect, RedirectKind, SimpleCommand,
+    TimeFormat, Word, WordPart,
 };
 
 const INDENT_STEP: usize = 4;
@@ -161,6 +161,12 @@ impl Printer {
     }
 
     fn pipeline(&mut self, pipeline: &Pipeline) {
+        // Bash prints the `time` reserved word before any `!`.
+        match pipeline.timed {
+            Some(TimeFormat::Shell) => self.out.push_str("time "),
+            Some(TimeFormat::Posix) => self.out.push_str("time -p "),
+            None => {}
+        }
         if pipeline.negated {
             self.out.push_str("! ");
         }
@@ -222,6 +228,7 @@ impl Printer {
                 words,
                 body,
                 redirects,
+                ..
             } => {
                 self.for_head("for", var, words.as_deref());
                 self.loop_body(body);
@@ -232,6 +239,7 @@ impl Printer {
                 words,
                 body,
                 redirects,
+                ..
             } => {
                 self.for_head("select", var, words.as_deref());
                 self.loop_body(body);
@@ -281,6 +289,7 @@ impl Printer {
                 word,
                 arms,
                 redirects,
+                ..
             } => {
                 self.case(word, arms);
                 redirects
@@ -297,10 +306,16 @@ impl Printer {
                 redirects,
             } => {
                 // Bash names an anonymous coprocess COPROC when printing it.
+                // A name only binds before a compound command, though: bash's
+                // `coproc COPROC cat` for `coproc cat` re-evaluates as a
+                // command named COPROC. Print a simple command unnamed so
+                // `eval "$(declare -f f)"` recreates the same function.
                 self.out.push_str("coproc ");
-                self.out.push_str(name.as_deref().unwrap_or("COPROC"));
-                self.out.push(' ');
-                self.simple(command);
+                if matches!(**command, Command::Compound(_)) {
+                    self.out.push_str(name.as_deref().unwrap_or("COPROC"));
+                    self.out.push(' ');
+                }
+                self.command(command);
                 redirects
             }
         };
@@ -469,8 +484,12 @@ impl Printer {
         let target = || unquoted_word(&redirect.target, false);
         // A descriptor is printed only when it differs from the operator's
         // default, except for duplications, which bash always spells in full.
-        let fd_prefix = |default: i32| match redirect.fd {
-            Some(fd) if fd != default => fd.to_string(),
+        // `{name}>file` names a variable that receives (or, for `>&-`,
+        // supplies) the descriptor; bash prints it in place of the number.
+        let named = redirect.fd_var.as_ref().map(|name| format!("{{{name}}}"));
+        let fd_prefix = |default: i32| match (&named, redirect.fd) {
+            (Some(named), _) => named.clone(),
+            (None, Some(fd)) if fd != default => fd.to_string(),
             _ => String::new(),
         };
         let text = match redirect.kind {
@@ -487,11 +506,13 @@ impl Printer {
                 } else {
                     (0, "<&")
                 };
-                let fd = redirect.fd.unwrap_or(default);
+                let fd = named
+                    .clone()
+                    .unwrap_or_else(|| redirect.fd.unwrap_or(default).to_string());
                 let target = target();
                 if target == "-" || target.bytes().all(|b| b.is_ascii_digit()) {
                     format!("{fd}{op}{target}")
-                } else if fd == default {
+                } else if named.is_none() && redirect.fd.unwrap_or(default) == default {
                     format!("{op}{target}")
                 } else {
                     format!("{fd}{op}{target}")
@@ -884,6 +905,9 @@ fn is_reserved_word(word: &str) -> bool {
             | "case"
             | "esac"
             | "function"
+            | "select"
+            | "time"
+            | "coproc"
             | "!"
             | "{"
             | "}"
@@ -1027,7 +1051,21 @@ mod tests {
             "f() { ! a | b; time sleep 1; }",
             "f () \n{ \n    ! a | b;\n    time sleep 1\n}",
         ),
-        ("f() { coproc cat; }", "f () \n{ \n    coproc COPROC cat\n}"),
+        // Deliberately not bash's `coproc COPROC cat`, which re-evaluates as a
+        // command named COPROC; see `Printer::compound`.
+        ("f() { coproc cat; }", "f () \n{ \n    coproc cat\n}"),
+        (
+            "f() { coproc C { cat; }; }",
+            "f () \n{ \n    coproc C { \n        cat\n    }\n}",
+        ),
+        (
+            "f() { time -p true | cat; time ! false; }",
+            "f () \n{ \n    time -p true | cat;\n    time ! false\n}",
+        ),
+        (
+            "f() { exec {fd}>/tmp/x; echo hi >&$fd; }",
+            "f () \n{ \n    exec {fd}> /tmp/x;\n    echo hi >&$fd\n}",
+        ),
         (
             "f() { echo a; # comment\necho b; }",
             "f () \n{ \n    echo a;\n    echo b\n}",
@@ -1178,6 +1216,7 @@ mod tests {
             Pipeline {
                 negated: pipeline.negated,
                 commands: pipeline.commands.iter().map(Self::command).collect(),
+                timed: pipeline.timed,
             }
         }
 
@@ -1191,6 +1230,9 @@ mod tests {
             }
             simple.words = Self::words(&simple.words);
             simple.redirects = Self::redirects(&simple.redirects);
+            // Source positions and recorded text change with the layout.
+            simple.line = 0;
+            simple.text.clear();
             simple
         }
 
@@ -1214,6 +1256,7 @@ mod tests {
                             first: Pipeline {
                                 negated: false,
                                 commands: vec![Command::Compound(other)],
+                                timed: None,
                             },
                             rest: Vec::new(),
                         },
@@ -1253,6 +1296,7 @@ mod tests {
                                 first: Pipeline {
                                     negated: false,
                                     commands: vec![Command::Compound(nested)],
+                                    timed: None,
                                 },
                                 rest: Vec::new(),
                             },
@@ -1272,7 +1316,10 @@ mod tests {
                     words,
                     body,
                     redirects,
+                    ..
                 } => C::For {
+                    line: 0,
+                    text: String::new(),
                     var: var.clone(),
                     words: Some(match words {
                         Some(words) => Self::words(words),
@@ -1288,7 +1335,10 @@ mod tests {
                     words,
                     body,
                     redirects,
+                    ..
                 } => C::Select {
+                    line: 0,
+                    text: String::new(),
                     var: var.clone(),
                     words: Some(match words {
                         Some(words) => Self::words(words),
@@ -1343,7 +1393,10 @@ mod tests {
                     word,
                     arms,
                     redirects,
+                    ..
                 } => C::Case {
+                    line: 0,
+                    text: String::new(),
                     word: Self::word(word),
                     arms: arms
                         .iter()
@@ -1365,7 +1418,7 @@ mod tests {
                     redirects,
                 } => C::Coproc {
                     name: Some(name.clone().unwrap_or_else(|| "COPROC".into())),
-                    command: Box::new(Self::simple(command)),
+                    command: Box::new(Self::command(command)),
                     redirects: Self::redirects(redirects),
                 },
             }

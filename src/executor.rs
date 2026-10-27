@@ -4,6 +4,7 @@ use crate::environment::ShellState;
 use crate::expand::{expand_word, expand_word_to_string, expand_words};
 use crate::parser::ast::*;
 use crate::signal;
+use crate::traps;
 
 use nix::errno::Errno;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -168,6 +169,7 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
         state.last_exit_code = status;
         return status;
     }
+    traps::run_pending_traps(state);
     let mut last = 0;
     for cmd in commands {
         if let Some(status) = signal::take_pending_status() {
@@ -203,9 +205,10 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
             break;
         }
 
-        if last != 0 && !outcome.failure_exempt && state.errexit_suppression_depth == 0 {
-            fire_err_trap(state);
-            state.last_failure_exempt = outcome.failure_exempt;
+        let stop = after_list_command(state, last, outcome.failure_exempt);
+        // `set -e` may also have stopped a trap action run just now.
+        if let Some(status) = state.errexit_status {
+            last = status;
         }
 
         if let Some(signal_status) = signal::take_pending_status() {
@@ -218,11 +221,7 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
             state.last_exit_code = last;
             break;
         }
-        if control_flow_requested(state) {
-            break;
-        }
-        if errexit_active(state) && last != 0 && !outcome.failure_exempt {
-            state.errexit_status = Some(last);
+        if stop || control_flow_requested(state) {
             break;
         }
     }
@@ -230,23 +229,90 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
     last
 }
 
-fn fire_err_trap(state: &mut ShellState) {
-    if let Some(action) = state.traps.get("ERR").cloned() {
-        if !action.is_empty() {
-            if let Ok(cmds) = crate::parser::parse(&action) {
-                let failed_status = state.last_exit_code;
-                for cmd in &cmds {
-                    execute_complete_command(cmd, state);
-                    if exit_requested() || signal::pending_status().is_some() {
-                        break;
-                    }
-                }
-                if !exit_requested() && signal::pending_status().is_none() {
-                    state.last_exit_code = failed_status;
-                }
-            }
+/// Bookkeeping after each command of a list: report a failure to the ERR
+/// trap and `set -e`, then run the actions of signals that arrived while it
+/// ran. Returns true when the list must stop.
+///
+/// Bash runs the ERR trap after every failing command outside a conditional
+/// context. A compound command (`{ }`, `if`, a loop) only passes on the
+/// status of the inner command that already reported it, so a reported
+/// failure is marked exempt for the enclosing lists. A function call, `eval`
+/// or `source` is a new simple command and reports again, as in bash.
+fn after_list_command(state: &mut ShellState, status: i32, failure_exempt: bool) -> bool {
+    if status != 0 && !failure_exempt && state.errexit_suppression_depth == 0 {
+        traps::run_err_trap(state);
+        if control_flow_requested(state) {
+            return true;
         }
+        // An ERR trap may intentionally disable errexit before returning.
+        if errexit_active(state) {
+            state.errexit_status = Some(status);
+            return true;
+        }
+        state.last_failure_exempt = true;
     }
+    traps::run_pending_traps(state);
+    control_flow_requested(state)
+}
+
+/// What a loop does after its body (or condition) ran.
+enum LoopAction {
+    Proceed,
+    Break,
+    Continue,
+}
+
+/// Consume a pending `break N`/`continue N` at this loop level. While levels
+/// remain, the flag stays set so the enclosing loop sees it too; for
+/// `continue N` only the outermost of the N loops continues.
+fn take_loop_control(state: &mut ShellState) -> LoopAction {
+    if state.loop_break {
+        if state.loop_unwind_levels > 0 {
+            state.loop_unwind_levels -= 1;
+        } else {
+            state.loop_break = false;
+        }
+        return LoopAction::Break;
+    }
+    if state.loop_continue {
+        if state.loop_unwind_levels > 0 {
+            state.loop_unwind_levels -= 1;
+            return LoopAction::Break;
+        }
+        state.loop_continue = false;
+        return LoopAction::Continue;
+    }
+    LoopAction::Proceed
+}
+
+/// A command parsed on `line` is about to run: update `$LINENO` and
+/// `BASH_COMMAND`, then run the DEBUG trap as bash does before simple
+/// commands and `for`/`case`/`select`/`((` headers.
+fn begin_command(state: &mut ShellState, line: usize, text: &str) {
+    state.call_stack.enter_line(line);
+    // Inside a trap action, BASH_COMMAND keeps naming the command that was
+    // executing when the trap fired.
+    if state.trap_runtime.running == 0 {
+        state.call_stack.set_bash_command(text);
+    }
+    if std::mem::take(&mut state.trap_runtime.skip_next_debug) {
+        return;
+    }
+    if state.traps.contains_key("DEBUG") {
+        traps::run_debug_trap(state);
+    }
+}
+
+/// Leave a forked subshell: run the EXIT trap it set for itself (traps are
+/// reset on entry), then exit with the resulting status.
+pub(crate) fn exit_subshell(state: &mut ShellState, status: i32) -> ! {
+    state.last_exit_code = status;
+    let status = if state.traps.get("EXIT").is_some_and(|a| !a.is_empty()) {
+        crate::shell::run_exit_trap(state)
+    } else {
+        status
+    };
+    child_exit(status)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -450,11 +516,18 @@ fn execute_complete_command_outcome(
         // Fork for background execution
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
+                traps::enter_subshell(state);
                 signal::reset_child_signals();
                 let pid = nix::unistd::getpid();
                 setpgid(pid, pid).ok();
-                let code = execute_and_or(&cmd.list, state).status;
-                child_exit(code);
+                // Like bash, a lone simple command replaces the forked shell
+                // instead of running as its grandchild, so `$!` is the
+                // command's own PID and `kill $!` reaches it.
+                let code = match lone_simple_command(&cmd.list) {
+                    Some(simple) => execute_simple_with_mode(simple, state, false),
+                    None => execute_and_or(&cmd.list, state).status,
+                };
+                exit_subshell(state, code);
             }
             Ok(ForkResult::Parent { child }) => {
                 setpgid(child, child).ok();
@@ -487,6 +560,18 @@ fn execute_complete_command_outcome(
     outcome
 }
 
+/// The single simple command an AND-OR list consists of, if that is all it is.
+fn lone_simple_command(list: &AndOrList) -> Option<&SimpleCommand> {
+    let pipeline = &list.first;
+    if !list.rest.is_empty() || pipeline.negated || pipeline.timed.is_some() {
+        return None;
+    }
+    match pipeline.commands.as_slice() {
+        [Command::Simple(simple)] => Some(simple),
+        _ => None,
+    }
+}
+
 fn execute_and_or(list: &AndOrList, state: &mut ShellState) -> CommandOutcome {
     let first_is_conditional = list.first.negated || !list.rest.is_empty();
     let mut code = execute_pipeline_in_context(&list.first, state, first_is_conditional);
@@ -504,6 +589,11 @@ fn execute_and_or(list: &AndOrList, state: &mut ShellState) -> CommandOutcome {
             Connector::And => code == 0,
             Connector::Or => code != 0,
         };
+        // `kill -USR1 $$ && next`: the trap runs before `next`, as in bash.
+        traps::run_pending_traps(state);
+        if control_flow_requested(state) {
+            break;
+        }
         if execute {
             let has_following_connector = index + 1 < list.rest.len();
             let conditional = pipeline.negated || has_following_connector;
@@ -661,8 +751,166 @@ fn job_control_active(state: &ShellState) -> bool {
 }
 
 fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
+    let Some(format) = pipeline.timed else {
+        return execute_untimed_pipeline(pipeline, state);
+    };
+    let start = TimeSample::now();
+    let code = execute_untimed_pipeline(pipeline, state);
+    report_time(format, &start, state);
+    code
+}
+
+/// CPU and wall-clock reading for the `time` reserved word. Like bash it
+/// counts the shell itself plus every child it has waited for.
+struct TimeSample {
+    wall: std::time::Instant,
+    user: std::time::Duration,
+    sys: std::time::Duration,
+}
+
+impl TimeSample {
+    fn now() -> Self {
+        fn usage(who: nix::libc::c_int) -> (std::time::Duration, std::time::Duration) {
+            let to_duration = |tv: nix::libc::timeval| {
+                std::time::Duration::new(
+                    u64::try_from(tv.tv_sec).unwrap_or(0),
+                    u32::try_from(tv.tv_usec).unwrap_or(0).min(999_999) * 1000,
+                )
+            };
+            // SAFETY: getrusage fills the zero-initialised struct it is given.
+            let mut usage: nix::libc::rusage = unsafe { std::mem::zeroed() };
+            if unsafe { nix::libc::getrusage(who, &mut usage) } != 0 {
+                return Default::default();
+            }
+            (to_duration(usage.ru_utime), to_duration(usage.ru_stime))
+        }
+        let (self_user, self_sys) = usage(nix::libc::RUSAGE_SELF);
+        let (child_user, child_sys) = usage(nix::libc::RUSAGE_CHILDREN);
+        TimeSample {
+            wall: std::time::Instant::now(),
+            user: self_user + child_user,
+            sys: self_sys + child_sys,
+        }
+    }
+}
+
+/// Bash's `time` report when `TIMEFORMAT` is unset.
+const DEFAULT_TIMEFORMAT: &str = "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS";
+/// `time -p`.
+const POSIX_TIMEFORMAT: &str = "real %2R\nuser %2U\nsys %2S";
+
+fn report_time(format: TimeFormat, start: &TimeSample, state: &ShellState) {
+    let end = TimeSample::now();
+    let real = end.wall.duration_since(start.wall);
+    let user = end.user.saturating_sub(start.user);
+    let sys = end.sys.saturating_sub(start.sys);
+    let template = match format {
+        TimeFormat::Posix => POSIX_TIMEFORMAT,
+        TimeFormat::Shell => state.get_var("TIMEFORMAT").unwrap_or(DEFAULT_TIMEFORMAT),
+    };
+    // A null TIMEFORMAT turns the report off.
+    if template.is_empty() {
+        return;
+    }
+    let mut stderr = io::stderr().lock();
+    let _ = match render_time_format(template, real, user, sys) {
+        Ok(report) => writeln!(stderr, "{report}"),
+        Err(bad) => writeln!(stderr, "jsh: TIMEFORMAT: `{bad}': invalid format character"),
+    };
+}
+
+/// Whole seconds and rounded milliseconds, as bash's `timeval_to_secs`.
+fn seconds_and_millis(duration: std::time::Duration) -> (u64, u64) {
+    let micros = u64::from(duration.subsec_micros());
+    let mut millis = micros / 1000 + u64::from(micros % 1000 >= 500);
+    let mut seconds = duration.as_secs();
+    if millis >= 1000 {
+        seconds += 1;
+        millis -= 1000;
+    }
+    (seconds, millis)
+}
+
+/// One `TIMEFORMAT` value: `precision` (0-3) truncated digits of the
+/// millisecond fraction, and with `long` the `XmY.ZZZs` form.
+fn format_time_value(precision: u32, long: bool, seconds: u64, millis: u64) -> String {
+    let mut out = String::new();
+    let mut seconds = seconds;
+    if long {
+        out.push_str(&format!("{}m", seconds / 60));
+        seconds %= 60;
+    }
+    out.push_str(&seconds.to_string());
+    if precision > 0 {
+        let fraction = format!("{millis:03}");
+        out.push('.');
+        out.push_str(&fraction[..precision as usize]);
+    }
+    if long {
+        out.push('s');
+    }
+    out
+}
+
+/// Expand a `TIMEFORMAT` template: `%%`, `%P` (CPU percentage) and
+/// `%[p][l]R|U|S`. An unknown escape aborts the report, as in bash.
+fn render_time_format(
+    template: &str,
+    real: std::time::Duration,
+    user: std::time::Duration,
+    sys: std::time::Duration,
+) -> Result<String, char> {
+    let mut out = String::new();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' || chars.peek().is_none() {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            Some('P') => {
+                chars.next();
+                // Hundredths of a percent, as bash's timeval_to_cpu.
+                let cpu = match real.as_micros() {
+                    0 => 0,
+                    wall => (user + sys).as_micros().saturating_mul(10_000) / wall,
+                };
+                let cpu = u64::try_from(cpu).unwrap_or(u64::MAX);
+                out.push_str(&format_time_value(2, false, cpu / 100, (cpu % 100) * 10));
+            }
+            _ => {
+                let mut precision = 3;
+                if let Some(digit) = chars.peek().and_then(|d| d.to_digit(10)) {
+                    chars.next();
+                    precision = digit.min(3);
+                }
+                let long = chars.next_if_eq(&'l').is_some();
+                let value = match chars.next() {
+                    Some('R' | 'E') => real,
+                    Some('U') => user,
+                    Some('S') => sys,
+                    other => return Err(other.unwrap_or(' ')),
+                };
+                let (seconds, millis) = seconds_and_millis(value);
+                out.push_str(&format_time_value(precision, long, seconds, millis));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn execute_untimed_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
     state.last_failure_exempt = false;
     let cmds = &pipeline.commands;
+
+    // A bare `time` times nothing.
+    if cmds.is_empty() {
+        return if pipeline.negated { 1 } else { 0 };
+    }
 
     if cmds.len() == 1 {
         let code = execute_command(&cmds[0], state);
@@ -749,13 +997,22 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
             break;
         }
 
+        // Bash runs the DEBUG trap for each stage in the shell itself, before
+        // the stage's process starts.
+        if let Command::Simple(simple) = cmd {
+            begin_command(state, simple.line, &simple.text);
+        }
+
         state
             .fork_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
+                traps::enter_subshell(state);
                 signal::reset_child_signals();
                 state.interactive = false;
+                // The parent already ran this stage's DEBUG trap.
+                state.trap_runtime.skip_next_debug = matches!(cmd, Command::Simple(_));
                 if !use_lastpipe {
                     let my_pid = nix::unistd::getpid();
                     let target_pgid = if pgid.as_raw() == 0 { my_pid } else { pgid };
@@ -777,7 +1034,7 @@ fn execute_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 {
                 let origin = crate::shadowing::stage_input_origin(cmd, stage_origin, state);
                 crate::shadowing::set_stdin_origin(origin);
                 let code = execute_command_in_pipeline_child(cmd, state);
-                child_exit(code);
+                exit_subshell(state, code);
             }
             Ok(ForkResult::Parent { child }) => {
                 if !use_lastpipe {
@@ -881,6 +1138,7 @@ fn execute_command(cmd: &Command, state: &mut ShellState) -> i32 {
         }
         Command::Compound(compound) => execute_compound(compound, state),
         Command::FunctionDef { name, body } => {
+            state.note_function_definition(name);
             state.functions.insert(name.clone(), *body.clone());
             0
         }
@@ -1345,6 +1603,10 @@ fn try_alias(cmd: &SimpleCommand, state: &mut ShellState) -> Option<i32> {
         }
     }
 
+    // The body was parsed on its own, from line 1; it runs on the line of
+    // the command that named the alias.
+    let nested_offset = state.call_stack.nested_line_offset();
+    let saved_offset = std::mem::replace(&mut state.call_stack.line_offset, nested_offset);
     let mut last = 0;
     for c in &program {
         last = execute_complete_command(c, state);
@@ -1352,6 +1614,7 @@ fn try_alias(cmd: &SimpleCommand, state: &mut ShellState) -> Option<i32> {
             break;
         }
     }
+    state.call_stack.line_offset = saved_offset;
     drop(guard);
     Some(last)
 }
@@ -1361,12 +1624,31 @@ fn execute_simple_with_mode(
     state: &mut ShellState,
     fork_external: bool,
 ) -> i32 {
+    state.call_stack.enter_line(cmd.line);
     // Aliases are substituted for the command word before anything is expanded,
     // like bash does at parse time.
     if let Some(code) = try_alias(cmd, state) {
         return code;
     }
+    begin_command(state, cmd.line, &cmd.text);
 
+    // `$_` becomes the command's last argument once it has finished, so the
+    // command itself (a function body, an `eval` string) still sees the
+    // previous command's.
+    let mut last_argument = None;
+    let code = execute_simple_body(cmd, state, fork_external, &mut last_argument);
+    if let Some(argument) = last_argument {
+        state.call_stack.set_last_argument(&argument);
+    }
+    code
+}
+
+fn execute_simple_body(
+    cmd: &SimpleCommand,
+    state: &mut ShellState,
+    fork_external: bool,
+    last_argument: &mut Option<String>,
+) -> i32 {
     // `set -u` has to look at the words BEFORE expansion: expansion turns an
     // unset parameter into the empty string and the distinction is gone.
     if state.shell_opts.nounset {
@@ -1410,6 +1692,7 @@ fn execute_simple_with_mode(
         if state.shell_opts.xtrace {
             eprintln!("{}{}", xtrace_prefix(state), traced.join(" "));
         }
+        *last_argument = Some(String::new());
         return match redirects {
             Ok(_guard) => state.last_command_sub_status.take().unwrap_or(0),
             Err(code) => code,
@@ -1428,7 +1711,8 @@ fn execute_simple_with_mode(
 
     // Expand words. A `[[ ]]` conditional keeps one operand per word: the
     // parser only ever produces a bare `[[` head word for that construct.
-    let expanded = if is_conditional_command(&cmd.words) {
+    let conditional = is_conditional_command(&cmd.words);
+    let expanded = if conditional {
         crate::expand::expand_conditional_words(&cmd.words, state)
     } else {
         expand_words(&cmd.words, state)
@@ -1438,6 +1722,10 @@ fn execute_simple_with_mode(
     }
     if expanded.is_empty() {
         return with_redirects(&cmd.redirects, state, |_| 0);
+    }
+    // `[[ ]]` is a compound command in bash and leaves `$_` alone.
+    if !conditional {
+        *last_argument = expanded.last().cloned();
     }
 
     let cmd_name = &expanded[0];
@@ -1467,15 +1755,7 @@ fn execute_simple_with_mode(
             })
             .collect();
 
-        state.push_local_scope();
-        state.push_positional_params(args.to_vec());
-        let caller_loop_depth = std::mem::replace(&mut state.loop_depth, 0);
-        state.return_depth += 1;
-        let code = execute_compound(&func_body, state);
-        state.return_depth -= 1;
-        state.loop_depth = caller_loop_depth;
-        state.pop_positional_params();
-        state.pop_local_scope();
+        let return_code = call_function(cmd_name, &func_body, args, state);
 
         for (name, old) in saved_vars {
             match old {
@@ -1483,16 +1763,6 @@ fn execute_simple_with_mode(
                 None => state.unset_var(&name),
             }
         }
-
-        // Handle return statement in function
-        let return_code = if state.return_requested {
-            let ret = state.return_value;
-            state.return_requested = false;
-            state.return_value = 0;
-            ret
-        } else {
-            code
-        };
 
         return return_code;
     }
@@ -1628,6 +1898,9 @@ fn execute_simple_with_mode(
             .collect();
 
         let _ = execvp(&c_cmd, &c_args);
+        if let Some(code) = command_not_found_handler(expanded, state) {
+            return code;
+        }
         let (msg, code) = exec_error_info(cmd_name);
         shell_error(&format!("{}: {}", cmd_name, msg));
         if code == 127 {
@@ -1660,6 +1933,9 @@ fn execute_simple_with_mode(
                 .collect();
 
             let _ = execvp(&c_cmd, &c_args);
+            if let Some(code) = command_not_found_handler(expanded, state) {
+                child_exit(code);
+            }
             let (msg, code) = exec_error_info(cmd_name);
             shell_error(&format!("{}: {}", cmd_name, msg));
             child_exit(code);
@@ -1677,7 +1953,8 @@ fn execute_simple_with_mode(
                 }
             };
             signal::set_foreground_pgid(None);
-            if exit_code == 127 {
+            // A command_not_found_handle owns the not-found report.
+            if exit_code == 127 && !state.functions.contains_key(COMMAND_NOT_FOUND_HANDLE) {
                 if let Some(suggestion) = suggest_command(cmd_name, state) {
                     shell_command_hint(&suggestion);
                 }
@@ -1689,6 +1966,63 @@ fn execute_simple_with_mode(
             1
         }
     }
+}
+
+/// Call shell function `name` in the current shell: positional parameters,
+/// local scope, a call-stack frame, bash's trap inheritance rules, and
+/// `return`. The caller owns the call's redirections and prefix assignments.
+pub(crate) fn call_function(
+    name: &str,
+    body: &CompoundCommand,
+    args: &[String],
+    state: &mut ShellState,
+) -> i32 {
+    state.push_local_scope();
+    state.push_positional_params(args.to_vec());
+    let caller_loop_depth = std::mem::replace(&mut state.loop_depth, 0);
+    let caller_offset = state.enter_function_frame(name);
+    let saved_traps = traps::enter_function(state);
+    // With functrace the DEBUG trap is inherited, and bash runs it once more
+    // as the body starts, still naming the call.
+    if state.traps.contains_key("DEBUG") {
+        traps::run_debug_trap(state);
+    }
+    state.return_depth += 1;
+    let code = execute_compound(body, state);
+    state.return_depth -= 1;
+
+    let status = if state.return_requested {
+        state.return_requested = false;
+        std::mem::take(&mut state.return_value)
+    } else {
+        code
+    };
+    // `$?` in the RETURN trap is the last command's status; after
+    // `return N` that is the command before it, as in bash.
+    traps::run_return_trap(state);
+    traps::leave_function(state, saved_traps);
+    state.leave_function_frame(caller_offset);
+    state.loop_depth = caller_loop_depth;
+    state.pop_positional_params();
+    state.pop_local_scope();
+    status
+}
+
+const COMMAND_NOT_FOUND_HANDLE: &str = "command_not_found_handle";
+
+/// Bash's `command_not_found_handle`: when a PATH search for a command fails
+/// and that function exists, the forked child that would have run the
+/// command calls it with the command and its arguments, and exits with its
+/// status. Must be called straight after the failed exec, while `errno`
+/// still describes it.
+fn command_not_found_handler(argv: &[String], state: &mut ShellState) -> Option<i32> {
+    if Errno::last() != Errno::ENOENT || argv.first()?.contains('/') {
+        return None;
+    }
+    let body = state.functions.get(COMMAND_NOT_FOUND_HANDLE)?.clone();
+    // This child is the handler's subshell: no parent traps run in it.
+    traps::enter_subshell(state);
+    Some(call_function(COMMAND_NOT_FOUND_HANDLE, &body, argv, state))
 }
 
 /// `command` preserves exec's special redirection behavior, whereas the
@@ -1790,6 +2124,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
         }
         CompoundCommand::Subshell { body, redirects } => match unsafe { fork() } {
             Ok(ForkResult::Child) => {
+                traps::enter_subshell(state);
                 signal::reset_child_signals();
                 let pid = nix::unistd::getpid();
                 setpgid(pid, pid).ok();
@@ -1798,7 +2133,7 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                     child_exit(code);
                 }
                 let code = execute_command_list(body, state);
-                child_exit(code);
+                exit_subshell(state, code);
             }
             Ok(ForkResult::Parent { child }) => {
                 setpgid(child, child).ok();
@@ -1851,8 +2186,11 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             words,
             body,
             redirects,
+            line,
+            text,
         } => {
             with_redirects(redirects, state, |state| {
+                state.call_stack.enter_line(*line);
                 let word_list = match words {
                     Some(ws) => expand_words(ws, state),
                     None => state.positional_params.clone(),
@@ -1864,21 +2202,15 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                 let mut code = 0;
                 state.loop_depth += 1;
                 for w in &word_list {
+                    // Bash reports the header before every iteration.
+                    begin_command(state, *line, text);
                     state.set_var(var, w);
                     code = execute_command_list(body, state);
-
                     if execution_unwind_requested(state) {
                         break;
                     }
-
-                    // Check for break/continue control flow
-                    if state.loop_break {
-                        state.loop_break = false;
+                    if let LoopAction::Break = take_loop_control(state) {
                         break;
-                    }
-                    if state.loop_continue {
-                        state.loop_continue = false;
-                        continue;
                     }
                 }
                 state.loop_depth -= 1;
@@ -1935,14 +2267,9 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                         break;
                     }
 
-                    // Check for break/continue
-                    if state.loop_break {
-                        state.loop_break = false;
+                    // `continue` still runs the update expression.
+                    if let LoopAction::Break = take_loop_control(state) {
                         break;
-                    }
-                    if state.loop_continue {
-                        state.loop_continue = false;
-                        // Continue to update without breaking
                     }
 
                     // Execute update expression
@@ -1973,31 +2300,28 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                     code = cond;
                     break;
                 }
-                if state.loop_break {
-                    state.loop_break = false;
-                    code = cond;
-                    failure_exempt = false;
-                    break;
-                }
                 if cond != 0 {
-                    state.loop_continue = false;
+                    // The test ended the loop. A `break`/`continue` it ran is
+                    // used up at this level, as in bash.
+                    take_loop_control(state);
                     break;
                 }
-                if state.loop_continue {
-                    state.loop_continue = false;
-                    continue;
+                match take_loop_control(state) {
+                    LoopAction::Break => {
+                        code = cond;
+                        failure_exempt = false;
+                        break;
+                    }
+                    LoopAction::Continue => continue,
+                    LoopAction::Proceed => {}
                 }
                 code = execute_command_list(body, state);
                 failure_exempt = state.last_failure_exempt;
                 if execution_unwind_requested(state) {
                     break;
                 }
-                if state.loop_break {
-                    state.loop_break = false;
+                if let LoopAction::Break = take_loop_control(state) {
                     break;
-                }
-                if state.loop_continue {
-                    state.loop_continue = false;
                 }
             }
             state.loop_depth -= 1;
@@ -2018,31 +2342,28 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                     code = cond;
                     break;
                 }
-                if state.loop_break {
-                    state.loop_break = false;
-                    code = cond;
-                    failure_exempt = false;
-                    break;
-                }
                 if cond == 0 {
-                    state.loop_continue = false;
+                    // The test ended the loop. A `break`/`continue` it ran is
+                    // used up at this level, as in bash.
+                    take_loop_control(state);
                     break;
                 }
-                if state.loop_continue {
-                    state.loop_continue = false;
-                    continue;
+                match take_loop_control(state) {
+                    LoopAction::Break => {
+                        code = cond;
+                        failure_exempt = false;
+                        break;
+                    }
+                    LoopAction::Continue => continue,
+                    LoopAction::Proceed => {}
                 }
                 code = execute_command_list(body, state);
                 failure_exempt = state.last_failure_exempt;
                 if execution_unwind_requested(state) {
                     break;
                 }
-                if state.loop_break {
-                    state.loop_break = false;
+                if let LoopAction::Break = take_loop_control(state) {
                     break;
-                }
-                if state.loop_continue {
-                    state.loop_continue = false;
                 }
             }
             state.loop_depth -= 1;
@@ -2053,8 +2374,11 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             word,
             arms,
             redirects,
+            line,
+            text,
         } => {
             with_redirects(redirects, state, |state| {
+                begin_command(state, *line, text);
                 let value = expand_word_to_string(word, state);
                 let mut last = 0;
                 let mut i = 0;
@@ -2096,83 +2420,47 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             words,
             body,
             redirects,
-        } => {
-            with_redirects(redirects, state, |state| {
-                // Expand items list
-                let items = match words {
-                    Some(ws) => expand_words(ws, state),
-                    None => state.positional_params.clone(),
+            line,
+            text,
+        } => with_redirects(redirects, state, |state| {
+            begin_command(state, *line, text);
+            let items = match words {
+                Some(ws) => expand_words(ws, state),
+                None => state.positional_params.clone(),
+            };
+            if let Some(code) = report_expansion_error(state) {
+                return code;
+            }
+            if items.is_empty() {
+                return 0;
+            }
+
+            state.loop_depth += 1;
+            let mut show_menu = true;
+            let code = loop {
+                let prompt = state.get_var("PS3").unwrap_or("#? ").to_string();
+                let Some(selection) = select_query(&items, &prompt, show_menu, state) else {
+                    // EOF on the reply ends the loop with status 1.
+                    break 1;
                 };
-                if let Some(code) = report_expansion_error(state) {
-                    return code;
+                state.set_var(var, &selection);
+                let code = execute_command_list(body, state);
+                if execution_unwind_requested(state) {
+                    break code;
                 }
-
-                if items.is_empty() {
-                    return 0;
+                if let LoopAction::Break = take_loop_control(state) {
+                    break code;
                 }
-
-                state.loop_depth += 1;
-                let code = loop {
-                    // Display menu
-                    for (i, item) in items.iter().enumerate() {
-                        println!("{}) {}", i + 1, item);
-                    }
-
-                    // Get PS3 prompt (default "#? ")
-                    let ps3 = state.get_var("PS3").unwrap_or("#? ").to_string();
-                    eprint!("{}", ps3);
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
-
-                    // Read user input
-                    let mut reply = String::new();
-                    match std::io::stdin().read_line(&mut reply) {
-                        Ok(0) => {
-                            // EOF reached
-                            break 0;
-                        }
-                        Ok(_) => {
-                            let reply_trimmed = reply.trim_end_matches('\n').trim_end_matches('\r');
-                            state.set_var("REPLY", reply_trimmed);
-
-                            // Validate selection
-                            if let Ok(n) = reply_trimmed.parse::<usize>() {
-                                if n >= 1 && n <= items.len() {
-                                    let selected = &items[n - 1];
-                                    state.set_var(var, selected);
-                                    let code = execute_command_list(body, state);
-
-                                    if execution_unwind_requested(state) {
-                                        break code;
-                                    }
-
-                                    // Check for break/continue control flow
-                                    if state.loop_break {
-                                        state.loop_break = false;
-                                        break code;
-                                    }
-                                    if state.loop_continue {
-                                        state.loop_continue = false;
-                                        continue;
-                                    }
-                                    continue;
-                                }
-                                // Invalid choice (out of range): show menu again without executing body
-                            }
-                            // Empty input or non-numeric: show menu again
-                        }
-                        Err(_) => {
-                            break 1;
-                        }
-                    }
-                };
-                state.loop_depth -= 1;
-
-                code
-            })
-        }
+                // Bash (ksh-compatible select) redraws the menu only when the
+                // body leaves REPLY empty.
+                show_menu = state.get_var("REPLY") == Some("");
+            };
+            state.loop_depth -= 1;
+            code
+        }),
         CompoundCommand::Arithmetic { expr, redirects } => {
             with_redirects(redirects, state, |state| {
+                begin_command(state, 0, &format!("(({expr}))"));
                 // In bash, (( expr )) returns 0 if expr != 0, and 1 if expr == 0
                 // This is the opposite of C - expressions are checked for truthiness
                 match run_arith_clause(expr, state) {
@@ -2185,80 +2473,198 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             name,
             command,
             redirects,
-        } => {
-            with_redirects(redirects, state, |state| {
-                // Create two pipes for bidirectional communication
-                // Pipe 1: parent writes to child's stdin
-                // Pipe 2: parent reads from child's stdout
-                let (read_from_parent, write_to_child) = match pipe() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("jsh: pipe failed: {}", e);
-                        return 1;
-                    }
-                };
-                let (read_from_child, write_to_parent) = match pipe() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("jsh: pipe failed: {}", e);
-                        return 1;
-                    }
-                };
+        } => with_redirects(redirects, state, |state| {
+            start_coprocess(name.as_deref().unwrap_or("COPROC"), command, state)
+        }),
+    }
+}
 
-                match unsafe { fork() } {
-                    Ok(ForkResult::Child) => {
-                        signal::reset_child_signals();
-                        let pid = nix::unistd::getpid();
-                        setpgid(pid, pid).ok();
+/// Bash's `select` prompt: show the menu (on stderr), print the prompt, read
+/// a reply into REPLY the way `read` does, and return the chosen item. An
+/// empty reply redraws the menu; a reply that is not an item's number
+/// selects nothing (the empty string). None means EOF.
+fn select_query(
+    items: &[String],
+    prompt: &str,
+    show_menu: bool,
+    state: &mut ShellState,
+) -> Option<String> {
+    let mut print_menu = show_menu;
+    loop {
+        if print_menu {
+            print_select_menu(items, state);
+        }
+        {
+            let mut stderr = io::stderr().lock();
+            let _ = stderr.write_all(prompt.as_bytes());
+            let _ = stderr.flush();
+        }
+        if builtins::run_builtin("read", &[], state) != 0 {
+            // Bash ends the prompt line on standard output at EOF.
+            println!();
+            return None;
+        }
+        let reply = state.get_var("REPLY").unwrap_or("").to_string();
+        if reply.is_empty() {
+            print_menu = true;
+            continue;
+        }
+        let chosen = reply
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| (1..=items.len()).contains(n))
+            .map(|n| items[n - 1].clone());
+        return Some(chosen.unwrap_or_default());
+    }
+}
 
-                        // Child: set up pipes
-                        let read_fd = read_from_parent.into_raw_fd();
-                        let write_fd = write_to_parent.into_raw_fd();
+/// The `select` menu laid out in columns across `$COLUMNS` (default 80),
+/// numbered down each column, exactly as bash's `print_select_list` does.
+fn print_select_menu(items: &[String], state: &ShellState) {
+    use unicode_width::UnicodeWidthStr;
+    const TAB: usize = 8;
+    let columns: usize = state
+        .get_var("COLUMNS")
+        .and_then(|c| c.trim().parse().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(80);
+    let count = items.len();
+    let digits = |n: usize| n.to_string().len();
+    let index_width = digits(count);
+    let widest = items.iter().map(|item| item.width()).max().unwrap_or(0);
+    // Room for the number, ") " and two spaces of gutter.
+    let cell = widest + index_width + 2 + 2;
 
-                        // Close parent's ends
-                        close(write_to_child.into_raw_fd()).ok();
-                        close(read_from_child.into_raw_fd()).ok();
+    let mut cols = (columns / cell).max(1);
+    let mut rows = count.div_ceil(cols);
+    cols = count.div_ceil(rows);
+    if rows == 1 {
+        rows = cols;
+    }
+    let first_index_width = digits(rows);
 
-                        // Redirect stdin from parent's write
-                        dup2_raw(read_fd, 0).ok();
-                        close(read_fd).ok();
-
-                        // Redirect stdout to parent's read
-                        dup2_raw(write_fd, 1).ok();
-                        close(write_fd).ok();
-
-                        // Execute the command
-                        let code = execute_simple(command, state);
-                        child_exit(code);
-                    }
-                    Ok(ForkResult::Parent { child }) => {
-                        // Parent: save pipe fds in array variable
-                        let coproc_var = name.clone().unwrap_or_else(|| "COPROC".to_string());
-
-                        // Close child's ends
-                        close(read_from_parent.into_raw_fd()).ok();
-                        close(write_to_parent.into_raw_fd()).ok();
-
-                        // Get raw fds for the pipes (still open)
-                        let write_fd = write_to_child.into_raw_fd();
-                        let read_fd = read_from_child.into_raw_fd();
-
-                        // Set array: COPROC[0]=read_fd COPROC[1]=write_fd
-                        let coproc_array = vec![read_fd.to_string(), write_fd.to_string()];
-                        state.arrays.insert(coproc_var, coproc_array);
-
-                        // Don't wait for coproc - it runs in background
-                        state.last_bg_pid = Some(child.as_raw() as u32);
-                        0
-                    }
-                    Err(_) => {
-                        eprintln!("jsh: coproc: fork failed");
-                        1
-                    }
+    let mut out = String::new();
+    for row in 0..rows {
+        let mut index = row;
+        let mut pos = 0;
+        loop {
+            let width = if pos == 0 {
+                first_index_width
+            } else {
+                index_width
+            };
+            let item = &items[index];
+            out.push_str(&format!("{:>width$}) {item}", index + 1));
+            let used = pos + width + 2 + item.width();
+            index += rows;
+            if index >= count {
+                break;
+            }
+            // Pad to the next cell with tabs where they fit, then spaces.
+            let target = pos + cell;
+            let mut at = used;
+            while at < target {
+                if target / TAB > at / TAB {
+                    out.push('\t');
+                    at += TAB - at % TAB;
+                } else {
+                    out.push(' ');
+                    at += 1;
                 }
-            })
+            }
+            pos += cell;
+        }
+        out.push('\n');
+    }
+    let _ = io::stderr().lock().write_all(out.as_bytes());
+}
+
+/// Move a descriptor the shell keeps for itself to 10 or above, close-on-exec,
+/// out of the way of the 0-9 range scripts redirect explicitly.
+fn move_to_private_fd(fd: OwnedFd) -> io::Result<OwnedFd> {
+    // SAFETY: duplicating a descriptor this function owns.
+    let raw = unsafe { nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_DUPFD_CLOEXEC, 10) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// `coproc [NAME] command`: run `command` asynchronously with its stdin and
+/// stdout connected to the shell through pipes. `NAME[0]` reads its output,
+/// `NAME[1]` writes its input, and `NAME_PID` is its process ID.
+fn start_coprocess(name: &str, command: &Command, state: &mut ShellState) -> i32 {
+    let (to_child_read, to_child_write) = match pipe() {
+        Ok(fds) => fds,
+        Err(e) => {
+            eprintln!("jsh: coproc: pipe failed: {e}");
+            return 1;
+        }
+    };
+    let (from_child_read, from_child_write) = match pipe() {
+        Ok(fds) => fds,
+        Err(e) => {
+            eprintln!("jsh: coproc: pipe failed: {e}");
+            return 1;
+        }
+    };
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
+            traps::enter_subshell(state);
+            signal::reset_child_signals();
+            let pid = nix::unistd::getpid();
+            setpgid(pid, pid).ok();
+            state.interactive = false;
+            if dup2_raw(to_child_read.as_raw_fd(), 0).is_err()
+                || dup2_raw(from_child_write.as_raw_fd(), 1).is_err()
+            {
+                child_exit(1);
+            }
+            drop((
+                to_child_read,
+                to_child_write,
+                from_child_read,
+                from_child_write,
+            ));
+            let code = execute_command(command, state);
+            exit_subshell(state, code);
+        }
+        Ok(ForkResult::Parent { child }) => {
+            drop((to_child_read, from_child_write));
+            let fds = move_to_private_fd(from_child_read)
+                .and_then(|read| Ok((read, move_to_private_fd(to_child_write)?)));
+            let (read, write) = match fds {
+                Ok(fds) => fds,
+                Err(e) => {
+                    eprintln!("jsh: coproc: {e}");
+                    return 1;
+                }
+            };
+            // The descriptors now belong to the script, which closes them
+            // with `exec {NAME[1]}>&-` and the like.
+            let read = read.into_raw_fd();
+            let write = write.into_raw_fd();
+            state.set_array(name, vec![read.to_string(), write.to_string()]);
+            state.set_var(&format!("{name}_PID"), &child.as_raw().to_string());
+            state.last_bg_pid = Some(child.as_raw() as u32);
+            0
+        }
+        Err(e) => {
+            eprintln!("jsh: coproc: fork failed: {e}");
+            1
         }
     }
+}
+
+/// Run a trap action's commands as a command list: between them the ERR
+/// trap, `set -e` and newly arrived signals apply, as they do in bash.
+pub(crate) fn execute_trap_commands(cmds: &[CompleteCommand], state: &mut ShellState) -> i32 {
+    execute_command_list(cmds, state)
 }
 
 fn execute_command_list(cmds: &[CompleteCommand], state: &mut ShellState) -> i32 {
@@ -2272,20 +2678,8 @@ fn execute_command_list(cmds: &[CompleteCommand], state: &mut ShellState) -> i32
         if control_flow_requested(state) {
             return code;
         }
-        if errexit_active(state) && code != 0 && !outcome.failure_exempt {
-            fire_err_trap(state);
-            state.last_failure_exempt = outcome.failure_exempt;
-            if control_flow_requested(state) {
-                return code;
-            }
-            // An ERR trap may intentionally disable errexit before returning.
-            if errexit_active(state) {
-                state.errexit_status = Some(code);
-                return code;
-            }
-            // The trap handled the failure and explicitly disabled errexit.
-            // A surrounding direct compound must not report it a second time.
-            state.last_failure_exempt = true;
+        if after_list_command(state, code, outcome.failure_exempt) {
+            return code;
         }
     }
     code
@@ -2543,20 +2937,49 @@ fn redirect_file(file: File, targets: &[RawFd]) -> io::Result<()> {
     Ok(())
 }
 
-fn duplicate_target(data: &str) -> io::Result<Option<RawFd>> {
-    if data == "-" {
-        return Ok(None);
+/// The word after `>&` or `<&`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DupTarget {
+    /// `N>&-`: close N.
+    Close,
+    /// `N>&M`: make N a copy of M.
+    Copy(RawFd),
+    /// `N>&M-`: move M to N (copy, then close M).
+    Move(RawFd),
+}
+
+impl DupTarget {
+    /// The descriptor read from, if any.
+    fn source(self) -> Option<RawFd> {
+        match self {
+            DupTarget::Close => None,
+            DupTarget::Copy(fd) | DupTarget::Move(fd) => Some(fd),
+        }
     }
-    if data.is_empty() || !data.bytes().all(|b| b.is_ascii_digit()) {
+}
+
+fn duplicate_target(data: &str) -> io::Result<DupTarget> {
+    if data == "-" {
+        return Ok(DupTarget::Close);
+    }
+    let (digits, moved) = match data.strip_suffix('-') {
+        Some(digits) => (digits, true),
+        None => (data, false),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "bad file descriptor",
         ));
     }
-    let fd = data
+    let fd = digits
         .parse::<RawFd>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad file descriptor"))?;
-    Ok(Some(fd))
+    Ok(if moved {
+        DupTarget::Move(fd)
+    } else {
+        DupTarget::Copy(fd)
+    })
 }
 
 fn apply_one_redirect(
@@ -2580,7 +3003,7 @@ fn apply_one_redirect(
         }
         RedirectKind::DupOutput | RedirectKind::DupInput => {
             match duplicate_target(data)? {
-                None => {
+                DupTarget::Close => {
                     if let Err(error) = close(fd) {
                         // Closing an already closed descriptor is legal.
                         if error != Errno::EBADF {
@@ -2588,7 +3011,13 @@ fn apply_one_redirect(
                         }
                     }
                 }
-                Some(source) => dup2_raw(source, fd).map_err(io::Error::from)?,
+                DupTarget::Copy(source) => dup2_raw(source, fd).map_err(io::Error::from)?,
+                DupTarget::Move(source) => {
+                    dup2_raw(source, fd).map_err(io::Error::from)?;
+                    if source != fd {
+                        close(source).map_err(io::Error::from)?;
+                    }
+                }
             }
             Ok(())
         }
@@ -2669,18 +3098,119 @@ fn expand_redirect(redir: &Redirect, state: &mut ShellState) -> Result<String, i
     Ok(data)
 }
 
+/// Descriptors the redirections write to, which backups must not occupy.
+/// A `{name}` redirection picks a free descriptor and has no fixed target.
+fn reserved_targets(redirects: &[Redirect]) -> HashSet<RawFd> {
+    redirects
+        .iter()
+        .filter(|redir| redir.fd_var.is_none())
+        .flat_map(redirect_targets)
+        .collect()
+}
+
+/// The descriptor number a `{name}` variable holds.
+fn fd_variable_value(name: &str, state: &mut ShellState) -> Option<RawFd> {
+    let word = crate::parser::parse_word_parts(&format!("${{{name}}}"));
+    let value = expand_word_to_string(&word, state);
+    value.trim().parse::<RawFd>().ok().filter(|fd| *fd >= 0)
+}
+
+fn assign_fd_variable(name: &str, fd: RawFd, state: &mut ShellState) {
+    match name.find('[') {
+        Some(open) => {
+            let subscript = &name[open + 1..name.len() - 1];
+            state.set_array_element(&name[..open], subscript, &fd.to_string());
+        }
+        None => state.set_var(name, &fd.to_string()),
+    }
+}
+
+/// `{name}>file`, `{name}<file`, `{name}>&N`: open the target on the lowest
+/// free descriptor from 10 up and store its number in `name`. `{name}>&-`
+/// closes the descriptor `name` holds. Bash leaves these descriptors open
+/// after the command (and to its children) for the script to manage, so
+/// nothing is saved for restoration.
+fn apply_fd_variable_redirect(
+    redir: &Redirect,
+    name: &str,
+    state: &mut ShellState,
+) -> Result<(), i32> {
+    let data = expand_redirect(redir, state)?;
+    let is_dup = matches!(redir.kind, RedirectKind::DupOutput | RedirectKind::DupInput);
+    if is_dup && data == "-" {
+        let Some(fd) = fd_variable_value(name, state) else {
+            let error = io::Error::new(io::ErrorKind::InvalidInput, "ambiguous redirect");
+            return Err(redirect_error(name, error, state));
+        };
+        // Closing a descriptor that is already closed is not an error.
+        let _ = close(fd);
+        return Ok(());
+    }
+    let noclobber = state.shell_opts.noclobber;
+    let opened = (|| -> io::Result<RawFd> {
+        let (source, owned, moved) = match redir.kind {
+            RedirectKind::Output | RedirectKind::Clobber => {
+                let file = open_output(&data, noclobber && redir.kind != RedirectKind::Clobber)?;
+                (file.as_raw_fd(), Some(file), None)
+            }
+            RedirectKind::Append => {
+                let file = OpenOptions::new().create(true).append(true).open(&data)?;
+                (file.as_raw_fd(), Some(file), None)
+            }
+            RedirectKind::Input => {
+                let file = File::open(&data)?;
+                (file.as_raw_fd(), Some(file), None)
+            }
+            RedirectKind::DupOutput | RedirectKind::DupInput => match duplicate_target(&data)? {
+                DupTarget::Copy(fd) => (fd, None, None),
+                DupTarget::Move(fd) => (fd, None, Some(fd)),
+                DupTarget::Close => unreachable!("handled above"),
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported redirection for a descriptor variable",
+                ))
+            }
+        };
+        // SAFETY: duplicating a descriptor that is open (or failing with EBADF).
+        let fd = unsafe { nix::libc::fcntl(source, nix::libc::F_DUPFD, 10) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        drop(owned);
+        if let Some(moved) = moved {
+            let _ = close(moved);
+        }
+        Ok(fd)
+    })();
+    match opened {
+        Ok(fd) => {
+            assign_fd_variable(name, fd, state);
+            Ok(())
+        }
+        Err(error) => Err(redirect_error(&data, error, state)),
+    }
+}
+
 fn setup_redirects(redirects: &[Redirect], state: &mut ShellState) -> Result<RedirectGuard, i32> {
     let mut guard = RedirectGuard::default();
-    let mut reserved: HashSet<RawFd> = redirects.iter().flat_map(redirect_targets).collect();
+    let mut reserved = reserved_targets(redirects);
     if !redirects.is_empty() {
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
     }
     for redir in redirects {
+        if let Some(name) = &redir.fd_var {
+            apply_fd_variable_redirect(redir, name, state)?;
+            continue;
+        }
         let data = expand_redirect(redir, state)?;
         let result = (|| -> io::Result<()> {
             if matches!(redir.kind, RedirectKind::DupOutput | RedirectKind::DupInput) {
-                if let Some(source) = duplicate_target(&data)? {
+                // A move's source is deliberately not saved: bash leaves the
+                // moved-from descriptor closed once the command finishes.
+                if let Some(source) = duplicate_target(&data)?.source() {
                     reserved.insert(source);
                     reserve_user_fd(source, &reserved)?;
                 }
@@ -2704,12 +3234,16 @@ fn setup_redirects(redirects: &[Redirect], state: &mut ShellState) -> Result<Red
 }
 
 fn apply_redirects_in_child(redirects: &[Redirect], state: &mut ShellState) -> Result<(), i32> {
-    let mut reserved: HashSet<RawFd> = redirects.iter().flat_map(redirect_targets).collect();
+    let mut reserved = reserved_targets(redirects);
     for redir in redirects {
+        if let Some(name) = &redir.fd_var {
+            apply_fd_variable_redirect(redir, name, state)?;
+            continue;
+        }
         let data = expand_redirect(redir, state)?;
         let result = (|| -> io::Result<()> {
             if matches!(redir.kind, RedirectKind::DupOutput | RedirectKind::DupInput) {
-                if let Some(source) = duplicate_target(&data)? {
+                if let Some(source) = duplicate_target(&data)?.source() {
                     reserved.insert(source);
                     reserve_user_fd(source, &reserved)?;
                 }
@@ -2769,5 +3303,24 @@ mod output_tests {
         assert!(!error.contains('\x1b'));
         assert!(!hint.contains('\x1b'));
         assert!(format_command_hint("echo", true).contains('\x1b'));
+    }
+
+    /// TIMEFORMAT values round microseconds to milliseconds and then
+    /// truncate to the requested precision, as bash does.
+    #[test]
+    fn timeformat_rendering_matches_bash() {
+        let real = std::time::Duration::from_micros(61_234_500);
+        let user = std::time::Duration::from_micros(500_400);
+        let sys = std::time::Duration::from_micros(499_600);
+        assert_eq!(
+            render_time_format("%R|%3lR|%0R|%1U|%2S|%lS|%P|%%|end%", real, user, sys),
+            Ok("61.235|1m1.235s|61|0.5|0.50|0m0.500s|1.63|%|end%".to_string())
+        );
+        assert_eq!(render_time_format("%x", real, user, sys), Err('x'));
+        assert_eq!(render_time_format("%3", real, user, sys), Err(' '));
+        assert_eq!(
+            render_time_format(POSIX_TIMEFORMAT, real, user, sys),
+            Ok("real 61.23\nuser 0.50\nsys 0.50".to_string())
+        );
     }
 }

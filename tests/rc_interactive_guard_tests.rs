@@ -31,7 +31,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Rejected by jsh's own parser, so `source` falls through to the bash bridge.
-const FORCE_BASH: &str = "coproc guard_probe { true; }\n";
+/// (Bash's brace-bodied `for` loop; jsh parses `coproc`, the old probe, itself.)
+const FORCE_BASH: &str = "for _ in 1; { :; }\n";
 
 const INTERACTIVE_GUARD: &str = "case $- in\n    *i*) ;;\n      *) return;;\nesac\n";
 

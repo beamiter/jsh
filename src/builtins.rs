@@ -83,6 +83,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "test",
     "[",
     "return",
+    "caller",
     "break",
     "continue",
     "shift",
@@ -201,6 +202,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "set" => builtin_set(args, state),
         "local" => builtin_local(args, state),
         "return" => builtin_return(args, state),
+        "caller" => crate::callstack::builtin_caller(args, state),
         "break" => builtin_loop_control("break", args, state),
         "continue" => builtin_loop_control("continue", args, state),
         "shift" => builtin_shift(args, state),
@@ -212,7 +214,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "pushd" => builtin_pushd(args, state),
         "popd" => builtin_popd(args, state),
         "dirs" => builtin_dirs(args, state),
-        "trap" => builtin_trap(args, state),
+        "trap" => crate::traps::builtin_trap(args, state),
         "jobs" => {
             let mut print_pids = false;
             let mut running_only = false;
@@ -817,20 +819,70 @@ fn builtin_return(args: &[String], state: &mut ShellState) -> i32 {
 
     state.return_requested = true;
     state.return_value = code;
-    code
+    // The function's status travels in `return_value`. `$?` itself keeps the
+    // previous command's status until the function has returned, which is
+    // what a RETURN trap sees in bash.
+    state.last_exit_code
 }
 
-fn builtin_loop_control(name: &str, _args: &[String], state: &mut ShellState) -> i32 {
+/// `break [N]` / `continue [N]`.
+///
+/// N counts enclosing loops of the current function (a function never sees
+/// its caller's loops); a count beyond the depth means the outermost loop.
+/// As in bash, a count below 1 is reported and leaves every loop, while a
+/// non-numeric or extra argument is a fatal error for a non-interactive
+/// shell, because both are POSIX special builtins.
+fn builtin_loop_control(name: &str, args: &[String], state: &mut ShellState) -> i32 {
+    let args = match args.first().map(String::as_str) {
+        Some("--") => &args[1..],
+        _ => args,
+    };
+    let fatal = |state: &mut ShellState, status: i32| {
+        if state.interactive {
+            state.abort_current_program = true;
+        } else {
+            EXIT_CODE.store(status, Ordering::SeqCst);
+            EXIT_REQUESTED.store(true, Ordering::SeqCst);
+        }
+        status
+    };
+    if args.len() > 1 {
+        eprintln!("jsh: {name}: too many arguments");
+        return fatal(state, 1);
+    }
+    // Bash's legal_number: surrounding whitespace and a sign are allowed.
+    let levels = match args.first() {
+        None => 1,
+        Some(arg) => match arg.trim().parse::<i64>() {
+            Ok(levels) => levels,
+            Err(_) => {
+                eprintln!("jsh: {name}: {arg}: numeric argument required");
+                return fatal(state, 128);
+            }
+        },
+    };
     if state.loop_depth == 0 {
-        eprintln!("jsh: {}: only meaningful in a loop", name);
+        eprintln!("jsh: {name}: only meaningful in a `for', `while', or `until' loop");
+        return 0;
+    }
+    if levels < 1 {
+        eprintln!(
+            "jsh: {name}: {}: loop count out of range",
+            args.first().map_or("", |a| a.as_str())
+        );
+        // Bash then leaves every enclosing loop.
+        state.loop_break = true;
+        state.loop_unwind_levels = state.loop_depth - 1;
         return 1;
     }
+    let levels = usize::try_from(levels).unwrap_or(usize::MAX);
 
     if name == "break" {
         state.loop_break = true;
     } else {
         state.loop_continue = true;
     }
+    state.loop_unwind_levels = levels.min(state.loop_depth) - 1;
     0
 }
 
@@ -954,8 +1006,11 @@ fn builtin_echo(args: &[String]) -> i32 {
         start = i + 1;
     }
 
-    let stdout = std::io::stdout();
-    let mut output = std::io::BufWriter::new(stdout.lock());
+    // Write to descriptor 1 itself: Rust's `Stdout` silently discards output
+    // when the descriptor is closed, but `echo x >&-` must fail like bash's.
+    // Anything still buffered in `Stdout` goes first to keep the order.
+    let _ = std::io::stdout().flush();
+    let mut output = std::io::BufWriter::new(StdoutFd);
     let result = (|| -> std::io::Result<()> {
         let mut stopped = false;
         for (i, arg) in args[start..].iter().enumerate() {
@@ -980,9 +1035,32 @@ fn builtin_echo(args: &[String]) -> i32 {
     match result {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("jsh: echo: {error}");
+            match error.raw_os_error() {
+                Some(code) => eprintln!(
+                    "jsh: echo: write error: {}",
+                    nix::errno::Errno::from_raw(code).desc()
+                ),
+                None => eprintln!("jsh: echo: {error}"),
+            }
             1
         }
+    }
+}
+
+/// Unbuffered writer on descriptor 1 that reports every error, EBADF
+/// included.
+struct StdoutFd;
+
+impl std::io::Write for StdoutFd {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // SAFETY: descriptor 1 is only borrowed for this call; an invalid
+        // descriptor is reported as EBADF.
+        let fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(1) };
+        nix::unistd::write(fd, buf).map_err(std::io::Error::from)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1754,11 +1832,14 @@ fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
 
     // Bash exposes the file being sourced as `${BASH_SOURCE[0]}`, with outer
     // frames following it. Setup scripts use it to locate their own directory,
-    // so push a frame for the duration of the source.
-    let old_bash_source = state.arrays.get("BASH_SOURCE").cloned();
-    let mut frames = old_bash_source.clone().unwrap_or_default();
-    frames.insert(0, resolved_path.clone());
-    state.set_array("BASH_SOURCE", frames);
+    // so push a frame for the duration of the source. Its lines are counted
+    // from the top of the file.
+    let call_line = state.call_stack.lineno();
+    state.push_call_frame(crate::callstack::CallFrame::sourced_file(
+        &resolved_path,
+        call_line,
+    ));
+    let saved_offset = std::mem::replace(&mut state.call_stack.line_offset, 0);
 
     state.return_depth += 1;
     let result = match crate::io_guard::read_regular_text(
@@ -1772,9 +1853,14 @@ fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
                     let last = crate::executor::execute_program(&commands, state);
                     // `return` exits a sourced file but must not leak into the
                     // caller's command list.
-                    if state.return_requested {
+                    let last = if state.return_requested {
                         state.return_requested = false;
-                    }
+                        std::mem::take(&mut state.return_value)
+                    } else {
+                        last
+                    };
+                    // The RETURN trap also fires when a sourced file finishes.
+                    crate::traps::run_return_trap(state);
                     last
                 }
                 Err(e) => {
@@ -1793,12 +1879,9 @@ fn builtin_source(args: &[String], state: &mut ShellState) -> i32 {
 
     // Restore state
     state.positional_params = old_params;
-    match old_bash_source {
-        Some(frames) => state.set_array("BASH_SOURCE", frames),
-        None => {
-            state.arrays.remove("BASH_SOURCE");
-        }
-    }
+    state.pop_call_frame();
+    state.call_stack.line_offset = saved_offset;
+    state.call_stack.set_lineno(call_line);
 
     result
 }
@@ -1811,9 +1894,17 @@ fn builtin_eval(args: &[String], state: &mut ShellState) -> i32 {
     // Join all arguments with space, just like bash does
     let input = args.join(" ");
 
-    // Parse and execute the input
+    // Parse and execute the input. Its first line is the line `eval` is on.
     match parser::parse(&input) {
-        Ok(commands) => crate::executor::execute_program(&commands, state),
+        Ok(commands) => {
+            let line = state.call_stack.lineno();
+            let nested_offset = state.call_stack.nested_line_offset();
+            let saved_offset = std::mem::replace(&mut state.call_stack.line_offset, nested_offset);
+            let status = crate::executor::execute_program(&commands, state);
+            state.call_stack.line_offset = saved_offset;
+            state.call_stack.set_lineno(line);
+            status
+        }
         Err(e) => {
             eprintln!("jsh: eval: parse error: {}", e);
             2
@@ -2966,6 +3057,14 @@ fn builtin_set(args: &[String], state: &mut ShellState) -> i32 {
 
 fn builtin_local(args: &[String], state: &mut ShellState) -> i32 {
     for arg in args {
+        // `local -`: the function's `set` options are restored on return.
+        if arg == "-" {
+            if !state.save_options_for_function() {
+                eprintln!("jsh: local: can only be used in a function");
+                return 1;
+            }
+            continue;
+        }
         if let Some(eq_pos) = arg.find('=') {
             let name = &arg[..eq_pos];
             let value = &arg[eq_pos + 1..];
@@ -3267,6 +3366,8 @@ fn builtin_exec(args: &[String], state: &mut ShellState) -> i32 {
         Signal::SIGCHLD,
     ]
     .into_iter()
+    // `trap '' SIG` carries over to the new program, as in bash.
+    .filter(|sig| !crate::signal::is_user_ignored(*sig as i32))
     .filter_map(|sig| {
         unsafe { signal::sigaction(sig, &default) }
             .ok()
@@ -3571,58 +3672,6 @@ fn builtin_dirs(args: &[String], state: &mut ShellState) -> i32 {
         }
     } else {
         println!("{}", entries.join(" "));
-    }
-    0
-}
-
-fn builtin_trap(args: &[String], state: &mut ShellState) -> i32 {
-    if args.is_empty() {
-        for (sig, cmd) in &state.traps {
-            println!("trap -- '{}' {}", cmd, sig);
-        }
-        return 0;
-    }
-
-    if args.len() == 1 && args[0] == "-l" {
-        // DEBUG and RETURN are listed for Bash compatibility but are not fired.
-        println!("EXIT HUP INT QUIT ABRT ALRM TERM USR1 USR2 ERR DEBUG RETURN");
-        return 0;
-    }
-
-    if args.len() == 1 && args[0] == "-p" {
-        for (sig, cmd) in &state.traps {
-            println!("trap -- '{}' {}", cmd, sig);
-        }
-        return 0;
-    }
-
-    if args.len() >= 2 {
-        let action = &args[0];
-        for sig in &args[1..] {
-            // Validate signal name. DEBUG and RETURN are accepted for Bash
-            // compatibility but are never executed (no DEBUG/RETURN trap fire).
-            let sig_lower = sig.to_uppercase();
-            let valid_signals = vec![
-                "EXIT", "HUP", "INT", "QUIT", "ABRT", "ALRM", "TERM", "USR1", "USR2", "PIPE",
-                "CHLD", "TSTP", "TTIN", "TTOU", "CONT", "STOP", "KILL", "ILL", "FPE", "SEGV",
-                "BUS", "SYS", "TRAP", "CLD", "PWR", "POLL", "PROF", "VTALRM", "XCPU", "XFSZ",
-                "IOT", "EMT", "STKFLT", "IO", "ERR", "RETURN", "DEBUG",
-            ];
-
-            let is_valid =
-                valid_signals.iter().any(|&s| s == sig_lower) || sig_lower.parse::<i32>().is_ok();
-
-            if !is_valid {
-                eprintln!("jsh: trap: {} is not a valid signal name", sig);
-                return 1;
-            }
-
-            if action == "-" || action.is_empty() {
-                state.traps.remove(&sig_lower);
-            } else {
-                state.traps.insert(sig_lower, action.clone());
-            }
-        }
     }
     0
 }
@@ -4523,7 +4572,6 @@ fn exit_status(status: nix::sys::wait::WaitStatus) -> Option<(i32, i32)> {
 /// reaped (an interactive shell polls its background jobs) answers from the
 /// job table or from the remembered statuses.
 fn wait_for_pid(pid: i32, state: &mut ShellState) -> Result<i32, i32> {
-    use nix::sys::wait::waitpid;
     if let Some(job) = state.jobs.jobs.iter().find(|job| job.pid.as_raw() == pid) {
         if let crate::job::JobStatus::Done(code) = job.status {
             state.jobs.jobs.retain(|job| job.pid.as_raw() != pid);
@@ -4532,7 +4580,7 @@ fn wait_for_pid(pid: i32, state: &mut ShellState) -> Result<i32, i32> {
         }
     }
     loop {
-        match waitpid(nix::unistd::Pid::from_raw(pid), None) {
+        match interruptible_wait(pid)? {
             Ok(status) => {
                 if let Some((_, code)) = exit_status(status) {
                     state.jobs.jobs.retain(|job| job.pid.as_raw() != pid);
@@ -4560,9 +4608,19 @@ fn wait_for_pid(pid: i32, state: &mut ShellState) -> Result<i32, i32> {
     }
 }
 
+/// One blocking waitpid that a trapped signal interrupts, as bash's `wait`
+/// is: the builtin then returns 128+N and the trap runs at the next safe
+/// point. A latched termination unwinds with its own status.
+fn interruptible_wait(pid: i32) -> Result<nix::Result<nix::sys::wait::WaitStatus>, i32> {
+    match crate::signal::wait_interruptibly(nix::unistd::Pid::from_raw(pid)) {
+        crate::signal::WaitOutcome::Done(waited) => Ok(waited),
+        crate::signal::WaitOutcome::Trapped(signal) => Err(128 + signal),
+        crate::signal::WaitOutcome::Terminating(status) => Err(status),
+    }
+}
+
 /// `wait -n`: the status of the next job (among `pids`, or any job) to finish.
 fn wait_for_next(pids: Option<Vec<i32>>, state: &mut ShellState) -> Result<(i32, i32), i32> {
-    use nix::sys::wait::waitpid;
     let candidates: Vec<i32> = match pids {
         Some(pids) => pids,
         None => state.jobs.jobs.iter().map(|job| job.pid.as_raw()).collect(),
@@ -4584,7 +4642,7 @@ fn wait_for_next(pids: Option<Vec<i32>>, state: &mut ShellState) -> Result<(i32,
         return Ok((pid, code));
     }
     loop {
-        match waitpid(nix::unistd::Pid::from_raw(-1), None) {
+        match interruptible_wait(-1)? {
             Ok(status) => {
                 let Some((pid, code)) = exit_status(status) else {
                     continue;

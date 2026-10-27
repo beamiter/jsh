@@ -934,6 +934,11 @@ impl<'a> Lexer<'a> {
                         let w = self.read_word();
                         Token::Word(w)
                     }
+                    Some('&') => {
+                        // `<&N` is `0<&N`.
+                        self.next_char();
+                        Token::RedirectFd(0, RedirectOp::DupInput)
+                    }
                     _ => Token::RedirectIn,
                 }
             }

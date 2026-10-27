@@ -313,11 +313,19 @@ zero, and `-l` prefixes that argument with `-`. With no command, successful
 `exec` redirections remain active in the shell. Failed process replacement
 terminates a noninteractive shell unless `shopt -s execfail` is enabled.
 
+`{name}>file`, `{name}<file` and `{name}>&N` open a descriptor numbered 10 or
+higher and store its number in `name` (an array element such as
+`{COPROC[1]}` works too); `{name}>&-` closes it. As in Bash, such descriptors
+stay open after the command until the script closes them. `N>&M-` and `N<&M-`
+move descriptor M to N; the moved-from descriptor stays closed afterwards.
+
 With `set -e`, an unhandled failure in a `for`, arithmetic `for`, `while`, or
 `until` body unwinds immediately. Direct compound commands retain the final
 `&&`, `||`, or `!` exemption, and tested functions/loops keep conditional
 suppression. `eval` and sourced programs propagate exit/return/error control;
 loop-condition `break` and `continue` are consumed by their own loop.
+`break N` and `continue N` act on the Nth enclosing loop of the current
+function (the outermost when N is larger); a count below 1 is an error.
 
 `test` and `[` return `0` for true, `1` for false, and `2` for an invalid
 expression. `[` requires its final `]`; `test` treats `]` as ordinary data.
@@ -390,6 +398,24 @@ step. Inside the substitution, `exit` and an explicitly enabled `set -e` stop
 the remaining commands before their output or status can replace the failure.
 The parent shell's `errexit` and `ERR` trap are reset there by default, matching
 Bash; `shopt -s inherit_errexit` and `set -E` opt into inheriting them.
+
+`trap` installs real signal handlers. A trapped signal's action runs between
+commands, after a foreground command finishes, or when it interrupts `wait`
+(which then returns 128 plus the signal number); a trapped `INT`, `HUP` or
+`TERM` no longer terminates the shell. `trap '' SIG` ignores a signal in the
+shell and its children, and `trap - SIG` restores the previous disposition.
+Subshells and command substitutions reset caught signals and the `EXIT` trap
+but still show the parent's traps to `trap -p` until they set their own; a
+subshell runs its own `EXIT` trap when it ends. `ERR` fires after each failing
+command outside a conditional context, `DEBUG` before each simple command and
+`for`/`case`/`select`/`((` header, and `RETURN` when a function or sourced file
+finishes. Functions inherit `ERR` only under `set -E`, and `DEBUG`/`RETURN` only
+under `set -T`; a trap a function sets for itself survives its return.
+`$LINENO`, `BASH_COMMAND`, `$_`, `FUNCNAME`, `BASH_SOURCE`, `BASH_LINENO` and
+`caller` follow Bash's call stack, `local -` makes `set` options local to a
+function, and `command_not_found_handle` is honoured. The `time [-p]` reserved
+word reports a pipeline's real, user and system time on the shell's stderr using
+`TIMEFORMAT`, keeping the pipeline's status.
 
 ## Startup and persistent state
 
@@ -1026,13 +1052,14 @@ measurements, not whole-shell startup or cross-shell rankings.
   shell options, but not every arbitrary Bash function or interactive plugin.
 - Some advanced Bash options and edge cases remain incomplete. Prefer an
   explicit Bash shebang for production scripts that depend on exact Bash
-  parsing or `set -e` corner cases. ERR-trap inheritance across ordinary
-  function calls is not yet fully aligned with Bash.
+  parsing or `set -e` corner cases.
 - `shopt -s lastpipe` runs the final pipeline stage in the current shell when
   job control (`monitor`) is off. Interactive shells keep `monitor` on by
   default, matching Bash.
 - `fg`/`bg`/`wait`/`disown` accept Bash job specs `%N`, `%%`, `%+`, and `%-`.
-- `DEBUG` and `RETURN` traps are accepted for compatibility but are not fired.
+- A trapped signal does not interrupt a blocking `read`; its action runs once
+  the read completes. `extdebug` (DEBUG-trap skipping) and `declare -t` are not
+  modelled.
 - Structured pipeline commands are jsh extensions and are not portable to Bash.
 - Closure forms of `where` and `each` still materialize their inputs.
   `from-ndjson` currently skips invalid JSON lines; it does not provide a strict
@@ -1048,8 +1075,8 @@ measurements, not whole-shell startup or cross-shell rankings.
   from complex/tagged keys may differ from the previous parser. Uncommon global
   tags follow the new parser's type inference. Completion offers no candidates
   for a document that fails parsing.
-- Descriptor duplication and closure (`N>&M`, `N<&M`, `N>&-`) are supported;
-  descriptor-moving forms such as `N>&M-` remain unsupported and return an error.
+- Descriptor duplication, closure and moving (`N>&M`, `N<&M`, `N>&-`, `N>&M-`)
+  are supported.
 - HTTP and AI features are available only in builds with the `ai` Cargo feature.
 
 Please include the smallest reproducing command, expected status, actual status,

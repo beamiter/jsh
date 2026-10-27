@@ -283,6 +283,15 @@ pub struct Parser<'a> {
     // When the line-ending newline at trigger is consumed, the lexer jumps to
     // resume, stepping over the here-doc body that was already collected.
     heredoc_skips: Vec<(usize, usize)>,
+    /// Byte offset of every newline in `input`, collected on first use so a
+    /// line lookup is a binary search rather than a rescan of the prefix.
+    newlines: Option<Vec<usize>>,
+    /// Span of the token `advance` consumed most recently.
+    prev_span: (usize, usize),
+    /// Tokens consumed while a command's `BASH_COMMAND` text is being
+    /// collected: each span, and whether the next token follows it without a
+    /// space (`2>&1`, `<<EOF`, `{fd}>`).
+    recording: Option<Vec<((usize, usize), bool)>>,
 }
 
 impl<'a> Parser<'a> {
@@ -295,10 +304,84 @@ impl<'a> Parser<'a> {
             peeked: None,
             input,
             heredoc_skips: Vec::new(),
+            newlines: None,
+            prev_span: (0, 0),
+            recording: None,
+        }
+    }
+
+    /// 1-based line of byte `offset`.
+    fn line_at(&mut self, offset: usize) -> usize {
+        let input = self.input;
+        let newlines = self.newlines.get_or_insert_with(|| {
+            input
+                .bytes()
+                .enumerate()
+                .filter_map(|(i, b)| (b == b'\n').then_some(i))
+                .collect()
+        });
+        newlines.partition_point(|&nl| nl < offset) + 1
+    }
+
+    /// Line holding the last character of a token. A token that spans lines
+    /// (a quoted newline, a line continuation before it) reports its last
+    /// line, which is where bash's lexer is when it has read the token.
+    fn end_line(&mut self, span: (usize, usize)) -> usize {
+        self.line_at(span.1.saturating_sub(1).max(span.0))
+    }
+
+    fn peek_span(&mut self) -> (usize, usize) {
+        self.peek();
+        self.peeked
+            .as_ref()
+            .map_or(self.current.span, |token| token.span)
+    }
+
+    /// Start collecting the tokens of a command's text, returning any outer
+    /// collection so it can be resumed afterwards.
+    fn begin_recording(&mut self) -> Option<Vec<((usize, usize), bool)>> {
+        self.recording.replace(Vec::new())
+    }
+
+    /// Finish the current collection and render it the way bash prints a
+    /// command: tokens as written, separated by one space.
+    fn finish_recording(&mut self, outer: Option<Vec<((usize, usize), bool)>>) -> String {
+        let tokens = std::mem::replace(&mut self.recording, outer).unwrap_or_default();
+        let mut text = String::new();
+        let mut glue = true;
+        for ((start, end), glue_next) in tokens {
+            if !glue {
+                text.push(' ');
+            }
+            text.push_str(self.input.get(start..end).unwrap_or_default());
+            glue = glue_next;
+        }
+        text
+    }
+
+    /// Mark the most recently collected token as joined to the next one.
+    fn glue_recorded_token(&mut self) {
+        if let Some(last) = self.recording.as_mut().and_then(|tokens| tokens.last_mut()) {
+            last.1 = true;
         }
     }
 
     fn advance(&mut self) {
+        self.prev_span = self.current.span;
+        if let Some(tokens) = self.recording.as_mut() {
+            // Line breaks inside a header (`for x\nin ...`) are not part of
+            // the command's printed form.
+            if self.current.token != Token::Newline {
+                let glue = matches!(
+                    self.current.token,
+                    Token::DupFd
+                        | Token::HereDoc
+                        | Token::HereDocStrip
+                        | Token::RedirectFd(_, RedirectOp::DupOutput | RedirectOp::DupInput)
+                );
+                tokens.push((self.current.span, glue));
+            }
+        }
         if let Some(t) = self.peeked.take() {
             self.current = t;
         } else {
@@ -433,20 +516,43 @@ impl<'a> Parser<'a> {
     }
 
     fn is_redirect(&self) -> bool {
-        matches!(
-            self.current.token,
-            Token::RedirectOut
-                | Token::RedirectClobber
-                | Token::RedirectAppend
-                | Token::RedirectIn
-                | Token::HereDoc
-                | Token::HereDocStrip
-                | Token::HereString
-                | Token::DupFd
-                | Token::RedirectAllOut
-                | Token::RedirectAllAppend
-                | Token::RedirectFd(_, _)
-        )
+        token_is_redirect(&self.current.token)
+    }
+
+    /// `{name}` immediately followed by a redirection operator: the shell
+    /// allocates the descriptor and stores its number in `name`.
+    fn fd_variable_prefix(&mut self) -> Option<String> {
+        let Token::Word(word) = &self.current.token else {
+            return None;
+        };
+        let name = word.strip_prefix('{')?.strip_suffix('}')?;
+        if !is_fd_variable_name(name) {
+            return None;
+        }
+        let name = name.to_string();
+        let end = self.current.span.1;
+        let next = self.peek_span();
+        let adjacent = next.0 == end;
+        // `{x}2>file` is a word followed by an ordinary redirection.
+        let numbered = self
+            .input
+            .as_bytes()
+            .get(next.0)
+            .is_some_and(u8::is_ascii_digit);
+        let redirect = !numbered
+            && self.peeked.as_ref().is_some_and(|t| {
+                token_is_redirect(&t.token)
+                    && !matches!(
+                        t.token,
+                        // Here-documents and `&>` have no single descriptor.
+                        Token::HereDoc
+                            | Token::HereDocStrip
+                            | Token::HereString
+                            | Token::RedirectAllOut
+                            | Token::RedirectAllAppend
+                    )
+            });
+        (adjacent && redirect).then_some(name)
     }
 
     fn parse_redirect(&mut self) -> Result<Redirect, ParseError> {
@@ -518,6 +624,7 @@ impl<'a> Parser<'a> {
             kind,
             target,
             here_doc: here_doc_opt,
+            fd_var: None,
         })
     }
 
@@ -541,6 +648,20 @@ impl<'a> Parser<'a> {
         let mut words: Vec<Word> = Vec::new();
         let mut redirects = Vec::new();
 
+        // Bash records a simple command's line when its grammar reduces the
+        // first element. After a plain word that needs one token of look-ahead
+        // (the word could still start `name()`), so `echo "a<newline>b"`
+        // reports the line the string ends on; an assignment or redirection
+        // is reduced on its own last token.
+        let first_is_word = matches!(&self.current.token, Token::Word(w) if !is_assignment(w));
+        let mut line = if first_is_word {
+            let span = self.peek_span();
+            self.end_line(span)
+        } else {
+            0
+        };
+        let outer_recording = self.begin_recording();
+
         // Parse leading assignments (VAR=value, arr[idx]=value, arr=(a b c), var+=value)
         loop {
             let is_assign = if let Token::Word(w) = &self.current.token {
@@ -554,30 +675,25 @@ impl<'a> Parser<'a> {
                 } else {
                     unreachable!()
                 };
-                let assign = parse_assignment(&w, self)?;
+                let assign = match parse_assignment(&w, self) {
+                    Ok(assign) => assign,
+                    Err(error) => {
+                        self.finish_recording(outer_recording);
+                        return Err(error);
+                    }
+                };
                 assignments.push(assign);
+                if line == 0 {
+                    line = self.end_line(self.prev_span);
+                }
                 continue;
             }
             break;
         }
 
-        // Parse words and redirects
-        loop {
-            if self.is_redirect() {
-                redirects.push(self.parse_redirect()?);
-            } else if let Token::Word(w) = &self.current.token {
-                let w = w.clone();
-                words.push(parse_word_parts(&w));
-                self.advance();
-                // `[[` opens a conditional expression: everything up to the
-                // matching `]]` belongs to it, including operator characters.
-                if words.len() == 1 && w == "[[" {
-                    self.parse_conditional_words(&mut words)?;
-                }
-            } else {
-                break;
-            }
-        }
+        let result = self.parse_simple_command_rest(&mut words, &mut redirects, &mut line);
+        let text = self.finish_recording(outer_recording);
+        result?;
 
         if words.is_empty() && assignments.is_empty() && redirects.is_empty() {
             if self.current.token == Token::Eof {
@@ -593,7 +709,43 @@ impl<'a> Parser<'a> {
             assignments,
             words,
             redirects,
+            line,
+            text,
         }))
+    }
+
+    /// The words and redirections of a simple command, after its assignments.
+    fn parse_simple_command_rest(
+        &mut self,
+        words: &mut Vec<Word>,
+        redirects: &mut Vec<Redirect>,
+        line: &mut usize,
+    ) -> Result<(), ParseError> {
+        loop {
+            if let Some(name) = self.fd_variable_prefix() {
+                self.advance();
+                self.glue_recorded_token();
+                let mut redirect = self.parse_redirect()?;
+                redirect.fd_var = Some(name);
+                redirects.push(redirect);
+            } else if self.is_redirect() {
+                redirects.push(self.parse_redirect()?);
+                if *line == 0 {
+                    *line = self.end_line(self.prev_span);
+                }
+            } else if let Token::Word(w) = &self.current.token {
+                let w = w.clone();
+                words.push(parse_word_parts(&w));
+                self.advance();
+                // `[[` opens a conditional expression: everything up to the
+                // matching `]]` belongs to it, including operator characters.
+                if words.len() == 1 && w == "[[" {
+                    self.parse_conditional_words(words)?;
+                }
+            } else {
+                return Ok(());
+            }
+        }
     }
 
     /// Collect the body of a `[[ ... ]]` conditional, stopping after the closing
@@ -790,37 +942,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_for(&mut self) -> Result<Command, ParseError> {
+        let line = self.end_line(self.current.span);
+        let outer_recording = self.begin_recording();
         self.advance(); // consume "for"
 
         // Check if this is C-style for: for ((
         if let Token::LParen = self.current.token {
             if let Token::LParen = self.peek() {
+                self.finish_recording(outer_recording);
                 return self.parse_c_style_for();
             }
         }
 
-        let var = self.expect_word()?;
-        self.skip_newlines();
-
-        let words = if self.is_keyword("in") {
-            self.advance();
-            let mut ws = Vec::new();
-            while let Token::Word(w) = &self.current.token {
-                let w = w.clone();
-                ws.push(parse_word_parts(&w));
-                self.advance();
-            }
-            // consume separator
-            if self.current.token == Token::Semi || self.current.token == Token::Newline {
-                self.advance();
-            }
-            Some(ws)
-        } else {
-            if self.current.token == Token::Semi || self.current.token == Token::Newline {
-                self.advance();
-            }
-            None
-        };
+        let header = self.parse_loop_header();
+        let text = self.finish_recording(outer_recording);
+        let (var, words) = header?;
 
         self.skip_newlines();
         self.expect_keyword("do")?;
@@ -833,7 +969,37 @@ impl<'a> Parser<'a> {
             words,
             body,
             redirects,
+            line,
+            text,
         }))
+    }
+
+    /// `NAME [in WORD...]` of a `for` or `select`, stopping before the
+    /// separator so the header text excludes it; the separator is consumed
+    /// afterwards.
+    fn parse_loop_header(&mut self) -> Result<(String, Option<Vec<Word>>), ParseError> {
+        let var = self.expect_word()?;
+        self.skip_newlines();
+
+        let words = if self.is_keyword("in") {
+            self.advance();
+            let mut ws = Vec::new();
+            while let Token::Word(w) = &self.current.token {
+                let w = w.clone();
+                ws.push(parse_word_parts(&w));
+                self.advance();
+            }
+            Some(ws)
+        } else {
+            None
+        };
+        let outer = self.recording.take();
+        // consume separator
+        if self.current.token == Token::Semi || self.current.token == Token::Newline {
+            self.advance();
+        }
+        self.recording = outer;
+        Ok((var, words))
     }
 
     fn parse_c_style_for(&mut self) -> Result<Command, ParseError> {
@@ -902,11 +1068,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_case(&mut self) -> Result<Command, ParseError> {
-        self.advance(); // consume "case"
-        let word_str = self.expect_word()?;
-        let word = parse_word_parts(&word_str);
-        self.skip_newlines();
-        self.expect_keyword("in")?;
+        let line = self.end_line(self.current.span);
+        let outer_recording = self.begin_recording();
+        let header = (|| {
+            self.advance(); // consume "case"
+            let word_str = self.expect_word()?;
+            self.skip_newlines();
+            self.expect_keyword("in")?;
+            Ok(word_str)
+        })();
+        // Bash prints the header with the space that would separate it from
+        // the first clause.
+        let text = self.finish_recording(outer_recording) + " ";
+        let word = parse_word_parts(&header?);
         self.skip_newlines();
 
         let mut arms = Vec::new();
@@ -960,6 +1134,8 @@ impl<'a> Parser<'a> {
             word,
             arms,
             redirects,
+            line,
+            text,
         }))
     }
 
@@ -1013,29 +1189,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Command, ParseError> {
+        let line = self.end_line(self.current.span);
+        let outer_recording = self.begin_recording();
         self.advance(); // consume "select"
-        let var = self.expect_word()?;
-        self.skip_newlines();
-
-        let words = if self.is_keyword("in") {
-            self.advance();
-            let mut ws = Vec::new();
-            while let Token::Word(w) = &self.current.token {
-                let w = w.clone();
-                ws.push(parse_word_parts(&w));
-                self.advance();
-            }
-            // consume separator
-            if self.current.token == Token::Semi || self.current.token == Token::Newline {
-                self.advance();
-            }
-            Some(ws)
-        } else {
-            if self.current.token == Token::Semi || self.current.token == Token::Newline {
-                self.advance();
-            }
-            None
-        };
+        let header = self.parse_loop_header();
+        let text = self.finish_recording(outer_recording);
+        let (var, words) = header?;
 
         self.skip_newlines();
         self.expect_keyword("do")?;
@@ -1048,6 +1207,8 @@ impl<'a> Parser<'a> {
             words,
             body,
             redirects,
+            line,
+            text,
         }))
     }
 
@@ -1137,49 +1298,34 @@ impl<'a> Parser<'a> {
             Token::LParen | Token::LBrace => self.parse_compound_command(),
             Token::Word(w) if is_compound_keyword(w) => self.parse_compound_command(),
             Token::Word(w) if w == "coproc" => {
-                // Parse coproc command
-                let w = w.clone();
-                if w == "coproc" {
-                    self.advance(); // consume "coproc"
-
-                    // Check if next token is a name (word without redirects/pipes)
-                    let mut coproc_name = None;
-
-                    // Peek at the next token
-                    let next_is_simple = if let Token::Word(potential_name) = &self.current.token {
-                        let potential = potential_name.clone();
-                        let peek_token = self.peek().clone();
-                        if matches!(peek_token, Token::Word(_) | Token::LParen | Token::LBrace) {
-                            coproc_name = Some(potential);
-                            true
-                        } else {
-                            false
+                self.advance(); // consume "coproc"
+                                // `coproc NAME compound` names the coprocess; a simple command
+                                // cannot be named, so its first word is always the command.
+                let mut name = None;
+                if !self.at_compound_start() {
+                    if let Token::Word(word) = &self.current.token {
+                        let word = word.clone();
+                        let next_is_compound = match self.peek() {
+                            Token::LParen | Token::LBrace => true,
+                            Token::Word(next) => is_compound_keyword(next),
+                            _ => false,
+                        };
+                        if next_is_compound && is_fd_variable_name(&word) && !word.contains('[') {
+                            name = Some(word);
+                            self.advance();
                         }
-                    } else {
-                        false
-                    };
-
-                    if next_is_simple {
-                        self.advance();
                     }
-
-                    // Parse the actual command as simple command
-                    let cmd = self.parse_simple_command()?;
-                    if let Command::Simple(simple) = cmd {
-                        let redirects = self.parse_optional_redirects()?;
-                        Ok(Command::Compound(CompoundCommand::Coproc {
-                            name: coproc_name,
-                            command: Box::new(simple),
-                            redirects,
-                        }))
-                    } else {
-                        Err(ParseError::Unexpected(
-                            "coproc requires a simple command".into(),
-                        ))
-                    }
-                } else {
-                    unreachable!()
                 }
+                let command = if name.is_some() || self.at_compound_start() {
+                    self.parse_compound_command()?
+                } else {
+                    self.parse_simple_command()?
+                };
+                Ok(Command::Compound(CompoundCommand::Coproc {
+                    name,
+                    command: Box::new(command),
+                    redirects: Vec::new(),
+                }))
             }
             Token::Word(w) if w == "function" => {
                 self.advance(); // consume "function"
@@ -1208,13 +1354,43 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// True when the current token opens a compound command.
+    fn at_compound_start(&self) -> bool {
+        match &self.current.token {
+            Token::LParen | Token::LBrace => true,
+            Token::Word(w) => is_compound_keyword(w),
+            _ => false,
+        }
+    }
+
     fn parse_pipeline(&mut self) -> Result<Pipeline, ParseError> {
-        let negated = if self.is_keyword("!") {
-            self.advance();
-            true
-        } else {
-            false
-        };
+        // `time` and `!` prefix a pipeline in either order.
+        let mut negated = false;
+        let mut timed = None;
+        loop {
+            if !negated && self.is_keyword("!") {
+                self.advance();
+                negated = true;
+            } else if timed.is_none() && self.is_keyword("time") {
+                self.advance();
+                timed = Some(TimeFormat::Shell);
+                if self.is_keyword("-p") {
+                    self.advance();
+                    timed = Some(TimeFormat::Posix);
+                }
+            } else {
+                break;
+            }
+        }
+
+        // A bare `time` reports the (empty) timing of nothing, as in bash.
+        if timed.is_some() && !self.is_command_start() {
+            return Ok(Pipeline {
+                negated,
+                commands: Vec::new(),
+                timed,
+            });
+        }
 
         let mut commands = vec![self.parse_command()?];
 
@@ -1224,7 +1400,11 @@ impl<'a> Parser<'a> {
             commands.push(self.parse_command()?);
         }
 
-        Ok(Pipeline { negated, commands })
+        Ok(Pipeline {
+            negated,
+            commands,
+            timed,
+        })
     }
 
     fn parse_and_or(&mut self) -> Result<AndOrList, ParseError> {
@@ -1325,6 +1505,41 @@ pub fn parse(input: &str) -> Result<Vec<CompleteCommand>, ParseError> {
 }
 
 // --- Helper functions ---
+
+fn token_is_redirect(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::RedirectOut
+            | Token::RedirectClobber
+            | Token::RedirectAppend
+            | Token::RedirectIn
+            | Token::HereDoc
+            | Token::HereDocStrip
+            | Token::HereString
+            | Token::DupFd
+            | Token::RedirectAllOut
+            | Token::RedirectAllAppend
+            | Token::RedirectFd(_, _)
+    )
+}
+
+/// The `name` of a `{name}>file` redirection: an identifier, optionally
+/// with one array subscript (`{COPROC[1]}>&-`).
+fn is_fd_variable_name(name: &str) -> bool {
+    let (base, subscript) = match name.find('[') {
+        Some(open) => match name[open + 1..].strip_suffix(']') {
+            Some(subscript) if !subscript.is_empty() => (&name[..open], Some(subscript)),
+            _ => return false,
+        },
+        None => (name, None),
+    };
+    let mut chars = base.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && subscript.is_none_or(|s| !s.contains(['[', ']']))
+}
 
 fn is_reserved_word(w: &str) -> bool {
     matches!(
@@ -2786,5 +3001,91 @@ mod tests {
                     echo done\n\
                    fi\n";
         assert!(parse(src).is_ok(), "{:?}", parse(src));
+    }
+
+    fn simple_commands(src: &str) -> Vec<crate::parser::ast::SimpleCommand> {
+        use crate::parser::ast::{Command, CompoundCommand};
+        fn walk(
+            commands: &[crate::parser::ast::CompleteCommand],
+            out: &mut Vec<crate::parser::ast::SimpleCommand>,
+        ) {
+            for complete in commands {
+                let pipelines = std::iter::once(&complete.list.first)
+                    .chain(complete.list.rest.iter().map(|(_, p)| p));
+                for pipeline in pipelines {
+                    for command in &pipeline.commands {
+                        match command {
+                            Command::Simple(simple) => out.push(simple.clone()),
+                            Command::FunctionDef { body, .. } => {
+                                if let CompoundCommand::BraceGroup { body, .. } = body.as_ref() {
+                                    walk(body, out);
+                                }
+                            }
+                            Command::Compound(CompoundCommand::BraceGroup { body, .. }) => {
+                                walk(body, out)
+                            }
+                            Command::Compound(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&parse(src).expect("parse"), &mut out);
+        out
+    }
+
+    /// Lines follow bash: a plain first word is reported on the line where
+    /// the token after it ends; an assignment or redirection on its own.
+    #[test]
+    fn simple_commands_carry_bash_line_numbers() {
+        let src =
+            "echo a \\\n  b\nx=1 \\\n  y=2\necho \"m\nl\"\nf() {\n  g\n}\ncat <<E\nbody\nE\nlast";
+        let lines: Vec<usize> = simple_commands(src).iter().map(|c| c.line).collect();
+        assert_eq!(lines, [1, 3, 6, 8, 10, 13]);
+    }
+
+    /// `BASH_COMMAND` text: tokens as written, one space apart, with
+    /// descriptor duplications and here-document operators kept whole.
+    #[test]
+    fn simple_commands_carry_their_text() {
+        let texts: Vec<String> =
+            simple_commands("echo   \"a  b\"  2>&1 >/dev/null <<E\nx\nE\nexec {fd}>out")
+                .into_iter()
+                .map(|c| c.text)
+                .collect();
+        assert_eq!(
+            texts,
+            ["echo \"a  b\" 2>&1 > /dev/null <<E", "exec {fd}> out"]
+        );
+    }
+
+    #[test]
+    fn descriptor_variables_and_coproc_and_time_parse() {
+        use crate::parser::ast::{Command, CompoundCommand, TimeFormat};
+        let program = parse(
+            "exec {fd}>&- {arr[1]}<in; x {y}2>z; coproc NAME { cat; }; coproc cat; time -p true",
+        )
+        .expect("parse");
+        let Command::Simple(exec) = &program[0].list.first.commands[0] else {
+            panic!("exec is a simple command");
+        };
+        let names: Vec<_> = exec.redirects.iter().map(|r| r.fd_var.clone()).collect();
+        assert_eq!(names, [Some("fd".to_string()), Some("arr[1]".to_string())]);
+        // `{y}2>z` is an argument followed by an ordinary `2>` redirection.
+        let Command::Simple(plain) = &program[1].list.first.commands[0] else {
+            panic!("simple command");
+        };
+        assert_eq!(plain.words.len(), 2);
+        assert_eq!(plain.redirects[0].fd_var, None);
+        for (index, expected) in [(2, Some("NAME")), (3, None)] {
+            let Command::Compound(CompoundCommand::Coproc { name, .. }) =
+                &program[index].list.first.commands[0]
+            else {
+                panic!("coproc");
+            };
+            assert_eq!(name.as_deref(), expected);
+        }
+        assert_eq!(program[4].list.first.timed, Some(TimeFormat::Posix));
     }
 }

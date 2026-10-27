@@ -323,13 +323,14 @@ fn invalid_top_level_control_flow_diagnoses_and_continues() {
          return; printf 'return:%s\\n' \"$?\"; echo after",
     );
     assert_eq!(output.status.code(), Some(0));
+    // Bash complains but returns 0 for `break`/`continue` outside a loop.
     assert_eq!(
         stdout(&output).lines().collect::<Vec<_>>(),
-        ["break:1", "continue:1", "return:2", "after"]
+        ["break:0", "continue:0", "return:2", "after"]
     );
     let errors = stderr(&output);
-    assert!(errors.contains("break: only meaningful in a loop"));
-    assert!(errors.contains("continue: only meaningful in a loop"));
+    assert!(errors.contains("break: only meaningful in a `for', `while', or `until' loop"));
+    assert!(errors.contains("continue: only meaningful in a `for', `while', or `until' loop"));
     assert!(errors.contains("return: can only return"));
 }
 

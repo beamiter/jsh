@@ -323,6 +323,9 @@ pub struct ShellState {
     pub loop_continue: bool,
     /// Number of active loop constructs in the current execution context.
     pub loop_depth: usize,
+    /// `break N`/`continue N`: how many loops beyond the innermost the
+    /// pending `loop_break`/`loop_continue` still has to leave.
+    pub loop_unwind_levels: usize,
     // Function return control flow
     pub return_requested: bool,
     pub return_value: i32,
@@ -380,6 +383,11 @@ pub struct ShellState {
     /// editor to prefill into the next prompt. Review-only: taking this never
     /// executes anything.
     pub pending_editor_insert: Option<String>,
+    /// Functions, sourced files and the current line: `FUNCNAME`,
+    /// `BASH_SOURCE`, `BASH_LINENO`, `$LINENO`, `BASH_COMMAND`, `$_`.
+    pub call_stack: crate::callstack::CallStack,
+    /// Signal dispositions and in-progress state behind `traps`.
+    pub trap_runtime: crate::traps::TrapRuntime,
 }
 
 impl ShellState {
@@ -465,6 +473,7 @@ impl ShellState {
             loop_break: false,
             loop_continue: false,
             loop_depth: 0,
+            loop_unwind_levels: 0,
             return_requested: false,
             return_value: 0,
             return_depth: 0,
@@ -487,6 +496,8 @@ impl ShellState {
             user_typed_fns: HashMap::new(),
             last_command_sub_status: None,
             pending_editor_insert: None,
+            call_stack: crate::callstack::CallStack::default(),
+            trap_runtime: crate::traps::TrapRuntime::default(),
         }
     }
 
@@ -558,6 +569,12 @@ impl ShellState {
     pub fn get_var(&self, name: &str) -> Option<&str> {
         if name == "?" {
             return None; // handled by expand
+        }
+        // `LINENO`, `BASH_COMMAND` and `$_` change with every command; they
+        // are read from the call stack rather than stored (and exported) as
+        // ordinary variables.
+        if let Some(value) = self.call_stack.dynamic_var(name) {
+            return Some(value);
         }
         // Check local_vars_stack from top to bottom
         for scope in self.local_vars_stack.iter().rev() {

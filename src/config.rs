@@ -188,22 +188,19 @@ fn source_file_lenient(path: &Path, state: &mut ShellState) {
             // own directory is a normal shape, and with the array empty
             // `$(dirname "${BASH_SOURCE[0]}")` silently resolves to the
             // working directory the shell happened to start in.
-            let outer_bash_source = state.arrays.get("BASH_SOURCE").cloned();
-            let mut frames = outer_bash_source.clone().unwrap_or_default();
-            frames.insert(0, path.display().to_string());
-            state.set_array("BASH_SOURCE", frames);
+            state.push_call_frame(crate::callstack::CallFrame::sourced_file(
+                &path.display().to_string(),
+                0,
+            ));
+            let saved_offset = std::mem::replace(&mut state.call_stack.line_offset, 0);
             state.return_depth += 1;
             executor::execute_program(&commands, state);
             state.return_depth -= 1;
             // A return consumed here must not leak into the first command the
             // user types, exactly as in the `source` builtin.
             state.return_requested = false;
-            match outer_bash_source {
-                Some(frames) => state.set_array("BASH_SOURCE", frames),
-                None => {
-                    state.arrays.remove("BASH_SOURCE");
-                }
-            }
+            state.call_stack.line_offset = saved_offset;
+            state.pop_call_frame();
         }
         Err(_) => {
             // Full parse failed, use bash as fallback for complex scripts.

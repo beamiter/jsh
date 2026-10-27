@@ -1423,15 +1423,11 @@ fn prepare_command_substitution_child(state: &mut ShellState) {
     if !state.shell_opts.inherit_errexit {
         state.shell_opts.errexit = false;
     }
-    let inherit_err_trap = state
-        .shell_opts
-        .tracked_opts
-        .get("errtrace")
-        .copied()
-        .unwrap_or(false);
-    if !inherit_err_trap {
-        state.traps.remove("ERR");
-    }
+    // Signal traps, EXIT, and (without errtrace/functrace) ERR, DEBUG and
+    // RETURN are reset as in any subshell.
+    crate::traps::enter_subshell(state);
+    // The body's first line is the line of the command it is part of.
+    state.call_stack.line_offset = state.call_stack.nested_line_offset();
 }
 
 fn expand_command_sub(cmd: &str, state: &mut ShellState) -> String {
@@ -1457,13 +1453,26 @@ fn expand_command_sub(cmd: &str, state: &mut ShellState) -> String {
             close(w).ok();
 
             prepare_command_substitution_child(state);
+            // Bash numbers the body from its first non-blank line.
+            let leading_blank_lines = cmd
+                .lines()
+                .take_while(|line| line.trim().is_empty())
+                .count();
+            state.call_stack.line_offset = state
+                .call_stack
+                .line_offset
+                .saturating_sub(leading_blank_lines);
             match crate::parser::parse(cmd) {
                 // A command substitution is a complete non-interactive shell
                 // program. Reuse its program-level exit/control-flow/errexit
                 // gates rather than executing every parsed command
                 // unconditionally and letting a later command overwrite the
-                // status from `exit` or `set -e`.
-                Ok(cmds) => std::process::exit(crate::executor::execute_program(&cmds, state)),
+                // status from `exit` or `set -e`. Its own EXIT trap runs as
+                // it ends.
+                Ok(cmds) => {
+                    let status = crate::executor::execute_program(&cmds, state);
+                    crate::executor::exit_subshell(state, status)
+                }
                 Err(_) => std::process::exit(2),
             }
         }
@@ -1548,7 +1557,10 @@ fn expand_process_sub(cmd: &str, kind: &ProcessSubKind, state: &mut ShellState) 
             // complete non-interactive program (exit/errexit gates).
             prepare_command_substitution_child(state);
             match crate::parser::parse(cmd) {
-                Ok(cmds) => std::process::exit(crate::executor::execute_program(&cmds, state)),
+                Ok(cmds) => {
+                    let status = crate::executor::execute_program(&cmds, state);
+                    crate::executor::exit_subshell(state, status)
+                }
                 Err(_) => std::process::exit(2),
             }
         }

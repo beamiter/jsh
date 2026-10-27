@@ -24,7 +24,8 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 /// Rejected by jsh's parser, so `source` falls through to the bash helper.
-const FORCE_BASH: &str = "coproc helper_probe { true; }\n";
+/// (Bash's brace-bodied `for` loop; jsh parses `coproc`, the old probe, itself.)
+const FORCE_BASH: &str = "for _ in 1; { :; }\n";
 
 struct Fixture {
     _temp: tempfile::TempDir,

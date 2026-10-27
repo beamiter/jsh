@@ -96,6 +96,12 @@ pub struct Redirect {
     pub kind: RedirectKind,
     pub target: Word,                     // For backward compatibility, kept as Word
     pub here_doc: Option<HereDocOptions>, // Here-doc specific data
+    /// `{name}>file`: the shell picks a free descriptor (10 or above) and
+    /// stores its number in `name` instead of using `fd`. For `{name}>&-` the
+    /// descriptor to close is read from `name`. `name` may be an array
+    /// element (`{COPROC[1]}>&-`).
+    #[serde(default)]
+    pub fd_var: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,6 +109,15 @@ pub struct SimpleCommand {
     pub assignments: Vec<Assignment>,
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
+    /// Line the command is reported on (`$LINENO`, `BASH_LINENO`, `caller`),
+    /// counted from 1 in the text this AST was parsed from. Zero means
+    /// unknown (an AST from an older session snapshot).
+    #[serde(default)]
+    pub line: usize,
+    /// The command as `BASH_COMMAND` and the DEBUG trap report it: its tokens
+    /// as written, joined by single spaces.
+    #[serde(default)]
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +154,12 @@ pub enum CompoundCommand {
         words: Option<Vec<Word>>,
         body: Vec<CompleteCommand>,
         redirects: Vec<Redirect>,
+        /// Line and `BASH_COMMAND` text of the `for ... in ...` header; see
+        /// [`SimpleCommand::line`].
+        #[serde(default)]
+        line: usize,
+        #[serde(default)]
+        text: String,
     },
     CStyleFor {
         init: String,
@@ -161,20 +182,32 @@ pub enum CompoundCommand {
         word: Word,
         arms: Vec<CaseArm>,
         redirects: Vec<Redirect>,
+        /// Line and `BASH_COMMAND` text of the `case ... in` header.
+        #[serde(default)]
+        line: usize,
+        #[serde(default)]
+        text: String,
     },
     Select {
         var: String,
         words: Option<Vec<Word>>,
         body: Vec<CompleteCommand>,
         redirects: Vec<Redirect>,
+        /// Line and `BASH_COMMAND` text of the `select ... in ...` header.
+        #[serde(default)]
+        line: usize,
+        #[serde(default)]
+        text: String,
     },
     Arithmetic {
         expr: String,
         redirects: Vec<Redirect>,
     },
+    /// `coproc cmd args` (a simple command, named `COPROC`) or
+    /// `coproc [NAME] compound-command`.
     Coproc {
         name: Option<String>,
-        command: Box<SimpleCommand>,
+        command: Box<Command>,
         redirects: Vec<Redirect>,
     },
 }
@@ -193,6 +226,18 @@ pub enum Command {
 pub struct Pipeline {
     pub negated: bool,
     pub commands: Vec<Command>,
+    /// `time [-p] pipeline`: report elapsed, user and system time on stderr.
+    #[serde(default)]
+    pub timed: Option<TimeFormat>,
+}
+
+/// Which report the `time` reserved word prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeFormat {
+    /// `$TIMEFORMAT`, or bash's default when it is unset.
+    Shell,
+    /// `time -p`: the fixed POSIX format.
+    Posix,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
