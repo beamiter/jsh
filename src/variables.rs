@@ -1032,6 +1032,7 @@ impl ShellState {
     pub(crate) fn report_assignment_error(&mut self, message: &str) {
         eprintln!("jsh: {message}");
         self.assignment_failed = true;
+        self.assignment_failure_fatal = false;
     }
 
     /// Was an assignment refused since the flag was last taken? Callers clear
@@ -1059,6 +1060,8 @@ impl ShellState {
             Some(error) => {
                 self.expansion_error = outer;
                 self.report_assignment_error(&error);
+                // A malformed `-i` value ends a bash script.
+                self.assignment_failure_fatal = true;
                 None
             }
             None => {

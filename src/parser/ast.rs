@@ -268,4 +268,9 @@ pub struct CompleteCommand {
     pub list: AndOrList,
     pub background: bool,
     pub disown: bool,
+    /// A newline (or the end of the input) follows the command. Bash reads a
+    /// script a line at a time, and an error that stops one command, such as
+    /// a failed expansion, also skips the rest of its line.
+    #[serde(default)]
+    pub ends_line: bool,
 }

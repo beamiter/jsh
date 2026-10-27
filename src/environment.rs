@@ -255,6 +255,28 @@ pub struct CompletionSpec {
     pub suffix: Option<String>,
 }
 
+/// How bash recovers from an error that stops a command before it runs.
+///
+/// A non-interactive bash discards the rest of the input line and reads the
+/// next one (`echo $((1/0)); echo skipped` newline `echo runs`), but inside a
+/// subshell the subshell exits. `eval`, `source` and trap actions recover
+/// line by line within their own text. Some errors end the program instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortKind {
+    /// Skip the rest of the line; under `set -e` exit. Bad substitutions,
+    /// failglob, refused assignment statements.
+    Line,
+    /// Skip the rest of the line, even under `set -e`: an arithmetic error in
+    /// `$((...))` or a substring offset.
+    Arithmetic,
+    /// End the program: an arithmetic error in an array subscript or an
+    /// integer variable's value.
+    Fatal,
+    /// End the program, with status 127 when it is the main shell's: an
+    /// unset parameter under `set -u`, or `${x:?}`.
+    Unbound,
+}
+
 pub struct ShellState {
     /// Global shell variables, the outermost scope. Variables inherited from
     /// the environment start here with the export attribute; see
@@ -296,10 +318,23 @@ pub struct ShellState {
     /// Expansion returns vectors for compatibility, so the executor consumes
     /// this immediately after `expand_words`.
     pub expansion_error: Option<String>,
-    /// Stop the remainder of the currently parsed program after a fatal
-    /// expansion error. Unlike `errexit`, failglob aborts the list even when
-    /// `set -e` is disabled.
+    /// How bash recovers from the pending `expansion_error`, recorded with
+    /// the message it applies to. See [`ShellState::raise_expansion_error`].
+    pub expansion_error_kind: Option<(String, AbortKind)>,
+    /// Stop the remainder of the current command line after an error such as
+    /// a failed expansion or a refused assignment. Unlike `errexit`, failglob
+    /// aborts the list even when `set -e` is disabled.
     pub abort_current_program: bool,
+    /// The abort ends the whole program (a script, a `-c` string) rather
+    /// than just the rest of its line. See [`ShellState::abort_program`].
+    pub abort_fatal: bool,
+    /// This process is a subshell (`( )`, a pipeline stage, a command
+    /// substitution, ...). An error that would skip one line of the main
+    /// shell's input ends a subshell instead.
+    pub in_subshell: bool,
+    /// The refused assignment was a malformed `-i` value, which bash treats
+    /// as fatal rather than skipping the rest of the line.
+    pub assignment_failure_fatal: bool,
     /// Nesting depth for contexts where Bash ignores `errexit` (the tested
     /// operands of `&&`, `||`, `!`, and shell-condition command lists).
     pub errexit_suppression_depth: usize,
@@ -459,7 +494,11 @@ impl ShellState {
             traps: HashMap::new(),
             pipestatus: Vec::new(),
             expansion_error: None,
+            expansion_error_kind: None,
             abort_current_program: false,
+            abort_fatal: false,
+            in_subshell: false,
+            assignment_failure_fatal: false,
             errexit_suppression_depth: 0,
             errexit_status: None,
             last_failure_exempt: false,
@@ -515,6 +554,47 @@ impl ShellState {
 
     pub fn take_expansion_error(&mut self) -> Option<String> {
         self.expansion_error.take()
+    }
+
+    /// Record an expansion error that bash recovers from in a particular
+    /// way; a plain `expansion_error` is an [`AbortKind::Line`] error.
+    pub fn raise_expansion_error(&mut self, message: String, kind: AbortKind) {
+        self.expansion_error_kind = Some((message.clone(), kind));
+        self.expansion_error = Some(message);
+    }
+
+    /// Take the pending expansion error and how to recover from it.
+    pub fn take_expansion_failure(&mut self) -> Option<(String, AbortKind)> {
+        let message = self.expansion_error.take()?;
+        let kind = match self.expansion_error_kind.take() {
+            Some((raised, kind)) if raised == message => kind,
+            _ => AbortKind::Line,
+        };
+        Some((message, kind))
+    }
+
+    /// The status of a command stopped by `set -u` or `${x:?}`: 127, with
+    /// which a script's shell then exits, or 1 in a subshell or an
+    /// interactive shell, as in bash.
+    pub fn unbound_status(&self) -> i32 {
+        if self.in_subshell || self.interactive {
+            1
+        } else {
+            127
+        }
+    }
+
+    /// Stop the rest of the current command line after an error, the way
+    /// bash does. Whether the program then carries on with its next line
+    /// depends on `kind` and `set -e`; see [`AbortKind`].
+    pub fn abort_program(&mut self, kind: AbortKind) {
+        self.abort_current_program = true;
+        let fatal = match kind {
+            AbortKind::Fatal | AbortKind::Unbound => true,
+            AbortKind::Line => self.shell_opts.errexit,
+            AbortKind::Arithmetic => false,
+        };
+        self.abort_fatal |= fatal;
     }
 
     /// Phase 14a: record a structured error. `msg` is the human-readable

@@ -1,6 +1,6 @@
 /// AST executor: fork/exec, pipes, redirects, compound commands.
 use crate::builtins;
-use crate::environment::ShellState;
+use crate::environment::{AbortKind, ShellState};
 use crate::expand::{expand_word, expand_word_to_string, expand_words};
 use crate::parser::ast::*;
 use crate::signal;
@@ -154,10 +154,11 @@ fn exec_error_info(_cmd_name: &str) -> (&'static str, i32) {
 }
 
 pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> i32 {
-    // A parsed command line/script is the lifetime of a fatal expansion
-    // failure. Keep the flag set while unwinding nested compound lists, then
-    // allow the next independently parsed program to run.
+    // An error that stops a command (a failed expansion, a refused
+    // assignment) unwinds nested compound lists and function calls back to
+    // here, where bash carries on with the next line; see `AbortKind`.
     state.abort_current_program = false;
+    state.abort_fatal = false;
     state.errexit_status = None;
     state.last_failure_exempt = false;
     if exit_requested() {
@@ -171,7 +172,12 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
     }
     traps::run_pending_traps(state);
     let mut last = 0;
+    let mut skip_line = false;
     for cmd in commands {
+        if skip_line {
+            skip_line = !cmd.ends_line;
+            continue;
+        }
         if let Some(status) = signal::take_pending_status() {
             last = status;
             state.last_exit_code = status;
@@ -193,6 +199,10 @@ pub fn execute_program(commands: &[CompleteCommand], state: &mut ShellState) -> 
         }
 
         if state.abort_current_program {
+            if recover_from_abort(state, &mut last) {
+                skip_line = !cmd.ends_line;
+                continue;
+            }
             state.last_exit_code = last;
             break;
         }
@@ -327,6 +337,22 @@ fn exit_requested() -> bool {
     builtins::EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// After an error stopped a command, decide whether its program carries on.
+/// Bash skips the rest of the line, leaves `$?` non-zero and reads the next
+/// line, without running the ERR trap. A subshell exits instead, and a fatal
+/// error ends the program. True when the caller should skip to the next line.
+fn recover_from_abort(state: &mut ShellState, last: &mut i32) -> bool {
+    if state.abort_fatal || state.in_subshell {
+        return false;
+    }
+    state.abort_current_program = false;
+    if *last == 0 {
+        *last = 1;
+    }
+    state.last_exit_code = *last;
+    true
+}
+
 fn control_flow_requested(state: &ShellState) -> bool {
     execution_unwind_requested(state) || state.loop_break || state.loop_continue
 }
@@ -373,12 +399,13 @@ fn execute_pipeline_in_context(
 fn report_nounset(state: &mut ShellState, param: &str) -> i32 {
     let message = format!("{}: unbound variable", param);
     eprintln!("jsh: {}", message);
-    state.set_error(message, 1);
-    state.last_exit_code = 1;
+    let status = state.unbound_status();
+    state.set_error(message, status);
+    state.last_exit_code = status;
     if !state.interactive {
-        state.abort_current_program = true;
+        state.abort_program(AbortKind::Unbound);
     }
-    1
+    status
 }
 
 /// The first parameter reference in `words` that `set -u` should reject, spelled
@@ -488,12 +515,16 @@ fn run_arith_clause(expr: &str, state: &mut ShellState) -> Result<i64, i32> {
 }
 
 fn report_expansion_error(state: &mut ShellState) -> Option<i32> {
-    state.take_expansion_error().map(|message| {
+    state.take_expansion_failure().map(|(message, kind)| {
         eprintln!("jsh: {}", message);
-        state.set_error(message, 1);
-        state.last_exit_code = 1;
-        state.abort_current_program = true;
-        1
+        let status = match kind {
+            AbortKind::Unbound => state.unbound_status(),
+            _ => 1,
+        };
+        state.set_error(message, status);
+        state.last_exit_code = status;
+        state.abort_program(kind);
+        status
     })
 }
 
@@ -532,7 +563,10 @@ fn execute_complete_command_outcome(
                 if !cmd.disown {
                     let cmd_str = "(background)";
                     let jid = state.jobs.add(child, cmd_str.to_string());
-                    eprintln!("[{}] {}", jid, child);
+                    // Like bash, only an interactive shell announces the job.
+                    if state.interactive {
+                        eprintln!("[{}] {}", jid, child);
+                    }
                 }
                 state.last_exit_code = 0;
                 return CommandOutcome {
@@ -1719,11 +1753,16 @@ fn execute_simple_body(
                 return code;
             }
             // A refused assignment statement (readonly variable, bad
-            // subscript, malformed integer) is fatal for the command line in
-            // bash: nothing after it on the line runs.
+            // subscript, malformed integer) stops the command line in bash:
+            // nothing after it on the line runs.
             if state.take_assignment_failure() {
                 state.last_exit_code = 1;
-                state.abort_current_program = true;
+                let kind = if std::mem::take(&mut state.assignment_failure_fatal) {
+                    AbortKind::Fatal
+                } else {
+                    AbortKind::Line
+                };
+                state.abort_program(kind);
                 return 1;
             }
         }
@@ -2412,6 +2451,9 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
             with_redirects(redirects, state, |state| {
                 begin_command(state, *line, text);
                 let value = expand_word_to_string(word, state);
+                if let Some(code) = report_expansion_error(state) {
+                    return code;
+                }
                 let mut last = 0;
                 let mut i = 0;
                 // `fall` is true when the previous arm ended with ;& and we must
@@ -2424,8 +2466,12 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                     let hit = fall
                         || arm.patterns.iter().any(|p| {
                             let pat = crate::expand::expand_pattern_word(p, state);
-                            crate::expand::pattern_matches(&pat, &value, state)
+                            state.expansion_error.is_none()
+                                && crate::expand::pattern_matches(&pat, &value, state)
                         });
+                    if let Some(code) = report_expansion_error(state) {
+                        return code;
+                    }
                     if hit {
                         last = execute_command_list(&arm.body, state);
                         if control_flow_requested(state) {
@@ -2697,8 +2743,32 @@ fn start_coprocess(name: &str, command: &Command, state: &mut ShellState) -> i32
 
 /// Run a trap action's commands as a command list: between them the ERR
 /// trap, `set -e` and newly arrived signals apply, as they do in bash.
+/// Like `eval`, an action recovers from an error line by line.
 pub(crate) fn execute_trap_commands(cmds: &[CompleteCommand], state: &mut ShellState) -> i32 {
-    execute_command_list(cmds, state)
+    if control_flow_requested(state) {
+        return state.last_exit_code;
+    }
+    let mut code = 0;
+    let mut skip_line = false;
+    for cmd in cmds {
+        if skip_line {
+            skip_line = !cmd.ends_line;
+            continue;
+        }
+        let outcome = execute_complete_command_outcome(cmd, state);
+        code = outcome.status;
+        if state.abort_current_program && recover_from_abort(state, &mut code) {
+            skip_line = !cmd.ends_line;
+            continue;
+        }
+        if control_flow_requested(state) {
+            return code;
+        }
+        if after_list_command(state, code, outcome.failure_exempt) {
+            return code;
+        }
+    }
+    code
 }
 
 fn execute_command_list(cmds: &[CompleteCommand], state: &mut ShellState) -> i32 {

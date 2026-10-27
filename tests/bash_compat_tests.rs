@@ -370,7 +370,8 @@ fn question_mark_operator_reports_and_aborts() {
     let (out, err, code) = run(r#"echo before; echo "${u:?is required}"; echo after"#);
     assert_eq!(out, "before\n");
     assert!(err.contains("u: is required"), "got stderr {:?}", err);
-    assert_eq!(code, 1);
+    // A script's shell exits with 127, as bash's does.
+    assert_eq!(code, 127);
 }
 
 #[test]

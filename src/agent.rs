@@ -1699,7 +1699,7 @@ fn take_agent_interrupt(session: &mut AgentSession, state: &mut ShellState) -> O
         // SIGINT is consumable so the interactive shell can return to its next
         // prompt. Preserve its control-flow meaning separately: do not run a
         // later command from the same parsed `agent ...; ...` list.
-        state.abort_current_program = true;
+        state.abort_program(crate::environment::AbortKind::Fatal);
         eprintln!("agent: interrupted");
     })
 }

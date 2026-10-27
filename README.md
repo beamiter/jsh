@@ -1048,11 +1048,12 @@ measurements, not whole-shell startup or cross-shell rankings.
 
 ## Current compatibility boundaries
 
-jsh's Bash compatibility is measured against bash 5.2 with a corpus of 1,055
+jsh's Bash compatibility is measured against bash 5.2 with a corpus of 1,114
 small scripts (`tests/data/bash_probes/`) covering arithmetic, builtins,
-variables and parameter expansion, execution and traps, and coreutils-style
-commands. Each script's stdout and exit status are compared; 1,050 match,
-and the remaining five are listed with reasons in `known_differences.txt`.
+variables and parameter expansion, execution and traps, error recovery, and
+coreutils-style commands. Each script's stdout and exit status are compared;
+1,110 match, and the remaining four are listed with reasons in
+`known_differences.txt`.
 Run the comparison on a machine with bash 5.x:
 
 ```sh
@@ -1068,10 +1069,11 @@ Known differences and limits:
   form follows Bash.
 - Alias expansion stays enabled in non-interactive `-c` scripts and script
   files (Bash disables it there), so `type -t` reports aliases in both modes.
-- An unset-variable error under `set -u` exits with status 1 under `-c` as
-  well; Bash uses 127 there. A refused assignment (for example to a readonly
-  variable) ends the whole `-c` string or script, where Bash ends only the
-  current line.
+- Errors that stop a command follow Bash: a failed expansion or a refused
+  assignment skips the rest of its line and the script continues, while
+  `set -u`, `${x:?}` and bad array indexes end it. A script is parsed whole
+  before it runs, though, so a syntax error on any line stops it before its
+  first line runs; Bash runs the lines before the error.
 - After `exit` inside a function, the EXIT trap sees an empty `FUNCNAME`.
 - `export -f` and `readonly -f` accept existing function names but do not
   export or protect function definitions. The deprecated `$[expr]` arithmetic

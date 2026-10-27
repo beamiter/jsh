@@ -1,0 +1,180 @@
+### discard_rest_of_line
+echo a; echo $((1/0)); echo b
+echo c
+### discard_multiline_compound
+if true; then
+ echo $((1/0))
+ echo after
+fi; echo same
+echo next
+### discard_unwinds_function
+f() { echo $((1/0)); echo in-f; }; f; echo same
+echo next
+### discard_ends_subshell
+( echo $((1/0)); echo sub-b ); echo st=$?
+echo next
+### discard_ends_command_substitution
+x=$(echo c1 $((1/0)); echo c2
+echo c3); echo "st=$? x=$x"
+echo next
+### discard_eval_boundary
+eval 'echo $((1/0)); echo in-eval'; echo after-eval st=$?
+echo next
+### discard_eval_next_line
+eval 'echo e1 $((1/0)); echo e2
+echo e3'; echo after st=$?
+echo next
+### discard_eval_in_function
+f() { eval 'echo $((1/0))'; echo in-f; }; f; echo same
+### discard_eval_in_subshell
+( eval 'echo $((1/0))
+echo e2'; echo after )
+echo next
+### discard_source_next_line
+printf 'echo s1 $((1/0)); echo s2\necho s3\n' > f.sh; source ./f.sh; echo after st=$?
+echo next
+### discard_unwinds_loop
+for i in 1 2; do echo $i $((1/0)); done; echo same
+echo next
+### discard_pipeline_stage
+echo x | while read l; do echo $((1/0)); echo in-loop; done; echo same
+echo next
+### discard_skips_err_trap
+trap 'echo ERR' ERR; echo $((1/0)); echo same
+echo next st=$?
+### discard_arith_ignores_errexit
+set -e; echo $((1/0)); echo same
+echo next st=$?
+### discard_arith_assignment
+x=$((1/0)); echo same
+echo next
+### discard_arith_recursive
+x=1/0; echo $(( x )); echo same
+echo next
+### discard_substring_offset
+x=abc; echo ${x:1/0}; echo same
+echo next
+### discard_substring_unset_unevaluated
+unset x; echo "[${x:1/0}]"; echo same
+### discard_case_word
+case $((1/0)) in *) ;; esac; echo same
+echo next
+### discard_case_pattern
+case x in $((1/0))) echo m;; esac; echo same
+echo next
+### discard_bad_substitution
+echo ${}; echo same
+echo next st=$?
+### discard_failglob
+shopt -s failglob; echo /nonexist*; echo same
+echo next st=$?
+### discard_readonly_assignment
+readonly R=1; R=2; echo same
+echo next st=$?
+### discard_readonly_local_in_function
+f() { local -r L=1; L=2; echo in-f; }; f; echo same
+echo next st=$?
+### discard_bad_array_subscript
+a=(1); a[-5]=x; echo same st=$?
+echo next
+### discard_readonly_each_line
+echo ok; readonly R=1
+R=2
+echo next st=$?
+R=3; echo no
+echo last st=$?
+### discard_and_or_across_lines
+echo a &&
+echo $((1/0)) &&
+echo b; echo same
+echo next
+### discard_heredoc_line
+cat <<X; echo $((1/0)); echo same
+body
+X
+echo next
+### discard_trap_action_lines
+trap 'echo t1 $((1/0)); echo t2
+echo t3' EXIT; echo body
+### discard_signal_trap_action
+trap 'echo $((1/0)); echo t2
+echo t3' USR1; kill -USR1 $$; echo after
+echo next
+### discard_background_job
+echo $((1/0)); echo same &
+wait; echo next
+### readonly_prefix_assignment_runs_command
+readonly R=1; R=2 echo hi; echo same
+echo next st=$?
+### errexit_readonly_is_fatal
+readonly R=1; set -e; R=2; echo same
+echo next
+### errexit_readonly_in_condition_is_fatal
+readonly R=1; set -e; R=2 || echo handled; echo same
+### errexit_bad_subscript_is_fatal
+set -e; a=(1); a[-5]=x; echo same
+echo next
+### errexit_failglob_is_fatal
+set -e; shopt -s failglob; if echo /nonexist*; then :; fi; echo same
+echo next
+### errexit_bad_substitution_in_function
+set -e; f() { echo ${}; echo in-f; }; f || echo handled; echo same
+echo next
+### fatal_integer_assignment
+declare -i n; n=1/0; echo same st=$?
+echo next
+### fatal_integer_syntax
+declare -i n; n='1+'; echo same
+echo next
+### fatal_integer_append
+declare -i n=1; n+=1/0; echo same
+echo next
+### fatal_subscript_read
+a=(1 2); echo ${a[1/0]}; echo same
+echo next
+### fatal_subscript_default
+a=(1 2); echo ${a[1/0]:-d}; echo same
+echo next
+### fatal_subscript_assignment
+a[1/0]=x; echo same
+echo next
+### fatal_subscript_exit_trap_status
+trap 'echo exit-trap st=$?' EXIT; a=(1); echo ${a[1/0]}
+### unbound_exits_127
+set -u; echo $nope; echo same
+echo next
+### unbound_in_function_exits_127
+set -u; f() { echo $nope; }; f
+### unbound_through_eval
+set -u; eval 'echo $nope'; echo after
+echo next
+### unbound_arith_command
+set -u; (( nope + 1 )); echo same
+### unbound_let
+set -u; let nope+1; echo same
+### unbound_in_subshell_status_1
+( set -u; echo $nope ); echo st=$?
+### unbound_exit_trap_status
+trap 'echo exit-trap st=$?' EXIT; set -u; echo $nope
+### unset_question_exits_127
+echo ${x:?gone}; echo same
+echo next
+### unset_question_exit_trap_status
+trap 'echo exit-trap st=$?' EXIT; echo ${x:?}
+### background_job_not_announced
+sleep 0.1 & wait; echo done
+### arith_command_error_continues
+(( 1/0 )); echo same st=$?
+echo next
+### let_error_continues
+let 1/0; echo same st=$?
+echo next
+### for_arith_error_continues
+for ((i=1/0;;)); do :; done; echo same
+echo next
+### readonly_declare_continues
+readonly R=1; declare R=2; echo same st=$?
+echo next
+### readonly_for_variable_continues
+readonly R=1; for R in 1; do :; done; echo same
+echo next st=$?

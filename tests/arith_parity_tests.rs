@@ -403,8 +403,8 @@ fn error_messages_name_the_failing_text() {
 }
 
 /// `set -u` makes an unset variable in arithmetic fatal, whether it is spliced
-/// in (`$q`) or named (`q`), in every arithmetic context. (Bash exits with 127
-/// here; jsh reports unbound variables with status 1 everywhere.)
+/// in (`$q`) or named (`q`), in every arithmetic context. The shell exits
+/// with 127, as bash's does.
 #[test]
 fn unbound_variables_abort_under_set_u() {
     for script in [
@@ -416,7 +416,7 @@ fn unbound_variables_abort_under_set_u() {
         "set -u; set -- 1; echo $(( $1 + $2 )); echo after",
     ] {
         let (out, err, code) = run(script);
-        assert_eq!((out.as_str(), code), ("", 1), "{script}: {err}");
+        assert_eq!((out.as_str(), code), ("", 127), "{script}: {err}");
         assert!(err.contains("unbound variable"), "{script}: {err}");
     }
     let (out, err, code) = run("set -u; a=(1); echo $((a[5])) $(( ${q:-2} + 1 ))");

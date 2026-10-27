@@ -1213,6 +1213,8 @@ mod tests {
                 .iter()
                 .map(|command| {
                     let mut command = command.clone();
+                    // Printing may join or split lines.
+                    command.ends_line = false;
                     command.list.first = Self::pipeline(&command.list.first);
                     for (_, pipeline) in &mut command.list.rest {
                         *pipeline = Self::pipeline(pipeline);
@@ -1272,6 +1274,7 @@ mod tests {
                         },
                         background: false,
                         disown: false,
+                        ends_line: false,
                     }],
                     redirects: Vec::new(),
                 },
@@ -1312,6 +1315,7 @@ mod tests {
                             },
                             background: false,
                             disown: false,
+                            ends_line: false,
                         }]);
                     }
                     let (condition, body) = &conditions[0];

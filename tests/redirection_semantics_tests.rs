@@ -161,7 +161,8 @@ fn redirection_expansion_requires_exactly_one_filename() {
         dir.path(),
         "set -u; printf NEVER > $missing; printf ALSO_NEVER",
     );
-    assert_eq!(output.status.code(), Some(1));
+    // Bash's script shell exits with 127 on an unset variable.
+    assert_eq!(output.status.code(), Some(127));
     assert!(output.stdout.is_empty());
 }
 

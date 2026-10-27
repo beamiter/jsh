@@ -2,7 +2,7 @@
 //! positional and special parameters, `${#...}`, `${!...}`) and every
 //! operator bash applies to them, element by element for `@`/`*` lists.
 
-use crate::environment::ShellState;
+use crate::environment::{AbortKind, ShellState};
 use crate::parser::ast::{Word, WordPart};
 use crate::variables::{
     array_assignment_body, double_quote_value, quote_assoc_key, single_quote_value, VarValue,
@@ -317,7 +317,7 @@ pub(super) fn expand_param(body: &str, state: &mut ShellState) -> ParamResult {
                 None if spec.name.as_bytes()[0].is_ascii_digit() => format!("${}", spec.name),
                 None => spec.name.to_string(),
             };
-            state.expansion_error = Some(format!("{what}: unbound variable"));
+            state.raise_expansion_error(format!("{what}: unbound variable"), AbortKind::Unbound);
             return ParamResult::Unset;
         }
     }
@@ -410,7 +410,9 @@ fn element_value(name: &str, subscript: &str, state: &mut ShellState) -> Result<
         Ok(n) => n,
         Err(_) => {
             let value = expand_arithmetic(&key, state);
-            if state.expansion_error.is_some() {
+            if let Some(message) = state.expansion_error.take() {
+                // Unlike `$((...))`, a bad index ends a bash script.
+                state.raise_expansion_error(message, AbortKind::Fatal);
                 return Ok(Base::Unset);
             }
             value.trim().parse().unwrap_or(0)
@@ -525,7 +527,7 @@ fn apply_operator(body: &str, spec: &Spec<'_>, base: Base, state: &mut ShellStat
                     Some(sub) => format!("{}[{}]", spec.name, sub),
                     None => spec.name.to_string(),
                 };
-                state.expansion_error = Some(if message.is_empty() {
+                let message = if message.is_empty() {
                     if colon {
                         format!("{what}: parameter null or not set")
                     } else {
@@ -533,7 +535,8 @@ fn apply_operator(body: &str, spec: &Spec<'_>, base: Base, state: &mut ShellStat
                     }
                 } else {
                     format!("{what}: {message}")
-                });
+                };
+                state.raise_expansion_error(message, AbortKind::Unbound);
                 ParamResult::Unset
             }
         };
@@ -568,7 +571,7 @@ fn apply_operator(body: &str, spec: &Spec<'_>, base: Base, state: &mut ShellStat
             base.map(|value| convert_case(value, first, all, pattern.as_deref(), options))
                 .into_result()
         }
-        b':' => substring(&op[1..], base, state),
+        b':' => substring(spec.name, &op[1..], base, state),
         b'@' if op.len() == 2 => transform(spec, op.as_bytes()[1], base, state),
         _ => bad_substitution(body, state),
     }
@@ -986,13 +989,25 @@ fn eval_arith_operand(text: &str, state: &mut ShellState) -> Option<i64> {
 
 /// `${v:offset}` / `${v:offset:length}`: substring of a scalar, slice of a
 /// list. Offset and length are arithmetic expressions.
-fn substring(spec: &str, base: Base, state: &mut ShellState) -> ParamResult {
+fn substring(name: &str, spec: &str, base: Base, state: &mut ShellState) -> ParamResult {
+    // Bash leaves the offset of an unset variable unevaluated.
+    if matches!(base, Base::Unset) {
+        return ParamResult::Unset;
+    }
     let (offset_text, length_text) = split_offset_length(spec);
-    let Some(offset) = eval_arith_operand(offset_text, state) else {
+    let operand = |text: &str, state: &mut ShellState| {
+        let value = eval_arith_operand(text, state);
+        // Bash names the variable: `x: 1/0: division by 0`.
+        if let Some((message, kind)) = state.take_expansion_failure() {
+            state.raise_expansion_error(format!("{name}: {message}"), kind);
+        }
+        value
+    };
+    let Some(offset) = operand(offset_text, state) else {
         return ParamResult::Unset;
     };
     let length = match length_text {
-        Some(text) => match eval_arith_operand(text, state) {
+        Some(text) => match operand(text, state) {
             Some(n) => Some(n),
             None => return ParamResult::Unset,
         },

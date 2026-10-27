@@ -560,6 +560,7 @@ pub fn leave_function(state: &mut ShellState, saved: SavedFunctionTraps) {
 /// trap is dropped, and ERR/DEBUG/RETURN survive only under errtrace or
 /// functrace.
 pub fn enter_subshell(state: &mut ShellState) {
+    state.in_subshell = true;
     let errtrace = shell_flag(state, "errtrace");
     let functrace = shell_flag(state, "functrace");
     let mut reset: HashMap<String, String> = HashMap::new();

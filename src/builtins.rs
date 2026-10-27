@@ -850,7 +850,7 @@ fn builtin_loop_control(name: &str, args: &[String], state: &mut ShellState) -> 
     };
     let fatal = |state: &mut ShellState, status: i32| {
         if state.interactive {
-            state.abort_current_program = true;
+            state.abort_program(crate::environment::AbortKind::Fatal);
         } else {
             EXIT_CODE.store(status, Ordering::SeqCst);
             EXIT_REQUESTED.store(true, Ordering::SeqCst);
@@ -3162,11 +3162,16 @@ fn builtin_let(args: &[String], state: &mut ShellState) -> i32 {
         match crate::expand::evaluate_arithmetic_text(expression, state) {
             Ok(value) => last = value,
             Err(message) => {
-                eprintln!("jsh: let: {message}");
                 // `set -u` rejecting an unset variable is fatal, as it is in
                 // any expansion; other failures just make `let` return 1.
-                if state.expansion_error.take().is_some() && !state.interactive {
-                    state.abort_current_program = true;
+                if state.expansion_error.take().is_none() {
+                    eprintln!("jsh: let: {message}");
+                    return 1;
+                }
+                eprintln!("jsh: {message}");
+                if !state.interactive {
+                    state.abort_program(crate::environment::AbortKind::Unbound);
+                    return state.unbound_status();
                 }
                 return 1;
             }

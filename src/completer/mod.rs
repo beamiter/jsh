@@ -564,7 +564,7 @@ fn apply_completion_spec(
                 state.return_depth,
             );
             let saved_loop = (state.loop_break, state.loop_continue, state.loop_depth);
-            let saved_abort = state.abort_current_program;
+            let saved_abort = (state.abort_current_program, state.abort_fatal);
             let saved_errexit = state.errexit_status.take();
             let saved_failure_exempt = std::mem::replace(&mut state.last_failure_exempt, false);
             let saved_expansion_error = state.expansion_error.take();
@@ -577,6 +577,7 @@ fn apply_completion_spec(
             state.loop_continue = false;
             state.loop_depth = 0;
             state.abort_current_program = false;
+            state.abort_fatal = false;
 
             // Execute the function
             crate::executor::execute_compound(&func_body, state);
@@ -607,7 +608,7 @@ fn apply_completion_spec(
                 state.return_depth,
             ) = saved_return;
             (state.loop_break, state.loop_continue, state.loop_depth) = saved_loop;
-            state.abort_current_program = saved_abort;
+            (state.abort_current_program, state.abort_fatal) = saved_abort;
             state.errexit_status = saved_errexit;
             state.last_failure_exempt = saved_failure_exempt;
             state.expansion_error = saved_expansion_error;

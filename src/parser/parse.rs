@@ -1442,6 +1442,7 @@ impl<'a> Parser<'a> {
             list,
             background,
             disown,
+            ends_line: false,
         })
     }
 
@@ -1468,11 +1469,14 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
 
         while self.is_command_start() {
-            commands.push(self.parse_complete_command()?);
+            let mut command = self.parse_complete_command()?;
             // consume separators
             while self.current.token == Token::Semi || self.current.token == Token::Newline {
+                command.ends_line |= self.current.token == Token::Newline;
                 self.advance();
             }
+            command.ends_line |= self.current.token == Token::Eof;
+            commands.push(command);
         }
 
         Ok(commands)

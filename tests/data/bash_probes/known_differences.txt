@@ -7,7 +7,6 @@ x_brace_json_kept  a word that is a JSON object literal stays one word for struc
 #
 # Open differences.
 y_exit_in_function_with_exit_trap  FUNCNAME is already unwound when `exit` in a function reaches the EXIT trap
-y_nounset_array_element  an unset-variable error under `set -u` exits 1; bash -c exits 127
 #
 # Nondeterministic in bash itself: whole-second SECONDS depends on where
 # the start time falls within its second.

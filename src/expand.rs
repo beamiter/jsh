@@ -1,6 +1,6 @@
 /// Variable, tilde, glob, command substitution, arithmetic, array, and process
 /// substitution expansion.
-use crate::environment::ShellState;
+use crate::environment::{AbortKind, ShellState};
 use crate::parser::ast::{InterpPart, PathSeg, ProcessSubKind, Word, WordPart};
 use crate::value::Value;
 
@@ -1211,7 +1211,7 @@ pub fn expand_arithmetic(expr: &str, state: &mut ShellState) -> String {
         Ok(value) => value.to_string(),
         Err(ArithFailure::Expansion) => "0".into(),
         Err(ArithFailure::Eval(message)) => {
-            state.expansion_error = Some(message);
+            state.raise_expansion_error(message, AbortKind::Arithmetic);
             "0".into()
         }
     }
@@ -1250,7 +1250,7 @@ pub fn evaluate_arithmetic_text(text: &str, state: &mut ShellState) -> Result<i6
     eval_arith_text(text, state).map_err(|error| {
         let message = error.to_string();
         if error.0.fatal {
-            state.expansion_error = Some(message.clone());
+            state.raise_expansion_error(message.clone(), AbortKind::Unbound);
         }
         message
     })
@@ -1276,8 +1276,9 @@ pub(crate) fn resolve_array_subscript(
     match eval_arithmetic(subscript, state) {
         Ok(index) => Some(index.to_string()),
         Err(ArithFailure::Expansion) => None,
+        // Unlike `$((...))`, a bad index ends a bash script.
         Err(ArithFailure::Eval(message)) => {
-            state.expansion_error = Some(message);
+            state.raise_expansion_error(message, AbortKind::Fatal);
             None
         }
     }
@@ -1349,7 +1350,10 @@ pub fn expand_arithmetic_text<'a>(
         if let WordPart::Variable(name) = &part {
             if state.shell_opts.nounset {
                 if let Some(param) = crate::executor::unset_parameter(name, state) {
-                    state.expansion_error = Some(format!("{param}: unbound variable"));
+                    state.raise_expansion_error(
+                        format!("{param}: unbound variable"),
+                        AbortKind::Unbound,
+                    );
                     return None;
                 }
             }
