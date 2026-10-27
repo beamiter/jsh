@@ -2693,8 +2693,10 @@ fn variable_is_set(name: &str, state: &mut ShellState) -> bool {
 
 /// `-R NAME`: is NAME a nameref? jsh has no namerefs (`declare -n`), so no
 /// variable ever is one.
-fn is_nameref(_name: &str, _state: &ShellState) -> bool {
-    false
+fn is_nameref(name: &str, state: &ShellState) -> bool {
+    state
+        .find_variable(name)
+        .is_some_and(|var| var.attrs.contains(crate::variables::VarAttrs::NAMEREF))
 }
 
 fn is_symlink(path: &str) -> bool {
@@ -3789,7 +3791,10 @@ fn is_cond_binary_op(op: &str) -> bool {
 /// BASH_REMATCH is populated with the whole match followed by the capture
 /// groups; `=~` is close to useless without it.
 fn eval_regex_match(left: &str, right: &str, state: &mut ShellState) -> i32 {
-    match regex::Regex::new(right) {
+    let built = regex::RegexBuilder::new(right)
+        .case_insensitive(crate::expand::nocasematch(state))
+        .build();
+    match built {
         Ok(re) => {
             if let Some(captures) = re.captures(left) {
                 let mut rematch = Vec::new();
@@ -3821,6 +3826,15 @@ fn eval_regex_match(left: &str, right: &str, state: &mut ShellState) -> i32 {
 /// the same answer. `[` counts as one ; `[[ a == [ab] ]]` is true ; and so do
 /// the extended-glob openers once `shopt -s extglob` is on.
 fn cond_pattern_match(pattern: &str, text: &str, state: &ShellState) -> bool {
+    // `shopt -s nocasematch` folds case for `[[ == ]]` as it does for `case`.
+    if crate::expand::nocasematch(state) {
+        let (pattern, text) = (pattern.to_lowercase(), text.to_lowercase());
+        return cond_pattern_match_exact(&pattern, &text, state);
+    }
+    cond_pattern_match_exact(pattern, text, state)
+}
+
+fn cond_pattern_match_exact(pattern: &str, text: &str, state: &ShellState) -> bool {
     let extglob = state.shell_opts.extglob;
     let is_pattern = pattern.contains(['*', '?', '['])
         || (extglob && crate::glob_match::contains_extglob(pattern));

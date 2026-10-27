@@ -936,3 +936,11 @@ fn printf_v_output_is_bounded() {
     assert_eq!(status, 0);
     assert_eq!(stdout, "st=1 0\n");
 }
+
+#[test]
+fn nocasematch_and_nameref_tests_match_bash() {
+    check(&[
+        ("shopt -s nocasematch; [[ ABC == abc ]] && echo nocase; [[ ABC == a* ]] && echo glob; [[ ABC =~ ^ab ]] && echo regex; shopt -u nocasematch; [[ ABC == abc ]] || echo case-sensitive", "nocase\nglob\nregex\ncase-sensitive\n", 0),
+        ("x=1; declare -n r=x; [[ -R r ]] && echo nameref; [[ -R x ]] || echo not-ref; test -R r && echo test-R; [ -R nosuch ]; echo $?", "nameref\nnot-ref\ntest-R\n1\n", 0),
+    ]);
+}

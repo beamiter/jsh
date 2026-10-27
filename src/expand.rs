@@ -5,6 +5,7 @@ use crate::parser::ast::{InterpPart, PathSeg, ProcessSubKind, Word, WordPart};
 use crate::value::Value;
 
 mod param;
+pub(crate) use param::nocasematch;
 
 use param::ParamResult;
 
