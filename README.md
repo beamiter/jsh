@@ -1048,23 +1048,46 @@ measurements, not whole-shell startup or cross-shell rankings.
 
 ## Current compatibility boundaries
 
+jsh's Bash compatibility is measured against bash 5.2 with a corpus of 1,055
+small scripts (`tests/data/bash_probes/`) covering arithmetic, builtins,
+variables and parameter expansion, execution and traps, and coreutils-style
+commands. Each script's stdout and exit status are compared; 1,050 match,
+and the remaining five are listed with reasons in `known_differences.txt`.
+Run the comparison on a machine with bash 5.x:
+
+```sh
+cargo test --test bash_differential_tests -- --ignored
+```
+
+Known differences and limits:
+
 - Startup-file import can transfer environment variables, aliases, and selected
   shell options, but not every arbitrary Bash function or interactive plugin.
-- Some advanced Bash options and edge cases remain incomplete. Prefer an
-  explicit Bash shebang for production scripts that depend on exact Bash
-  parsing or `set -e` corner cases.
-- `shopt -s lastpipe` runs the final pipeline stage in the current shell when
-  job control (`monitor`) is off. Interactive shells keep `monitor` on by
-  default, matching Bash.
-- `fg`/`bg`/`wait`/`disown` accept Bash job specs `%N`, `%%`, `%+`, and `%-`.
+- `let NAME = EXPR` with a bare `=` is jsh's typed binding, and a word that is a
+  JSON object literal (`{"a":1}`) stays one word; every other `let` and brace
+  form follows Bash.
+- Alias expansion stays enabled in non-interactive `-c` scripts and script
+  files (Bash disables it there), so `type -t` reports aliases in both modes.
+- An unset-variable error under `set -u` exits with status 1 under `-c` as
+  well; Bash uses 127 there. A refused assignment (for example to a readonly
+  variable) ends the whole `-c` string or script, where Bash ends only the
+  current line.
+- After `exit` inside a function, the EXIT trap sees an empty `FUNCNAME`.
+- `export -f` and `readonly -f` accept existing function names but do not
+  export or protect function definitions. The deprecated `$[expr]` arithmetic
+  syntax is not supported.
 - A trapped signal does not interrupt a blocking `read`; its action runs once
   the read completes. `extdebug` (DEBUG-trap skipping) and `declare -t` are not
   modelled.
+- `shopt -s lastpipe` runs the final pipeline stage in the current shell when
+  job control (`monitor`) is off. Interactive shells keep `monitor` on by
+  default, matching Bash.
 - Structured pipeline commands are jsh extensions and are not portable to Bash.
-- Closure forms of `where` and `each` still materialize their inputs.
-  `from-ndjson` currently skips invalid JSON lines; it does not provide a strict
-  malformed-line error mode. `avg`, `product`, and statistical formulas use
-  floating-point arithmetic.
+  Closure forms of `where` and `each` stream lazily when their input is a
+  stream and the body is a pure expression; shell-command bodies and
+  materialized input run eagerly, row by row. `math median`, `stddev`, and
+  `variance` use floating-point arithmetic; `sum`, `product`, `avg`, `min`, and
+  `max` keep integers exact.
 - YAML conversion uses serde-saphyr with bounded parsing and optional
   include/property expansion disabled. Field order, ordinary `<<` keys, and
   non-finite-number-to-null conversion are preserved. Some mixed-type mapping
@@ -1075,8 +1098,6 @@ measurements, not whole-shell startup or cross-shell rankings.
   from complex/tagged keys may differ from the previous parser. Uncommon global
   tags follow the new parser's type inference. Completion offers no candidates
   for a document that fails parsing.
-- Descriptor duplication, closure and moving (`N>&M`, `N<&M`, `N>&-`, `N>&M-`)
-  are supported.
 - HTTP and AI features are available only in builds with the `ai` Cargo feature.
 
 Please include the smallest reproducing command, expected status, actual status,
