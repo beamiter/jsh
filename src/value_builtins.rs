@@ -1344,11 +1344,11 @@ fn vb_from_xml(
                     Event::Start(e) | Event::Empty(e) => e,
                     _ => unreachable!(),
                 };
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
                 let mut attrs = IndexMap::new();
                 for a in e.attributes().flatten() {
-                    let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
-                    let v = String::from_utf8_lossy(&a.value).to_string();
+                    let k = a.key.as_ref().to_string();
+                    let v = a.value.into_owned();
                     attrs.insert(k, Value::String(v));
                 }
                 let opened = Open {
@@ -1375,9 +1375,8 @@ fn vb_from_xml(
                 }
             }
             Ok(Event::Text(t)) => {
-                let s = String::from_utf8_lossy(&t).to_string();
                 if let Some(o) = stack.last_mut() {
-                    o.text.push_str(&s);
+                    o.text.push_str(&t);
                 }
             }
             Ok(Event::End(_)) => {

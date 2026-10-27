@@ -913,13 +913,20 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                     session.turns_used() + 1,
                     session.max_turns()
                 ));
+                let Some(request) = session.model_request_token() else {
+                    return 1;
+                };
                 let reply = match request_model(&chat, &session, share_context, &agent_cwd, wire) {
                     Ok(reply) => reply,
                     Err(error) => {
                         if let Some(status) = take_agent_interrupt(&mut session, state) {
                             return status;
                         }
-                        let _ = session.model_failed(&error);
+                        if let Err(jagent::session::ModelRequestError::StaleRequest) =
+                            session.model_failed_for(&request, &error)
+                        {
+                            continue;
+                        }
                         let error = crate::ai::redact_sensitive_text(&error);
                         eprintln!(
                             "{}",
@@ -939,7 +946,8 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                 if let Some(status) = take_agent_interrupt(&mut session, state) {
                     return status;
                 }
-                match session.accept_agent_response(&reply) {
+                match session.accept_agent_response_for(&request, &reply) {
+                    Err(jagent::session::ModelRequestError::StaleRequest) => continue,
                     Ok(ModelOutcome::Proposal {
                         id,
                         command,
@@ -991,7 +999,9 @@ pub fn builtin_agent(args: &[String], state: &mut ShellState) -> i32 {
                             )
                         );
                     }
-                    Err(SessionError::Protocol(error)) => {
+                    Err(jagent::session::ModelRequestError::Session(SessionError::Protocol(
+                        error,
+                    ))) => {
                         let error = crate::ai::redact_sensitive_text(&error.to_string());
                         eprintln!(
                             "{}",
