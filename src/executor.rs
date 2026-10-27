@@ -918,7 +918,7 @@ fn execute_untimed_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 
     if cmds.len() == 1 {
         let code = execute_command(&cmds[0], state);
         state.pipestatus = vec![code];
-        state.set_array("PIPESTATUS", vec![code.to_string()]);
+        state.set_shell_array("PIPESTATUS", vec![code.to_string()]);
         return if pipeline.negated {
             if code == 0 {
                 1
@@ -939,7 +939,7 @@ fn execute_untimed_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 
     {
         let code = execute_value_pipeline(cmds, state);
         state.pipestatus = vec![code];
-        state.set_array("PIPESTATUS", vec![code.to_string()]);
+        state.set_shell_array("PIPESTATUS", vec![code.to_string()]);
         return if pipeline.negated {
             if code == 0 {
                 1
@@ -1112,7 +1112,7 @@ fn execute_untimed_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> i32 
         }
     }
     state.pipestatus = pipestatus.clone();
-    state.set_array(
+    state.set_shell_array(
         "PIPESTATUS",
         pipestatus.iter().map(|c| c.to_string()).collect(),
     );

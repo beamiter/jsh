@@ -289,19 +289,16 @@ impl ShellState {
             .map(|f| f.call_line.to_string())
             .collect();
         if has_function {
-            self.set_array("FUNCNAME", funcnames);
-        } else if self.is_array("FUNCNAME") {
-            self.unset_var("FUNCNAME");
+            self.set_shell_array("FUNCNAME", funcnames);
+        } else {
+            self.unset_shell_array("FUNCNAME");
         }
         if sources.is_empty() {
-            for name in ["BASH_SOURCE", "BASH_LINENO"] {
-                if self.is_array(name) {
-                    self.unset_var(name);
-                }
-            }
+            self.unset_shell_array("BASH_SOURCE");
+            self.unset_shell_array("BASH_LINENO");
         } else {
-            self.set_array("BASH_SOURCE", sources);
-            self.set_array("BASH_LINENO", lines);
+            self.set_shell_array("BASH_SOURCE", sources);
+            self.set_shell_array("BASH_LINENO", lines);
         }
     }
 }

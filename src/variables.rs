@@ -17,9 +17,40 @@
 //! with `execvp`, which hands the child the process environment.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::environment::{remove_env_checked, set_env_checked, ShellState};
+
+/// Names the process environment may hold: everything inherited at startup
+/// plus everything the shell has exported since. The shell only adds to its
+/// environment through [`ShellState::sync_env`], so a name outside this set
+/// is certainly absent and needs no `getenv` to prove it. Removals leave the
+/// set a superset, which only costs a lookup.
+static ENV_NAMES: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+
+fn with_env_names<T>(f: impl FnOnce(&mut HashSet<String>) -> T) -> T {
+    let mut guard = ENV_NAMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let names = guard.get_or_insert_with(|| {
+        std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .collect()
+    });
+    f(names)
+}
+
+fn may_be_in_env(name: &str) -> bool {
+    with_env_names(|names| names.contains(name))
+}
+
+fn note_env_name(name: &str) {
+    with_env_names(|names| {
+        if !names.contains(name) {
+            names.insert(name.to_string());
+        }
+    });
+}
 
 /// Bash's limit on following a chain of namerefs (`NAMEREF_MAX`). A longer
 /// chain is reported as circular rather than followed forever.
@@ -978,10 +1009,14 @@ impl ShellState {
             Some(value) => {
                 if std::env::var_os(name).as_deref() != Some(std::ffi::OsStr::new(value)) {
                     set_env_checked(name, value);
+                    note_env_name(name);
                 }
             }
             None => {
-                if std::env::var_os(name).is_some() {
+                // Every assignment to an unexported variable lands here, and
+                // getenv locks and scans the whole environment: skip it for
+                // names the environment has never held.
+                if may_be_in_env(name) && std::env::var_os(name).is_some() {
                     remove_env_checked(name);
                 }
             }
@@ -1415,6 +1450,31 @@ impl ShellState {
             }
         }
         let _ = self.assign_compound(&target, slot, elements, false, Some(ArrayKind::Indexed));
+    }
+
+    /// Replace one of the arrays the shell maintains for itself on every
+    /// function call and return or after every pipeline (`FUNCNAME`,
+    /// `BASH_SOURCE`, `BASH_LINENO`, `PIPESTATUS`) in the global scope.
+    ///
+    /// This skips the general assignment path. These names are rewritten
+    /// twice per call, and going through [`Self::set_array`] (nameref
+    /// resolution, compound assignment, then a process-environment check per
+    /// array) made function calls about three times slower. An array is never
+    /// exported, so the environment only needs attention when the name was
+    /// inherited from it as a scalar.
+    pub(crate) fn set_shell_array(&mut self, name: &str, values: Vec<String>) {
+        let value = VarValue::Indexed(IndexedArray::from_values(values));
+        let var = self.globals.entry(name.to_string()).or_default();
+        if var.attrs.contains(VarAttrs::EXPORT) {
+            var.attrs.remove(VarAttrs::EXPORT);
+            remove_env_checked(name);
+        }
+        var.value = value;
+    }
+
+    /// Drop a shell-maintained array set by [`Self::set_shell_array`].
+    pub(crate) fn unset_shell_array(&mut self, name: &str) {
+        self.globals.remove(name);
     }
 
     /// Append `values` to indexed array `name` (`arr+=(...)` with plain words).
