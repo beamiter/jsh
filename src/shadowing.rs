@@ -5,7 +5,7 @@
 //! program most systems install. Taking every invocation of such a name broke
 //! ordinary shell use: `printf 'b\na\n' | sort` failed to parse JSON, `date +%Y`
 //! was an unknown subcommand, and `uniq -d` silently ignored its flag. Each such
-//! name is declared in [`SHADOWS`] with a predicate that recognises jsh's own
+//! name is declared in `SHADOWS` with a predicate that recognises jsh's own
 //! forms; every other invocation runs the program found on PATH, unchanged.
 //!
 //! # The rule
@@ -56,7 +56,7 @@
 //! # Names left alone
 //!
 //! Every builtin name was checked against programs commonly installed on Linux
-//! and macOS. Those not in [`SHADOWS`] stay builtins on purpose:
+//! and macOS. Those not in `SHADOWS` stay builtins on purpose:
 //!
 //! * `ls` and `ps` are already pipeline-only routes in the command catalog, so
 //!   their bare forms are the programs.

@@ -217,7 +217,7 @@ const ASSOC_INITIAL_BUCKETS: u64 = 1024;
 /// sorts by `(bucket, newest first)`. When bash grows the table (once the
 /// entry count reaches twice the bucket count, to four times the buckets) it
 /// re-inserts every item in listing order at the head of its new bucket,
-/// which [`Self::grow`] mirrors by renumbering the sequence.
+/// which `Self::grow` mirrors by renumbering the sequence.
 #[derive(Debug, Clone)]
 pub struct AssocArray {
     entries: HashMap<String, AssocEntry>,
