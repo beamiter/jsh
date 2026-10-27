@@ -156,7 +156,14 @@ impl PipelineData {
             PipelineData::Bytes(bytes) => output.write_all(&bytes)?,
             PipelineData::Values(values) => {
                 if values.len() == 1 {
-                    write!(output, "{}", values[0])?;
+                    // A scalar's display form has no line ending of its own;
+                    // without one, `range 1..5 | math sum; echo next` printed
+                    // `15next`. Records and tables already end their lines.
+                    let mut tracked = LastByte::new(&mut output);
+                    write!(tracked, "{}", values[0])?;
+                    if tracked.last.is_some_and(|byte| byte != b'\n') {
+                        output.write_all(b"\n")?;
+                    }
                 } else if values.iter().all(|value| value.is_record()) {
                     write!(output, "{}", crate::value::render_table(&values))?;
                 } else {
@@ -172,6 +179,33 @@ impl PipelineData {
             }
         }
         output.flush()
+    }
+}
+
+/// Forwards writes while remembering the final byte, so a rendered value can
+/// be terminated with a newline without first buffering its whole text.
+struct LastByte<W> {
+    inner: W,
+    last: Option<u8>,
+}
+
+impl<W> LastByte<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, last: None }
+    }
+}
+
+impl<W: Write> Write for LastByte<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if written > 0 {
+            self.last = Some(buf[written - 1]);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
