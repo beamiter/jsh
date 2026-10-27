@@ -272,8 +272,8 @@ pub enum AbortKind {
     /// End the program: an arithmetic error in an array subscript or an
     /// integer variable's value.
     Fatal,
-    /// End the program, with status 127 when it is the main shell's: an
-    /// unset parameter under `set -u`, or `${x:?}`.
+    /// End the program, with status 127 for a `-c` string: an unset
+    /// parameter under `set -u`, or `${x:?}`.
     Unbound,
 }
 
@@ -335,6 +335,8 @@ pub struct ShellState {
     /// The refused assignment was a malformed `-i` value, which bash treats
     /// as fatal rather than skipping the rest of the line.
     pub assignment_failure_fatal: bool,
+    /// The shell is running a `-c` command string.
+    pub command_string: bool,
     /// Nesting depth for contexts where Bash ignores `errexit` (the tested
     /// operands of `&&`, `||`, `!`, and shell-condition command lists).
     pub errexit_suppression_depth: usize,
@@ -499,6 +501,7 @@ impl ShellState {
             abort_fatal: false,
             in_subshell: false,
             assignment_failure_fatal: false,
+            command_string: false,
             errexit_suppression_depth: 0,
             errexit_status: None,
             last_failure_exempt: false,
@@ -573,14 +576,14 @@ impl ShellState {
         Some((message, kind))
     }
 
-    /// The status of a command stopped by `set -u` or `${x:?}`: 127, with
-    /// which a script's shell then exits, or 1 in a subshell or an
-    /// interactive shell, as in bash.
+    /// The status of a command stopped by `set -u` or `${x:?}`. Bash's
+    /// `-c` command string exits with 127; a script file, standard input, a
+    /// subshell and an interactive shell use 1.
     pub fn unbound_status(&self) -> i32 {
-        if self.in_subshell || self.interactive {
-            1
-        } else {
+        if self.command_string && !self.in_subshell && !self.interactive {
             127
+        } else {
+            1
         }
     }
 

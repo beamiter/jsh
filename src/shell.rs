@@ -151,6 +151,7 @@ fn read_script_interruptibly(path: &Path) -> Result<String, ProgramReadError> {
 /// Execute a `-c` command without loading startup files, history, or sessions.
 pub fn run_command(command: &str, arg0: &str, args: &[String]) -> i32 {
     let mut state = noninteractive_state(arg0, args);
+    state.command_string = true;
     let status = execute_text(command, &mut state);
     finish_noninteractive(state, status)
 }

@@ -200,3 +200,34 @@ fn a_non_interactive_shell_does_not_announce_background_jobs() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "done\n");
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 }
+
+#[test]
+fn only_a_command_string_exits_127_on_an_unset_parameter() {
+    // Bash's `-c` string exits with 127, but a script file or standard input
+    // exits with 1.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = dir.path().join("u.sh");
+    std::fs::write(&script, "trap 'echo trap st=$?' EXIT\nset -u\necho $nope\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
+        .arg("--norc")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run jsh");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "trap st=1\n");
+    assert_eq!(output.status.code(), Some(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
+        .arg("--norc")
+        .stdin(std::fs::File::open(&script).unwrap())
+        .output()
+        .expect("run jsh");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "trap st=1\n");
+    assert_eq!(output.status.code(), Some(1));
+
+    assert_run(
+        &format!("source {}", script.display()),
+        "trap st=127\n",
+        127,
+    );
+}
