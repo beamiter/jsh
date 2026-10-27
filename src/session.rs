@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::environment::*;
 use crate::parser::ast::CompoundCommand;
+use crate::variables::{AssocArray, IndexedArray, VarAttrs, VarValue, Variable};
 
 /// Snapshot format version. Bump when adding fields (use #[serde(default)] for compat).
 const SNAPSHOT_VERSION: u32 = 1;
@@ -186,11 +187,22 @@ pub struct SessionSnapshot {
     pub version: u32,
     pub session_id: String,
     pub cwd: String,
+    /// Global scalar variables.
     pub env_vars: HashMap<String, String>,
     pub aliases: HashMap<String, String>,
     pub functions: HashMap<String, CompoundCommand>,
+    /// Global indexed arrays, values in subscript order.
     pub arrays: HashMap<String, Vec<String>>,
     pub assoc_arrays: HashMap<String, HashMap<String, String>>,
+    /// `declare`-style attribute letters (`"x"`, `"irx"`, `"a"`) of the
+    /// variables above. Snapshots written before jsh modelled attributes have
+    /// none; every `env_vars` entry was exported then, and restores so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub var_attrs: Option<HashMap<String, String>>,
+    /// The subscripts of the `arrays` entries that are sparse (one decimal
+    /// subscript per value); a dense array `0..n` has no entry.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub array_indices: HashMap<String, Vec<String>>,
     pub shell_opts: ShellOpts,
     pub hooks: ShellHooks,
     pub traps: HashMap<String, String>,
@@ -643,8 +655,9 @@ impl<'de, 'a, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for CountedMap
     }
 }
 
-/// `HashMap<String, Vec<String>>` — shell arrays.
+/// `HashMap<String, Vec<String>>` — shell arrays (and their subscripts).
 struct ArrayMapSeed<'a> {
+    field: &'static str,
     budget: SharedBudget<'a>,
 }
 
@@ -669,10 +682,10 @@ impl<'de, 'a> serde::de::Visitor<'de> for ArrayMapSeed<'a> {
         while let Some(key) = map.next_key_seed(TextSeed {
             budget: self.budget,
         })? {
-            check_capacity::<A::Error>("arrays", out.len() + 1, MAX_SESSION_MAP_ITEMS)?;
+            check_capacity::<A::Error>(self.field, out.len() + 1, MAX_SESSION_MAP_ITEMS)?;
             charge_items::<A::Error>(self.budget, 1)?;
             let values = map.next_value_seed(TextVecSeed {
-                field: "arrays",
+                field: self.field,
                 limit: MAX_SESSION_VECTOR_ITEMS,
                 budget: self.budget,
             })?;
@@ -797,6 +810,8 @@ impl<'de, 'a> serde::de::Visitor<'de> for SessionSnapshotSeed<'a> {
         let mut functions = None;
         let mut arrays = None;
         let mut assoc_arrays = None;
+        let mut var_attrs = None;
+        let mut array_indices = None;
         let mut shell_opts = None;
         let mut hooks = None;
         let mut traps = None;
@@ -861,7 +876,24 @@ impl<'de, 'a> serde::de::Visitor<'de> for SessionSnapshotSeed<'a> {
                         budget
                     ))?
                 ),
-                "arrays" => once!(arrays, map.next_value_seed(ArrayMapSeed { budget })?),
+                "arrays" => once!(
+                    arrays,
+                    map.next_value_seed(ArrayMapSeed {
+                        field: "arrays",
+                        budget
+                    })?
+                ),
+                "var_attrs" => once!(
+                    var_attrs,
+                    map.next_value_seed(text_map("var_attrs", MAX_SESSION_MAP_ITEMS))?
+                ),
+                "array_indices" => once!(
+                    array_indices,
+                    map.next_value_seed(ArrayMapSeed {
+                        field: "array_indices",
+                        budget
+                    })?
+                ),
                 "assoc_arrays" => {
                     once!(assoc_arrays, map.next_value_seed(AssocMapSeed { budget })?)
                 }
@@ -906,6 +938,9 @@ impl<'de, 'a> serde::de::Visitor<'de> for SessionSnapshotSeed<'a> {
             functions: functions.ok_or_else(|| required("functions"))?,
             arrays: arrays.ok_or_else(|| required("arrays"))?,
             assoc_arrays: assoc_arrays.ok_or_else(|| required("assoc_arrays"))?,
+            // Both postdate the format; absent means "written before them".
+            var_attrs,
+            array_indices: array_indices.unwrap_or_default(),
             shell_opts: shell_opts.ok_or_else(|| required("shell_opts"))?,
             hooks: hooks.ok_or_else(|| required("hooks"))?,
             traps: traps.ok_or_else(|| required("traps"))?,
@@ -974,7 +1009,18 @@ fn validate_snapshot_logical(snapshot: &SessionSnapshot) -> io::Result<()> {
     };
     budget.text(&snapshot.session_id)?;
     budget.text(&snapshot.cwd)?;
-    for map in [&snapshot.env_vars, &snapshot.aliases, &snapshot.traps] {
+    limit(
+        snapshot.var_attrs.as_ref().map_or(0, HashMap::len) <= MAX_SESSION_MAP_ITEMS
+            && snapshot.array_indices.len() <= MAX_SESSION_MAP_ITEMS,
+        "session snapshot map exceeds its entry limit",
+    )?;
+    let empty = HashMap::new();
+    for map in [
+        &snapshot.env_vars,
+        &snapshot.aliases,
+        &snapshot.traps,
+        snapshot.var_attrs.as_ref().unwrap_or(&empty),
+    ] {
         budget.items(map.len())?;
         for (name, value) in map {
             budget.text(name)?;
@@ -985,7 +1031,7 @@ fn validate_snapshot_logical(snapshot: &SessionSnapshot) -> io::Result<()> {
     for name in snapshot.functions.keys() {
         budget.text(name)?;
     }
-    for (name, values) in &snapshot.arrays {
+    for (name, values) in snapshot.arrays.iter().chain(&snapshot.array_indices) {
         limit(
             values.len() <= MAX_SESSION_VECTOR_ITEMS,
             "session array exceeds its item limit",
@@ -1120,13 +1166,50 @@ impl SessionSnapshot {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "/".to_string());
 
-        // Filter out process/terminal-specific env vars
-        let env_vars: HashMap<String, String> = state
-            .env_vars
-            .iter()
-            .filter(|(k, v)| should_persist_env(k, v))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Global variables, without process/terminal-specific or secret
+        // scalars and without the ones every new shell sets itself.
+        let mut env_vars = HashMap::new();
+        let mut arrays = HashMap::new();
+        let mut assoc_arrays = HashMap::new();
+        let mut var_attrs = HashMap::new();
+        let mut array_indices = HashMap::new();
+        for (name, var) in &state.globals {
+            if matches!(name.as_str(), "UID" | "EUID" | "PPID") {
+                continue;
+            }
+            match &var.value {
+                VarValue::Scalar(value) => {
+                    if !should_persist_env(name, value) {
+                        continue;
+                    }
+                    env_vars.insert(name.clone(), value.clone());
+                }
+                VarValue::Indexed(array) => {
+                    arrays.insert(name.clone(), array.values().cloned().collect());
+                    if !array.is_dense() {
+                        array_indices.insert(
+                            name.clone(),
+                            array.indices().map(|i| i.to_string()).collect(),
+                        );
+                    }
+                }
+                VarValue::Assoc(map) => {
+                    assoc_arrays.insert(
+                        name.clone(),
+                        map.iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    );
+                }
+                // A declaration without a value (`export X`) is only kept
+                // for its attributes.
+                VarValue::Unset => {}
+            }
+            let letters = var.attr_letters();
+            if !letters.is_empty() {
+                var_attrs.insert(name.clone(), letters);
+            }
+        }
 
         SessionSnapshot {
             version: SNAPSHOT_VERSION,
@@ -1135,8 +1218,10 @@ impl SessionSnapshot {
             env_vars,
             aliases: state.aliases.clone(),
             functions: state.functions.clone(),
-            arrays: state.arrays.clone(),
-            assoc_arrays: state.assoc_arrays.clone(),
+            arrays,
+            assoc_arrays,
+            var_attrs: Some(var_attrs),
+            array_indices,
             shell_opts: state.shell_opts.clone(),
             hooks: state.hooks.clone(),
             traps: state.traps.clone(),
@@ -1157,18 +1242,83 @@ impl SessionSnapshot {
             eprintln!("jsh: session restore: failed to cd to {:?}: {e}", self.cwd);
         }
 
-        // Merge env vars: snapshot values override, but keep process-inherited vars for SKIP list
+        // Merge variables: snapshot values override, but keep
+        // process-inherited vars for SKIP list.
+        let attrs_for = |name: &str, default: VarAttrs| match &self.var_attrs {
+            Some(attrs) => attrs
+                .get(name)
+                .and_then(|letters| VarAttrs::from_letters(letters))
+                .unwrap_or_default(),
+            None => default,
+        };
+        let mut restored: Vec<(String, Variable)> = Vec::new();
         for (k, v) in &self.env_vars {
             if should_persist_env(k, v) {
-                state.env_vars.insert(k.clone(), v.clone());
-                std::env::set_var(k, v);
+                // Before attributes were recorded, every variable was exported.
+                restored.push((
+                    k.clone(),
+                    Variable {
+                        value: VarValue::Scalar(v.clone()),
+                        attrs: attrs_for(k, VarAttrs::EXPORT),
+                    },
+                ));
             }
         }
+        for (k, values) in self.arrays {
+            let array = match self.array_indices.get(&k) {
+                Some(indices) if indices.len() == values.len() => {
+                    let mut array = IndexedArray::new();
+                    for (index, value) in indices.iter().zip(values) {
+                        if let Ok(index) = index.parse::<i64>() {
+                            array.set(index, value);
+                        }
+                    }
+                    array
+                }
+                _ => IndexedArray::from_values(values),
+            };
+            let mut attrs = attrs_for(&k, VarAttrs::NONE);
+            attrs.insert(VarAttrs::ARRAY);
+            restored.push((
+                k,
+                Variable {
+                    value: VarValue::Indexed(array),
+                    attrs,
+                },
+            ));
+        }
+        for (k, values) in self.assoc_arrays {
+            let mut map = AssocArray::new();
+            for (key, value) in values {
+                map.insert(key, value);
+            }
+            let mut attrs = attrs_for(&k, VarAttrs::NONE);
+            attrs.insert(VarAttrs::ASSOC);
+            restored.push((
+                k,
+                Variable {
+                    value: VarValue::Assoc(map),
+                    attrs,
+                },
+            ));
+        }
+        for (name, var) in restored {
+            // The shell's own readonly variables (UID, ...) describe this
+            // process, not the one the snapshot came from.
+            if state
+                .globals
+                .get(&name)
+                .is_some_and(|v| v.attrs.contains(VarAttrs::READONLY))
+            {
+                continue;
+            }
+            state.globals.insert(name.clone(), var);
+            state.sync_env(&name);
+        }
+        state.invalidate_path_cache();
 
         state.aliases = self.aliases;
         state.functions = self.functions;
-        state.arrays = self.arrays;
-        state.assoc_arrays = self.assoc_arrays;
         state.shell_opts = self.shell_opts;
         state.hooks = self.hooks;
         state.traps = self.traps;
@@ -1402,7 +1552,7 @@ pub fn reactivate_environment(ctx: &EnvironmentContext, state: &mut ShellState) 
                 // Set VIRTUAL_ENV and prepend its bin to PATH
                 state.export_var("VIRTUAL_ENV", virtual_env);
                 let venv_bin = venv_path.join("bin");
-                if let Some(path) = state.env_vars.get("PATH").cloned() {
+                if let Some(path) = state.get_var("PATH").map(str::to_string) {
                     let venv_bin_str = venv_bin.to_string_lossy();
                     // Only prepend if not already there
                     if !path.split(':').any(|p| p == venv_bin_str.as_ref()) {
@@ -1695,78 +1845,150 @@ mod tests {
     }
 
     #[test]
+    fn variables_round_trip_with_attributes_and_sparse_arrays() {
+        let mut state = ShellState::new(false);
+        state.set_var("JSH_SESSION_PLAIN", "plain");
+        state.export_var("JSH_SESSION_EXPORTED", "exported");
+        state.set_var("JSH_SESSION_INT", "7");
+        state.set_attrs("JSH_SESSION_INT", VarAttrs::INTEGER, VarAttrs::NONE);
+        state.set_array(
+            "jsh_session_sparse",
+            vec!["a".into(), "b".into(), "c".into()],
+        );
+        state.unset_element("jsh_session_sparse", "1").unwrap();
+
+        let mut snapshot = SessionSnapshot::capture(&state, "test-variables");
+        // apply() changes directory; keep it where the test already is.
+        snapshot.cwd = std::env::current_dir().unwrap().display().to_string();
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let restored = decode_snapshot(json.as_bytes()).expect("deserialize");
+
+        let mut fresh = ShellState::new(false);
+        restored.apply(&mut fresh);
+        assert_eq!(fresh.get_var("JSH_SESSION_PLAIN"), Some("plain"));
+        assert_eq!(fresh.exported_value("JSH_SESSION_PLAIN"), None);
+        assert_eq!(
+            fresh.exported_value("JSH_SESSION_EXPORTED"),
+            Some("exported")
+        );
+        assert!(fresh
+            .find_variable("JSH_SESSION_INT")
+            .is_some_and(|v| v.attrs.contains(VarAttrs::INTEGER)));
+        assert_eq!(fresh.array_keys("jsh_session_sparse"), vec!["0", "2"]);
+        assert_eq!(fresh.array_values("jsh_session_sparse"), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn snapshots_from_before_attributes_restore_variables_as_exported() {
+        let mut state = ShellState::new(false);
+        state.set_var("JSH_SESSION_LEGACY", "legacy");
+        let mut snapshot = SessionSnapshot::capture(&state, "test-legacy-vars");
+        snapshot.cwd = std::env::current_dir().unwrap().display().to_string();
+        let mut json = serde_json::to_value(&snapshot).expect("serialize");
+        // The shape older builds wrote: no attribute or subscript fields.
+        let object = json.as_object_mut().unwrap();
+        object.remove("var_attrs");
+        object.remove("array_indices");
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let restored = decode_snapshot(&bytes).expect("deserialize");
+        assert!(restored.var_attrs.is_none());
+
+        let mut fresh = ShellState::new(false);
+        restored.apply(&mut fresh);
+        assert_eq!(fresh.exported_value("JSH_SESSION_LEGACY"), Some("legacy"));
+    }
+
+    #[test]
     fn test_env_var_filtering() {
         let mut state = ShellState::new(false);
-        state
-            .env_vars
-            .insert("COLUMNS".to_string(), "80".to_string());
-        state.env_vars.insert("LINES".to_string(), "24".to_string());
-        state
-            .env_vars
-            .insert("MY_APP".to_string(), "value".to_string());
-        state
-            .env_vars
-            .insert("OPENAI_API_KEY".to_string(), "sk-secret".to_string());
-        state
-            .env_vars
-            .insert("GITHUB_TOKEN".to_string(), "token".to_string());
-        state
-            .env_vars
-            .insert("DB_PASSWORD".to_string(), "password".to_string());
-        state.env_vars.insert(
+        state.globals.insert(
+            "COLUMNS".to_string(),
+            crate::variables::Variable::exported("80".to_string()),
+        );
+        state.globals.insert(
+            "LINES".to_string(),
+            crate::variables::Variable::exported("24".to_string()),
+        );
+        state.globals.insert(
+            "MY_APP".to_string(),
+            crate::variables::Variable::exported("value".to_string()),
+        );
+        state.globals.insert(
+            "OPENAI_API_KEY".to_string(),
+            crate::variables::Variable::exported("sk-secret".to_string()),
+        );
+        state.globals.insert(
+            "GITHUB_TOKEN".to_string(),
+            crate::variables::Variable::exported("token".to_string()),
+        );
+        state.globals.insert(
+            "DB_PASSWORD".to_string(),
+            crate::variables::Variable::exported("password".to_string()),
+        );
+        state.globals.insert(
             "AWS_SECRET_ACCESS_KEY".to_string(),
-            "aws-secret".to_string(),
+            crate::variables::Variable::exported("aws-secret".to_string()),
         );
-        state
-            .env_vars
-            .insert("GITHUB_PAT".to_string(), "github-pat".to_string());
-        state
-            .env_vars
-            .insert("SIGNING_PRIVATE_KEY".to_string(), "private-key".to_string());
-        state.env_vars.insert(
+        state.globals.insert(
+            "GITHUB_PAT".to_string(),
+            crate::variables::Variable::exported("github-pat".to_string()),
+        );
+        state.globals.insert(
+            "SIGNING_PRIVATE_KEY".to_string(),
+            crate::variables::Variable::exported("private-key".to_string()),
+        );
+        state.globals.insert(
             "DATABASE_URL".to_string(),
-            "postgres://user:pass@host/db".to_string(),
+            crate::variables::Variable::exported("postgres://user:pass@host/db".to_string()),
         );
-        state.env_vars.insert(
+        state.globals.insert(
             "REDIS_URL".to_string(),
-            "redis://cache-user:cache-password@example.invalid/0".to_string(),
+            crate::variables::Variable::exported(
+                "redis://cache-user:cache-password@example.invalid/0".to_string(),
+            ),
         );
-        state.env_vars.insert(
+        state.globals.insert(
             "PUBLIC_URL".to_string(),
-            "https://example.invalid/public".to_string(),
+            crate::variables::Variable::exported("https://example.invalid/public".to_string()),
         );
-        state.env_vars.insert(
+        state.globals.insert(
             "CERT_BLOB".to_string(),
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret".to_string(),
+            crate::variables::Variable::exported(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret".to_string(),
+            ),
         );
-        state.env_vars.insert(
+        state.globals.insert(
             "SENTRY_DSN".to_string(),
-            "https://secret@example.invalid/1".to_string(),
+            crate::variables::Variable::exported("https://secret@example.invalid/1".to_string()),
         );
-        state
-            .env_vars
-            .insert("PGPASSWORD".to_string(), "postgres-secret".to_string());
-        state
-            .env_vars
-            .insert("MYSQL_PWD".to_string(), "mysql-secret".to_string());
-        state.env_vars.insert(
+        state.globals.insert(
+            "PGPASSWORD".to_string(),
+            crate::variables::Variable::exported("postgres-secret".to_string()),
+        );
+        state.globals.insert(
+            "MYSQL_PWD".to_string(),
+            crate::variables::Variable::exported("mysql-secret".to_string()),
+        );
+        state.globals.insert(
             "NPM_CONFIG__AUTH".to_string(),
-            "npm-auth-secret".to_string(),
+            crate::variables::Variable::exported("npm-auth-secret".to_string()),
         );
-        state.env_vars.insert(
+        state.globals.insert(
             "DOCKER_AUTH_CONFIG".to_string(),
-            "docker-auth-secret".to_string(),
+            crate::variables::Variable::exported("docker-auth-secret".to_string()),
         );
-        state.env_vars.insert(
+        state.globals.insert(
             "SSH_CONNECTION".to_string(),
-            "203.0.113.1 12345 192.0.2.1 22".to_string(),
+            crate::variables::Variable::exported("203.0.113.1 12345 192.0.2.1 22".to_string()),
         );
-        state
-            .env_vars
-            .insert("SSH_CLIENT".to_string(), "203.0.113.1 12345 22".to_string());
-        state
-            .env_vars
-            .insert("SSH_TTY".to_string(), "/dev/pts/9".to_string());
+        state.globals.insert(
+            "SSH_CLIENT".to_string(),
+            crate::variables::Variable::exported("203.0.113.1 12345 22".to_string()),
+        );
+        state.globals.insert(
+            "SSH_TTY".to_string(),
+            crate::variables::Variable::exported("/dev/pts/9".to_string()),
+        );
 
         let snapshot = SessionSnapshot::capture(&state, "test-filter");
         assert!(!snapshot.env_vars.contains_key("COLUMNS"));

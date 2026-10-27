@@ -4,30 +4,13 @@ use crate::environment::ShellState;
 use crate::parser::ast::{InterpPart, PathSeg, ProcessSubKind, Word, WordPart};
 use crate::value::Value;
 
+mod param;
+
+use param::ParamResult;
+
 /// Expand a Word (`Vec<WordPart>`) into a list of strings.
 /// Word splitting and globbing may produce multiple strings from one Word.
 pub fn expand_word(word: &Word, state: &mut ShellState) -> Vec<String> {
-    // Array expansions produce one field per element: ${arr[@]} and ${arr[*]},
-    // quoted or not (only "${arr[*]}" joins into a single field).
-    if word_refs_array_at_star(word, state) {
-        let fields = expand_parts_to_fields(word, state, false);
-        // "${empty[@]}" contributes no fields at all, the same way "$@" doesn't.
-        if fields.len() == 1 && fields[0].is_empty() && array_refs_all_empty(word, state) {
-            return Vec::new();
-        }
-        return glob_fields(fields, state);
-    }
-
-    // Check for "$@"/$@/$* which expand to multiple fields (positional params).
-    if word_contains_at_star(word) {
-        let fields = expand_parts_to_fields(word, state, false);
-        // "$@" / "$*" with no positional params and no surrounding text → no words.
-        if fields.len() == 1 && fields[0].is_empty() && state.positional_params.is_empty() {
-            return Vec::new();
-        }
-        return glob_fields(fields, state);
-    }
-
     // Check for brace expansion/range that produces multiple words.
     //
     // Brace expansion runs before pathname expansion, and each alternative keeps
@@ -63,19 +46,23 @@ pub fn expand_word(word: &Word, state: &mut ShellState) -> Vec<String> {
         }
     }
 
-    // Expand parts while tracking, per byte, which bytes came from unquoted
-    // expansions (candidates for IFS word splitting) and which may act as glob
-    // metacharacters (candidates for pathname expansion).
-    let (expanded, mask, has_unsplittable) = expand_word_masked(word, state);
+    // Expand the parts into fields, tracking per byte which bytes came from
+    // unquoted expansions (candidates for IFS word splitting) and which may
+    // act as glob metacharacters; `"$@"`-style lists already separate fields.
+    let mut builder = FieldBuilder::default();
+    builder.push_parts(word, state, false);
 
-    let mut fields = ifs_split(&expanded, &mask, state);
-    if fields.is_empty() {
-        if has_unsplittable {
-            // e.g. `echo ""` or `echo "$empty"` → one empty field.
-            fields.push(Field::new());
+    let mut fields = Vec::new();
+    for pending in builder.finish() {
+        let split = ifs_split(&pending.field, &pending.splittable, state);
+        if split.is_empty() {
+            // `echo ""` and `echo "$empty"` keep one empty field; `echo
+            // $empty` keeps none.
+            if pending.keep {
+                fields.push(Field::new());
+            }
         } else {
-            // e.g. `echo $empty` → no fields at all.
-            return Vec::new();
+            fields.extend(split);
         }
     }
 
@@ -119,61 +106,6 @@ impl Field {
     fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
-
-    /// A field whose bytes are all glob-eligible — used where the caller already
-    /// knows the text came from an unquoted expansion.
-    fn unquoted(text: &str) -> Self {
-        let mut field = Self::new();
-        field.push_str(text, true);
-        field
-    }
-}
-
-/// Expand each part of a word, recording per-byte whether it originated from an
-/// unquoted expansion (splittable) plus whether any unsplittable part was seen
-/// (so an empty result can be distinguished: `echo ""` keeps one empty field,
-/// `echo $empty` keeps none).
-fn expand_word_masked(word: &Word, state: &mut ShellState) -> (Field, Vec<bool>, bool) {
-    let mut field = Field::new();
-    let mut mask: Vec<bool> = Vec::new();
-    let mut has_unsplittable = false;
-    for part in word {
-        let splittable = matches!(
-            part,
-            WordPart::Variable(_) | WordPart::CommandSub(_) | WordPart::Arithmetic(_)
-        );
-        if !splittable {
-            has_unsplittable = true;
-        }
-        let text = expand_part(part, state);
-        for _ in 0..text.len() {
-            mask.push(splittable);
-        }
-        field.push_str(&text, part_is_globbable(part, false));
-    }
-    (field, mask, has_unsplittable)
-}
-
-/// May the bytes this part expands to act as glob metacharacters?
-///
-/// Only two sources qualify, matching POSIX: metacharacters the *parser* saw
-/// unquoted (`WordPart::Glob`, which is the only place unquoted `*?[` land), and
-/// the results of unquoted expansions (`x='*'; echo $x` does glob). Everything
-/// else is protected — quoted text, backslash escapes (which the parser folds
-/// into `Literal`), tilde expansion, and process substitution paths. `quoted`
-/// is set when the part sits inside double quotes, which protects it outright.
-fn part_is_globbable(part: &WordPart, quoted: bool) -> bool {
-    if quoted {
-        return false;
-    }
-    matches!(
-        part,
-        WordPart::Glob(_)
-            | WordPart::Variable(_)
-            | WordPart::VariablePath { .. }
-            | WordPart::CommandSub(_)
-            | WordPart::Arithmetic(_)
-    )
 }
 
 /// Split a string into fields at splittable IFS characters. `mask[byte]` is true
@@ -262,13 +194,6 @@ fn ifs_split(input: &Field, mask: &[bool], state: &ShellState) -> Vec<Field> {
     fields
 }
 
-/// IFS-split a string that came entirely from an unquoted expansion. Such bytes
-/// are glob-eligible: `arr=('*'); echo ${arr[@]}` globs, exactly as bash does.
-fn ifs_split_unquoted(s: &str, state: &ShellState) -> Vec<Field> {
-    let mask = vec![true; s.len()];
-    ifs_split(&Field::unquoted(s), &mask, state)
-}
-
 /// Apply glob expansion to every field of a split word, in order.
 fn glob_fields(fields: Vec<Field>, state: &mut ShellState) -> Vec<String> {
     let mut out = Vec::new();
@@ -305,7 +230,11 @@ fn glob_field(field: &Field, state: &mut ShellState) -> Vec<String> {
         expand_with_extglob(expanded, state)
     } else if field_contains_glob(field) && !state.shell_opts.noglob {
         let pattern = glob_pattern_for(field);
-        match glob::glob(&pattern) {
+        let options = glob::MatchOptions {
+            case_sensitive: !state.shell_opts.nocaseglob,
+            ..glob::MatchOptions::new()
+        };
+        match glob::glob_with(&pattern, options) {
             Ok(paths) => {
                 let mut results: Vec<String> = paths
                     .filter_map(|p| p.ok())
@@ -349,11 +278,13 @@ fn glob_field(field: &Field, state: &mut ShellState) -> Vec<String> {
 }
 
 /// Split a `name[subscript]` body into its two halves, or `None` when the body
-/// is not a closed subscript reference at all.
+/// is not a closed subscript reference at all. (Parameter expansion now takes
+/// bodies apart in `param::split_param`; this stays for its regression tests.)
 ///
 /// Never slice a `${...}` body by hand: `${a[}` arrives here as the name `a[`,
 /// where the old `&name[bracket + 1..name.len() - 1]` is the reversed byte
 /// range `2..1` and panics — a typo at the prompt killed the whole shell.
+#[cfg(test)]
 fn split_subscript(name: &str) -> Option<(&str, &str)> {
     let bracket = name.find('[')?;
     let close = name.len().checked_sub(1)?;
@@ -366,6 +297,7 @@ fn split_subscript(name: &str) -> Option<(&str, &str)> {
 /// Is `s` a plain parameter name (`[A-Za-z_][A-Za-z0-9_]*`)? Used to keep the
 /// subscript handling from claiming bodies like `v#[a-z]`, where the `[` opens a
 /// glob bracket expression inside a pattern operator instead of a subscript.
+#[cfg(test)]
 fn is_name(s: &str) -> bool {
     let mut bytes = s.bytes();
     match bytes.next() {
@@ -417,87 +349,6 @@ fn subscript_is_malformed(body: &str) -> bool {
     true // ran off the end of the body with the `[` still open
 }
 
-/// The values `var_name` contributes through an `[@]`/`[*]` subscript. Bash
-/// treats a plain scalar as a one-element array, so `${x[0]}`, `${x[@]}` and
-/// `${#x[@]}` all answer for `x=abc`; jsh used to expand them to nothing.
-fn element_values(var_name: &str, state: &ShellState) -> Vec<String> {
-    if state.is_array(var_name) {
-        state.array_values(var_name)
-    } else {
-        match state.get_var(var_name) {
-            Some(v) => vec![v.to_string()],
-            None => Vec::new(),
-        }
-    }
-}
-
-/// One element of `var_name[subscript]`, treating a scalar as a one-element
-/// array so that `${x[0]}` on `x=abc` yields `abc` the way bash does. The
-/// subscript is expanded and, for an indexed array, evaluated arithmetically
-/// (`${a[i+1]}`); a failure leaves an expansion error and yields `None`.
-fn subscript_element(var_name: &str, subscript: &str, state: &mut ShellState) -> Option<String> {
-    let key = resolve_array_subscript(var_name, subscript, state)?;
-    if state.is_array(var_name) {
-        return state.get_array_element(var_name, &key);
-    }
-    let value = state.get_var(var_name)?;
-    (key == "0").then(|| value.to_string())
-}
-
-/// Split `arr[@]` / `arr[*]` into (name, subscript) when the name has elements
-/// to expand: a declared array, or a scalar standing in for a one-element one.
-fn array_at_star_ref<'a>(name: &'a str, state: &ShellState) -> Option<(&'a str, &'a str)> {
-    let (var_name, subscript) = split_subscript(name)?;
-    if (subscript == "@" || subscript == "*")
-        && (state.is_array(var_name) || state.get_var(var_name).is_some())
-    {
-        Some((var_name, subscript))
-    } else {
-        None
-    }
-}
-
-/// Does this word reference an array as `${arr[@]}` / `${arr[*]}` (at top level
-/// or inside double quotes)?
-fn word_refs_array_at_star(word: &Word, state: &ShellState) -> bool {
-    fn walk(part: &WordPart, state: &ShellState) -> bool {
-        match part {
-            WordPart::Variable(name) => array_at_star_ref(name, state).is_some(),
-            WordPart::DoubleQuoted(parts) => parts.iter().any(|p| walk(p, state)),
-            _ => false,
-        }
-    }
-    word.iter().any(|p| walk(p, state))
-}
-
-/// Are all the arrays this word references via `[@]`/`[*]` empty?
-fn array_refs_all_empty(word: &Word, state: &ShellState) -> bool {
-    fn walk(part: &WordPart, state: &ShellState) -> bool {
-        match part {
-            WordPart::Variable(name) => match array_at_star_ref(name, state) {
-                Some((var_name, _)) => element_values(var_name, state).is_empty(),
-                None => true,
-            },
-            WordPart::DoubleQuoted(parts) => parts.iter().all(|p| walk(p, state)),
-            _ => true,
-        }
-    }
-    word.iter().all(|p| walk(p, state))
-}
-
-/// Does this word reference $@ or $* (top-level or inside double quotes)?
-fn word_contains_at_star(word: &Word) -> bool {
-    word.iter().any(part_refs_at_star)
-}
-
-fn part_refs_at_star(part: &WordPart) -> bool {
-    match part {
-        WordPart::Variable(name) => name == "@" || name == "*",
-        WordPart::DoubleQuoted(parts) => parts.iter().any(part_refs_at_star),
-        _ => false,
-    }
-}
-
 /// First character of IFS (used to join "$*"). Default is a space; an empty IFS
 /// joins with no separator.
 fn ifs_first(state: &ShellState) -> String {
@@ -507,91 +358,155 @@ fn ifs_first(state: &ShellState) -> String {
     }
 }
 
-/// Expand a list of parts into separate fields, honoring $@/$* splitting rules.
-/// `quoted` indicates the parts are inside double quotes (affects $* joining).
-///
-/// `quoted` also decides glob eligibility for the values this produces:
-/// positional parameters and array elements are patterns only while unquoted, so
-/// `set -- '*'; echo $@` globs while `echo "$@"` does not.
-fn expand_parts_to_fields(parts: &[WordPart], state: &mut ShellState, quoted: bool) -> Vec<Field> {
-    let mut fields: Vec<Field> = vec![Field::new()];
-    for part in parts {
-        match part {
-            WordPart::Variable(name) if name == "@" => {
-                let params = state.positional_params.clone();
-                append_fields(&mut fields, as_fields(params, !quoted));
-            }
-            WordPart::Variable(name) if name == "*" => {
-                if quoted {
-                    let sep = ifs_first(state);
-                    let joined = state.positional_params.join(&sep);
-                    fields.last_mut().unwrap().push_str(&joined, false);
-                } else {
-                    let params = state.positional_params.clone();
-                    append_fields(&mut fields, as_fields(params, !quoted));
-                }
-            }
-            WordPart::Variable(name) if array_at_star_ref(name, state).is_some() => {
-                let (var_name, subscript) = array_at_star_ref(name, state).unwrap();
-                let vals = element_values(var_name, state);
-                if quoted {
-                    if subscript == "*" {
-                        let sep = ifs_first(state);
-                        fields.last_mut().unwrap().push_str(&vals.join(&sep), false);
-                    } else {
-                        append_fields(&mut fields, as_fields(vals, false));
-                    }
-                } else {
-                    // Unquoted, each element is still subject to IFS splitting.
-                    let mut split = Vec::new();
-                    for v in &vals {
-                        split.extend(ifs_split_unquoted(v, state));
-                    }
-                    append_fields(&mut fields, split);
-                }
-            }
-            WordPart::DoubleQuoted(inner) => {
-                let sub = expand_parts_to_fields(inner, state, true);
-                append_fields(&mut fields, sub);
-            }
-            other => {
-                let s = expand_part(other, state);
-                let globbable = part_is_globbable(other, quoted);
-                fields.last_mut().unwrap().push_str(&s, globbable);
-            }
+/// A field of a word under construction.
+#[derive(Debug, Default)]
+struct PendingField {
+    field: Field,
+    /// `splittable[i]` is true when byte `i` came from an unquoted expansion
+    /// and so is subject to IFS word splitting.
+    splittable: Vec<bool>,
+    /// The field survives being empty: it holds quoted or literal text
+    /// (`""`, `"$empty"`), not just unquoted expansions that came to nothing.
+    keep: bool,
+}
+
+/// Builds the fields of one word. Most parts append to the current field;
+/// list expansions (`"$@"`, `"${a[@]}"`) start a new field per element, and a
+/// quoted empty list contributes no field at all.
+#[derive(Default)]
+struct FieldBuilder {
+    done: Vec<PendingField>,
+    current: Option<PendingField>,
+}
+
+impl FieldBuilder {
+    fn push(&mut self, text: &str, globbable: bool, splittable: bool, keep: bool) {
+        let current = self.current.get_or_insert_with(PendingField::default);
+        current.field.push_str(text, globbable);
+        current
+            .splittable
+            .resize(current.field.text.len(), splittable);
+        current.keep |= keep;
+    }
+
+    fn break_field(&mut self) {
+        if let Some(current) = self.current.take() {
+            self.done.push(current);
         }
     }
-    fields
-}
 
-/// Wrap already-expanded strings as fields with uniform glob eligibility.
-fn as_fields(values: Vec<String>, globbable: bool) -> Vec<Field> {
-    values
-        .into_iter()
-        .map(|value| {
-            let mut field = Field::new();
-            field.push_str(&value, globbable);
-            field
-        })
-        .collect()
-}
+    fn mark_keep(&mut self) {
+        self.current.get_or_insert_with(PendingField::default).keep = true;
+    }
 
-/// Merge additional fields: the first attaches to the current trailing field,
-/// the rest become new fields. Empty input leaves `fields` untouched.
-fn append_fields(fields: &mut Vec<Field>, more: Vec<Field>) {
-    let mut iter = more.into_iter();
-    if let Some(first) = iter.next() {
-        let last = fields.last_mut().unwrap();
-        last.text.push_str(&first.text);
-        last.globbable.extend_from_slice(&first.globbable);
-        for f in iter {
-            fields.push(f);
+    fn push_list(&mut self, items: Vec<String>, star: bool, quoted: bool, state: &ShellState) {
+        if quoted && star {
+            // "$*" and "${a[*]}" are one field, joined with IFS's first char.
+            self.push(&items.join(&ifs_first(state)), false, false, true);
+            return;
         }
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                self.break_field();
+            }
+            // Unquoted, every element is still subject to splitting and
+            // globbing: `arr=('*'); echo ${arr[@]}` globs, as in bash.
+            self.push(item, !quoted, !quoted, quoted);
+        }
+    }
+
+    /// Expand `parts` into the fields. Returns whether they contributed
+    /// anything that makes an enclosing pair of double quotes produce a
+    /// field: everything but a list that expanded to no elements.
+    fn push_parts(&mut self, parts: &[WordPart], state: &mut ShellState, quoted: bool) -> bool {
+        let mut content = false;
+        for part in parts {
+            content |= self.push_part(part, state, quoted);
+        }
+        content
+    }
+
+    /// Expand one part. Which bytes may glob follows POSIX: metacharacters
+    /// the *parser* saw unquoted (`WordPart::Glob`, the only place unquoted
+    /// `*?[` land) and the results of unquoted expansions (`x='*'; echo $x`
+    /// does glob). Everything else is protected — quoted text, backslash
+    /// escapes (which the parser folds into `Literal`), tilde expansion and
+    /// process substitution paths. Only unquoted expansions are split.
+    fn push_part(&mut self, part: &WordPart, state: &mut ShellState, quoted: bool) -> bool {
+        match part {
+            // An empty unquoted literal, such as the operand of `${u-}`, adds
+            // nothing: only quoting (`${u-""}`, `''`) keeps an empty field.
+            WordPart::Literal(s) if s.is_empty() && !quoted => {}
+            WordPart::Literal(s) | WordPart::SingleQuoted(s) => {
+                self.push(s, false, false, true);
+            }
+            WordPart::Glob(pattern) => {
+                self.push(pattern, !quoted, false, true);
+            }
+            WordPart::DoubleQuoted(inner) => {
+                if self.push_parts(inner, state, true) || inner.is_empty() {
+                    self.mark_keep();
+                    return true;
+                }
+                return false;
+            }
+            WordPart::Variable(body) if param::is_simple_parameter(body) => {
+                let value = expand_variable(body, state);
+                self.push(&value, !quoted, !quoted, quoted);
+            }
+            WordPart::Variable(body) => {
+                if body.is_empty() || subscript_is_malformed(body) {
+                    state.expansion_error = Some(format!("${{{}}}: bad substitution", body));
+                    return true;
+                }
+                match param::expand_param(body, state) {
+                    ParamResult::Unset => {
+                        if quoted {
+                            self.push("", false, false, true);
+                        }
+                    }
+                    ParamResult::Scalar(value) => self.push(&value, !quoted, !quoted, quoted),
+                    ParamResult::List { items, star } => {
+                        let produced = !items.is_empty() || (quoted && star);
+                        self.push_list(items, star, quoted, state);
+                        return produced;
+                    }
+                    ParamResult::Word(word) => {
+                        let produced = self.push_parts(&word, state, quoted);
+                        if quoted && word.is_empty() {
+                            self.push("", false, false, true);
+                            return true;
+                        }
+                        return produced;
+                    }
+                }
+            }
+            WordPart::CommandSub(_) | WordPart::Arithmetic(_) => {
+                let value = expand_part(part, state);
+                self.push(&value, !quoted, !quoted, quoted);
+            }
+            WordPart::VariablePath { .. } => {
+                let value = expand_part(part, state);
+                self.push(&value, !quoted, false, true);
+            }
+            _ => {
+                // Tilde, process substitution, interpolation, closures: their
+                // results are never split or globbed.
+                let value = expand_part(part, state);
+                self.push(&value, false, false, true);
+            }
+        }
+        true
+    }
+
+    fn finish(mut self) -> Vec<PendingField> {
+        self.break_field();
+        self.done
     }
 }
 
 /// Expand a Word into a single string (no word splitting/globbing).
-pub fn expand_word_to_string(word: &Word, state: &mut ShellState) -> String {
+pub fn expand_word_to_string(word: &[WordPart], state: &mut ShellState) -> String {
     let mut result = String::new();
     for part in word {
         result.push_str(&expand_part(part, state));
@@ -714,18 +629,15 @@ fn expand_interpolated(parts: &[InterpPart], state: &mut ShellState) -> String {
     out
 }
 
-fn expand_param_operand(raw: &str, state: &mut ShellState) -> String {
-    let word = crate::parser::parse_word_parts(raw);
-    expand_word_to_string(&word, state)
-}
-
 fn parameter_value(name: &str, state: &ShellState) -> Option<String> {
     match name {
         "?" => Some(state.last_exit_code.to_string()),
-        "$" => Some(std::process::id().to_string()),
+        // The shell's pid, also inside subshells (`$BASHPID` is the current one).
+        "$" => Some(state.shell_pid.to_string()),
         "!" => Some(state.last_bg_pid.map_or(String::new(), |p| p.to_string())),
         "#" => Some(state.positional_params.len().to_string()),
-        "@" | "*" => Some(state.positional_params.join(" ")),
+        "@" => Some(state.positional_params.join(" ")),
+        "*" => Some(state.positional_params.join(&ifs_first(state))),
         "0" => Some(state.arg0.clone()),
         "-" => Some(state.option_flags()),
         _ if name.len() <= 3 && name.chars().all(|c| c.is_ascii_digit()) => {
@@ -736,7 +648,8 @@ fn parameter_value(name: &str, state: &ShellState) -> Option<String> {
                 None
             }
         }
-        _ => state.get_var(name).map(|v| v.to_string()),
+        // Variables, including the computed ones (`RANDOM`, `SECONDS`, ...).
+        _ => state.var_value(name).map(|v| v.into_owned()),
     }
 }
 
@@ -750,10 +663,11 @@ fn expand_variable(name: &str, state: &mut ShellState) -> String {
     }
     match name {
         "?" => state.last_exit_code.to_string(),
-        "$" => std::process::id().to_string(),
+        "$" => state.shell_pid.to_string(),
         "!" => state.last_bg_pid.map_or(String::new(), |p| p.to_string()),
         "#" => state.positional_params.len().to_string(),
-        "@" | "*" => state.positional_params.join(" "),
+        "@" => state.positional_params.join(" "),
+        "*" => state.positional_params.join(&ifs_first(state)),
         "0" => state.arg0.clone(),
         "-" => state.option_flags(),
         _ if name.len() <= 3 && name.chars().all(|c| c.is_ascii_digit()) => {
@@ -768,532 +682,231 @@ fn expand_variable(name: &str, state: &mut ShellState) -> String {
     }
 }
 
+/// `${...}` in a context that wants one string (see `param` for the forms).
 fn expand_parameter(name: &str, state: &mut ShellState) -> String {
-    // ${#arr[@]} / ${#arr[*]} → element count; ${#arr[i]} → length of one
-    // element. Bash answers for undeclared names too (0 elements) and counts a
-    // plain scalar as one element, so neither form requires a declared array.
-    if let Some(inner) = name.strip_prefix('#') {
-        if let Some((var_name, subscript)) = split_subscript(inner) {
-            if is_name(var_name) {
-                if subscript == "@" || subscript == "*" {
-                    return element_values(var_name, state).len().to_string();
-                }
-                return subscript_element(var_name, subscript, state)
-                    .unwrap_or_default()
-                    .chars()
-                    .count()
-                    .to_string();
-            }
-        }
-    }
-
-    // ${!var} - Indirect variable reference
-    if let Some(var_name) = name.strip_prefix('!') {
-        // Check if it's not the special array keys syntax (${!arr[@]})
-        if !var_name.contains('[') && !var_name.contains('@') && !var_name.contains('*') {
-            // Get the value of the variable named by var_name
-            if let Some(ref_name) = state.get_var(var_name) {
-                return state.get_var(ref_name).unwrap_or("").to_string();
-            }
-        }
-    }
-
-    // ${!prefix@} and ${!prefix*} - List variable names with prefix
-    if let Some(var_spec) = name.strip_prefix('!') {
-        if var_spec.ends_with('@') || var_spec.ends_with('*') {
-            let prefix = &var_spec[..var_spec.len() - 1];
-            let mut names = Vec::new();
-
-            // Collect all variable names starting with prefix
-            for k in state.env_vars.keys() {
-                if k.starts_with(prefix) {
-                    names.push(k.clone());
-                }
-            }
-            // Also collect from all local scopes
-            for scope in &state.local_vars_stack {
-                for k in scope.keys() {
-                    if k.starts_with(prefix) && !names.contains(k) {
-                        names.push(k.clone());
-                    }
-                }
-            }
-
-            names.sort();
-            if var_spec.ends_with('@') {
-                return names
-                    .iter()
-                    .map(|n| format!("\"{}\"", n))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-            } else {
-                return names.join(" ");
-            }
-        }
-    }
-
-    // ${!arr[@]} → array keys
-    if let Some(inner) = name.strip_prefix('!') {
-        if let Some((var_name, subscript)) = split_subscript(inner) {
-            if (subscript == "@" || subscript == "*") && is_name(var_name) {
-                if state.is_array(var_name) {
-                    return state.array_keys(var_name).join(" ");
-                }
-                // A scalar stands in for a one-element array, so its only key
-                // is 0; an unset name has no keys at all.
-                return match state.get_var(var_name) {
-                    Some(_) => "0".to_string(),
-                    None => String::new(),
-                };
-            }
-        }
-    }
-
-    // Array element access and slicing: ${arr[idx]}, ${arr[@]}, ${arr[@]:offset:length}
-    if let Some(bracket) = name.find('[') {
-        if let Some(bracket_end) = name[bracket..].find(']') {
-            let bracket_pos = bracket + bracket_end;
-            let var_name = &name[..bracket];
-            let subscript_part = &name[bracket + 1..bracket_pos];
-            let after_bracket = &name[bracket_pos + 1..];
-
-            // Handle array slicing: ${arr[@]:offset:length} or ${arr[*]:offset:length}
-            if subscript_part == "@" || subscript_part == "*" {
-                // Check if there's slicing syntax after the bracket
-                if let Some(slice_part) = after_bracket.strip_prefix(':') {
-                    // Remove the ':'
-                    let parts: Vec<&str> = slice_part.split(':').collect();
-                    if let Ok(offset) = parts[0].parse::<usize>() {
-                        let arr_vals = state.array_values(var_name);
-                        let length = if parts.len() > 1 {
-                            parts[1].parse::<usize>().unwrap_or(arr_vals.len())
-                        } else {
-                            arr_vals.len()
-                        };
-                        let sliced: Vec<String> =
-                            arr_vals.iter().skip(offset).take(length).cloned().collect();
-                        return sliced.join(" ");
-                    }
-                } else if state.is_array(var_name) {
-                    // No slicing, just return array values
-                    return state.array_values(var_name).join(" ");
-                }
-            }
-
-            // ${arr[@]} or ${arr[*]} as string (without slicing)
-            if (subscript_part == "@" || subscript_part == "*") && after_bracket.is_empty() {
-                if state.is_array(var_name) {
-                    return state.array_values(var_name).join(" ");
-                }
-                // A scalar stands in for a one-element array.
-                if let Some(v) = state.get_var(var_name) {
-                    return v.to_string();
-                }
-            }
-
-            // ${arr[idx]} - single element access
-            if after_bracket.is_empty() && state.is_array(var_name) {
-                return subscript_element(var_name, subscript_part, state).unwrap_or_default();
-            }
-            // `x=abc` behaves like `x=(abc)`: `${x[0]}` is the value and every
-            // other index is unset. Real scripts index scalars defensively
-            // (`${BASH_SOURCE[0]}`, `${PIPESTATUS[0]}`), so answering nothing
-            // here silently hands them the wrong value.
-            if after_bracket.is_empty() && is_name(var_name) && state.get_var(var_name).is_some() {
-                return subscript_element(var_name, subscript_part, state).unwrap_or_default();
-            }
-        }
-    }
-
-    // ${#var} (string length) — the leading `#` is a prefix, not an operator,
-    // so this is settled before the operator dispatch below.
-    if let Some(var) = name.strip_prefix('#') {
-        if !var.is_empty() && !var.contains('#') && !var.contains('[') {
-            let val = state.get_var(var).unwrap_or("");
-            return val.chars().count().to_string();
-        }
-    }
-
-    // Everything after the parameter name is one operator plus its word. Bash
-    // decides which operator from the character at exactly that boundary, so
-    // find the boundary once and dispatch on it. Searching the whole body for
-    // each operator in turn let punctuation inside a pattern hijack the
-    // expansion: `${v##*a-b*}` was read as `${v##*a}` defaulting to `b*`.
-    if let Some(op) = param_op_start(name) {
-        let var = &name[..op];
-        let spec = &name[op..];
-
-        // ${var:-default} / ${var:=default} / ${var:?message} / ${var:+alt}
-        // treat an empty value like an unset one; the colon-less forms below
-        // only react to a genuinely unset parameter.
-        if let Some(rest) = spec.strip_prefix(":-") {
-            return match parameter_value(var, state) {
-                Some(v) if !v.is_empty() => v,
-                _ => expand_param_operand(rest, state),
-            };
-        }
-        if let Some(rest) = spec.strip_prefix(":=") {
-            return match parameter_value(var, state) {
-                Some(v) if !v.is_empty() => v,
-                _ => {
-                    let default = expand_param_operand(rest, state);
-                    state.set_var(var, &default);
-                    default
-                }
-            };
-        }
-        if let Some(rest) = spec.strip_prefix(":+") {
-            return match parameter_value(var, state) {
-                Some(v) if !v.is_empty() => expand_param_operand(rest, state),
-                _ => String::new(),
-            };
-        }
-        if let Some(rest) = spec.strip_prefix(":?") {
-            return match parameter_value(var, state) {
-                Some(v) if !v.is_empty() => v,
-                _ => {
-                    let msg = expand_param_operand(rest, state);
-                    state.expansion_error = Some(if msg.is_empty() {
-                        format!("{}: parameter null or not set", var)
-                    } else {
-                        format!("{}: {}", var, msg)
-                    });
-                    String::new()
-                }
-            };
-        }
-        if let Some(rest) = spec.strip_prefix('?') {
-            return match parameter_value(var, state) {
-                Some(v) => v,
-                None => {
-                    let msg = expand_param_operand(rest, state);
-                    state.expansion_error = Some(if msg.is_empty() {
-                        format!("{}: parameter not set", var)
-                    } else {
-                        format!("{}: {}", var, msg)
-                    });
-                    String::new()
-                }
-            };
-        }
-        if let Some(rest) = spec.strip_prefix('-') {
-            return parameter_value(var, state)
-                .unwrap_or_else(|| expand_param_operand(rest, state));
-        }
-        if let Some(rest) = spec.strip_prefix('=') {
-            return match parameter_value(var, state) {
-                Some(v) => v,
-                None => {
-                    let default = expand_param_operand(rest, state);
-                    state.set_var(var, &default);
-                    default
-                }
-            };
-        }
-        if let Some(rest) = spec.strip_prefix('+') {
-            return if parameter_value(var, state).is_some() {
-                expand_param_operand(rest, state)
-            } else {
-                String::new()
-            };
-        }
-
-        // Pattern operators: #/## (prefix strip), %/%% (suffix strip),
-        // / (replace), ^/^^ and ,/,, (case conversion).
-        match spec.as_bytes()[0] {
-            b'#' => {
-                let val = parameter_value(var, state).unwrap_or_default();
-                if let Some(pat) = spec.strip_prefix("##") {
-                    let pat = expand_param_operand(pat, state);
-                    // greedy (longest) prefix strip
-                    for i in (0..=val.len()).rev() {
-                        if val.is_char_boundary(i) && match_glob(&pat, &val[..i]) {
-                            return val[i..].to_string();
-                        }
-                    }
-                } else {
-                    let pat = expand_param_operand(&spec[1..], state);
-                    for i in 0..=val.len() {
-                        if val.is_char_boundary(i) && match_glob(&pat, &val[..i]) {
-                            return val[i..].to_string();
-                        }
-                    }
-                }
-                return val;
-            }
-            b'%' => {
-                let val = parameter_value(var, state).unwrap_or_default();
-                if let Some(pat) = spec.strip_prefix("%%") {
-                    let pat = expand_param_operand(pat, state);
-                    // greedy (longest) suffix strip
-                    for i in 0..=val.len() {
-                        if val.is_char_boundary(i) && match_glob(&pat, &val[i..]) {
-                            return val[..i].to_string();
-                        }
-                    }
-                } else {
-                    let pat = expand_param_operand(&spec[1..], state);
-                    for i in (0..=val.len()).rev() {
-                        if val.is_char_boundary(i) && match_glob(&pat, &val[i..]) {
-                            return val[..i].to_string();
-                        }
-                    }
-                }
-                return val;
-            }
-            b'/' => {
-                let val = parameter_value(var, state).unwrap_or_default();
-                return pattern_replace(&val, spec, state);
-            }
-            b'^' | b',' => {
-                let val = parameter_value(var, state).unwrap_or_default();
-                return convert_case(&val, spec);
-            }
-            b':' => {
-                // ${var:offset} and ${var:offset:length}. The four colon
-                // operators above have already been ruled out.
-                let val = parameter_value(var, state).unwrap_or_default();
-                let rest = &spec[1..];
-                let (offset_text, length_text) = match rest.split_once(':') {
-                    Some((o, l)) => (o, Some(l)),
-                    None => (rest, None),
-                };
-                // Shell string offsets count characters, not UTF-8 bytes.
-                // Keep byte boundaries only for the final slice, and saturate
-                // additions so user-supplied integer extremes cannot panic.
-                let boundaries: Vec<usize> = val
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .chain(std::iter::once(val.len()))
-                    .collect();
-                let count = boundaries.len() - 1;
-                // Offset and length are arithmetic expressions: `${s:1+1:2}`.
-                let offset = substring_bound(offset_text, state);
-                let start = if offset < 0 {
-                    (count as i64).saturating_add(offset).max(0) as usize
-                } else {
-                    (offset as usize).min(count)
-                };
-                let end = match length_text {
-                    Some(l) => {
-                        let len = substring_bound(l, state);
-                        if len < 0 {
-                            (count as i64).saturating_add(len).max(start as i64) as usize
-                        } else {
-                            start.saturating_add(len as usize).min(count)
-                        }
-                    }
-                    None => count,
-                };
-                return val[boundaries[start]..boundaries[end]].to_string();
-            }
-            _ => {}
-        }
-    }
-    if let Some(v) = state.get_var(name) {
-        return v.to_string();
-    }
-    // Phase 5a: fall back to typed let-bindings.
-    if let Some(v) = state.let_vars.get(name) {
-        return v.to_display_string();
-    }
-    String::new()
-}
-
-/// Evaluate a `${var:offset:length}` bound, which bash treats as arithmetic.
-/// A failure leaves an expansion error, and the bound reads as 0.
-fn substring_bound(text: &str, state: &mut ShellState) -> i64 {
-    match eval_arithmetic(text, state) {
-        Ok(value) => value,
-        Err(ArithFailure::Expansion) => 0,
-        Err(ArithFailure::Eval(message)) => {
-            state.expansion_error = Some(message);
-            0
-        }
+    match param::expand_param(name, state) {
+        // Phase 5a: an unset name falls back to typed let-bindings.
+        ParamResult::Unset => state
+            .let_vars
+            .get(name)
+            .map(|v| v.to_display_string())
+            .unwrap_or_default(),
+        other => other.into_string(state),
     }
 }
 
-/// Byte offset where a `${...}` body stops being the parameter name and starts
-/// being an operator, or `None` when the body is nothing but a name (or a form
-/// the callers above already handled, such as a leading `#` or `!`).
+/// Expand an array subscript or other `[...]` text: parameter, command and
+/// arithmetic substitution with quote removal, no splitting or globbing.
+/// An indexed array then evaluates the result arithmetically.
+pub(crate) fn expand_subscript_text(raw: &str, state: &mut ShellState) -> String {
+    if !raw.contains(['$', '`', '\'', '"', '\\']) {
+        return raw.to_string();
+    }
+    expand_word_to_string(&crate::parser::parse_word_parts(raw), state)
+}
+
+/// Expand the elements of a compound assignment `name=(...)`. A `[key]=value`
+/// element is expanded like an assignment (no splitting or globbing); any
+/// other element is an ordinary word and may become several elements.
+pub(crate) fn expand_compound_elements(
+    words: &[Word],
+    state: &mut ShellState,
+) -> Vec<crate::variables::CompoundElement> {
+    use crate::variables::CompoundElement;
+    let mut elements = Vec::new();
+    for word in words {
+        if let Some((key, append, value)) = param::keyed_element(word) {
+            let key = expand_subscript_text(&key, state);
+            let value = expand_word_to_string(&value, state);
+            elements.push(CompoundElement {
+                key: Some(key),
+                value,
+                append,
+            });
+        } else {
+            for value in expand_word(word, state) {
+                elements.push(CompoundElement {
+                    key: None,
+                    value,
+                    append: false,
+                });
+            }
+        }
+    }
+    elements
+}
+
+/// Expand the words of a declaration builtin (`declare`, `local`, ...).
 ///
-/// A name is `[A-Za-z_][A-Za-z0-9_]*` with an optional `[subscript]`, a run of
-/// digits for positional parameters, or a single special character. Everything
-/// from there on belongs to the operator, punctuation included — which is what
-/// keeps `${v##*a-b*}` from being read as `${v-...}`.
-fn param_op_start(name: &str) -> Option<usize> {
-    let b = name.as_bytes();
-    let first = *b.first()?;
-    let mut i = 1;
-    match first {
-        // `#` and `!` lead the length and indirection forms, not a name.
-        b'#' | b'!' => return None,
-        b'@' | b'*' | b'?' | b'$' | b'-' | b'0' => {}
-        b'1'..=b'9' => {
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
+/// Bash treats an argument that looks like an assignment as one: its value is
+/// neither word-split nor globbed (`local x=$y` keeps spaces, `declare g=*`
+/// stays `*`) and a `~` after the `=` is expanded. A compound assignment the
+/// parser recorded in `compound` is passed through as its source text, to be
+/// expanded element by element by the builtin; the indices of those arguments
+/// (counted from the first argument after the command name) are returned.
+pub(crate) fn expand_declaration_words(
+    words: &[Word],
+    compound: &[(usize, String)],
+    state: &mut ShellState,
+) -> (Vec<String>, Vec<usize>) {
+    state.expansion_error = None;
+    let mut result = Vec::new();
+    let mut compound_indices = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        if let Some((_, raw)) = compound.iter().find(|(index, _)| *index == i) {
+            if !result.is_empty() {
+                compound_indices.push(result.len() - 1);
             }
+            result.push(raw.clone());
+        } else if i > 0 && assignment_prefix(word).is_some() {
+            let word = with_assignment_tilde(word);
+            result.push(expand_word_to_string(&word, state));
+        } else {
+            result.extend(expand_word(word, state));
         }
-        b'_' | b'A'..=b'Z' | b'a'..=b'z' => {
-            while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
-                i += 1;
-            }
-            if b.get(i) == Some(&b'[') {
-                let mut depth = 0usize;
-                while i < b.len() {
-                    match b[i] {
-                        b'[' => depth += 1,
-                        b']' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                i += 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-            }
+        if state.expansion_error.is_some() {
+            break;
         }
-        _ => return None,
     }
-    if i < b.len() {
-        Some(i)
-    } else {
-        None
-    }
+    (result, compound_indices)
 }
 
-/// `${var^}`, `${var^^}`, `${var,}` and `${var,,}`. `spec` starts with the
-/// operator character; an optional glob after it limits which characters are
-/// converted (bash defaults that pattern to `?`, i.e. every character).
-fn convert_case(val: &str, spec: &str) -> String {
-    let op = spec.as_bytes()[0];
-    let all = spec.len() >= 2 && spec.as_bytes()[1] == op;
-    let pat = &spec[if all { 2 } else { 1 }..];
-    let matches = |c: char| pat.is_empty() || match_glob(pat, &c.to_string());
-    let convert = |c: char| -> String {
-        if op == b'^' {
-            c.to_uppercase().collect()
-        } else {
-            c.to_lowercase().collect()
-        }
+/// The `name=` / `name+=` / `name[sub]=` prefix of a word whose first part
+/// is literal text, if it has one.
+fn assignment_prefix(word: &Word) -> Option<usize> {
+    let Some(WordPart::Literal(text)) = word.first() else {
+        return None;
     };
-    let mut out = String::with_capacity(val.len());
-    for (idx, c) in val.chars().enumerate() {
-        // The single-character form only touches the first character.
-        if (all || idx == 0) && matches(c) {
-            out.push_str(&convert(c));
-        } else {
-            out.push(c);
+    let (lhs, append, _) = crate::parser::parse::split_assignment_word(text)?;
+    Some(lhs.len() + if append { 2 } else { 1 })
+}
+
+/// `declare x=~/dir`: bash expands a tilde right after the `=` of an
+/// assignment argument, and after every unquoted `:` in its value. The
+/// parser only recognises a tilde at the start of a word, so split the
+/// literal `name=` prefix off and look for tildes in what follows it.
+fn with_assignment_tilde(word: &Word) -> std::borrow::Cow<'_, Word> {
+    let (Some(prefix_len), Some(WordPart::Literal(text))) = (assignment_prefix(word), word.first())
+    else {
+        return std::borrow::Cow::Borrowed(word);
+    };
+    let value = &text[prefix_len..];
+    if !value.contains('~') && !word[1..].iter().any(literal_has_colon_tilde) {
+        return std::borrow::Cow::Borrowed(word);
+    }
+    let mut rebuilt: Word = vec![WordPart::Literal(text[..prefix_len].to_string())];
+    rebuilt.extend(split_tilde_prefixes(value, true));
+    rebuilt.extend(assignment_value_word(&word[1..]).into_owned());
+    std::borrow::Cow::Owned(rebuilt)
+}
+
+fn literal_has_colon_tilde(part: &WordPart) -> bool {
+    matches!(part, WordPart::Literal(text) if text.contains(":~"))
+}
+
+/// The value of an assignment with bash's extra tilde expansion: a `~` that
+/// follows an unquoted `:` (`PATH=~/bin:~/.local/bin`) is expanded too. A
+/// leading `~` already became a `Tilde` part when the value was parsed.
+pub(crate) fn assignment_value_word(word: &[WordPart]) -> std::borrow::Cow<'_, [WordPart]> {
+    if !word.iter().any(literal_has_colon_tilde) {
+        return std::borrow::Cow::Borrowed(word);
+    }
+    let mut rebuilt = Vec::with_capacity(word.len() + 2);
+    for part in word {
+        match part {
+            WordPart::Literal(text) if text.contains(":~") => {
+                rebuilt.extend(split_tilde_prefixes(text, false));
+            }
+            other => rebuilt.push(other.clone()),
         }
+    }
+    std::borrow::Cow::Owned(rebuilt)
+}
+
+/// Split literal text into literal and `Tilde` parts at each tilde prefix:
+/// a `~` at the start (when `at_start`) or right after a `:`, up to the next
+/// `/` or `:`.
+fn split_tilde_prefixes(text: &str, at_start: bool) -> Vec<WordPart> {
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut rest = text;
+    let mut boundary = at_start;
+    while !rest.is_empty() {
+        if boundary && rest.starts_with('~') {
+            let end = rest[1..].find(['/', ':']).map_or(rest.len(), |i| i + 1);
+            if !literal.is_empty() {
+                parts.push(WordPart::Literal(std::mem::take(&mut literal)));
+            }
+            parts.push(WordPart::Tilde(rest[1..end].to_string()));
+            rest = &rest[end..];
+            boundary = false;
+            continue;
+        }
+        let c = rest.chars().next().expect("rest is not empty");
+        literal.push(c);
+        boundary = c == ':';
+        rest = &rest[c.len_utf8()..];
+    }
+    if !literal.is_empty() {
+        parts.push(WordPart::Literal(literal));
+    }
+    parts
+}
+
+/// Expand a word for use as a pattern (`case` arms, `${v#pat}`, `[[ x == pat ]]`).
+///
+/// Quoted characters and the results of quoted expansions come back
+/// backslash-escaped, so they match only themselves; unquoted text and
+/// unquoted expansions keep their pattern meaning. Match the result with
+/// [`pattern_matches`] or `glob_match::pattern_match_with`.
+pub fn expand_pattern_word(word: &Word, state: &mut ShellState) -> String {
+    let mut out = String::new();
+    for part in word {
+        push_pattern_part(part, state, false, &mut out);
     }
     out
 }
 
-/// Split a `${var/pat/rep}` body at its first unescaped `/`, returning the raw
-/// pattern and replacement with `\/` reduced to a literal slash. A slash that
-/// only appears after expanding a variable is data, not the separator, so the
-/// split happens before expansion.
-fn split_replace_spec(body: &str) -> (String, String) {
-    let mut pat = String::new();
-    let mut chars = body.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some('/') => pat.push('/'),
-                Some(other) => {
-                    pat.push('\\');
-                    pat.push(other);
+fn push_pattern_part(part: &WordPart, state: &mut ShellState, quoted: bool, out: &mut String) {
+    use crate::glob_match::escape_pattern;
+    match part {
+        WordPart::Glob(pattern) if !quoted => out.push_str(pattern),
+        // Unquoted literal text never holds `*`, `?` or `[` as pattern
+        // characters (the parser makes those `Glob` parts; these came from
+        // backslash escapes), but extended-glob syntax such as `!(...)`
+        // arrives here and must keep its meaning.
+        WordPart::Literal(text) if !quoted => {
+            for c in text.chars() {
+                if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                    out.push('\\');
                 }
-                None => pat.push('\\'),
-            },
-            '/' => return (pat, chars.as_str().replace("\\/", "/")),
-            _ => pat.push(c),
-        }
-    }
-    (pat, String::new())
-}
-
-enum ReplaceAnchor {
-    None,
-    Start,
-    End,
-}
-
-/// Handle ${var/pat/rep}, ${var//pat/rep}, ${var/#pat/rep}, ${var/%pat/rep}.
-/// `spec` begins with '/'. The pattern is a shell glob.
-fn pattern_replace(val: &str, spec: &str, state: &mut ShellState) -> String {
-    let global = spec.starts_with("//");
-    let body = if global { &spec[2..] } else { &spec[1..] };
-    let (anchor, body) = if let Some(rest) = body.strip_prefix('#') {
-        (ReplaceAnchor::Start, rest)
-    } else if let Some(rest) = body.strip_prefix('%') {
-        (ReplaceAnchor::End, rest)
-    } else {
-        (ReplaceAnchor::None, body)
-    };
-    let (pat, rep) = split_replace_spec(body);
-    let pat = expand_param_operand(&pat, state);
-    let rep = expand_param_operand(&rep, state);
-    let (pat, rep) = (pat.as_str(), rep.as_str());
-    if pat.is_empty() {
-        return val.to_string();
-    }
-
-    match anchor {
-        ReplaceAnchor::Start => {
-            // longest prefix matching pat
-            for i in (1..=val.len()).rev() {
-                if val.is_char_boundary(i) && match_glob(pat, &val[..i]) {
-                    return format!("{}{}", rep, &val[i..]);
-                }
+                out.push(c);
             }
-            val.to_string()
         }
-        ReplaceAnchor::End => {
-            // longest suffix matching pat
-            for i in 0..val.len() {
-                if val.is_char_boundary(i) && match_glob(pat, &val[i..]) {
-                    return format!("{}{}", &val[..i], rep);
-                }
+        WordPart::DoubleQuoted(inner) => {
+            for p in inner {
+                push_pattern_part(p, state, true, out);
             }
-            val.to_string()
         }
-        ReplaceAnchor::None => {
-            let mut result = String::new();
-            let mut i = 0;
-            let mut done = false;
-            while i < val.len() {
-                let matched_len = if !done || global {
-                    longest_match_at(pat, &val[i..])
-                } else {
-                    None
-                };
-                if let Some(l) = matched_len {
-                    result.push_str(rep);
-                    i += l;
-                    done = true;
-                } else {
-                    let ch = val[i..].chars().next().unwrap();
-                    result.push(ch);
-                    i += ch.len_utf8();
-                }
-            }
-            result
+        WordPart::Variable(_) | WordPart::CommandSub(_) | WordPart::Arithmetic(_) if !quoted => {
+            out.push_str(&expand_part(part, state));
         }
+        _ => out.push_str(&escape_pattern(&expand_part(part, state))),
     }
 }
 
-/// Longest non-empty prefix length of `s` matching glob `pat`, if any.
-fn longest_match_at(pat: &str, s: &str) -> Option<usize> {
-    for l in (1..=s.len()).rev() {
-        if s.is_char_boundary(l) && match_glob(pat, &s[..l]) {
-            return Some(l);
-        }
-    }
-    None
+/// Match `value` against a pattern from [`expand_pattern_word`], honouring
+/// `shopt -s extglob` and `shopt -s nocasematch` the way `case` and `[[ == ]]`
+/// do in bash.
+pub fn pattern_matches(pattern: &str, value: &str, state: &ShellState) -> bool {
+    crate::glob_match::pattern_match_with(
+        pattern,
+        value,
+        crate::glob_match::MatchOptions {
+            extglob: state.shell_opts.extglob,
+            nocase: param::nocasematch(state),
+        },
+    )
 }
 
 fn expand_brace_items(items: &[Vec<WordPart>], state: &mut ShellState) -> Vec<String> {
@@ -1393,13 +1006,17 @@ fn expand_brace_range(start: &str, end: &str, step: Option<&str>) -> Vec<String>
     vec![]
 }
 
-fn match_glob(pattern: &str, text: &str) -> bool {
-    crate::glob_match::glob_match(pattern, text)
-}
-
 fn expand_tilde(user: &str, state: &mut ShellState) -> String {
     if user.is_empty() {
         state.home_dir.to_string_lossy().to_string()
+    } else if user == "+" || user == "-" {
+        // `~+` is `$PWD`, `~-` is `$OLDPWD`; bash leaves the tilde alone when
+        // the variable is unset.
+        let name = if user == "+" { "PWD" } else { "OLDPWD" };
+        match state.get_var(name) {
+            Some(dir) => dir.to_string(),
+            None => format!("~{}", user),
+        }
     } else {
         let c_user = std::ffi::CString::new(user).unwrap_or_default();
         let pw = unsafe { nix::libc::getpwnam(c_user.as_ptr()) };
@@ -1651,8 +1268,8 @@ pub(crate) fn resolve_array_subscript(
     subscript: &str,
     state: &mut ShellState,
 ) -> Option<String> {
-    if state.is_assoc_array(name) {
-        let key = expand_param_operand(subscript, state);
+    if state.is_assoc(name) {
+        let key = expand_subscript_text(subscript, state);
         return state.expansion_error.is_none().then_some(key);
     }
     match eval_arithmetic(subscript, state) {
@@ -2466,7 +2083,7 @@ impl<'t> ArithParser<'t, '_> {
                     let reference = format!("{name}[{subscript}]");
                     return Err(ArithError::at(&reference, "bad array subscript"));
                 }
-                if self.state.is_assoc_array(name) {
+                if self.state.is_assoc(name) {
                     Some(subscript.to_string())
                 } else {
                     let _depth = ArithDepth::enter()?;
@@ -2502,10 +2119,11 @@ impl<'t> ArithParser<'t, '_> {
             }),
             // An array named without a subscript means its element 0.
             None if state.is_array(target.name) => state.get_array_element(target.name, "0"),
-            None => match state.get_var(target.name) {
-                Some(value) => match plain_integer_value(value) {
+            // var_value includes the computed specials (RANDOM, SECONDS, ...).
+            None => match state.var_value(target.name) {
+                Some(value) => match plain_integer_value(&value) {
                     Some(result) => return result.map(ArithValue::Number),
-                    None => Some(value.to_string()),
+                    None => Some(value.into_owned()),
                 },
                 None if state.shell_opts.nounset => return Err(ArithError::unbound(target.name)),
                 None => None,
@@ -2624,7 +2242,15 @@ fn expand_with_extglob(pattern: &str, state: &mut ShellState) -> Vec<String> {
             }
 
             // Apply extglob matching
-            if crate::glob_match::extglob_match(&file_pattern, filename) {
+            let matched = if state.shell_opts.nocaseglob {
+                crate::glob_match::extglob_match(
+                    &file_pattern.to_lowercase(),
+                    &filename.to_lowercase(),
+                )
+            } else {
+                crate::glob_match::extglob_match(&file_pattern, filename)
+            };
+            if matched {
                 results.push(format!("{}{}", prefix, filename));
             }
         }
@@ -2752,6 +2378,22 @@ fn conditional_pattern_operator(word: &Word) -> Option<ConditionalPattern> {
         },
         _ => None,
     }
+}
+
+/// Can the expanded text of `part` act as a glob pattern? Quoted parts never
+/// can; unquoted globs and expansions can.
+fn part_is_globbable(part: &WordPart, quoted: bool) -> bool {
+    if quoted {
+        return false;
+    }
+    matches!(
+        part,
+        WordPart::Glob(_)
+            | WordPart::Variable(_)
+            | WordPart::VariablePath { .. }
+            | WordPart::CommandSub(_)
+            | WordPart::Arithmetic(_)
+    )
 }
 
 /// Expand a `[[ ]]` pattern operand, making every quoted character literal.

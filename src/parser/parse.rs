@@ -192,12 +192,15 @@ fn scan_double_paren(src: &str) -> DoubleParenEnd {
 fn split_array_elements(s: &str) -> Vec<String> {
     let mut elems = Vec::new();
     let mut cur = String::new();
-    // Pending closers for `$( ... )` / `${ ... }`, inside which whitespace does
-    // not separate elements.
-    let mut closers: Vec<char> = Vec::new();
+    // Constructs still open, inside which whitespace does not separate
+    // elements: `"` for double quotes, `` ` `` for backquotes, `)` for `$(`
+    // (and parentheses nested in it), `}` for `${`. Each may contain the
+    // others, so `"$(echo "1 2")"` is one element.
+    let mut open: Vec<char> = Vec::new();
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
+        let top = open.last().copied();
         match c {
             '\\' => {
                 cur.push(c);
@@ -205,7 +208,8 @@ fn split_array_elements(s: &str) -> Vec<String> {
                     cur.push(c2);
                 }
             }
-            '\'' => {
+            // Single quotes are literal text inside double quotes.
+            '\'' if top != Some('"') => {
                 cur.push(c);
                 for c2 in chars.by_ref() {
                     cur.push(c2);
@@ -216,42 +220,27 @@ fn split_array_elements(s: &str) -> Vec<String> {
             }
             '"' | '`' => {
                 cur.push(c);
-                while let Some(c2) = chars.next() {
-                    cur.push(c2);
-                    if c2 == '\\' {
-                        if let Some(c3) = chars.next() {
-                            cur.push(c3);
-                        }
-                    } else if c2 == c {
-                        break;
-                    }
+                if top == Some(c) {
+                    open.pop();
+                } else {
+                    open.push(c);
                 }
             }
-            '$' => {
+            '$' if matches!(chars.peek(), Some(&'(') | Some(&'{')) => {
                 cur.push(c);
-                match chars.peek() {
-                    Some(&'(') => {
-                        closers.push(')');
-                        cur.push('(');
-                        chars.next();
-                    }
-                    Some(&'{') => {
-                        closers.push('}');
-                        cur.push('{');
-                        chars.next();
-                    }
-                    _ => {}
-                }
+                let opener = chars.next().expect("peeked");
+                cur.push(opener);
+                open.push(if opener == '(' { ')' } else { '}' });
             }
-            '(' if !closers.is_empty() => {
-                closers.push(')');
+            '(' if top == Some(')') => {
+                open.push(')');
                 cur.push(c);
             }
-            _ if Some(&c) == closers.last() => {
-                closers.pop();
+            ')' | '}' if top == Some(c) => {
+                open.pop();
                 cur.push(c);
             }
-            '#' if closers.is_empty() && cur.is_empty() => {
+            '#' if open.is_empty() && cur.is_empty() => {
                 while let Some(&c2) = chars.peek() {
                     if c2 == '\n' {
                         break;
@@ -259,7 +248,7 @@ fn split_array_elements(s: &str) -> Vec<String> {
                     chars.next();
                 }
             }
-            ' ' | '\t' | '\n' | '\r' if closers.is_empty() => {
+            ' ' | '\t' | '\n' | '\r' if open.is_empty() => {
                 if !cur.is_empty() {
                     elems.push(std::mem::take(&mut cur));
                 }
@@ -691,7 +680,13 @@ impl<'a> Parser<'a> {
             break;
         }
 
-        let result = self.parse_simple_command_rest(&mut words, &mut redirects, &mut line);
+        let mut compound_args = Vec::new();
+        let result = self.parse_simple_command_rest(
+            &mut words,
+            &mut redirects,
+            &mut compound_args,
+            &mut line,
+        );
         let text = self.finish_recording(outer_recording);
         result?;
 
@@ -711,6 +706,7 @@ impl<'a> Parser<'a> {
             redirects,
             line,
             text,
+            compound_args,
         }))
     }
 
@@ -719,6 +715,7 @@ impl<'a> Parser<'a> {
         &mut self,
         words: &mut Vec<Word>,
         redirects: &mut Vec<Redirect>,
+        compound_args: &mut Vec<(usize, String)>,
         line: &mut usize,
     ) -> Result<(), ParseError> {
         loop {
@@ -735,6 +732,9 @@ impl<'a> Parser<'a> {
                 }
             } else if let Token::Word(w) = &self.current.token {
                 let w = w.clone();
+                if is_declaration_command(words) && split_compound_assignment(&w).is_some() {
+                    compound_args.push((words.len(), w.clone()));
+                }
                 words.push(parse_word_parts(&w));
                 self.advance();
                 // `[[` opens a conditional expression: everything up to the
@@ -1623,14 +1623,111 @@ fn is_valid_assign_lhs(s: &str) -> bool {
         && !name.starts_with(|c: char| c.is_ascii_digit())
 }
 
+/// Split an assignment word at its operator: the first `=` or `+=` after the
+/// name and its optional `[subscript]`, as `(lhs, append, value)`.
+///
+/// The operator has to be found from the left, past the name. Searching the
+/// whole word for `+=` misread `x=a+=b` (whose value is `a+=b`) and every
+/// compound assignment with a `[k]+=v` element.
+pub fn split_assignment_word(w: &str) -> Option<(&str, bool, &str)> {
+    let bytes = w.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+        i += 1;
+    }
+    if i == 0 || bytes[0].is_ascii_digit() {
+        return None;
+    }
+    if bytes.get(i) == Some(&b'[') {
+        let mut depth = 0usize;
+        loop {
+            match bytes.get(i)? {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    match (bytes.get(i), bytes.get(i + 1)) {
+        (Some(b'='), _) => Some((&w[..i], false, &w[i + 1..])),
+        (Some(b'+'), Some(b'=')) => Some((&w[..i], true, &w[i + 2..])),
+        _ => None,
+    }
+}
+
+/// The parts of a compound assignment written as one word, `name=(...)` or
+/// `name+=(...)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundAssignmentText<'a> {
+    pub name: &'a str,
+    pub append: bool,
+    /// The element words, parsed but not yet expanded.
+    pub elements: Vec<Word>,
+}
+
+/// Parse `name=(a "b c" [k]=v)` (or `name+=(...)`) into its name and element
+/// words; `None` when the word is not a compound assignment to a plain name.
+pub fn split_compound_assignment(text: &str) -> Option<CompoundAssignmentText<'_>> {
+    let (lhs, append, value) = split_assignment_word(text)?;
+    if !lhs.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let inner = value.strip_prefix('(')?.strip_suffix(')')?;
+    if !quotes_are_closed(inner) {
+        return None;
+    }
+    Some(CompoundAssignmentText {
+        name: lhs,
+        append,
+        elements: split_array_elements(inner)
+            .iter()
+            .map(|element| parse_word_parts(element))
+            .collect(),
+    })
+}
+
+/// Does every quote in `text` close? A compound assignment that arrives as a
+/// string (`declare -A 'm=([k]="v)'`) is re-parsed, and an unterminated
+/// quote there must be an error rather than swallow the rest of the list.
+fn quotes_are_closed(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (Some('"'), '"') => quote = None,
+            _ => {}
+        }
+    }
+    quote.is_none()
+}
+
+/// Is this the command word of a declaration builtin, whose arguments bash
+/// parses as assignments (`local -a xs=(1 2)` declares an array)?
+fn is_declaration_command(words: &[Word]) -> bool {
+    matches!(
+        words.first().map(Vec::as_slice),
+        Some([WordPart::Literal(name)])
+            if matches!(name.as_str(), "declare" | "typeset" | "local" | "export" | "readonly")
+    )
+}
+
 fn parse_assignment(w: &str, parser: &mut Parser) -> Result<Assignment, ParseError> {
-    // Detect += vs =
-    let (before_eq, value_str, append) = if let Some(pos) = w.find("+=") {
-        (&w[..pos], &w[pos + 2..], true)
-    } else {
-        let eq_pos = w.find('=').unwrap();
-        (&w[..eq_pos], &w[eq_pos + 1..], false)
-    };
+    // is_assignment() accepted the word, so it has an operator.
+    let (before_eq, append, value_str) =
+        split_assignment_word(w).ok_or_else(|| ParseError::Unexpected(w.to_string()))?;
 
     // Extract name and optional index from lhs
     let (name, index) = if let Some(bracket) = before_eq.find('[') {
@@ -2384,7 +2481,9 @@ pub fn parse_word_parts(raw: &str) -> Word {
                             || c2 == '*' =>
                     {
                         let mut var = String::new();
-                        if "?$!#@*-".contains(c2) {
+                        // `$10` is `${1}0`: an unbraced positional parameter
+                        // is a single digit.
+                        if "?$!#@*-".contains(c2) || c2.is_ascii_digit() {
                             var.push(c2);
                             chars.next();
                         } else {
@@ -2622,7 +2721,8 @@ fn parse_double_quoted_body(input: &str, arithmetic: bool) -> Vec<WordPart> {
                         || c2 == '*' =>
                 {
                     let mut var = String::new();
-                    if "?$!#@*-".contains(c2) {
+                    // `$10` is `${1}0`, as at the top level of a word.
+                    if "?$!#@*-".contains(c2) || c2.is_ascii_digit() {
                         var.push(c2);
                         chars.next();
                     } else {
@@ -2676,7 +2776,7 @@ fn parse_double_quoted_body(input: &str, arithmetic: bool) -> Vec<WordPart> {
 }
 
 /// Decode ANSI-C escape sequences for $'...' quoting.
-fn decode_ansi_c(s: &str) -> String {
+pub(crate) fn decode_ansi_c(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -2970,6 +3070,54 @@ mod tests {
             parse_word_parts("{a..j..3}").as_slice(),
             [WordPart::BraceRange { .. }]
         ));
+    }
+
+    #[test]
+    fn assignment_operator_is_found_after_the_name() {
+        use super::split_assignment_word;
+        assert_eq!(split_assignment_word("x=a+=b"), Some(("x", false, "a+=b")));
+        assert_eq!(split_assignment_word("x+=1"), Some(("x", true, "1")));
+        assert_eq!(
+            split_assignment_word("a[i+=1]=v"),
+            Some(("a[i+=1]", false, "v"))
+        );
+        assert_eq!(
+            split_assignment_word("m=([k]+=v)"),
+            Some(("m", false, "([k]+=v)"))
+        );
+        assert_eq!(split_assignment_word("1x=2"), None);
+        assert_eq!(split_assignment_word("=x"), None);
+    }
+
+    #[test]
+    fn compound_assignment_elements_keep_quoting_and_substitutions() {
+        use super::split_compound_assignment;
+        let parsed = split_compound_assignment(r#"a=("x y" $(echo "1 2") [k]=v)"#).unwrap();
+        assert_eq!(parsed.name, "a");
+        assert!(!parsed.append);
+        assert_eq!(parsed.elements.len(), 3);
+        assert!(split_compound_assignment(r#"a=("unterminated)"#).is_none());
+        assert!(split_compound_assignment("a=scalar").is_none());
+    }
+
+    #[test]
+    fn declaration_builtins_record_compound_arguments() {
+        use crate::parser::ast::Command;
+        let cmds = parse(r#"local -a xs=(a "b c") y=1"#).unwrap();
+        let Command::Simple(simple) = &cmds[0].list.first.commands[0] else {
+            panic!("expected a simple command");
+        };
+        assert_eq!(
+            simple.compound_args,
+            vec![(2, r#"xs=(a "b c")"#.to_string())]
+        );
+        // Anything else keeps an empty table.
+        let cmds = parse(r#"echo xs=(a)"#);
+        if let Ok(cmds) = cmds {
+            if let Command::Simple(simple) = &cmds[0].list.first.commands[0] {
+                assert!(simple.compound_args.is_empty());
+            }
+        }
     }
 
     #[test]

@@ -178,8 +178,8 @@ fn test_expand_words_multiple() {
 #[test]
 fn test_array_expansion() {
     let mut state = make_state();
-    state.arrays.insert(
-        "arr".to_string(),
+    state.set_array(
+        "arr",
         vec!["a".to_string(), "b".to_string(), "c".to_string()],
     );
 
@@ -196,9 +196,8 @@ fn test_array_expansion() {
 #[test]
 fn test_assoc_array_expansion() {
     let mut state = make_state();
-    let mut map = std::collections::HashMap::new();
-    map.insert("key".to_string(), "value".to_string());
-    state.assoc_arrays.insert("mymap".to_string(), map);
+    jsh::var_builtins::declare(&["-A".to_string(), "mymap".to_string()], &mut state);
+    state.set_array_element("mymap", "key", "value");
 
     let word = parse_word_parts("${mymap[key]}");
     assert_eq!(expand_word_to_string(&word, &mut state), "value");

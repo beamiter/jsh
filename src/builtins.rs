@@ -106,6 +106,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "hash",
     "[[",
     "declare",
+    "typeset",
+    "readonly",
     "z",
     "hook",
     "complete",
@@ -390,7 +392,8 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "kill" => signals::builtin_kill(args, state),
         "enable" => builtin_enable(args, state),
         // New builtins
-        "declare" => builtin_declare(args, state),
+        "declare" | "typeset" => builtin_declare(args, state),
+        "readonly" => crate::var_builtins::readonly(args, state),
         "z" => builtin_z(args, state),
         "hook" => builtin_hook(args, state),
         "complete" => builtin_complete(args, state),
@@ -895,101 +898,11 @@ fn builtin_loop_control(name: &str, args: &[String], state: &mut ShellState) -> 
 }
 
 fn builtin_export(args: &[String], state: &mut ShellState) -> i32 {
-    if args.is_empty() {
-        let mut vars: Vec<_> = state.env_vars.iter().collect();
-        vars.sort_by_key(|(k, _)| (*k).clone());
-        for (k, v) in vars {
-            println!("declare -x {}=\"{}\"", k, v);
-        }
-        return 0;
-    }
-
-    if args.first().map(|s| s.as_str()) == Some("-n") {
-        let mut status = 0;
-        for arg in &args[1..] {
-            if !crate::environment::is_valid_identifier(arg) {
-                eprintln!("jsh: export: `{}': not a valid identifier", arg);
-                status = 1;
-                continue;
-            }
-            if let Some(val) = state.env_vars.remove(arg) {
-                env::remove_var(arg);
-                // If in function scope, set to local_vars; otherwise just unset
-                if let Some(scope) = state.local_vars_stack.last_mut() {
-                    scope.insert(arg.clone(), val);
-                }
-            }
-        }
-        return status;
-    }
-
-    let mut status = 0;
-    for arg in args {
-        // Validate before touching the environment: `export =` used to reach
-        // std::env::set_var with an empty name, which panics and takes the whole
-        // shell down with exit 101.
-        let (name, value) = match arg.find('=') {
-            Some(eq_pos) => (&arg[..eq_pos], Some(&arg[eq_pos + 1..])),
-            None => (arg.as_str(), None),
-        };
-        if !crate::environment::is_valid_identifier(name) {
-            eprintln!("jsh: export: `{}': not a valid identifier", arg);
-            status = 1;
-            continue;
-        }
-        match value {
-            Some(value) => state.export_var(name, value),
-            None => {
-                // Get value from any scope
-                if let Some(val) = state.get_var(name).map(|s| s.to_string()) {
-                    state.export_var(name, &val);
-                } else if !state.env_vars.contains_key(name) {
-                    state.export_var(name, "");
-                }
-            }
-        }
-    }
-    status
+    crate::var_builtins::export(args, state)
 }
 
 fn builtin_unset(args: &[String], state: &mut ShellState) -> i32 {
-    // Bash only complains about an invalid name when the kind was pinned with
-    // `-v`/`-f`; a bare `unset ""` or `unset a=b` is a silent no-op returning 0.
-    // Either way the name must never reach std::env::remove_var, which panics
-    // on an empty name and killed the shell with exit 101.
-    let explicit_kind = args.iter().any(|a| a == "-v" || a == "-f");
-    let mut status = 0;
-    for name in args {
-        if name == "-v" || name == "-f" {
-            continue;
-        }
-        if !crate::environment::is_valid_identifier(name) && !name.contains('[') {
-            if explicit_kind {
-                eprintln!("jsh: unset: `{}': not a valid identifier", name);
-                status = 1;
-            }
-            continue;
-        }
-        // Support unset arr[idx]
-        if let Some(bracket) = name.find('[') {
-            if name.ends_with(']') {
-                let var_name = &name[..bracket];
-                let idx = &name[bracket + 1..name.len() - 1];
-                if let Some(arr) = state.arrays.get_mut(var_name) {
-                    if let Ok(i) = idx.parse::<usize>() {
-                        if i < arr.len() {
-                            arr[i] = String::new();
-                        }
-                    }
-                } else if let Some(map) = state.assoc_arrays.get_mut(var_name) {
-                    map.remove(idx);
-                }
-                continue;
-            }
-        }
-        state.unset_var(name);
-    }
-    status
+    crate::var_builtins::unset(args, state)
 }
 
 fn builtin_echo(args: &[String]) -> i32 {
@@ -2938,14 +2851,13 @@ fn shell_option_enabled(state: &ShellState, name: &str) -> bool {
 
 fn builtin_set(args: &[String], state: &mut ShellState) -> i32 {
     if args.is_empty() {
-        let mut all: Vec<_> = state.env_vars.iter().collect();
-        // Also include variables from all local scopes
-        for scope in &state.local_vars_stack {
-            all.extend(scope.iter());
-        }
-        all.sort_by_key(|(k, _)| (*k).clone());
-        for (k, v) in all {
-            println!("{}={}", k, v);
+        for (name, _, var) in state.visible_variables() {
+            if !crate::environment::is_valid_identifier(name) {
+                continue;
+            }
+            if let Some(line) = crate::var_builtins::set_style_line(name, var) {
+                println!("{}", line);
+            }
         }
         return 0;
     }
@@ -3064,28 +2976,13 @@ fn builtin_set(args: &[String], state: &mut ShellState) -> i32 {
 }
 
 fn builtin_local(args: &[String], state: &mut ShellState) -> i32 {
-    for arg in args {
-        // `local -`: the function's `set` options are restored on return.
-        if arg == "-" {
-            if !state.save_options_for_function() {
-                eprintln!("jsh: local: can only be used in a function");
-                return 1;
-            }
-            continue;
-        }
-        if let Some(eq_pos) = arg.find('=') {
-            let name = &arg[..eq_pos];
-            let value = &arg[eq_pos + 1..];
-            if let Some(scope) = state.local_vars_stack.last_mut() {
-                scope.insert(name.to_string(), value.to_string());
-            }
-        } else {
-            if let Some(scope) = state.local_vars_stack.last_mut() {
-                scope.insert(arg.clone(), String::new());
-            }
-        }
+    // `local -`: the function's `set` options are restored on return. The
+    // variable side of `local` treats `-` as a no-op operand.
+    if args.iter().any(|arg| arg == "-") && !state.save_options_for_function() {
+        eprintln!("jsh: local: can only be used in a function");
+        return 1;
     }
-    0
+    crate::var_builtins::local(args, state)
 }
 
 fn builtin_history(_state: &ShellState) -> i32 {
@@ -3939,190 +3836,7 @@ fn cond_pattern_match(pattern: &str, text: &str, state: &ShellState) -> bool {
 // ============================================================
 
 fn builtin_declare(args: &[String], state: &mut ShellState) -> i32 {
-    let mut indexed = false;
-    let mut associative = false;
-    let mut print = false;
-    let mut names: Vec<&str> = Vec::new();
-    let mut i = 0;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "-a" => indexed = true,
-            "-A" => associative = true,
-            "-p" => print = true,
-            s => names.push(s),
-        }
-        i += 1;
-    }
-
-    if print {
-        for name in &names {
-            if let Some(arr) = state.arrays.get(*name) {
-                println!(
-                    "declare -a {}=({})",
-                    name,
-                    arr.iter()
-                        .enumerate()
-                        .map(|(i, s)| format!("[{}]=\"{}\"", i, s))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-            } else if let Some(map) = state.assoc_arrays.get(*name) {
-                let pairs: Vec<String> = map
-                    .iter()
-                    .map(|(k, v)| format!("[{}]=\"{}\"", k, v))
-                    .collect();
-                println!("declare -A {}=({})", name, pairs.join(" "));
-            } else if let Some(val) = state.get_var(name) {
-                println!("declare -- {}=\"{}\"", name, val);
-            }
-        }
-        return 0;
-    }
-
-    for name in &names {
-        // Handle name=value or name=()
-        let (var_name, value) = if let Some(eq) = name.find('=') {
-            (&name[..eq], Some(&name[eq + 1..]))
-        } else {
-            (*name, None)
-        };
-
-        if associative {
-            // Parse initialization value like: ([key1]=val1 [key2]=val2)
-            match value {
-                Some(val) if val.starts_with('(') && val.ends_with(')') => {
-                    let inner = &val[1..val.len() - 1].trim();
-                    match parse_assoc_array_init(inner) {
-                        Ok(values) => {
-                            state
-                                .assoc_arrays
-                                .entry(var_name.to_string())
-                                .or_default()
-                                .extend(values);
-                        }
-                        Err(error) => {
-                            eprintln!("jsh: declare: {var_name}: {error}");
-                            return 1;
-                        }
-                    }
-                }
-                Some(val) if val.starts_with('(') => {
-                    eprintln!("jsh: declare: {var_name}: unterminated array initializer");
-                    return 1;
-                }
-                Some(val) if !val.is_empty() => {
-                    // Handle single value assignment (rare for assoc arrays)
-                    state
-                        .assoc_arrays
-                        .entry(var_name.to_string())
-                        .or_default()
-                        .insert("0".to_string(), val.to_string());
-                }
-                _ => {
-                    state.assoc_arrays.entry(var_name.to_string()).or_default();
-                }
-            }
-        } else if indexed {
-            if !state.arrays.contains_key(var_name) {
-                state.arrays.insert(var_name.to_string(), Vec::new());
-            }
-
-            // Parse initialization value like: (val1 val2 val3)
-            if let Some(val) = value {
-                if val.starts_with('(') && val.ends_with(')') {
-                    let inner = &val[1..val.len() - 1];
-                    let elements: Vec<&str> = inner.split_whitespace().collect();
-                    *state.arrays.get_mut(var_name).unwrap() =
-                        elements.iter().map(|s| s.to_string()).collect();
-                } else if !val.is_empty() && !val.starts_with('(') {
-                    // Single value
-                    state
-                        .arrays
-                        .get_mut(var_name)
-                        .unwrap()
-                        .push(val.to_string());
-                }
-            }
-        } else {
-            // Regular variable
-            if let Some(val) = value {
-                state.set_var(var_name, val);
-            }
-        }
-    }
-    0
-}
-
-fn parse_assoc_array_init(
-    input: &str,
-) -> Result<std::collections::HashMap<String, String>, &'static str> {
-    // Parse input like: [key1]=val1 [key2]=val2
-    let mut current = input;
-    let mut values = std::collections::HashMap::new();
-    loop {
-        current = current.trim_start();
-        if current.is_empty() {
-            return Ok(values);
-        }
-        if !current.starts_with('[') {
-            return Err("expected '[key]=value' in associative-array initializer");
-        }
-
-        // Find closing bracket
-        if let Some(bracket_end) = current.find(']') {
-            let key = &current[1..bracket_end];
-            if key.is_empty() {
-                return Err("associative-array key cannot be empty");
-            }
-            let rest = &current[bracket_end + 1..];
-
-            // Skip = sign
-            if let Some(value_part) = rest.strip_prefix('=') {
-                let value_part = value_part.trim_start();
-
-                // Extract value (quoted or unquoted)
-                let (value, next_pos) = if let Some(quoted) = value_part.strip_prefix('"') {
-                    // Quoted value
-                    let mut escaped = false;
-                    let mut closing_quote = None;
-                    for (i, ch) in quoted.char_indices() {
-                        if escaped {
-                            escaped = false;
-                        } else if ch == '\\' {
-                            escaped = true;
-                        } else if ch == '"' {
-                            closing_quote = Some(i);
-                            break;
-                        }
-                    }
-                    let Some(end) = closing_quote else {
-                        return Err("unterminated double-quoted value");
-                    };
-                    (quoted[..end].to_string(), end + 2)
-                } else if let Some(quoted) = value_part.strip_prefix('\'') {
-                    // Single-quoted value
-                    if let Some(end) = quoted.find('\'') {
-                        (quoted[..end].to_string(), end + 2)
-                    } else {
-                        return Err("unterminated single-quoted value");
-                    }
-                } else {
-                    // Unquoted value (until space or next bracket)
-                    let end_pos = value_part.find([' ', '[']).unwrap_or(value_part.len());
-                    (value_part[..end_pos].to_string(), end_pos)
-                };
-
-                values.insert(key.to_string(), value);
-
-                current = &value_part[next_pos..];
-            } else {
-                return Err("expected '=' after associative-array key");
-            }
-        } else {
-            return Err("unterminated associative-array key");
-        }
-    }
+    crate::var_builtins::declare(args, state)
 }
 
 // ============================================================

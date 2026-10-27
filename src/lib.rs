@@ -50,6 +50,8 @@ mod terminal_text;
 pub mod traps;
 pub mod value;
 pub mod value_builtins;
+pub mod var_builtins;
+pub mod variables;
 pub mod wire_json;
 pub mod workflows;
 pub(crate) mod yaml;

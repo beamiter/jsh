@@ -241,8 +241,9 @@ mod tests {
         )
         .unwrap();
         let mut state = ShellState::new(false);
-        state.set_var("JSH_TEST_VALUE", "live-state");
-        state.set_var("JSH_TEST_MARKER", marker.to_str().unwrap());
+        // Only exported variables reach a launched program, as in bash.
+        state.export_var("JSH_TEST_VALUE", "live-state");
+        state.export_var("JSH_TEST_MARKER", marker.to_str().unwrap());
         let status = launch(Path::new("/bin/sh"), &path, &state)
             .unwrap()
             .wait()

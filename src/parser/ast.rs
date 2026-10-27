@@ -118,6 +118,17 @@ pub struct SimpleCommand {
     /// as written, joined by single spaces.
     #[serde(default)]
     pub text: String,
+    /// Arguments of a declaration builtin (`declare`, `typeset`, `local`,
+    /// `export`, `readonly`) written as compound assignments, as
+    /// `(index into words, source text)`: `local -a xs=(a "b c")`.
+    ///
+    /// Bash expands such an argument element by element, the way it expands
+    /// `xs=(a "b c")` itself, so the builtin needs the text from before word
+    /// expansion; quoting it (`declare 'xs=(a b)'`) makes it a plain string.
+    /// `words` keeps the ordinary parse of the same argument for everything
+    /// else that looks at the command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compound_args: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

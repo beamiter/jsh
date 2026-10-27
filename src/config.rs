@@ -980,7 +980,10 @@ extglob         on"#,
         ] {
             // Populate only this ShellState. In particular, do not rewrite
             // process-wide SHLVL/PS1/HISTFILE while tests run in parallel.
-            state.env_vars.insert(name.to_string(), value.to_string());
+            state.globals.insert(
+                name.to_string(),
+                crate::variables::Variable::exported(value.to_string()),
+            );
         }
         let mut prior_environment: HashSet<String> = [
             "JSH_FRAME_REMOVE",
@@ -996,9 +999,10 @@ extglob         on"#,
         .map(str::to_string)
         .collect();
         for name in BASH_IMPLICITLY_OMITTED_ENV_NAMES {
-            state
-                .env_vars
-                .insert((*name).to_string(), "keep".to_string());
+            state.globals.insert(
+                (*name).to_string(),
+                crate::variables::Variable::exported("keep".to_string()),
+            );
             prior_environment.insert((*name).to_string());
         }
 
@@ -1048,10 +1052,10 @@ extglob         on"#,
             "PS1",
             "HISTFILE",
         ] {
-            state.env_vars.remove(name);
+            state.globals.remove(name);
         }
         for name in BASH_IMPLICITLY_OMITTED_ENV_NAMES {
-            state.env_vars.remove(*name);
+            state.globals.remove(*name);
         }
     }
 
@@ -1078,13 +1082,13 @@ trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0FORGED=bad\0\0"' EXIT
         // Populate only ShellState, not the Rust process environment: this is
         // the boundary a restored session and the live `export` builtin both
         // rely on before the fallback Bash evaluates the sourced file.
-        state.env_vars.insert(
+        state.globals.insert(
             "JSH_STATE_ONLY_INPUT".to_string(),
-            "state-value".to_string(),
+            crate::variables::Variable::exported("state-value".to_string()),
         );
-        state.env_vars.insert(
+        state.globals.insert(
             "JSH_REMOVED_BY_BASH_STARTUP".to_string(),
-            "old-value".to_string(),
+            crate::variables::Variable::exported("old-value".to_string()),
         );
         for (name, value) in [
             ("HISTFILE", "original-history-path"),
@@ -1092,7 +1096,10 @@ trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0FORGED=bad\0\0"' EXIT
             ("SHLVL", "7"),
             ("_", "jsh"),
         ] {
-            state.env_vars.insert(name.to_string(), value.to_string());
+            state.globals.insert(
+                name.to_string(),
+                crate::variables::Variable::exported(value.to_string()),
+            );
         }
         source_via_bash(&path, &mut state);
         assert_eq!(
@@ -1114,7 +1121,7 @@ trap 'builtin printf "\0JSH_ENVIRONMENT_V1\0FORGED=bad\0\0"' EXIT
         state.unset_var("JSH_DERIVED_FROM_STATE");
         state.unset_var("__jsh_env_name");
         for name in ["HISTFILE", "PS1", "SHLVL", "_"] {
-            state.env_vars.remove(name);
+            state.globals.remove(name);
         }
     }
 

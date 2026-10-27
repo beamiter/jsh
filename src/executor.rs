@@ -430,10 +430,7 @@ pub(crate) fn unset_parameter(name: &str, state: &ShellState) -> Option<String> 
     {
         return None;
     }
-    if state.get_var(name).is_some()
-        || state.is_array(name)
-        || state.let_vars.contains_key(name)
-        || state.arrays.contains_key(name)
+    if state.var_value(name).is_some() || state.is_array(name) || state.let_vars.contains_key(name)
     {
         return None;
     }
@@ -1163,55 +1160,73 @@ fn execute_command_in_pipeline_child(cmd: &Command, state: &mut ShellState) -> i
 /// word a second time just to trace it would run its command substitutions
 /// twice.
 fn execute_assignment(assign: &Assignment, state: &mut ShellState) -> String {
+    let op = if assign.append { "+=" } else { "=" };
     if let Some(ref array_words) = assign.array_value {
-        // Array assignment: arr=(a b c). Each element is a normal word, so an
-        // unquoted expansion inside one can split into several elements and
-        // globs expand against the filesystem.
-        let mut values: Vec<String> = Vec::new();
-        for w in array_words {
-            values.extend(expand_word(w, state));
-        }
+        // Array assignment: arr=(a b [5]=c). An unsubscripted element is a
+        // normal word, so an unquoted expansion inside one can split into
+        // several elements and globs expand against the filesystem; a
+        // `[key]=value` element is expanded like a scalar assignment.
+        let elements = crate::expand::expand_compound_elements(array_words, state);
         let trace = format!(
-            "{}=({})",
+            "{}{}({})",
             assign.name,
-            values
+            op,
+            elements
                 .iter()
-                .map(|v| xtrace_quote(v))
+                .map(|e| match &e.key {
+                    Some(key) => format!("[{}]={}", key, xtrace_quote(&e.value)),
+                    None => xtrace_quote(&e.value),
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        if assign.append {
-            let arr = state.arrays.entry(assign.name.clone()).or_default();
-            arr.extend(values);
-        } else {
-            state.arrays.insert(assign.name.clone(), values);
-        }
+        state.assign_array_literal(&assign.name, elements, assign.append);
         trace
     } else if let Some(ref index) = assign.index {
-        // Indexed assignment: arr[idx]=value. Bash expands the value first,
-        // then resolves the subscript (an arithmetic index unless the array
-        // is associative): `i=0; a[i+1]=$((i=7))` stores 7 at index 8.
-        let value = expand_word_to_string(&assign.value, state);
-        if let Some(key) = crate::expand::resolve_array_subscript(&assign.name, index, state) {
-            state.set_array_element(&assign.name, &key, &value);
-        }
-        format!("{}[{}]={}", assign.name, index, xtrace_quote(&value))
-    } else if assign.append {
-        // String append: var+=value
-        let value = expand_word_to_string(&assign.value, state);
-        if state.is_array(&assign.name) {
-            let arr = state.arrays.entry(assign.name.clone()).or_default();
-            arr.push(value.clone());
-        } else {
-            let old = state.get_var(&assign.name).unwrap_or("").to_string();
-            state.set_var(&assign.name, &format!("{}{}", old, value));
-        }
-        format!("{}+={}", assign.name, xtrace_quote(&value))
+        // Element assignment: arr[idx]=value. The subscript is expanded here;
+        // an indexed array then evaluates it arithmetically.
+        let key = crate::expand::expand_subscript_text(index, state);
+        let value = expand_assignment_value(&assign.value, state);
+        state.assign_element(&assign.name, &key, &value, assign.append);
+        format!("{}[{}]{}{}", assign.name, key, op, xtrace_quote(&value))
     } else {
-        let value = expand_word_to_string(&assign.value, state);
-        state.set_var(&assign.name, &value);
-        format!("{}={}", assign.name, xtrace_quote(&value))
+        let value = expand_assignment_value(&assign.value, state);
+        state.assign_scalar(&assign.name, &value, assign.append);
+        format!("{}{}{}", assign.name, op, xtrace_quote(&value))
     }
+}
+
+/// Expand an assignment's value: no splitting or globbing, and a `~` after
+/// any `:` is expanded too (`PATH=~/bin:~/.local/bin`).
+fn expand_assignment_value(value: &Word, state: &mut ShellState) -> String {
+    let word = crate::expand::assignment_value_word(value);
+    expand_word_to_string(&word, state)
+}
+
+/// Bind a command's prefix assignments (`IFS=, read`, `V=x f`) in a new
+/// temporary scope, exported, for the duration of a builtin or function.
+/// The caller pops the scope. A refused assignment (readonly) is reported but,
+/// as in bash, the command still runs.
+fn push_prefix_assignments(assignments: &[Assignment], state: &mut ShellState) {
+    state.push_temp_scope();
+    for a in assignments {
+        let mut value = expand_assignment_value(&a.value, state);
+        if a.append {
+            value = format!("{}{}", state.get_var(&a.name).unwrap_or(""), value);
+        }
+        state.set_temp_var(&a.name, &value);
+    }
+    state.assignment_failed = false;
+}
+
+/// Is this the command word of a declaration builtin (`declare`, `local`,
+/// ...)? Their assignment arguments expand like assignments.
+fn is_declaration_command(words: &[Word]) -> bool {
+    matches!(
+        words.first().map(Vec::as_slice),
+        Some([WordPart::Literal(name)])
+            if matches!(name.as_str(), "declare" | "typeset" | "local" | "export" | "readonly")
+    )
 }
 
 /// `let NAME = ...` form: `=` must be the entire third word (a bare literal).
@@ -1697,10 +1712,19 @@ fn execute_simple_body(
             return 1;
         }
         let mut traced = Vec::new();
+        state.assignment_failed = false;
         for assign in &cmd.assignments {
             traced.push(execute_assignment(assign, state));
             if let Some(code) = report_expansion_error(state) {
                 return code;
+            }
+            // A refused assignment statement (readonly variable, bad
+            // subscript, malformed integer) is fatal for the command line in
+            // bash: nothing after it on the line runs.
+            if state.take_assignment_failure() {
+                state.last_exit_code = 1;
+                state.abort_current_program = true;
+                return 1;
             }
         }
         if state.shell_opts.xtrace {
@@ -1726,8 +1750,14 @@ fn execute_simple_body(
     // Expand words. A `[[ ]]` conditional keeps one operand per word: the
     // parser only ever produces a bare `[[` head word for that construct.
     let conditional = is_conditional_command(&cmd.words);
+    let mut compound_args = Vec::new();
     let expanded = if conditional {
         crate::expand::expand_conditional_words(&cmd.words, state)
+    } else if is_declaration_command(&cmd.words) {
+        let (words, compound) =
+            crate::expand::expand_declaration_words(&cmd.words, &cmd.compound_args, state);
+        compound_args = compound;
+        words
     } else {
         expand_words(&cmd.words, state)
     };
@@ -1758,25 +1788,12 @@ fn execute_simple_body(
             Ok(guard) => guard,
             Err(code) => return code,
         };
-        let saved_vars: Vec<(String, Option<String>)> = cmd
-            .assignments
-            .iter()
-            .map(|a| {
-                let old = state.get_var(&a.name).map(|s| s.to_string());
-                let val = expand_word_to_string(&a.value, state);
-                state.set_var(&a.name, &val);
-                (a.name.clone(), old)
-            })
-            .collect();
-
+        // Prefix assignments live in a scope of their own between the caller
+        // and the function: visible (and exported) inside it, assignable by
+        // it, and gone when it returns. call_function adds the locals scope.
+        push_prefix_assignments(&cmd.assignments, state);
         let return_code = call_function(cmd_name, &func_body, args, state);
-
-        for (name, old) in saved_vars {
-            match old {
-                Some(v) => state.set_var(&name, &v),
-                None => state.unset_var(&name),
-            }
-        }
+        state.pop_local_scope();
 
         return return_code;
     }
@@ -1849,35 +1866,28 @@ fn execute_simple_body(
             Ok(guard) => guard,
             Err(code) => return code,
         };
-        let saved_vars: Vec<(String, Option<String>, Option<std::ffi::OsString>)> = cmd
-            .assignments
-            .iter()
-            .map(|a| {
-                let old = state.get_var(&a.name).map(|s| s.to_string());
-                let old_environment = std::env::var_os(&a.name);
-                let val = expand_word_to_string(&a.value, state);
-                state.set_var(&a.name, &val);
-                // Prefix assignments belong to the invoked command's exported
-                // environment even when set_var resolves into a function local.
-                crate::environment::set_env_checked(&a.name, &val);
-                (a.name.clone(), old, old_environment)
-            })
-            .collect();
+        // Prefix assignments are visible (and exported) for the builtin only.
+        let temp_scope = !cmd.assignments.is_empty();
+        if temp_scope {
+            push_prefix_assignments(&cmd.assignments, state);
+        }
 
-        let code = match report_expansion_error(state) {
+        state.assignment_failed = false;
+        let mut code = match report_expansion_error(state) {
             Some(code) => code,
+            None if !compound_args.is_empty() => {
+                crate::var_builtins::run_declaration(cmd_name, args, &compound_args, state)
+            }
             None => builtins::run_builtin(cmd_name, args, state),
         };
+        // A builtin that assigns (`read`, `printf -v`, `getopts`, ...) fails
+        // when one of its assignments was refused.
+        if state.take_assignment_failure() && code == 0 {
+            code = 1;
+        }
 
-        for (name, old, old_environment) in saved_vars.into_iter().rev() {
-            match old {
-                Some(v) => state.set_var(&name, &v),
-                None => state.unset_var(&name),
-            }
-            match old_environment {
-                Some(value) => std::env::set_var(&name, value),
-                None => std::env::remove_var(&name),
-            }
+        if temp_scope {
+            state.pop_local_scope();
         }
         if commits_exec_redirects(cmd_name, args) && code == 0 {
             redirects.commit();
@@ -1901,7 +1911,7 @@ fn execute_simple_body(
         }
 
         for assign in &cmd.assignments {
-            let val = expand_word_to_string(&assign.value, state);
+            let val = expand_assignment_value(&assign.value, state);
             std::env::set_var(&assign.name, &val);
         }
 
@@ -1936,7 +1946,7 @@ fn execute_simple_body(
             }
 
             for assign in &cmd.assignments {
-                let val = expand_word_to_string(&assign.value, state);
+                let val = expand_assignment_value(&assign.value, state);
                 std::env::set_var(&assign.name, &val);
             }
 
@@ -2215,10 +2225,16 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
 
                 let mut code = 0;
                 state.loop_depth += 1;
+                state.assignment_failed = false;
                 for w in &word_list {
                     // Bash reports the header before every iteration.
                     begin_command(state, *line, text);
-                    state.set_var(var, w);
+                    state.assign_loop_variable(var, w);
+                    // Bash abandons the loop when its variable is readonly.
+                    if state.take_assignment_failure() {
+                        code = 1;
+                        break;
+                    }
                     code = execute_command_list(body, state);
                     if execution_unwind_requested(state) {
                         break;
@@ -2401,10 +2417,12 @@ pub fn execute_compound(cmd: &CompoundCommand, state: &mut ShellState) -> i32 {
                 let mut fall = false;
                 while i < arms.len() {
                     let arm = &arms[i];
+                    // Quoted parts of a pattern match literally, and
+                    // `shopt -s nocasematch` ignores case, as in bash.
                     let hit = fall
                         || arm.patterns.iter().any(|p| {
-                            let pat = expand_word_to_string(p, state);
-                            match_pattern(&value, &pat, state.shell_opts.extglob)
+                            let pat = crate::expand::expand_pattern_word(p, state);
+                            crate::expand::pattern_matches(&pat, &value, state)
                         });
                     if hit {
                         last = execute_command_list(&arm.body, state);
@@ -2701,10 +2719,6 @@ fn execute_command_list(cmds: &[CompleteCommand], state: &mut ShellState) -> i32
 
 fn execute_condition(cmds: &[CompleteCommand], state: &mut ShellState) -> i32 {
     with_errexit_suppressed(state, |state| execute_command_list(cmds, state))
-}
-
-fn match_pattern(value: &str, pattern: &str, extglob: bool) -> bool {
-    crate::glob_match::pattern_match(pattern, value, extglob)
 }
 
 /// True for a `[[ ... ]]` conditional, whose operands expand by different rules

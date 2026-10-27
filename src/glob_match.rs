@@ -11,7 +11,144 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
     }
     let p: Vec<char> = pattern.chars().collect();
     let v: Vec<char> = value.chars().collect();
-    glob_match_iter(&p, &v)
+    glob_match_iter(&p, &v, false)
+}
+
+/// How [`pattern_match_with`] matches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MatchOptions {
+    /// Recognise `?(...)`, `*(...)`, `+(...)`, `@(...)` and `!(...)`.
+    pub extglob: bool,
+    /// Ignore letter case (`shopt -s nocasematch` / `nocaseglob`).
+    pub nocase: bool,
+}
+
+/// Match `value` against a shell pattern in which a backslash makes the next
+/// character literal.
+///
+/// That is the form word expansion produces for patterns (see
+/// `crate::expand::expand_pattern_word`): quoted characters arrive
+/// backslash-escaped, so `case $x in "*")` matches only a literal star, as
+/// in bash. [`glob_match`] and [`pattern_match`] keep treating a backslash as
+/// an ordinary character for their existing callers.
+pub fn pattern_match_with(pattern: &str, value: &str, options: MatchOptions) -> bool {
+    let (pattern, value): (std::borrow::Cow<str>, std::borrow::Cow<str>) = if options.nocase {
+        (pattern.to_lowercase().into(), value.to_lowercase().into())
+    } else {
+        (pattern.into(), value.into())
+    };
+    if options.extglob && contains_extglob(&pattern) {
+        return extglob_match(&pattern, &value);
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let v: Vec<char> = value.chars().collect();
+    glob_match_iter(&p, &v, true)
+}
+
+/// A pattern prepared once for matching against many candidate substrings, as
+/// `${v//pat/rep}` and `${v#pat}` do: the characters are decoded a single time
+/// and, when the pattern can only match a fixed number of characters (no `*`
+/// and no extended-glob group), callers need try one length per position.
+pub struct CompiledPattern {
+    chars: Vec<char>,
+    options: MatchOptions,
+    extglob: bool,
+    /// The exact length in characters of every string the pattern matches,
+    /// when there is one.
+    pub fixed_len: Option<usize>,
+}
+
+impl CompiledPattern {
+    /// `pattern` is in the backslash-escaped form of [`pattern_match_with`].
+    pub fn new(pattern: &str, options: MatchOptions) -> Self {
+        let text = if options.nocase {
+            pattern.to_lowercase()
+        } else {
+            pattern.to_string()
+        };
+        let extglob = options.extglob && contains_extglob(&text);
+        let chars: Vec<char> = text.chars().collect();
+        let fixed_len = if extglob {
+            None
+        } else {
+            fixed_match_len(&chars)
+        };
+        CompiledPattern {
+            chars,
+            options,
+            extglob,
+            fixed_len,
+        }
+    }
+
+    /// Decode a value for matching (lower-cased under `nocase`).
+    pub fn prepare(&self, value: &str) -> Vec<char> {
+        if self.options.nocase {
+            value.to_lowercase().chars().collect()
+        } else {
+            value.chars().collect()
+        }
+    }
+
+    /// The literal character every match starts with, if the pattern
+    /// begins with one; lets a caller skip positions that cannot match.
+    pub fn first_literal(&self) -> Option<char> {
+        match self.chars.first()? {
+            '\\' => self.chars.get(1).copied(),
+            '*' | '?' | '[' => None,
+            c if self.extglob && matches!(c, '+' | '@' | '!') => None,
+            c => Some(*c),
+        }
+    }
+
+    /// Does the pattern match all of `value` (from [`Self::prepare`])?
+    pub fn matches(&self, value: &[char]) -> bool {
+        if self.extglob {
+            match_from(&self.chars, 0, value, 0)
+        } else {
+            glob_match_iter(&self.chars, value, true)
+        }
+    }
+}
+
+/// The number of characters every match of a plain (escaped) pattern has,
+/// or `None` when a `*` makes it variable.
+fn fixed_match_len(pattern: &[char]) -> Option<usize> {
+    let mut len = 0;
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            '*' => return None,
+            '\\' if i + 1 < pattern.len() => i += 2,
+            '[' => {
+                let mut end = i;
+                if match_char_class(pattern, &mut end).is_some() {
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+        len += 1;
+    }
+    Some(len)
+}
+
+/// Escape every character a shell pattern would treat specially, so that the
+/// text matches only itself under [`pattern_match_with`].
+pub fn escape_pattern(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '*' | '?' | '[' | ']' | '\\' | '(' | ')' | '|' | '!' | '@' | '+'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Parse a `[...]` character class starting at `pattern[pi]` (which must be `[`).
@@ -80,15 +217,27 @@ fn char_in_class(ch: char, negated: bool, ranges: &[(char, char)]) -> bool {
 }
 
 /// Iterative two-pointer glob matching (O(n*m) worst case, no stack overflow).
-/// Supports `*`, `?`, and `[...]` character classes.
-fn glob_match_iter(pattern: &[char], value: &[char]) -> bool {
+/// Supports `*`, `?`, and `[...]` character classes, and with `escapes` a
+/// backslash that makes the next pattern character literal.
+fn glob_match_iter(pattern: &[char], value: &[char], escapes: bool) -> bool {
     let mut pi = 0;
     let mut vi = 0;
     let mut star_pi: Option<usize> = None;
     let mut star_vi = 0;
 
     while vi < value.len() {
-        if pi < pattern.len() && pattern[pi] == '[' {
+        if escapes && pi + 1 < pattern.len() && pattern[pi] == '\\' {
+            if pattern[pi + 1] == value[vi] {
+                pi += 2;
+                vi += 1;
+            } else if let Some(sp) = star_pi {
+                pi = sp + 1;
+                star_vi += 1;
+                vi = star_vi;
+            } else {
+                return false;
+            }
+        } else if pi < pattern.len() && pattern[pi] == '[' {
             let mut tmp_pi = pi;
             if let Some((negated, ranges)) = match_char_class(pattern, &mut tmp_pi) {
                 if char_in_class(value[vi], negated, &ranges) {
@@ -364,6 +513,38 @@ fn parse_extglob_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escaped_patterns_match_quoted_characters_literally() {
+        let plain = MatchOptions::default();
+        assert!(pattern_match_with("a\\*", "a*", plain));
+        assert!(!pattern_match_with("a\\*", "abc", plain));
+        assert!(pattern_match_with("a*", "abc", plain));
+        assert!(pattern_match_with(&escape_pattern("[x]?"), "[x]?", plain));
+        let nocase = MatchOptions {
+            nocase: true,
+            ..MatchOptions::default()
+        };
+        assert!(pattern_match_with("[a-c]BC", "Abc", nocase));
+        assert!(!pattern_match_with("[a-c]BC", "Abc", plain));
+    }
+
+    #[test]
+    fn compiled_patterns_know_their_fixed_length() {
+        let options = MatchOptions::default();
+        assert_eq!(
+            CompiledPattern::new("a?[xyz]\\*", options).fixed_len,
+            Some(4)
+        );
+        assert_eq!(CompiledPattern::new("a*", options).fixed_len, None);
+        let compiled = CompiledPattern::new("[ab]c", options);
+        assert!(compiled.matches(&compiled.prepare("bc")));
+        assert_eq!(compiled.first_literal(), None);
+        assert_eq!(
+            CompiledPattern::new("\\*x", options).first_literal(),
+            Some('*')
+        );
+    }
 
     #[test]
     fn test_exact() {

@@ -105,9 +105,9 @@ fn quoted_variable_prefix_stays_expandable_but_generated_names_do_not() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("file$JSH_COMPLETION_LITERAL.txt"), "").unwrap();
     let mut state = ShellState::new(false);
-    state.env_vars.insert(
+    state.globals.insert(
         "JSH_COMPLETION_BASE".to_string(),
-        temp.path().to_str().unwrap().to_string(),
+        jsh::variables::Variable::exported(temp.path().to_str().unwrap().to_string()),
     );
     let buffer = "cat \"$JSH_COMPLETION_BASE/fi";
     let results = candidates(buffer, &mut state);
@@ -285,19 +285,15 @@ fn completion_function_does_not_clobber_the_previous_command_state() {
     state.last_exit_code = 42;
     state.pipestatus = vec![42, 7];
     state.positional_params = vec!["original argument".into()];
-    state
-        .arrays
-        .insert("COMP_WORDS".into(), vec!["saved words".into()]);
-    state
-        .arrays
-        .insert("COMPREPLY".into(), vec!["saved replies".into()]);
+    state.set_array("COMP_WORDS", vec!["saved words".into()]);
+    state.set_array("COMPREPLY", vec!["saved replies".into()]);
     let results = candidates("jsh-test-command ", &mut state);
     assert!(results.iter().any(|item| item.text == "ready"));
     assert_eq!(state.last_exit_code, 42);
     assert_eq!(state.pipestatus, vec![42, 7]);
     assert_eq!(state.positional_params, vec!["original argument"]);
-    assert_eq!(state.arrays["COMP_WORDS"], vec!["saved words"]);
-    assert_eq!(state.arrays["COMPREPLY"], vec!["saved replies"]);
+    assert_eq!(state.array_values("COMP_WORDS"), vec!["saved words"]);
+    assert_eq!(state.array_values("COMPREPLY"), vec!["saved replies"]);
     assert_eq!(state.return_depth, 0);
     assert!(!state.return_requested);
     assert!(state.local_vars_stack.is_empty());

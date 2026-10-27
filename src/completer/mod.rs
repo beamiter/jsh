@@ -517,14 +517,29 @@ fn apply_completion_spec(
                 words.push(String::new());
             }
             let cword = words.len().saturating_sub(1);
-            let saved_words = state.arrays.insert("COMP_WORDS".to_string(), words.clone());
+            // The completion variables are the callback's locals: they vanish
+            // with its scope and never disturb a global of the same name.
             if let Some(scope) = state.local_vars_stack.last_mut() {
-                scope.insert("COMP_CWORD".to_string(), cword.to_string());
-                scope.insert("COMP_LINE".to_string(), line.to_string());
-                scope.insert("COMP_POINT".to_string(), line.len().to_string());
-                // What bash passes as $1/$2/$3 to a `-F` function.
-                scope.insert("COMP_KEY".to_string(), "9".to_string());
-                scope.insert("COMP_TYPE".to_string(), "9".to_string());
+                use crate::variables::{IndexedArray, VarAttrs, VarValue, Variable};
+                for (name, value) in [
+                    ("COMP_CWORD", cword.to_string()),
+                    ("COMP_LINE", line.to_string()),
+                    ("COMP_POINT", line.len().to_string()),
+                    // What bash passes as $1/$2/$3 to a `-F` function.
+                    ("COMP_KEY", "9".to_string()),
+                    ("COMP_TYPE", "9".to_string()),
+                ] {
+                    scope.vars.insert(name.to_string(), Variable::scalar(value));
+                }
+                for (name, values) in [("COMP_WORDS", words.clone()), ("COMPREPLY", Vec::new())] {
+                    scope.vars.insert(
+                        name.to_string(),
+                        Variable {
+                            value: VarValue::Indexed(IndexedArray::from_values(values)),
+                            attrs: VarAttrs::ARRAY,
+                        },
+                    );
+                }
             }
             state
                 .positional_stack
@@ -537,7 +552,6 @@ fn apply_completion_spec(
                     .cloned()
                     .unwrap_or_default(),
             ];
-            let saved_replies = state.arrays.insert("COMPREPLY".to_string(), Vec::new());
 
             // Completion is an editor query, not the user's next command.
             // Give its callback a real function context (including `return`)
@@ -568,8 +582,8 @@ fn apply_completion_spec(
             crate::executor::execute_compound(&func_body, state);
 
             // Read COMPREPLY
-            if let Some(replies) = state.arrays.get("COMPREPLY") {
-                for reply in replies {
+            {
+                for reply in &state.array_values("COMPREPLY") {
                     if reply.starts_with(prefix) {
                         completions.push(Completion {
                             text: reply.clone(),
@@ -585,13 +599,6 @@ fn apply_completion_spec(
             // Clean up - pop the local scope
             state.pop_local_scope();
             state.positional_params = state.positional_stack.pop().unwrap_or_default();
-            for (name, saved) in [("COMP_WORDS", saved_words), ("COMPREPLY", saved_replies)] {
-                if let Some(saved) = saved {
-                    state.arrays.insert(name.to_string(), saved);
-                } else {
-                    state.arrays.remove(name);
-                }
-            }
             state.last_exit_code = saved_exit_code;
             state.pipestatus = saved_pipestatus;
             (
@@ -2622,27 +2629,14 @@ fn parse_known_hosts(content: &str) -> Vec<String> {
 
 /// Bare variable names for `export`/`unset`/`declare`-style builtins.
 fn complete_variable_names(prefix: &str, state: &ShellState) -> Vec<Completion> {
-    let mut entries: Vec<(String, &'static str)> = Vec::new();
-    for name in state.env_vars.keys() {
-        entries.push((name.clone(), "environment variable"));
-    }
-    for scope in &state.local_vars_stack {
-        for name in scope.keys() {
-            entries.push((name.clone(), "local"));
-        }
-    }
-    for name in state.arrays.keys() {
-        entries.push((name.clone(), "array"));
-    }
-    for name in state.assoc_arrays.keys() {
-        entries.push((name.clone(), "assoc array"));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut seen = std::collections::HashSet::new();
-    entries
+    state
+        .visible_variables()
         .into_iter()
-        .filter(|(name, _)| name.starts_with(prefix) && seen.insert(name.clone()))
-        .map(|(name, desc)| Completion::new(name, CompletionKind::Variable).with_desc(desc))
+        .filter(|(name, _, _)| name.starts_with(prefix))
+        .map(|(name, slot, var)| {
+            Completion::new(name.to_string(), CompletionKind::Variable)
+                .with_desc(variable_kind_description(slot, var))
+        })
         .collect()
 }
 
@@ -2994,11 +2988,29 @@ enum KubeName {
     Namespace,
 }
 
+/// How a variable is labelled in completion menus.
+fn variable_kind_description(
+    slot: crate::variables::Slot,
+    var: &crate::variables::Variable,
+) -> &'static str {
+    if var.is_assoc() {
+        "assoc array"
+    } else if var.is_indexed() {
+        "array"
+    } else if slot != crate::variables::Slot::Global {
+        "local"
+    } else if var.attrs.contains(crate::variables::VarAttrs::EXPORT) {
+        "environment variable"
+    } else {
+        "shell variable"
+    }
+}
+
 /// `KUBECONFIG` is a path list, like PATH, and wins over the default. It is
 /// read from this shell's own environment rather than the process's: an
 /// `export` typed at this prompt is what the next command will see.
 fn kubeconfig_paths(state: &ShellState) -> Vec<PathBuf> {
-    if let Some(value) = state.env_vars.get("KUBECONFIG") {
+    if let Some(value) = state.get_var("KUBECONFIG") {
         let paths: Vec<PathBuf> = value
             .split(':')
             .filter(|entry| !entry.is_empty())
@@ -3771,7 +3783,7 @@ fn venv_activators_in(cwd: &Path, state: &ShellState) -> Vec<Completion> {
         );
     }
     // A venv named in the environment but living elsewhere still activates.
-    if let Some(active) = state.env_vars.get("VIRTUAL_ENV") {
+    if let Some(active) = state.get_var("VIRTUAL_ENV") {
         let activate = Path::new(active).join("bin/activate");
         if activate.is_file() {
             let text = escape_shell_word(&activate.to_string_lossy());
@@ -3793,8 +3805,7 @@ fn complete_toolchain_versions(cmd: &str, state: &ShellState) -> Vec<Completion>
     let (roots, label): (Vec<PathBuf>, &str) = match cmd {
         "nvm" | "node" | "npx" => (
             vec![state
-                .env_vars
-                .get("NVM_DIR")
+                .get_var("NVM_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".nvm"))
                 .join("versions/node")],
@@ -3802,8 +3813,7 @@ fn complete_toolchain_versions(cmd: &str, state: &ShellState) -> Vec<Completion>
         ),
         "pyenv" => (
             vec![state
-                .env_vars
-                .get("PYENV_ROOT")
+                .get_var("PYENV_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".pyenv"))
                 .join("versions")],
@@ -3938,17 +3948,13 @@ pub fn action_candidates(action: &str, prefix: &str, state: &mut ShellState) -> 
                 .collect()
         }
         "variable" | "arrayvar" => complete_variable_names("", state),
-        "export" => {
-            let mut names: Vec<&String> = state.env_vars.keys().collect();
-            names.sort();
-            names
-                .into_iter()
-                .map(|name| {
-                    Completion::new(name.clone(), CompletionKind::Variable)
-                        .with_desc("environment variable")
-                })
-                .collect()
-        }
+        "export" => state
+            .exported_vars()
+            .into_iter()
+            .map(|(name, _)| {
+                Completion::new(name, CompletionKind::Variable).with_desc("environment variable")
+            })
+            .collect(),
         "user" => complete_users(""),
         "group" => complete_groups(""),
         "hostname" => complete_ssh_hosts("", false, &state.home_dir),
@@ -4456,14 +4462,13 @@ thread_local! {
 }
 
 fn variable_candidate_generation(state: &ShellState) -> u64 {
-    let locals: usize = state.local_vars_stack.iter().map(HashMap::len).sum();
-    (state.env_vars.len() as u64)
+    let locals: usize = state.local_vars_stack.iter().map(|s| s.vars.len()).sum();
+    let arrays = state.globals.values().filter(|v| v.is_array()).count();
+    (state.globals.len() as u64)
         .wrapping_mul(31)
         .wrapping_add(locals as u64)
         .wrapping_mul(31)
-        .wrapping_add(state.arrays.len() as u64)
-        .wrapping_mul(31)
-        .wrapping_add(state.assoc_arrays.len() as u64)
+        .wrapping_add(arrays as u64)
 }
 
 fn complete_variable(prefix: &str, state: &ShellState) -> Vec<Completion> {
@@ -4534,63 +4539,27 @@ fn build_variable_candidates(state: &ShellState) -> Vec<Completion> {
 
     // Never echo environment values into the completion UI: values commonly
     // contain API keys, access tokens, and other screen-recording-sensitive data.
-    let mut env_vars: Vec<_> = state.env_vars.keys().collect();
-    env_vars.sort();
-    for name in env_vars {
-        {
+    for (name, slot, var) in state.visible_variables() {
+        // Declared-but-unset names (`declare -x OLDPWD`) expand to nothing,
+        // and exported entries that are not identifiers cannot be expanded.
+        if !(var.is_set() || var.is_array()) || !crate::environment::is_valid_identifier(name) {
+            continue;
+        }
+        let description = variable_kind_description(slot, var);
+        if var.is_array() {
+            let len = state.array_length(name);
+            completions.push(Completion {
+                text: format!("${{{}[@]}}", name),
+                display: format!("{} [{}]", name, len),
+                description: Some(format!("{} ({} items)", description, len)),
+                kind: CompletionKind::Variable,
+                is_dir: false,
+            });
+        } else {
             completions.push(Completion {
                 text: format!("${}", name),
-                display: name.clone(),
-                description: Some("environment variable".to_string()),
-                kind: CompletionKind::Variable,
-                is_dir: false,
-            });
-        }
-    }
-
-    // Add local variables from all scopes
-    for scope in &state.local_vars_stack {
-        let mut local_names: Vec<_> = scope.keys().collect();
-        local_names.sort();
-        for name in local_names {
-            {
-                completions.push(Completion {
-                    text: format!("${}", name),
-                    display: name.clone(),
-                    description: Some("local".to_string()),
-                    kind: CompletionKind::Variable,
-                    is_dir: false,
-                });
-            }
-        }
-    }
-
-    // Add array names
-    let mut array_names: Vec<_> = state.arrays.keys().collect();
-    array_names.sort();
-    for name in array_names {
-        {
-            let len = state.array_length(name);
-            completions.push(Completion {
-                text: format!("${{{}[@]}}", name),
-                display: format!("{} [{}]", name, len),
-                description: Some(format!("array ({} items)", len)),
-                kind: CompletionKind::Variable,
-                is_dir: false,
-            });
-        }
-    }
-
-    // Add associative array names
-    let mut assoc_names: Vec<_> = state.assoc_arrays.keys().collect();
-    assoc_names.sort();
-    for name in assoc_names {
-        {
-            let len = state.array_length(name);
-            completions.push(Completion {
-                text: format!("${{{}[@]}}", name),
-                display: format!("{} [{}]", name, len),
-                description: Some(format!("assoc array ({} items)", len)),
+                display: name.to_string(),
+                description: Some(description.to_string()),
                 kind: CompletionKind::Variable,
                 is_dir: false,
             });
@@ -5257,9 +5226,9 @@ mod tests {
     #[test]
     fn variable_completion_never_displays_environment_values() {
         let mut state = ShellState::new(false);
-        state.env_vars.insert(
+        state.globals.insert(
             "JSH_TEST_SECRET".to_string(),
-            "super-secret-token".to_string(),
+            crate::variables::Variable::exported("super-secret-token".to_string()),
         );
 
         let completions = complete_variable("JSH_TEST_SECRET", &state);
@@ -5658,9 +5627,10 @@ mod tests {
     #[test]
     fn declaration_builtins_complete_bare_names() {
         let mut state = ShellState::new(false);
-        state
-            .env_vars
-            .insert("JSH_COMPLETE_ME".to_string(), "value".to_string());
+        state.globals.insert(
+            "JSH_COMPLETE_ME".to_string(),
+            crate::variables::Variable::exported("value".to_string()),
+        );
 
         clear_cache();
         let buffer = "export JSH_COMPLE";
@@ -5734,9 +5704,10 @@ mod tests {
     #[test]
     fn braced_variables_complete_closed() {
         let mut state = ShellState::new(false);
-        state
-            .env_vars
-            .insert("JSH_BRACED_VAR".to_string(), "value".to_string());
+        state.globals.insert(
+            "JSH_BRACED_VAR".to_string(),
+            crate::variables::Variable::exported("value".to_string()),
+        );
 
         clear_cache();
         let buffer = "echo ${JSH_BRACED";
@@ -6115,9 +6086,10 @@ mod tests {
     #[test]
     fn parsed_sources_fall_back_to_fuzzy_matches_too() {
         let mut state = ShellState::new(false);
-        state
-            .env_vars
-            .insert("JSH_COMPLETE_ME".to_string(), "value".to_string());
+        state.globals.insert(
+            "JSH_COMPLETE_ME".to_string(),
+            crate::variables::Variable::exported("value".to_string()),
+        );
         state
             .aliases
             .insert("gst".to_string(), "git status".to_string());
@@ -6580,9 +6552,10 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         let elsewhere = other.path().join("other.yaml");
         fs::write(&elsewhere, "contexts:\n- name: staging\n").unwrap();
-        state
-            .env_vars
-            .insert("KUBECONFIG".to_string(), elsewhere.display().to_string());
+        state.globals.insert(
+            "KUBECONFIG".to_string(),
+            crate::variables::Variable::exported(elsewhere.display().to_string()),
+        );
 
         clear_cache();
         let buffer = "kubectx sta";
@@ -6597,9 +6570,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("projects")).unwrap();
         fs::write(tmp.path().join("notes.txt"), "").unwrap();
-        state
-            .env_vars
-            .insert("JSH_BASE".to_string(), tmp.path().display().to_string());
+        state.globals.insert(
+            "JSH_BASE".to_string(),
+            crate::variables::Variable::exported(tmp.path().display().to_string()),
+        );
 
         // `$VAR/` scans the value but the candidate keeps the variable.
         clear_cache();
@@ -6784,9 +6758,10 @@ mod tests {
     #[test]
     fn spec_generators_resolve_to_builtin_sources_and_never_to_commands() {
         let mut state = ShellState::new(false);
-        state
-            .env_vars
-            .insert("JSH_GENERATOR_VAR".to_string(), "x".to_string());
+        state.globals.insert(
+            "JSH_GENERATOR_VAR".to_string(),
+            crate::variables::Variable::exported("x".to_string()),
+        );
 
         // A generator name reaches the same dynamic source the built-in
         // branches use.
@@ -6882,7 +6857,7 @@ mod tests {
         state.home_dir = tmp.path().to_path_buf();
         // The machine running the tests may have its own nvm; this asserts
         // about the one in the temporary home.
-        state.env_vars.remove("NVM_DIR");
+        state.globals.remove("NVM_DIR");
 
         let results = complete_toolchain_versions("nvm", &state);
         let texts: Vec<&str> = results.iter().map(|c| c.text.as_str()).collect();
@@ -6897,9 +6872,10 @@ mod tests {
         // NVM_DIR from this shell's environment relocates the search.
         let other = tempfile::tempdir().unwrap();
         fs::create_dir_all(other.path().join("versions/node/v22.0.0")).unwrap();
-        state
-            .env_vars
-            .insert("NVM_DIR".to_string(), other.path().display().to_string());
+        state.globals.insert(
+            "NVM_DIR".to_string(),
+            crate::variables::Variable::exported(other.path().display().to_string()),
+        );
         let results = complete_toolchain_versions("nvm", &state);
         let texts: Vec<&str> = results.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["v22.0.0"]);
@@ -6918,7 +6894,7 @@ mod tests {
         fs::write(tmp.path().join(".venv/bin/python"), "").unwrap();
 
         let mut state = ShellState::new(false);
-        state.env_vars.remove("VIRTUAL_ENV");
+        state.globals.remove("VIRTUAL_ENV");
         let found = venv_activators_in(tmp.path(), &state);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].text, ".venv/bin/activate");
@@ -6933,9 +6909,9 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         fs::create_dir_all(elsewhere.path().join("bin")).unwrap();
         fs::write(elsewhere.path().join("bin/activate"), "").unwrap();
-        state.env_vars.insert(
+        state.globals.insert(
             "VIRTUAL_ENV".to_string(),
-            elsewhere.path().display().to_string(),
+            crate::variables::Variable::exported(elsewhere.path().display().to_string()),
         );
         let found = venv_activators_in(bare.path(), &state);
         assert_eq!(found.len(), 1);

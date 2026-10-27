@@ -211,7 +211,7 @@ pub(crate) fn set_env_checked(name: &str, value: &str) {
     }
 }
 
-fn remove_env_checked(name: &str) {
+pub(crate) fn remove_env_checked(name: &str) {
     if env_name_ok(name) {
         env::remove_var(name);
     }
@@ -256,8 +256,21 @@ pub struct CompletionSpec {
 }
 
 pub struct ShellState {
-    pub env_vars: HashMap<String, String>,
-    pub local_vars_stack: Vec<HashMap<String, String>>,
+    /// Global shell variables, the outermost scope. Variables inherited from
+    /// the environment start here with the export attribute; see
+    /// `crate::variables` for the scoping rules and the attribute model.
+    pub globals: HashMap<String, crate::variables::Variable>,
+    /// Function scopes, and the temporary scopes of `NAME=value cmd` prefix
+    /// assignments, innermost last.
+    pub local_vars_stack: Vec<crate::variables::VarScope>,
+    /// State behind the dynamic special variables (`RANDOM`, `SECONDS`, ...).
+    pub dynamic: crate::variables::DynamicVars,
+    /// An assignment was refused (readonly variable, malformed `-i` value,
+    /// bad array subscript) since this was last taken. The message is already
+    /// on stderr. See [`ShellState::take_assignment_failure`].
+    pub assignment_failed: bool,
+    /// The shell's own pid, which `$$` reports even inside subshells.
+    pub shell_pid: u32,
     pub aliases: HashMap<String, String>,
     pub functions: HashMap<String, CompoundCommand>,
     pub last_exit_code: i32,
@@ -302,9 +315,6 @@ pub struct ShellState {
     /// the `hash` table, the shell start time for `printf %(...)T`).
     pub builtin_state: crate::builtins::BuiltinState,
     pub jobs: JobTable,
-    // Arrays (Phase 1)
-    pub arrays: HashMap<String, Vec<String>>,
-    pub assoc_arrays: HashMap<String, HashMap<String, String>>,
     // Hooks (Phase 4)
     pub hooks: ShellHooks,
     // Completion specs (Phase 7)
@@ -392,32 +402,19 @@ pub struct ShellState {
 
 impl ShellState {
     pub fn new(interactive: bool) -> Self {
-        let mut env_vars = HashMap::new();
+        use crate::variables::{VarValue, Variable};
+        let mut globals = HashMap::new();
         for (k, v) in env::vars() {
-            env_vars.insert(k, v);
+            globals.insert(k, Variable::exported(v));
         }
         // Bash always starts with IFS at its default. Scripts routinely save and
         // restore it (`old=$IFS; ...; IFS=$old`), so leaving it unset would let
         // that idiom clobber IFS to the empty string and kill word splitting for
         // the rest of the session.
-        env_vars.insert("IFS".to_string(), " \t\n".to_string());
-        // Bash starts with an exported PWD naming the current directory: the
-        // inherited value when it still names it (it may go through symbolic
-        // links), otherwise the physical path. `cd`, `pwd` and `dirs` keep the
-        // logical directory there.
-        if let Ok(cwd) = env::current_dir() {
-            let inherited_is_current = env_vars.get("PWD").is_some_and(|pwd| {
-                use std::os::unix::fs::MetadataExt;
-                pwd.starts_with('/')
-                    && match (std::fs::metadata(pwd), std::fs::metadata(&cwd)) {
-                        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-                        _ => false,
-                    }
-            });
-            if !inherited_is_current {
-                env_vars.insert("PWD".to_string(), cwd.to_string_lossy().into_owned());
-            }
-        }
+        globals
+            .entry("IFS".to_string())
+            .or_insert_with(Variable::default)
+            .value = VarValue::Scalar(" \t\n".to_string());
         let mut aliases = HashMap::new();
         if interactive {
             aliases.insert("ls".to_string(), "ls --color=auto".to_string());
@@ -430,12 +427,20 @@ impl ShellState {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| String::from("localhost"));
 
-        let path_hash = Self::hash_path(env_vars.get("PATH").map(|s| s.as_str()).unwrap_or(""));
+        let path_hash = Self::hash_path(
+            globals
+                .get("PATH")
+                .and_then(Variable::scalar_value)
+                .unwrap_or(""),
+        );
         let arg0 = env::args().next().unwrap_or_else(|| "jsh".to_string());
 
-        ShellState {
-            env_vars,
+        let mut state = ShellState {
+            globals,
             local_vars_stack: Vec::new(),
+            dynamic: crate::variables::DynamicVars::new(),
+            assignment_failed: false,
+            shell_pid: std::process::id(),
             aliases,
             functions: HashMap::new(),
             last_exit_code: 0,
@@ -461,8 +466,6 @@ impl ShellState {
             procsub_pids: Vec::new(),
             builtin_state: Default::default(),
             jobs: JobTable::new(),
-            arrays: HashMap::new(),
-            assoc_arrays: HashMap::new(),
             hooks: ShellHooks::default(),
             completion_specs: HashMap::new(),
             notification_threshold: std::time::Duration::from_secs(10),
@@ -498,7 +501,10 @@ impl ShellState {
             pending_editor_insert: None,
             call_stack: crate::callstack::CallStack::default(),
             trap_runtime: crate::traps::TrapRuntime::default(),
-        }
+        };
+        state.init_shell_variables();
+        state.sync_env("IFS");
+        state
     }
 
     /// Set `$0` and the positional parameters for a new shell invocation.
@@ -566,26 +572,6 @@ impl ShellState {
         flags
     }
 
-    pub fn get_var(&self, name: &str) -> Option<&str> {
-        if name == "?" {
-            return None; // handled by expand
-        }
-        // `LINENO`, `BASH_COMMAND` and `$_` change with every command; they
-        // are read from the call stack rather than stored (and exported) as
-        // ordinary variables.
-        if let Some(value) = self.call_stack.dynamic_var(name) {
-            return Some(value);
-        }
-        // Check local_vars_stack from top to bottom
-        for scope in self.local_vars_stack.iter().rev() {
-            if let Some(val) = scope.get(name) {
-                return Some(val.as_str());
-            }
-        }
-        // Fall back to env_vars
-        self.env_vars.get(name).map(|s| s.as_str())
-    }
-
     /// Give a helper process the shell's exported environment exactly.
     ///
     /// `Command` otherwise inherits the Rust process environment, which can
@@ -599,10 +585,10 @@ impl ShellState {
     ) -> HashSet<String> {
         command.env_clear();
         let mut names = HashSet::new();
-        for (name, value) in &self.env_vars {
-            if env_name_ok(name) && !value.contains('\0') {
-                command.env(name, value);
-                names.insert(name.clone());
+        for (name, value) in self.exported_vars() {
+            if env_name_ok(&name) && !value.contains('\0') {
+                command.env(&name, &value);
+                names.insert(name);
             }
         }
         names
@@ -629,57 +615,10 @@ impl ShellState {
         80
     }
 
-    pub fn set_var(&mut self, name: &str, value: &str) {
-        if self.env_vars.contains_key(name) {
-            self.env_vars.insert(name.to_string(), value.to_string());
-            set_env_checked(name, value);
-            if name == "PATH" {
-                self.invalidate_path_cache();
-            }
-        } else if let Some(scope) = self.local_vars_stack.last_mut() {
-            // In function scope: set in current local scope
-            scope.insert(name.to_string(), value.to_string());
-        } else {
-            // At global scope: set in env_vars
-            self.env_vars.insert(name.to_string(), value.to_string());
-            set_env_checked(name, value);
-            if name == "PATH" {
-                self.invalidate_path_cache();
-            }
-        }
-    }
-
-    pub fn export_var(&mut self, name: &str, value: &str) {
-        self.env_vars.insert(name.to_string(), value.to_string());
-        set_env_checked(name, value);
-        // Remove from all local scopes
-        for scope in &mut self.local_vars_stack {
-            scope.remove(name);
-        }
-        if name == "PATH" {
-            self.invalidate_path_cache();
-        }
-    }
-
-    pub fn unset_var(&mut self, name: &str) {
-        self.env_vars.remove(name);
-        // Remove from all local scopes
-        for scope in &mut self.local_vars_stack {
-            scope.remove(name);
-        }
-        self.arrays.remove(name);
-        self.assoc_arrays.remove(name);
-        remove_env_checked(name);
-        if name == "PATH" {
-            self.invalidate_path_cache();
-        }
-    }
-
-    fn invalidate_path_cache(&mut self) {
+    pub(crate) fn invalidate_path_cache(&mut self) {
         self.path_cache = None;
         // Update the hash for the next check
-        self.path_hash =
-            Self::hash_path(self.env_vars.get("PATH").map(|s| s.as_str()).unwrap_or(""));
+        self.path_hash = Self::hash_path(self.get_var("PATH").unwrap_or(""));
     }
 
     /// Commands already discovered on PATH, without starting a scan.
@@ -693,8 +632,7 @@ impl ShellState {
     }
 
     pub fn path_cache(&mut self) -> &Vec<String> {
-        let current_path_hash =
-            Self::hash_path(self.env_vars.get("PATH").map(|s| s.as_str()).unwrap_or(""));
+        let current_path_hash = Self::hash_path(self.get_var("PATH").unwrap_or(""));
 
         if self.path_hash != current_path_hash {
             self.path_cache = None;
@@ -717,12 +655,7 @@ impl ShellState {
 
         if self.path_cache.is_none() && self.path_scan_rx.is_none() {
             // Start async scan
-            let path_val = bounded_path_value(
-                self.env_vars
-                    .get("PATH")
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-            );
+            let path_val = bounded_path_value(self.get_var("PATH").unwrap_or_default());
             let (tx, rx) = mpsc::sync_channel(PATH_SCAN_QUEUE_CAPACITY);
             let worker_path = path_val.clone();
             match std::thread::Builder::new()
@@ -758,7 +691,8 @@ impl ShellState {
     pub(crate) fn replace_path_for_test(&mut self, path: &str) {
         // Unit tests need to model a shell PATH without changing the process
         // environment shared by Rust's parallel test threads.
-        self.env_vars.insert("PATH".to_string(), path.to_string());
+        self.globals
+            .insert("PATH".to_string(), crate::variables::Variable::scalar(path));
         self.invalidate_path_cache();
     }
 
@@ -770,35 +704,6 @@ impl ShellState {
     pub fn pop_positional_params(&mut self) {
         if let Some(old) = self.positional_stack.pop() {
             self.positional_params = old;
-        }
-    }
-
-    // Array helpers
-    pub fn get_array_element(&self, name: &str, index: &str) -> Option<String> {
-        if let Some(arr) = self.arrays.get(name) {
-            let idx: usize = index.parse().ok()?;
-            arr.get(idx).cloned()
-        } else if let Some(map) = self.assoc_arrays.get(name) {
-            map.get(index).cloned()
-        } else {
-            None
-        }
-    }
-
-    pub fn set_array_element(&mut self, name: &str, index: &str, value: &str) {
-        if self.assoc_arrays.contains_key(name) {
-            self.assoc_arrays
-                .get_mut(name)
-                .unwrap()
-                .insert(index.to_string(), value.to_string());
-        } else {
-            let arr = self.arrays.entry(name.to_string()).or_default();
-            if let Ok(idx) = index.parse::<usize>() {
-                if idx >= arr.len() {
-                    arr.resize(idx + 1, String::new());
-                }
-                arr[idx] = value.to_string();
-            }
         }
     }
 
@@ -816,62 +721,6 @@ impl ShellState {
                 Ok(WaitStatus::StillAlive)
             )
         });
-    }
-
-    /// Replace an indexed array's contents wholesale.
-    pub fn set_array(&mut self, name: &str, values: Vec<String>) {
-        self.assoc_arrays.remove(name);
-        self.arrays.insert(name.to_string(), values);
-    }
-
-    pub fn array_values(&self, name: &str) -> Vec<String> {
-        if let Some(arr) = self.arrays.get(name) {
-            arr.clone()
-        } else if let Some(map) = self.assoc_arrays.get(name) {
-            map.values().cloned().collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    pub fn array_keys(&self, name: &str) -> Vec<String> {
-        if let Some(arr) = self.arrays.get(name) {
-            (0..arr.len()).map(|i| i.to_string()).collect()
-        } else if let Some(map) = self.assoc_arrays.get(name) {
-            map.keys().cloned().collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    pub fn array_length(&self, name: &str) -> usize {
-        if let Some(arr) = self.arrays.get(name) {
-            arr.len()
-        } else if let Some(map) = self.assoc_arrays.get(name) {
-            map.len()
-        } else {
-            0
-        }
-    }
-
-    pub fn is_array(&self, name: &str) -> bool {
-        self.arrays.contains_key(name) || self.assoc_arrays.contains_key(name)
-    }
-
-    /// True for an associative array, whose subscripts are string keys rather
-    /// than arithmetic expressions (`m[k]` names the key `k`, not `$k`'s value).
-    pub fn is_assoc_array(&self, name: &str) -> bool {
-        self.assoc_arrays.contains_key(name)
-    }
-
-    /// Push a new local variable scope (for function entry)
-    pub fn push_local_scope(&mut self) {
-        self.local_vars_stack.push(HashMap::new());
-    }
-
-    /// Pop the current local variable scope (for function exit)
-    pub fn pop_local_scope(&mut self) {
-        self.local_vars_stack.pop();
     }
 }
 

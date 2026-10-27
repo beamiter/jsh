@@ -3021,9 +3021,10 @@ mod tests {
         // This deterministically fails before Command::spawn, exercising the
         // production setup-failure route rather than only constructing the
         // enum directly in the test.
-        state
-            .env_vars
-            .insert("AGENT_OVERSIZED_STATE".into(), "x".repeat(5 * 1024 * 1024));
+        state.globals.insert(
+            "AGENT_OVERSIZED_STATE".into(),
+            crate::variables::Variable::exported("x".repeat(5 * 1024 * 1024)),
+        );
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let mut terminal_output = std::io::sink();
         let execution: CapturedExecution = run_captured_to(

@@ -457,6 +457,12 @@ impl Printer {
                 previous_was_regex_op =
                     matches!(word.as_slice(), [WordPart::Literal(op)] if op == "=~");
                 printed
+            } else if let Some((_, source)) =
+                command.compound_args.iter().find(|(at, _)| *at == index)
+            {
+                // `declare -A m=([k]=v)`: a declaration's compound assignment
+                // keeps its source text, which bash also prints verbatim.
+                source.clone()
             } else {
                 unquoted_word(word, command_position)
             };
@@ -1050,6 +1056,10 @@ mod tests {
         (
             "f() { ! a | b; time sleep 1; }",
             "f () \n{ \n    ! a | b;\n    time sleep 1\n}",
+        ),
+        (
+            "f() { declare -A m=([k]=v [j]=w); local -a x=(1 \"2 3\"); }",
+            "f () \n{ \n    declare -A m=([k]=v [j]=w);\n    local -a x=(1 \"2 3\")\n}",
         ),
         // Deliberately not bash's `coproc COPROC cat`, which re-evaluates as a
         // command named COPROC; see `Printer::compound`.

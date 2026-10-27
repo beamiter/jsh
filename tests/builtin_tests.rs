@@ -59,7 +59,8 @@ fn test_true_false() {
 fn test_export_and_get() {
     let mut state = make_state();
     run_builtin("export", &["TESTVAR=hello".into()], &mut state);
-    assert_eq!(state.env_vars.get("TESTVAR"), Some(&"hello".to_string()));
+    assert_eq!(state.get_var("TESTVAR"), Some("hello"));
+    assert_eq!(state.exported_value("TESTVAR"), Some("hello"));
 }
 
 #[test]
@@ -78,10 +79,15 @@ fn test_local() {
     state.push_local_scope();
     run_builtin("local", &["X=hello".into()], &mut state);
     assert_eq!(
-        state.local_vars_stack.last().and_then(|s| s.get("X")),
-        Some(&"hello".to_string())
+        state
+            .local_vars_stack
+            .last()
+            .and_then(|s| s.vars.get("X"))
+            .and_then(|v| v.scalar_value()),
+        Some("hello")
     );
     state.pop_local_scope();
+    assert_eq!(state.get_var("X"), None, "the local is gone with its scope");
 }
 
 #[test]
@@ -135,24 +141,22 @@ fn test_set_errexit() {
 fn test_declare_indexed_array() {
     let mut state = make_state();
     run_builtin("declare", &["-a".into(), "myarr".into()], &mut state);
-    assert!(state.arrays.contains_key("myarr"));
+    assert!(state.is_array("myarr"));
+    assert!(!state.is_assoc("myarr"));
 }
 
 #[test]
 fn test_declare_assoc_array() {
     let mut state = make_state();
     run_builtin("declare", &["-A".into(), "mymap".into()], &mut state);
-    assert!(state.assoc_arrays.contains_key("mymap"));
+    assert!(state.is_assoc("mymap"));
 }
 
 #[test]
 fn invalid_assoc_initializer_fails_without_partial_mutation() {
     let mut state = make_state();
-    state
-        .assoc_arrays
-        .entry("mymap".into())
-        .or_default()
-        .insert("existing".into(), "keep".into());
+    run_builtin("declare", &["-A".into(), "mymap".into()], &mut state);
+    state.set_array_element("mymap", "existing", "keep");
 
     let status = run_builtin(
         "declare",
@@ -164,8 +168,11 @@ fn invalid_assoc_initializer_fails_without_partial_mutation() {
     );
 
     assert_eq!(status, 1);
-    assert_eq!(state.assoc_arrays["mymap"].len(), 1);
-    assert_eq!(state.assoc_arrays["mymap"]["existing"], "keep");
+    assert_eq!(state.array_length("mymap"), 1);
+    assert_eq!(
+        state.get_array_element("mymap", "existing").as_deref(),
+        Some("keep")
+    );
 
     let status = run_builtin(
         "declare",
@@ -173,7 +180,7 @@ fn invalid_assoc_initializer_fails_without_partial_mutation() {
         &mut state,
     );
     assert_eq!(status, 1);
-    assert!(!state.assoc_arrays.contains_key("newmap"));
+    assert_eq!(state.array_length("newmap"), 0);
 }
 
 #[test]
@@ -250,8 +257,8 @@ fn test_double_bracket_regex() {
     );
     assert_eq!(result, 0);
     // Check BASH_REMATCH
-    assert!(state.arrays.contains_key("BASH_REMATCH"));
-    let rematch = &state.arrays["BASH_REMATCH"];
+    assert!(state.is_array("BASH_REMATCH"));
+    let rematch = &state.array_values("BASH_REMATCH");
     assert_eq!(rematch[0], "hello123");
     assert_eq!(rematch[1], "123");
 }

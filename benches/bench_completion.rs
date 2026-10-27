@@ -16,9 +16,10 @@ use jsh::environment::ShellState;
 fn populated_state() -> ShellState {
     let mut state = ShellState::new(false);
     for index in 0..200 {
-        state
-            .env_vars
-            .insert(format!("JSH_BENCH_VAR_{index}"), format!("value {index}"));
+        state.globals.insert(
+            format!("JSH_BENCH_VAR_{index}"),
+            jsh::variables::Variable::exported(format!("value {index}")),
+        );
         state
             .aliases
             .insert(format!("bench_alias_{index}"), format!("echo {index}"));
@@ -132,9 +133,10 @@ fn bench_ranking(c: &mut Criterion) {
     // a repository with hundreds of refs, a host with hundreds of units.
     let mut state = ShellState::new(false);
     for index in 0..500 {
-        state
-            .env_vars
-            .insert(format!("candidate_{index:03}"), String::new());
+        state.globals.insert(
+            format!("candidate_{index:03}"),
+            jsh::variables::Variable::exported(String::new()),
+        );
     }
     let candidates = jsh::completer::complete_from_history("");
     group.bench_function("filter_500_candidates", |b| {

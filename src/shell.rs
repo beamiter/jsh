@@ -66,6 +66,9 @@ fn noninteractive_state(arg0: &str, args: &[String]) -> ShellState {
     signal::install_noninteractive_signals();
     let mut state = ShellState::new(false);
     state.set_invocation(arg0, args);
+    // Like bash, every shell process — `-c`, a script, stdin — is one level
+    // deeper than the one that started it.
+    state.increment_shlvl();
     state
 }
 
@@ -384,8 +387,10 @@ impl Default for Shell {
 impl Shell {
     pub fn new() -> Self {
         let terminal_vim = config::TerminalVimIntegration::capture();
+        let mut state = ShellState::new(true);
+        state.increment_shlvl();
         Shell {
-            state: ShellState::new(true),
+            state,
             history: History::new(10000),
             editor: Editor::new(),
             session_id: None,
