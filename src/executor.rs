@@ -1554,10 +1554,11 @@ fn execute_simple_with_mode(
         }
     }
 
-    // Check for builtin. A builtin that shadows a system program (`sort`,
-    // `date`, ...) yields to it unless this invocation is jsh's own form; the
-    // command then continues below as an ordinary external command.
-    if builtins::is_builtin(cmd_name)
+    // Check for builtin. A builtin disabled with `enable -n` resolves through
+    // PATH instead, and one that shadows a system program (`sort`, `date`,
+    // ...) yields to it unless this invocation is jsh's own form; either way
+    // the command continues below as an ordinary external command.
+    if builtins::is_enabled_builtin(cmd_name, state)
         && !crate::shadowing::runs_system_program(cmd_name, args, &cmd.redirects)
     {
         let mut redirects = match setup_redirects(&cmd.redirects, state) {

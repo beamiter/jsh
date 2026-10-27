@@ -298,6 +298,9 @@ pub struct ShellState {
     pub last_failure_exempt: bool,
     // PIDs of process-substitution children awaiting non-blocking reaping.
     pub procsub_pids: Vec<i32>,
+    /// State private to individual builtins (getopts position, `enable -n`,
+    /// the `hash` table, the shell start time for `printf %(...)T`).
+    pub builtin_state: crate::builtins::BuiltinState,
     pub jobs: JobTable,
     // Arrays (Phase 1)
     pub arrays: HashMap<String, Vec<String>>,
@@ -390,6 +393,23 @@ impl ShellState {
         // that idiom clobber IFS to the empty string and kill word splitting for
         // the rest of the session.
         env_vars.insert("IFS".to_string(), " \t\n".to_string());
+        // Bash starts with an exported PWD naming the current directory: the
+        // inherited value when it still names it (it may go through symbolic
+        // links), otherwise the physical path. `cd`, `pwd` and `dirs` keep the
+        // logical directory there.
+        if let Ok(cwd) = env::current_dir() {
+            let inherited_is_current = env_vars.get("PWD").is_some_and(|pwd| {
+                use std::os::unix::fs::MetadataExt;
+                pwd.starts_with('/')
+                    && match (std::fs::metadata(pwd), std::fs::metadata(&cwd)) {
+                        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                        _ => false,
+                    }
+            });
+            if !inherited_is_current {
+                env_vars.insert("PWD".to_string(), cwd.to_string_lossy().into_owned());
+            }
+        }
         let mut aliases = HashMap::new();
         if interactive {
             aliases.insert("ls".to_string(), "ls --color=auto".to_string());
@@ -431,6 +451,7 @@ impl ShellState {
             errexit_status: None,
             last_failure_exempt: false,
             procsub_pids: Vec::new(),
+            builtin_state: Default::default(),
             jobs: JobTable::new(),
             arrays: HashMap::new(),
             assoc_arrays: HashMap::new(),

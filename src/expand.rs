@@ -2692,16 +2692,100 @@ pub fn expand_words(words: &[Word], state: &mut ShellState) -> Vec<String> {
 /// of an unset parameter turned `[[ -n ${ZSH_VERSION-} ]]` into the one-operand
 /// test `[[ -n ]]`, which is true — so every bash script that branches on
 /// "am I zsh?" took the zsh branch.
+///
+/// The right operand of `==`, `=`, `!=` and `=~` is a pattern, and in a pattern
+/// quoting matters after expansion: `[[ $x == "a*" ]]` compares literally while
+/// `[[ $x == a* ]]` globs, and a quoted `=~` operand (or quoted part of one) is
+/// a literal string inside the regex. Quote characters are gone by the time the
+/// evaluator sees the operands, so the quoted characters are made literal here,
+/// where the parts are still known: glob metacharacters become one-character
+/// bracket expressions (`*` → `[*]`) and regex text goes through
+/// `regex::escape`. The evaluator therefore always treats these operands as
+/// patterns.
 pub fn expand_conditional_words(words: &[Word], state: &mut ShellState) -> Vec<String> {
     state.expansion_error = None;
     let mut result = Vec::new();
-    for word in words {
-        result.push(expand_word_to_string(word, state));
+    for (index, word) in words.iter().enumerate() {
+        // words[0] is `[[`, so an operator needs index 2 or later to have a
+        // left operand.
+        let operator = index
+            .checked_sub(1)
+            .filter(|&op_index| op_index > 1)
+            .and_then(|op_index| conditional_pattern_operator(&words[op_index]));
+        result.push(match operator {
+            Some(kind) => expand_conditional_pattern(word, kind, state),
+            None => expand_word_to_string(word, state),
+        });
         if state.expansion_error.is_some() {
             break;
         }
     }
     result
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConditionalPattern {
+    Glob,
+    Regex,
+}
+
+/// The pattern operators of `[[ ]]`. The parser stores an operator as a single
+/// bare literal, so a quoted `"=="` operand is never mistaken for one.
+fn conditional_pattern_operator(word: &Word) -> Option<ConditionalPattern> {
+    match word.as_slice() {
+        [WordPart::Literal(op)] => match op.as_str() {
+            "==" | "=" | "!=" => Some(ConditionalPattern::Glob),
+            "=~" => Some(ConditionalPattern::Regex),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Expand a `[[ ]]` pattern operand, making every quoted character literal.
+fn expand_conditional_pattern(
+    word: &Word,
+    kind: ConditionalPattern,
+    state: &mut ShellState,
+) -> String {
+    let mut pattern = String::new();
+    for part in word {
+        let text = expand_part(part, state);
+        let active = match kind {
+            // Exactly the characters a pathname expansion may glob with.
+            ConditionalPattern::Glob => part_is_globbable(part, false),
+            // The regex operand's unquoted text arrives as literal parts (the
+            // parser protects only glob and brace characters in it), so here
+            // only real quoting makes text literal.
+            ConditionalPattern::Regex => !matches!(
+                part,
+                WordPart::SingleQuoted(_) | WordPart::DoubleQuoted(_) | WordPart::Interpolated(_)
+            ),
+        };
+        // Unquoted text is a literal part too (only `*?[` get parts of their
+        // own), and its `(`, `|` and `)` are extglob syntax.
+        let quoted = !matches!(part, WordPart::Literal(_));
+        if active {
+            pattern.push_str(&text);
+        } else if kind == ConditionalPattern::Regex {
+            pattern.push_str(&regex::escape(&text));
+        } else {
+            for c in text.chars() {
+                // A one-character bracket expression is literal in both the
+                // plain and the extglob matcher; `\` needs one because the
+                // extglob matcher treats it as an escape, and a quoted `(` so
+                // it cannot open an extglob group.
+                if matches!(c, '*' | '?' | '[' | '\\') || (quoted && c == '(') {
+                    pattern.push('[');
+                    pattern.push(c);
+                    pattern.push(']');
+                } else {
+                    pattern.push(c);
+                }
+            }
+        }
+    }
+    pattern
 }
 
 #[cfg(test)]

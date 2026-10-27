@@ -25,38 +25,6 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// Operator word the `[[ ]]` evaluator sees in place of `=~` when the right
-/// operand was quoted, which bash matches literally instead of as a regex. The
-/// trailing control character cannot occur in a word a user typed.
-pub const REGEX_LITERAL_OP: &str = "=~\u{1}";
-
-/// True when the whole operand is a single quoted string (`"a|b"`, `'a|b'`,
-/// `"$re"`). Bash then matches it literally rather than as a regex.
-fn is_fully_quoted(raw: &str) -> bool {
-    let mut chars = raw.chars();
-    let quote = match chars.next() {
-        Some(q @ ('\'' | '"')) => q,
-        _ => return false,
-    };
-    let mut consumed = quote.len_utf8();
-    let mut escaped = false;
-    for c in chars {
-        consumed += c.len_utf8();
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quote == '"' && c == '\\' {
-            escaped = true;
-            continue;
-        }
-        if c == quote {
-            return consumed == raw.len();
-        }
-    }
-    false
-}
-
 fn copy_balanced(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String, close: char) {
     let open = if close == ')' { '(' } else { '{' };
     let mut depth = 0usize;
@@ -701,17 +669,9 @@ impl<'a> Parser<'a> {
             }
         }
         let raw = &self.input[start..end];
-        if is_fully_quoted(raw) {
-            // Bash matches a quoted operand literally. The evaluator only ever
-            // sees expanded strings, so the intent has to ride along with the
-            // operator; the marker is a control character no real word contains.
-            if let Some(last) = words.last_mut() {
-                *last = vec![WordPart::Literal(REGEX_LITERAL_OP.to_string())];
-            }
-            words.push(parse_word_parts(raw));
-        } else {
-            words.push(parse_word_parts(&protect_regex_operand(raw)));
-        }
+        // Quoted parts survive as quoted word parts; the conditional expander
+        // makes their text literal within the regex.
+        words.push(parse_word_parts(&protect_regex_operand(raw)));
         Ok(())
     }
 
@@ -1385,6 +1345,8 @@ fn is_reserved_word(w: &str) -> bool {
             | "!"
             | "{"
             | "}"
+            // `[[ ( a ) ]]` is a conditional, not a function named `[[`.
+            | "[["
     )
 }
 

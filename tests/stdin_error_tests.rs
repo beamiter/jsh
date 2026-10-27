@@ -48,10 +48,11 @@ fn read_leaves_unconsumed_bytes_for_the_next_external_command() {
             "前雪后\n".as_bytes(),
             "<前>后\n".as_bytes(),
         ),
+        // -N counts characters, as in bash: 雪 is one of the three.
         (
             "read -N 3 value",
             "雪remaining\n".as_bytes(),
-            "<雪>remaining\n".as_bytes(),
+            "<雪re>maining\n".as_bytes(),
         ),
         ("read value", b"partial-at-eof", b"<partial-at-eof>"),
     ];

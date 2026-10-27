@@ -321,6 +321,13 @@ loop-condition `break` and `continue` are consumed by their own loop.
 
 `test` and `[` return `0` for true, `1` for false, and `2` for an invalid
 expression. `[` requires its final `]`; `test` treats `]` as ordinary data.
+Both, like `[[ ]]`, accept `-v NAME` (also `NAME[SUBSCRIPT]`), `-o OPTION`, the
+file tests `-a -b -c -d -e -f -g -G -h -k -L -N -O -p -r -s -S -t -u -w -x`
+and `-nt`/`-ot`/`-ef`. Inside `[[ ]]`, a quoted right operand of `==`/`!=` is
+matched literally (`[[ $x == "a*" ]]`), quoted parts of an `=~` operand are
+literal text inside the regex, `&&`/`||` short-circuit, and the operands of
+`-eq`, `-lt` and the other integer comparisons are arithmetic expressions
+(`[[ 1+1 -eq 2 ]]`, and `010` is octal); `test` reads them as decimal integers.
 Parameter default and alternate words are evaluated only when selected, so
 `${value:-$(command)}` does not run `command` when `value` is nonempty.
 String lengths (`${#value}`) and substring offsets (`${value:1:2}`) count
@@ -338,13 +345,19 @@ evaluates each argument. `let NAME = EXPR`, with a bare `=`, remains jsh's
 typed binding.
 
 `printf` supports field flags, width and precision, dynamic `*` fields, and
-`%s`, `%b`, `%c`, `%d`, `%i`, `%u`, `%o`, `%x`, `%X`, `%f`, `%F`, `%e`, `%E`,
-`%g`, and `%G`. Formats repeat over remaining arguments. `%b` decodes escapes;
-`\c` in a `%b` argument stops output. Use `printf --` before a format beginning
-with `-`. Width and precision are capped at 1,048,576 per field; floating-point
-formatting uses `f64`. String precision counts bytes; `%c` preserves one complete
-Unicode character. Output is streamed, and write failures return a failure
-status. `echo -e` shares hexadecimal, octal and Unicode escapes and `\c` handling.
+`%s`, `%b`, `%c`, `%q`, `%d`, `%i`, `%u`, `%o`, `%x`, `%X`, `%f`, `%F`, `%e`,
+`%E`, `%g`, `%G` and `%(FORMAT)T`. Formats repeat over remaining arguments. `%b`
+decodes escapes; `\c` in a `%b` argument stops output. `%q` quotes its argument
+for reuse as shell input, as bash does (`''`, backslash escapes, or `$'...'` for
+control characters). `%(FORMAT)T` formats an epoch time with strftime in the
+local time zone (`TZ` is honored); `-1` or a missing argument is now and `-2` is
+when the shell started. Use `printf --` before a format beginning with `-`.
+`printf -v NAME` (or `NAME[SUBSCRIPT]`) assigns the output instead of printing
+it; that output is limited to 64 MiB. Width and precision are capped at
+1,048,576 per field; floating-point formatting uses `f64`. String precision
+counts bytes; `%c` preserves one complete Unicode character. Output is
+streamed, and write failures return a failure status. `echo -e` shares
+hexadecimal, octal and Unicode escapes and `\c` handling.
 
 ```sh
 jsh -c 'printf "%04d %.2f\n" 7 3.14159'
@@ -354,9 +367,21 @@ The `read` builtin accepts fractional decimal timeouts, such as
 `read -t 0.5 value`. One deadline covers the whole read; timeout returns `142`
 and assigns any partial input already received. `read -t 0` only checks input
 readiness, without consuming data or changing variables. Invalid, negative,
-non-finite, and overflowing timeout values fail before reading. The current
-`-n` and `-N` counts are byte counts: `-n` also stops at the delimiter, while
-`-N` waits for exactly the requested byte count, EOF, or timeout.
+non-finite, and overflowing timeout values fail before reading. `-n` and `-N`
+count characters (UTF-8), not bytes: `-n` also stops at the delimiter, while
+`-N` waits for exactly the requested character count, EOF, or timeout and
+assigns what it read without field splitting. `-d DELIM` ends the input at
+`DELIM` instead of a newline (`-d ''` at a NUL byte), `-a NAME` assigns the
+fields to an indexed array, and `-u FD` reads another descriptor. Fields are
+split as in bash: leading and trailing IFS whitespace is trimmed, IFS
+characters other than whitespace delimit possibly empty fields, and the last
+name receives the rest of the line with its inner separators. Without `-r`, a
+backslash quotes the next character and a backslash-newline joins lines. With no
+names, `REPLY` gets the line untrimmed. At end of input `read` returns `1` but
+still assigns what it read. `-p` prompts only when the input is a terminal. One
+`read` collects at most 256 MiB, and `mapfile`/`readarray` likewise stores at
+most 256 MiB per call; input is read only up to what each call consumes, so
+the next reader of a pipe or file continues where it stopped.
 
 An assignment-only command takes the status of its last command substitution,
 as in Bash: `out=$(false)` returns `1`. That status also reaches `ERR` traps and

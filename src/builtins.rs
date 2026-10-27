@@ -6,6 +6,47 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+mod getopts;
+mod limits;
+mod mapfile;
+mod signals;
+
+/// Per-shell state owned by individual builtins.
+pub struct BuiltinState {
+    getopts: getopts::GetoptsState,
+    /// Builtins turned off with `enable -n`. A disabled name resolves like any
+    /// other command name (function, then `PATH`).
+    disabled: std::collections::BTreeSet<String>,
+    /// The `hash` table: command name to (path, lookups), in insertion order.
+    hashed: indexmap::IndexMap<String, (String, u32)>,
+    /// Statuses of background children `wait` has reaped, oldest first.
+    reaped: std::collections::VecDeque<(i32, i32)>,
+    /// When the shell started; `printf '%(...)T' -2` formats it.
+    pub(crate) start_time: std::time::SystemTime,
+}
+
+impl Default for BuiltinState {
+    fn default() -> Self {
+        Self {
+            getopts: Default::default(),
+            disabled: Default::default(),
+            hashed: Default::default(),
+            reaped: Default::default(),
+            start_time: std::time::SystemTime::now(),
+        }
+    }
+}
+
+/// An OS error's message without the ` (os error N)` suffix std appends,
+/// so diagnostics read like bash's (`Bad file descriptor`).
+fn os_error_text(error: &std::io::Error) -> String {
+    let text = error.to_string();
+    match text.find(" (os error") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
+}
+
 /// Set by the `exit` builtin so the main loop can exit gracefully
 /// (allowing session save, history save, EXIT trap to run).
 pub static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -85,6 +126,14 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "count",
     "math",
     "exec",
+    "getopts",
+    "mapfile",
+    "readarray",
+    "umask",
+    "ulimit",
+    "times",
+    "kill",
+    "enable",
     // Stream processing commands
     "sum",
     "avg",
@@ -124,6 +173,11 @@ pub fn is_builtin(name: &str) -> bool {
     crate::command_catalog::is_builtin(name)
 }
 
+/// A builtin that `enable -n` has not turned off: what command lookup runs.
+pub fn is_enabled_builtin(name: &str, state: &ShellState) -> bool {
+    is_builtin(name) && !state.builtin_state.disabled.contains(name)
+}
+
 pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
     match name {
         "agent" => builtin_agent(args, state),
@@ -132,8 +186,8 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "export" => builtin_export(args, state),
         "unset" => builtin_unset(args, state),
         "echo" => builtin_echo(args),
-        "printf" => builtin_printf(args),
-        "pwd" => builtin_pwd(),
+        "printf" => builtin_printf(args, state),
+        "pwd" => builtin_pwd(args, state),
         "alias" => builtin_alias(args, state),
         "unalias" => builtin_unalias(args, state),
         "type" => builtin_type(args, state),
@@ -143,7 +197,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         ":" => 0,
         "true" => 0,
         "false" => 1,
-        "test" | "[" => builtin_test(name, args),
+        "test" | "[" => builtin_test(name, args, state),
         "set" => builtin_set(args, state),
         "local" => builtin_local(args, state),
         "return" => builtin_return(args, state),
@@ -156,8 +210,8 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "history" => builtin_history(state),
         "context" => crate::execution_context::run_args(args),
         "pushd" => builtin_pushd(args, state),
-        "popd" => builtin_popd(state),
-        "dirs" => builtin_dirs(state),
+        "popd" => builtin_popd(args, state),
+        "dirs" => builtin_dirs(args, state),
         "trap" => builtin_trap(args, state),
         "jobs" => {
             let mut print_pids = false;
@@ -251,25 +305,34 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
         "[[" => builtin_double_bracket(args, state),
         "command" => {
             // Strip the option prefix: -v/-V describe the command instead of
-            // running it, -p only affects which PATH is searched.
+            // running it, -p searches the system default path.
             let mut describe: Option<char> = None;
+            let mut default_path = false;
             let mut rest = args;
             while let Some(first) = rest.first() {
-                match first.as_str() {
-                    "-v" | "-V" => {
-                        describe = Some(first.chars().nth(1).unwrap());
-                        rest = &rest[1..];
-                    }
-                    "-p" => rest = &rest[1..],
-                    "--" => {
-                        rest = &rest[1..];
-                        break;
-                    }
-                    _ => break,
+                let Some(flags) = first.strip_prefix('-').filter(|f| !f.is_empty()) else {
+                    break;
+                };
+                if flags == "-" {
+                    rest = &rest[1..];
+                    break;
                 }
+                if !flags.chars().all(|c| matches!(c, 'v' | 'V' | 'p')) {
+                    eprintln!("jsh: command: {first}: invalid option");
+                    eprintln!("command: usage: command [-pVv] command [arg ...]");
+                    return 2;
+                }
+                for flag in flags.chars() {
+                    match flag {
+                        'p' => default_path = true,
+                        // Of -v and -V, the last one given wins.
+                        other => describe = Some(other),
+                    }
+                }
+                rest = &rest[1..];
             }
             if let Some(mode) = describe {
-                return command_describe(rest, mode == 'V', state);
+                return command_describe(rest, mode == 'V', default_path, state);
             }
             let args = rest;
             if args.is_empty() {
@@ -278,8 +341,25 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             let cmd_name = &args[0];
             // `command sort` is how a user asks for the system program that a
             // structured builtin shadows; genuine shell builtins stay builtins.
-            if is_builtin(cmd_name) && crate::shadowing::system_program(cmd_name).is_none() {
+            if is_enabled_builtin(cmd_name, state)
+                && crate::shadowing::system_program(cmd_name).is_none()
+            {
                 run_builtin(cmd_name, &args[1..], state)
+            } else if default_path && !cmd_name.contains('/') {
+                match path_matches(cmd_name, &default_command_path())
+                    .into_iter()
+                    .next()
+                {
+                    Some(program) => {
+                        let mut argv = args.to_vec();
+                        argv[0] = program;
+                        crate::executor::spawn_external(&argv, state)
+                    }
+                    None => {
+                        eprintln!("jsh: {cmd_name}: command not found");
+                        127
+                    }
+                }
             } else {
                 // Hand the already-expanded argv straight to exec. Re-joining
                 // and re-parsing it would destroy any argument holding
@@ -292,14 +372,21 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
                 return 0;
             }
             let cmd_name = &args[0];
-            if is_builtin(cmd_name) {
+            if is_enabled_builtin(cmd_name, state) {
                 run_builtin(cmd_name, &args[1..], state)
             } else {
                 eprintln!("jsh: builtin: {}: not a shell builtin", cmd_name);
                 1
             }
         }
-        "hash" => 0,
+        "hash" => builtin_hash(args, state),
+        "getopts" => getopts::builtin_getopts(args, state),
+        "mapfile" | "readarray" => mapfile::builtin_mapfile(name, args, state),
+        "umask" => limits::builtin_umask(args, state),
+        "ulimit" => limits::builtin_ulimit(args, state),
+        "times" => limits::builtin_times(args, state),
+        "kill" => signals::builtin_kill(args, state),
+        "enable" => builtin_enable(args, state),
         // New builtins
         "declare" => builtin_declare(args, state),
         "z" => builtin_z(args, state),
@@ -436,93 +523,202 @@ fn run_value_builtin_in_fork(
 // Original builtins
 // ============================================================
 
+/// Lexically resolve `.` and `..` in an absolute path, as bash's logical
+/// `cd` does: `..` removes the previous component even if that component is
+/// a symbolic link.
+fn normalize_logical_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// The shell's logical working directory: `$PWD` when it is an absolute,
+/// `.`/`..`-free name for the current directory (it may go through symbolic
+/// links), otherwise the physical directory.
+fn logical_cwd(state: &ShellState) -> String {
+    use std::os::unix::fs::MetadataExt;
+    if let Some(pwd) = state.get_var("PWD") {
+        let clean = pwd.starts_with('/')
+            && !pwd
+                .split('/')
+                .any(|component| component == "." || component == "..");
+        let same_directory = || match (std::fs::metadata(pwd), std::fs::metadata(".")) {
+            (Ok(named), Ok(current)) => {
+                named.dev() == current.dev() && named.ino() == current.ino()
+            }
+            _ => false,
+        };
+        if clean && same_directory() {
+            return pwd.to_string();
+        }
+    }
+    env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The home directory a person means by `cd` alone and by `~` in `dirs`
+/// output: `$HOME`, as in bash, unless `JSH_REAL_HOME` separates the home a
+/// person types from the (sandboxed) `$HOME` programs write to.
+fn typed_home(state: &ShellState) -> Option<String> {
+    if state
+        .get_var("JSH_REAL_HOME")
+        .is_some_and(|real| !real.is_empty())
+    {
+        return Some(state.home_dir.to_string_lossy().into_owned());
+    }
+    state.get_var("HOME").map(str::to_string)
+}
+
+/// `set -o physical` (`set -P`) makes `cd` and `pwd` resolve symbolic links.
+fn physical_by_default(state: &ShellState) -> bool {
+    shell_option_enabled(state, "physical")
+}
+
+/// Change directory and return the new logical directory. The logical form
+/// (`$PWD` + target, with `..` resolved lexically) is tried first, as bash
+/// does without `-P`; the physical path is the fallback and the `-P` answer.
+fn change_directory(target: &str, physical: bool, state: &ShellState) -> std::io::Result<String> {
+    if !physical {
+        let absolute = if target.starts_with('/') {
+            target.to_string()
+        } else {
+            format!("{}/{}", logical_cwd(state), target)
+        };
+        let logical = normalize_logical_path(&absolute);
+        if env::set_current_dir(&logical).is_ok() {
+            return Ok(logical);
+        }
+    }
+    env::set_current_dir(target)?;
+    Ok(env::current_dir()?.to_string_lossy().into_owned())
+}
+
+/// Change to `target` and update `PWD`/`OLDPWD` (and run the chpwd hooks).
+fn enter_directory(
+    target: &str,
+    physical: bool,
+    state: &mut ShellState,
+) -> std::io::Result<String> {
+    let old = logical_cwd(state);
+    let new = change_directory(target, physical, state)?;
+    update_directory_vars(Some(Path::new(&old)), Path::new(&new), state);
+    Ok(new)
+}
+
 fn builtin_cd(args: &[String], state: &mut ShellState) -> i32 {
-    let target = if args.is_empty() {
-        state.home_dir.to_string_lossy().to_string()
-    } else if args[0] == "-" {
-        match state.get_var("OLDPWD") {
-            Some(d) => {
-                println!("{}", d);
-                d.to_string()
+    let mut physical = physical_by_default(state);
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        // `-` alone is the OLDPWD operand; `-N` is a directory-stack index.
+        if arg == "-" || !arg.starts_with('-') || arg[1..].bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        for flag in arg[1..].chars() {
+            match flag {
+                'L' => physical = false,
+                'P' => physical = true,
+                'e' | '@' => {}
+                _ => {
+                    eprintln!("jsh: cd: -{flag}: invalid option");
+                    eprintln!("cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
+                    return 2;
+                }
+            }
+        }
+        index += 1;
+    }
+    let operands = &args[index..];
+    if operands.len() > 1 {
+        eprintln!("jsh: cd: too many arguments");
+        return 1;
+    }
+    let mut print = false;
+    let target = match operands.first().map(String::as_str) {
+        None => match typed_home(state) {
+            Some(home) => home,
+            None => {
+                eprintln!("jsh: cd: HOME not set");
+                return 1;
+            }
+        },
+        Some("-") => match state.get_var("OLDPWD") {
+            Some(dir) => {
+                print = true;
+                dir.to_string()
             }
             None => {
                 eprintln!("jsh: cd: OLDPWD not set");
                 return 1;
             }
-        }
-    } else if args[0].starts_with('+') || args[0].starts_with('-') {
-        // Handle directory stack navigation: cd +N or cd -N
-        if let Ok(idx) = args[0][1..].parse::<usize>() {
-            if args[0].starts_with('+') {
-                if idx < state.dir_stack.len() {
-                    state.dir_stack[idx].to_string_lossy().to_string()
-                } else {
-                    eprintln!("jsh: cd: invalid stack index: +{}", idx);
-                    return 1;
-                }
-            } else {
-                // -N means from the end
-                if idx > 0 && idx <= state.dir_stack.len() {
-                    state.dir_stack[state.dir_stack.len() - idx]
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    eprintln!("jsh: cd: invalid stack index: -{}", idx);
+        },
+        // jsh extension: `cd +N` / `cd -N` jump to a directory-stack entry.
+        Some(spec) if stack_index(spec).is_some() => {
+            let entries = stack_entries(state);
+            match stack_index(spec).and_then(|index| resolve_stack_index(index, entries.len())) {
+                Some(position) => entries[position].clone(),
+                None => {
+                    eprintln!("jsh: cd: {spec}: directory stack index out of range");
                     return 1;
                 }
             }
-        } else {
-            args[0].clone()
         }
-    } else {
-        args[0].clone()
+        Some(dir) => dir.to_string(),
     };
-
-    let old_dir = env::current_dir().ok();
-
-    // Try to change to target directory
-    // First try as absolute/relative path
-    if let Ok(new_dir) = change_to_directory(&target, state) {
-        update_directory_vars(old_dir.as_deref(), &new_dir, state);
+    // `cd ''` stays where it is, as in bash.
+    if target.is_empty() {
         return 0;
     }
 
-    // Try CDPATH if target doesn't contain /
-    if !target.contains('/') {
-        if let Some(cdpath_ref) = state.get_var("CDPATH") {
-            let cdpath = cdpath_ref.to_string();
-            for dir in cdpath.split(':') {
-                if dir.is_empty() {
+    // CDPATH applies to relative names that do not start with `.` or `..`.
+    let searches_cdpath = !target.starts_with('/')
+        && !matches!(target.as_str(), "." | "..")
+        && !target.starts_with("./")
+        && !target.starts_with("../");
+    if searches_cdpath {
+        if let Some(cdpath) = state.get_var("CDPATH").map(str::to_string) {
+            for entry in cdpath.split(':') {
+                let candidate = if entry.is_empty() {
+                    target.clone()
+                } else {
+                    format!("{}/{}", entry.trim_end_matches('/'), target)
+                };
+                if !Path::new(&candidate).is_dir() {
                     continue;
                 }
-                let candidate = format!("{}/{}", dir, target);
-                if let Ok(new_dir) = change_to_directory(&candidate, state) {
-                    println!("{}", new_dir.display());
-                    update_directory_vars(old_dir.as_deref(), &new_dir, state);
+                if let Ok(new) = enter_directory(&candidate, physical, state) {
+                    // A directory found through a CDPATH entry is announced.
+                    if print || !entry.is_empty() {
+                        println!("{new}");
+                    }
                     return 0;
                 }
             }
         }
     }
 
-    eprintln!("jsh: cd: {}: No such file or directory", target);
-    1
-}
-
-fn change_to_directory(
-    path: &str,
-    _state: &mut ShellState,
-) -> Result<std::path::PathBuf, std::io::Error> {
-    let old = env::current_dir().ok();
-    env::set_current_dir(path)?;
-
-    match env::current_dir() {
-        Ok(new_dir) => Ok(new_dir),
-        Err(e) => {
-            if let Some(old_dir) = old {
-                let _ = env::set_current_dir(&old_dir);
+    match enter_directory(&target, physical, state) {
+        Ok(new) => {
+            if print {
+                println!("{new}");
             }
-            Err(e)
+            0
+        }
+        Err(error) => {
+            eprintln!("jsh: cd: {target}: {}", os_error_text(&error));
+            1
         }
     }
 }
@@ -790,76 +986,305 @@ fn builtin_echo(args: &[String]) -> i32 {
     }
 }
 
-fn builtin_pwd() -> i32 {
-    match env::current_dir() {
-        Ok(p) => {
-            println!("{}", p.display());
-            0
+fn builtin_pwd(args: &[String], state: &ShellState) -> i32 {
+    let mut physical = physical_by_default(state);
+    for arg in args {
+        match arg.as_str() {
+            "-L" => physical = false,
+            "-P" => physical = true,
+            "--" => break,
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("jsh: pwd: {other}: invalid option");
+                eprintln!("pwd: usage: pwd [-LP]");
+                return 2;
+            }
+            _ => break,
         }
-        Err(e) => {
-            eprintln!("jsh: pwd: {}", e);
-            1
+    }
+    if physical {
+        match env::current_dir() {
+            Ok(dir) => {
+                println!("{}", dir.display());
+                0
+            }
+            Err(error) => {
+                eprintln!(
+                    "jsh: pwd: error retrieving current directory: {}",
+                    os_error_text(&error)
+                );
+                1
+            }
         }
+    } else {
+        let dir = logical_cwd(state);
+        if dir.is_empty() {
+            eprintln!("jsh: pwd: error retrieving current directory");
+            return 1;
+        }
+        println!("{dir}");
+        0
     }
 }
 
 fn builtin_alias(args: &[String], state: &mut ShellState) -> i32 {
+    // `-p` only asks for the listing, which is the default anyway.
+    let args: Vec<&String> = args
+        .iter()
+        .filter(|arg| *arg != "-p" && *arg != "--")
+        .collect();
+    let print = |name: &str, value: &str| {
+        println!("alias {name}={}", parser::unparse::single_quote(value));
+    };
     if args.is_empty() {
-        for (k, v) in &state.aliases {
-            println!("alias {}='{}'", k, v);
+        let mut names: Vec<&String> = state.aliases.keys().collect();
+        names.sort();
+        for name in names {
+            print(name, &state.aliases[name]);
         }
         return 0;
     }
+    let mut status = 0;
     for arg in args {
         if let Some(eq_pos) = arg.find('=') {
+            // The value is stored exactly as given; quoting in it is
+            // interpreted when the alias is expanded.
             let name = &arg[..eq_pos];
             let value = &arg[eq_pos + 1..];
-            let value = value.trim_matches('\'').trim_matches('"');
             state.aliases.insert(name.to_string(), value.to_string());
         } else {
-            match state.aliases.get(arg) {
-                Some(v) => println!("alias {}='{}'", arg, v),
+            match state.aliases.get(arg.as_str()) {
+                Some(value) => print(arg, value),
                 None => {
                     eprintln!("jsh: alias: {}: not found", arg);
-                    return 1;
+                    status = 1;
                 }
             }
         }
     }
-    0
+    status
 }
 
 fn builtin_unalias(args: &[String], state: &mut ShellState) -> i32 {
+    if args.is_empty() {
+        eprintln!("unalias: usage: unalias [-a] name [name ...]");
+        return 2;
+    }
+    let mut status = 0;
     for name in args {
         if name == "-a" {
             state.aliases.clear();
-            return 0;
+            continue;
         }
-        state.aliases.remove(name);
+        if name == "--" {
+            continue;
+        }
+        if state.aliases.remove(name).is_none() {
+            eprintln!("jsh: unalias: {name}: not found");
+            status = 1;
+        }
     }
-    0
+    status
+}
+
+/// How `type` and `command -v/-V` report a name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Describe {
+    /// `command -v`: the name, the alias definition, or the file's path.
+    Terse,
+    /// `type`, `command -V`: a sentence, with a function's definition.
+    Verbose,
+    /// `type -t`: one word (`alias`, `keyword`, `function`, `builtin`, `file`).
+    Kind,
+    /// `type -p`: a path, and only when the name would run a file.
+    PathOnly,
+}
+
+#[derive(Clone, Copy)]
+struct DescribeOptions {
+    style: Describe,
+    /// `type -a`: every match, not just the one that would run.
+    all: bool,
+    /// `type -f`: skip shell functions.
+    skip_functions: bool,
+    /// `type -P`: search `PATH` even for aliases, builtins and functions.
+    force_path: bool,
+    /// `command -p`: search the system default path instead of `PATH`.
+    default_path: bool,
 }
 
 fn builtin_type(args: &[String], state: &mut ShellState) -> i32 {
-    let mut ret = 0;
-    for arg in args {
-        // A builtin that shadows an installed program (`sort`, `date`, ...)
-        // yields to it for ordinary use, so report the program; `help NAME`
-        // documents when the structured builtin runs instead.
-        if is_builtin(arg) && crate::shadowing::system_program(arg).is_none() {
-            println!("{} is a shell builtin", arg);
-        } else if state.aliases.contains_key(arg) {
-            println!("{} is aliased to '{}'", arg, state.aliases[arg]);
-        } else if state.functions.contains_key(arg) {
-            println!("{} is a function", arg);
-        } else if let Some(path) = find_in_path(arg) {
-            println!("{} is {}", arg, path);
-        } else {
-            eprintln!("jsh: type: {}: not found", arg);
-            ret = 1;
+    let mut options = DescribeOptions {
+        style: Describe::Verbose,
+        all: false,
+        skip_functions: false,
+        force_path: false,
+        default_path: false,
+    };
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            break;
+        };
+        for flag in flags.chars() {
+            match flag {
+                't' => options.style = Describe::Kind,
+                'p' => options.style = Describe::PathOnly,
+                'P' => {
+                    options.style = Describe::PathOnly;
+                    options.force_path = true;
+                }
+                'a' => options.all = true,
+                'f' => options.skip_functions = true,
+                _ => {
+                    eprintln!("jsh: type: -{flag}: invalid option");
+                    eprintln!("type: usage: type [-afptP] name [name ...]");
+                    return 2;
+                }
+            }
+        }
+        index += 1;
+    }
+    let mut status = 0;
+    for name in &args[index..] {
+        if !describe_command(name, options, state) {
+            if options.style == Describe::Verbose {
+                eprintln!("jsh: type: {name}: not found");
+            }
+            status = 1;
         }
     }
-    ret
+    status
+}
+
+/// Every executable file named `name` along `path`, in search order. A name
+/// with a slash is not searched for; it is reported if it is executable.
+fn path_matches(name: &str, path: &str) -> Vec<String> {
+    if name.contains('/') {
+        return if is_executable_file(Path::new(name)) {
+            vec![name.to_string()]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut found: Vec<String> = Vec::new();
+    for dir in path.split(':') {
+        let dir = if dir.is_empty() { "." } else { dir };
+        let full = format!("{dir}/{name}");
+        if is_executable_file(Path::new(&full)) && !found.contains(&full) {
+            found.push(full);
+        }
+    }
+    found
+}
+
+/// The system's default command path, used by `command -p`.
+fn default_command_path() -> String {
+    let mut buffer = [0u8; 256];
+    // SAFETY: confstr writes at most buffer.len() bytes, NUL included.
+    let length = unsafe {
+        nix::libc::confstr(
+            nix::libc::_CS_PATH,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if length > 1 && length <= buffer.len() {
+        String::from_utf8_lossy(&buffer[..length - 1]).into_owned()
+    } else {
+        "/bin:/usr/bin".to_string()
+    }
+}
+
+/// Report how `name` resolves, in the order the shell resolves a command:
+/// alias, keyword, function, builtin, then files on the search path. Returns
+/// whether anything was found.
+fn describe_command(name: &str, options: DescribeOptions, state: &ShellState) -> bool {
+    let style = options.style;
+    let mut found = false;
+    if !options.force_path {
+        if let Some(value) = state.aliases.get(name) {
+            match style {
+                Describe::Terse => {
+                    println!("alias {name}={}", parser::unparse::single_quote(value))
+                }
+                Describe::Verbose => println!("{name} is aliased to `{value}'"),
+                Describe::Kind => println!("alias"),
+                Describe::PathOnly => {}
+            }
+            if !options.all {
+                return true;
+            }
+            found = true;
+        }
+        if is_shell_keyword(name) {
+            match style {
+                Describe::Terse => println!("{name}"),
+                Describe::Verbose => println!("{name} is a shell keyword"),
+                Describe::Kind => println!("keyword"),
+                Describe::PathOnly => {}
+            }
+            if !options.all {
+                return true;
+            }
+            found = true;
+        }
+        if !options.skip_functions {
+            if let Some(body) = state.functions.get(name) {
+                match style {
+                    Describe::Terse => println!("{name}"),
+                    Describe::Verbose => println!(
+                        "{name} is a function\n{}",
+                        parser::unparse::format_function(name, body)
+                    ),
+                    Describe::Kind => println!("function"),
+                    Describe::PathOnly => {}
+                }
+                if !options.all {
+                    return true;
+                }
+                found = true;
+            }
+        }
+        // A builtin that shadows an installed program (`sort`, `date`, ...)
+        // yields to it for ordinary use, so report the program first; `-a`
+        // still lists the builtin, and `help NAME` says when it runs.
+        if is_enabled_builtin(name, state)
+            && (options.all || crate::shadowing::system_program(name).is_none())
+        {
+            match style {
+                Describe::Terse => println!("{name}"),
+                Describe::Verbose => println!("{name} is a shell builtin"),
+                Describe::Kind => println!("builtin"),
+                Describe::PathOnly => {}
+            }
+            if !options.all {
+                return true;
+            }
+            found = true;
+        }
+    }
+    let search_path = if options.default_path {
+        default_command_path()
+    } else {
+        state.get_var("PATH").unwrap_or_default().to_string()
+    };
+    let mut paths = path_matches(name, &search_path);
+    if !options.all {
+        paths.truncate(1);
+    }
+    for path in paths {
+        match style {
+            Describe::Terse | Describe::PathOnly => println!("{path}"),
+            Describe::Verbose => println!("{name} is {path}"),
+            Describe::Kind => println!("file"),
+        }
+        found = true;
+    }
+    found
 }
 
 pub(crate) fn find_in_path(cmd: &str) -> Option<String> {
@@ -919,42 +1344,252 @@ fn is_shell_keyword(name: &str) -> bool {
             | "{"
             | "}"
             | "!"
+            | "[["
+            | "]]"
+            | "coproc"
     )
 }
 
 /// `command -v NAME...` / `command -V NAME...`: report how each name would be
-/// resolved, without running it. Exit status is 1 if any name is not found.
-fn command_describe(names: &[String], verbose: bool, state: &ShellState) -> i32 {
-    let mut ret = 0;
-    for name in names {
-        // (terse form for -v, description for -V) of the first match, in the
-        // order the shell itself resolves a command name.
-        let found = if let Some(alias) = state.aliases.get(name) {
-            Some((
-                format!("alias {}='{}'", name, alias),
-                format!("{} is aliased to `{}'", name, alias),
-            ))
-        } else if is_shell_keyword(name) {
-            Some((name.clone(), format!("{} is a shell keyword", name)))
-        } else if state.functions.contains_key(name) {
-            Some((name.clone(), format!("{} is a function", name)))
-        } else if is_builtin(name) && crate::shadowing::system_program(name).is_none() {
-            Some((name.clone(), format!("{} is a shell builtin", name)))
+/// resolved, without running it. As in bash, the status is 0 if any name was
+/// found.
+fn command_describe(
+    names: &[String],
+    verbose: bool,
+    default_path: bool,
+    state: &ShellState,
+) -> i32 {
+    let options = DescribeOptions {
+        style: if verbose {
+            Describe::Verbose
         } else {
-            find_in_path(name).map(|path| (path.clone(), format!("{} is {}", name, path)))
-        };
+            Describe::Terse
+        },
+        all: false,
+        skip_functions: false,
+        force_path: false,
+        default_path,
+    };
+    let mut any_found = false;
+    for name in names {
+        if describe_command(name, options, state) {
+            any_found = true;
+        } else if verbose {
+            eprintln!("jsh: command: {name}: not found");
+        }
+    }
+    if any_found {
+        0
+    } else {
+        1
+    }
+}
 
-        match found {
-            Some((terse, described)) => println!("{}", if verbose { described } else { terse }),
-            None => {
-                if verbose {
-                    eprintln!("jsh: command: {}: not found", name);
+/// Bash's POSIX special builtins, which `enable -s` lists.
+const SPECIAL_BUILTINS: &[&str] = &[
+    "break", ":", ".", "continue", "eval", "exec", "exit", "export", "readonly", "return", "set",
+    "shift", "times", "trap", "unset",
+];
+
+/// Builtins `enable` can list and toggle: every builtin except `[[`, which is
+/// a keyword (bash says so too).
+fn toggleable_builtins() -> impl Iterator<Item = &'static str> {
+    crate::command_catalog::builtin_names()
+        .iter()
+        .copied()
+        .filter(|name| *name != "[[")
+}
+
+/// `enable [-anps] [name ...]`: list builtins, or turn them off (`-n`) and on.
+/// A disabled builtin's name then runs a function or a file of that name.
+fn builtin_enable(args: &[String], state: &mut ShellState) -> i32 {
+    let mut disable = false;
+    let mut all = false;
+    let mut special = false;
+    let mut print = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            break;
+        };
+        for flag in flags.chars() {
+            match flag {
+                'n' => disable = true,
+                'a' => all = true,
+                's' => special = true,
+                'p' => print = true,
+                'f' | 'd' => {
+                    eprintln!("jsh: enable: -{flag}: loadable builtins are not supported");
+                    return 1;
                 }
-                ret = 1;
+                _ => {
+                    eprintln!("jsh: enable: -{flag}: invalid option");
+                    eprintln!("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]");
+                    return 2;
+                }
+            }
+        }
+        index += 1;
+    }
+    let names = &args[index..];
+    if names.is_empty() || print {
+        // -a lists everything; -n the disabled builtins; otherwise the
+        // enabled ones. Each line re-creates the current setting.
+        for name in toggleable_builtins() {
+            if special && !SPECIAL_BUILTINS.contains(&name) {
+                continue;
+            }
+            let disabled = state.builtin_state.disabled.contains(name);
+            if !all && disabled != disable {
+                continue;
+            }
+            println!("enable {}{name}", if disabled { "-n " } else { "" });
+        }
+        return 0;
+    }
+    let mut status = 0;
+    for name in names {
+        if name == "[[" || !is_builtin(name) {
+            eprintln!("jsh: enable: {name}: not a shell builtin");
+            status = 1;
+        } else if disable {
+            state.builtin_state.disabled.insert(name.clone());
+        } else {
+            state.builtin_state.disabled.remove(name.as_str());
+        }
+    }
+    status
+}
+
+/// `hash [-lrt] [-p path] [-d] [name ...]`: remember, list and forget command
+/// locations. jsh looks commands up on every run, so the table records what
+/// was asked for (`hash -t` and `hash -l` report it) without short-cutting
+/// execution.
+fn builtin_hash(args: &[String], state: &mut ShellState) -> i32 {
+    let mut clear = false;
+    let mut delete = false;
+    let mut print_paths = false;
+    let mut reusable = false;
+    let mut explicit_path: Option<String> = None;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            break;
+        };
+        index += 1;
+        for flag in flags.chars() {
+            match flag {
+                'r' => clear = true,
+                'd' => delete = true,
+                't' => print_paths = true,
+                'l' => reusable = true,
+                'p' => match args.get(index) {
+                    Some(path) => {
+                        explicit_path = Some(path.clone());
+                        index += 1;
+                    }
+                    None => {
+                        eprintln!("jsh: hash: -p: option requires an argument");
+                        return 1;
+                    }
+                },
+                _ => {
+                    eprintln!("jsh: hash: -{flag}: invalid option");
+                    eprintln!("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]");
+                    return 2;
+                }
             }
         }
     }
-    ret
+    if clear {
+        state.builtin_state.hashed.clear();
+    }
+    let names = &args[index..];
+    if names.is_empty() {
+        if print_paths || delete {
+            eprintln!(
+                "jsh: hash: -{}: option requires an argument",
+                if print_paths { 't' } else { 'd' }
+            );
+            return 1;
+        }
+        if clear || explicit_path.is_some() {
+            return 0;
+        }
+        let table = &state.builtin_state.hashed;
+        if table.is_empty() {
+            if !reusable {
+                println!("hash: hash table empty");
+            }
+            return 0;
+        }
+        if !reusable {
+            println!("hits\tcommand");
+        }
+        for (name, (path, hits)) in table {
+            if reusable {
+                println!("builtin hash -p {path} {name}");
+            } else {
+                println!("{hits:4}\t{path}");
+            }
+        }
+        return 0;
+    }
+    let mut status = 0;
+    for name in names {
+        if delete {
+            if state.builtin_state.hashed.shift_remove(name).is_none() {
+                eprintln!("jsh: hash: {name}: not found");
+                status = 1;
+            }
+        } else if print_paths {
+            // Bash counts a `-t` lookup as a use of the entry.
+            match state.builtin_state.hashed.get_mut(name) {
+                Some((path, hits)) => {
+                    *hits += 1;
+                    if names.len() > 1 {
+                        println!("{name}\t{path}");
+                    } else {
+                        println!("{path}");
+                    }
+                }
+                None => {
+                    eprintln!("jsh: hash: {name}: not found");
+                    status = 1;
+                }
+            }
+        } else if let Some(path) = &explicit_path {
+            state
+                .builtin_state
+                .hashed
+                .insert(name.clone(), (path.clone(), 0));
+        } else if name.contains('/')
+            || is_enabled_builtin(name, state)
+            || state.functions.contains_key(name)
+        {
+            // Bash hashes only commands it would look up on PATH.
+        } else {
+            let path = state.get_var("PATH").unwrap_or_default().to_string();
+            match path_matches(name, &path).into_iter().next() {
+                Some(found) => {
+                    state.builtin_state.hashed.insert(name.clone(), (found, 0));
+                }
+                None => {
+                    eprintln!("jsh: hash: {name}: not found");
+                    status = 1;
+                }
+            }
+        }
+    }
+    status
 }
 
 /// Drop the two lines an interactive bash prints when it is started without a
@@ -1186,141 +1821,393 @@ fn builtin_eval(args: &[String], state: &mut ShellState) -> i32 {
     }
 }
 
-fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
-    let mut prompt_str = None;
-    let mut silent = false;
-    let mut raw = false;
-    let mut timeout = None;
-    let mut count_chars: Option<usize> = None;
-    let mut delim = '\n';
-    let mut exact_count: Option<usize> = None;
-    let mut read_array = false;
-    let mut var_names: Vec<&str> = Vec::new();
-    let mut i = 0;
+/// Upper bound on the bytes a single `read` collects. Input such as
+/// `read -d '' < /dev/zero` never reaches its delimiter; failing loudly
+/// beats exhausting memory.
+const MAX_READ_BYTES: usize = 256 * 1024 * 1024;
 
-    while i < args.len() {
-        match args[i].as_str() {
-            "-p" => {
-                i += 1;
-                if i < args.len() {
-                    prompt_str = Some(args[i].as_str());
-                }
-            }
-            "-s" => silent = true,
-            "-r" => raw = true,
-            "-t" => {
-                i += 1;
-                let Some(value) = args.get(i) else {
-                    eprintln!("read: -t requires a timeout");
-                    return 2;
-                };
-                timeout = match parse_read_timeout(value) {
-                    Some(timeout) => Some(timeout),
-                    None => {
-                        eprintln!("read: invalid timeout");
-                        return 1;
+const READ_USAGE: &str = "read: usage: read [-ers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]";
+
+/// Parsed `read` options.
+struct ReadOptions {
+    raw: bool,
+    silent: bool,
+    prompt: Option<String>,
+    timeout: Option<std::time::Duration>,
+    /// `-n`/`-N` character count; `exact` is `-N`, which ignores the
+    /// delimiter and does no field splitting.
+    count: Option<usize>,
+    exact: bool,
+    /// The record delimiter; `-d ''` is NUL.
+    delimiter: char,
+    array: Option<String>,
+    fd: std::os::fd::RawFd,
+}
+
+/// `read`'s options, which may cluster (`-rn 2`) or carry their value in the
+/// same word (`-d,`, `-n2`), as with bash's getopt. Returns the options and
+/// the index of the first name, or the exit status for a usage error.
+fn parse_read_options(args: &[String]) -> Result<(ReadOptions, usize), i32> {
+    let mut options = ReadOptions {
+        raw: false,
+        silent: false,
+        prompt: None,
+        timeout: None,
+        count: None,
+        exact: false,
+        delimiter: '\n',
+        array: None,
+        fd: 0,
+    };
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            break;
+        };
+        index += 1;
+        for (at, flag) in flags.char_indices() {
+            match flag {
+                'r' => options.raw = true,
+                's' => options.silent = true,
+                // Readline editing (-e) and its initial text (-i) only apply
+                // when reading from a terminal through readline, which jsh's
+                // `read` does not use; they are accepted and ignored.
+                'e' => {}
+                'a' | 'd' | 'i' | 'n' | 'N' | 'p' | 't' | 'u' => {
+                    let attached = &flags[at + flag.len_utf8()..];
+                    let value = if !attached.is_empty() {
+                        attached.to_string()
+                    } else if let Some(next) = args.get(index) {
+                        index += 1;
+                        next.clone()
+                    } else {
+                        eprintln!("jsh: read: -{flag}: option requires an argument");
+                        eprintln!("{READ_USAGE}");
+                        return Err(2);
+                    };
+                    match flag {
+                        'a' => options.array = Some(value),
+                        'd' => options.delimiter = value.chars().next().unwrap_or('\0'),
+                        'i' => {}
+                        'p' => options.prompt = Some(value),
+                        'n' | 'N' => match value.parse::<usize>() {
+                            Ok(count) => {
+                                options.count = Some(count);
+                                options.exact = flag == 'N';
+                            }
+                            Err(_) => {
+                                eprintln!("jsh: read: {value}: invalid number");
+                                return Err(1);
+                            }
+                        },
+                        't' => match parse_read_timeout(&value) {
+                            Some(timeout) => options.timeout = Some(timeout),
+                            None => {
+                                eprintln!("jsh: read: {value}: invalid timeout specification");
+                                return Err(1);
+                            }
+                        },
+                        _ => match value.parse::<std::os::fd::RawFd>() {
+                            Ok(fd) if fd >= 0 => options.fd = fd,
+                            _ => {
+                                eprintln!(
+                                    "jsh: read: {value}: invalid file descriptor specification"
+                                );
+                                return Err(1);
+                            }
+                        },
                     }
-                };
-            }
-            "-n" => {
-                i += 1;
-                if i < args.len() {
-                    count_chars = args[i].parse::<usize>().ok();
+                    break;
                 }
-            }
-            "-N" => {
-                i += 1;
-                if i < args.len() {
-                    exact_count = args[i].parse::<usize>().ok();
+                _ => {
+                    eprintln!("jsh: read: -{flag}: invalid option");
+                    eprintln!("{READ_USAGE}");
+                    return Err(2);
                 }
-            }
-            "-d" => {
-                i += 1;
-                if i < args.len() {
-                    let d = &args[i];
-                    if !d.is_empty() {
-                        delim = d.chars().next().unwrap();
-                    }
-                }
-            }
-            "-a" => {
-                read_array = true;
-            }
-            s if s.starts_with('-') => {}
-            _ => {
-                var_names.push(&args[i]);
             }
         }
-        i += 1;
+    }
+    Ok((options, index))
+}
+
+fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
+    let (options, first_name) = match parse_read_options(args) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
+    };
+    let names = &args[first_name..];
+    // Names are checked before anything is read, so a typo does not swallow
+    // the line the next command expected.
+    if let Some(array) = &options.array {
+        if !crate::environment::is_valid_identifier(array) {
+            eprintln!("jsh: read: `{array}': not a valid identifier");
+            return 1;
+        }
+    }
+    if let Some(bad) = names.iter().find(|name| variable_target(name).is_none()) {
+        eprintln!("jsh: read: `{bad}': not a valid identifier");
+        return 1;
+    }
+    let fd = options.fd;
+    // SAFETY: F_GETFD only queries the descriptor's flags.
+    if unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) } < 0 {
+        let error = std::io::Error::last_os_error();
+        eprintln!(
+            "jsh: read: {fd}: invalid file descriptor: {}",
+            os_error_text(&error)
+        );
+        return 1;
     }
 
-    if var_names.is_empty() && !read_array {
-        var_names.push("REPLY");
+    if options.timeout == Some(std::time::Duration::ZERO) {
+        return poll_read_fd(fd, 0).map_or_else(|status| status, |ready| if ready { 0 } else { 1 });
     }
-
-    if timeout == Some(std::time::Duration::ZERO) {
-        return poll_read_stdin(0).map_or_else(|status| status, |ready| if ready { 0 } else { 1 });
-    }
-    let deadline = match timeout {
+    let deadline = match options.timeout {
         Some(timeout) => match std::time::Instant::now().checked_add(timeout) {
             Some(deadline) => Some(deadline),
             None => {
-                eprintln!("read: invalid timeout");
+                eprintln!("jsh: read: invalid timeout specification");
                 return 1;
             }
         },
         None => None,
     };
 
-    if let Some(p) = prompt_str {
-        eprint!("{}", p);
+    // The prompt and the silent mode only mean something on a terminal.
+    // SAFETY: isatty only inspects the descriptor.
+    let terminal = unsafe { nix::libc::isatty(fd) } == 1;
+    if let (Some(prompt), true) = (&options.prompt, terminal) {
         use std::io::Write;
+        eprint!("{prompt}");
         std::io::stderr().flush().ok();
     }
-
-    let echo_guard = silent.then(StdinEchoGuard::disable).flatten();
-
-    let result = if let Some(count) = exact_count {
-        // Existing -N count is bytes, not Unicode scalar values.
-        read_exact_chars(count, &var_names, read_array, state, deadline)
-    } else if let Some(count) = count_chars {
-        // Existing -n count is bytes, while still honoring the delimiter.
-        read_limited_chars(count, delim, &var_names, read_array, state, deadline)
-    } else {
-        // Read line with delimiter
-        read_line_with_delimiter(delim, raw, &var_names, read_array, state, deadline)
-    };
-
+    let echo_guard = (options.silent && terminal)
+        .then(|| EchoGuard::disable(fd))
+        .flatten();
+    let (input, status) = read_input(&options, deadline);
     drop(echo_guard);
-    if silent {
-        eprintln!();
+
+    if status != 0 && status != 1 && status != READ_TIMEOUT_STATUS {
+        // An error or a signal: nothing is assigned.
+        return status;
     }
 
-    result
+    if let Some(array) = &options.array {
+        let ifs = if options.exact {
+            String::new()
+        } else {
+            state.get_var("IFS").unwrap_or(" \t\n").to_string()
+        };
+        let mut fields = Vec::new();
+        let mut rest = trim_leading_ifs_whitespace(&input, &ifs);
+        while !rest.is_empty() {
+            let (field, after) = take_ifs_field(rest, &ifs);
+            fields.push(field);
+            rest = after;
+        }
+        state.set_array(array, fields);
+        return status;
+    }
+    if names.is_empty() {
+        // REPLY gets the line as read: escapes removed, nothing trimmed.
+        let line: String = input.iter().map(|&(c, _)| c).collect();
+        state.set_var("REPLY", &line);
+        return status;
+    }
+
+    // -N assigns the characters read without splitting them.
+    let ifs = if options.exact {
+        String::new()
+    } else {
+        state.get_var("IFS").unwrap_or(" \t\n").to_string()
+    };
+    let mut rest = trim_leading_ifs_whitespace(&input, &ifs);
+    for (index, name) in names.iter().enumerate() {
+        let value = if index + 1 < names.len() {
+            let (field, after) = take_ifs_field(rest, &ifs);
+            rest = after;
+            field
+        } else {
+            last_field(rest, &ifs)
+        };
+        assign_target(name, &value, state);
+    }
+    status
+}
+
+/// IFS whitespace: space, tab and newline, when IFS contains them.
+fn is_ifs_whitespace(c: char, ifs: &str) -> bool {
+    matches!(c, ' ' | '\t' | '\n') && ifs.contains(c)
+}
+
+/// Characters read by `read`, each marked when a backslash escaped it (an
+/// escaped character is never a field separator).
+type ReadChars = [(char, bool)];
+
+fn trim_leading_ifs_whitespace<'a>(input: &'a ReadChars, ifs: &str) -> &'a ReadChars {
+    let start = input
+        .iter()
+        .position(|&(c, escaped)| escaped || !is_ifs_whitespace(c, ifs))
+        .unwrap_or(input.len());
+    &input[start..]
+}
+
+/// Bash's `get_word_from_string`: the next field, then the separator after
+/// it (surrounding IFS whitespace plus at most one other IFS character).
+fn take_ifs_field<'a>(input: &'a ReadChars, ifs: &str) -> (String, &'a ReadChars) {
+    let input = trim_leading_ifs_whitespace(input, ifs);
+    let end = input
+        .iter()
+        .position(|&(c, escaped)| !escaped && ifs.contains(c))
+        .unwrap_or(input.len());
+    let field: String = input[..end].iter().map(|&(c, _)| c).collect();
+    let mut rest = trim_leading_ifs_whitespace(&input[end..], ifs);
+    if let Some(&(c, false)) = rest.first() {
+        if ifs.contains(c) && !is_ifs_whitespace(c, ifs) {
+            rest = trim_leading_ifs_whitespace(&rest[1..], ifs);
+        }
+    }
+    (field, rest)
+}
+
+/// The value of the last name: everything left, separators included, minus
+/// trailing IFS whitespace. When what is left is a single field followed by
+/// its separator, that separator goes too (`IFS=, read a <<< 'x,'` gives `x`).
+fn last_field(input: &ReadChars, ifs: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let (field, rest) = take_ifs_field(input, ifs);
+    if rest.is_empty() {
+        return field;
+    }
+    let end = input
+        .iter()
+        .rposition(|&(c, escaped)| escaped || !is_ifs_whitespace(c, ifs))
+        .map_or(0, |last| last + 1);
+    input[..end].iter().map(|&(c, _)| c).collect()
+}
+
+/// Read one record: up to the delimiter (unless `-N`), `count` characters, end
+/// of input, the deadline, or a signal. Without `-r`, a backslash escapes the
+/// next character and a backslash-newline pair disappears. Returns the
+/// characters read and the status: 0, 1 at end of input, 142 on timeout, or
+/// another status for an error or signal.
+fn read_input(
+    options: &ReadOptions,
+    deadline: Option<std::time::Instant>,
+) -> (Vec<(char, bool)>, i32) {
+    let mut chars: Vec<(char, bool)> = Vec::new();
+    let mut bytes_read = 0usize;
+    let mut escape_pending = false;
+    let status = loop {
+        if options.count.is_some_and(|count| chars.len() >= count) {
+            break 0;
+        }
+        let c = match read_char(options.fd, deadline) {
+            Ok(Some((c, width))) => {
+                bytes_read += width;
+                c
+            }
+            Ok(None) => break 1,
+            Err(status) => break status,
+        };
+        if bytes_read > MAX_READ_BYTES {
+            eprintln!("jsh: read: input exceeds {MAX_READ_BYTES} bytes");
+            break 1;
+        }
+        if escape_pending {
+            escape_pending = false;
+            // A backslash-newline is a line continuation.
+            if c != '\n' {
+                chars.push((c, true));
+            }
+            continue;
+        }
+        if c == '\\' && !options.raw {
+            escape_pending = true;
+            continue;
+        }
+        if c == options.delimiter && !options.exact {
+            break 0;
+        }
+        chars.push((c, false));
+    };
+    (chars, status)
+}
+
+/// Read one character from `fd`, a byte at a time so nothing beyond it is
+/// consumed (the next command reading the same descriptor must see the rest).
+/// A byte that does not start valid UTF-8 counts as one character and reads
+/// as U+FFFD. Returns the character and its width in bytes, or `None` at end
+/// of input.
+fn read_char(
+    fd: std::os::fd::RawFd,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<(char, usize)>, i32> {
+    let mut first = [0u8; 1];
+    if read_fd_interruptibly(fd, &mut first, deadline)? == 0 {
+        return Ok(None);
+    }
+    let width = match first[0] {
+        0x00..=0x7f => return Ok(Some((first[0] as char, 1))),
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return Ok(Some((char::REPLACEMENT_CHARACTER, 1))),
+    };
+    let mut buffer = [first[0], 0, 0, 0];
+    let mut filled = 1;
+    while filled < width {
+        let mut next = [0u8; 1];
+        if read_fd_interruptibly(fd, &mut next, deadline)? == 0 {
+            break;
+        }
+        buffer[filled] = next[0];
+        filled += 1;
+        if next[0] & 0xc0 != 0x80 {
+            break;
+        }
+    }
+    let c = std::str::from_utf8(&buffer[..filled])
+        .ok()
+        .and_then(|text| text.chars().next())
+        .unwrap_or(char::REPLACEMENT_CHARACTER);
+    Ok(Some((c, filled)))
 }
 
 /// Restores the exact terminal mode even when a silent read exits early.
-struct StdinEchoGuard(nix::sys::termios::Termios);
+struct EchoGuard {
+    fd: std::os::fd::RawFd,
+    original: nix::sys::termios::Termios,
+}
 
-impl StdinEchoGuard {
-    fn disable() -> Option<Self> {
+impl EchoGuard {
+    fn disable(fd: std::os::fd::RawFd) -> Option<Self> {
         use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
 
-        let stdin = std::io::stdin();
-        let original = tcgetattr(&stdin).ok()?;
+        // SAFETY: the descriptor is only borrowed for these two calls.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let original = tcgetattr(borrowed).ok()?;
         let mut hidden = original.clone();
         hidden.local_flags.remove(LocalFlags::ECHO);
-        tcsetattr(&stdin, SetArg::TCSANOW, &hidden).ok()?;
-        Some(Self(original))
+        tcsetattr(borrowed, SetArg::TCSANOW, &hidden).ok()?;
+        Some(Self { fd, original })
     }
 }
 
-impl Drop for StdinEchoGuard {
+impl Drop for EchoGuard {
     fn drop(&mut self) {
+        // SAFETY: the descriptor outlives the read that created the guard.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) };
         let _ = nix::sys::termios::tcsetattr(
-            std::io::stdin(),
+            borrowed,
             nix::sys::termios::SetArg::TCSANOW,
-            &self.0,
+            &self.original,
         );
     }
 }
@@ -1356,12 +2243,12 @@ fn parse_read_timeout(value: &str) -> Option<std::time::Duration> {
     })
 }
 
-fn poll_read_stdin(timeout_ms: i32) -> Result<bool, i32> {
+fn poll_read_fd(fd: std::os::fd::RawFd, timeout_ms: i32) -> Result<bool, i32> {
     if let Some(status) = crate::signal::pending_status() {
         return Err(status);
     }
     let mut descriptor = nix::libc::pollfd {
-        fd: nix::libc::STDIN_FILENO,
+        fd,
         events: nix::libc::POLLIN,
         revents: 0,
     };
@@ -1382,48 +2269,11 @@ fn poll_read_stdin(timeout_ms: i32) -> Result<bool, i32> {
     Ok(descriptor.revents & (nix::libc::POLLIN | nix::libc::POLLHUP) != 0)
 }
 
-fn read_exact_chars(
-    count: usize,
-    var_names: &[&str],
-    read_array: bool,
-    state: &mut ShellState,
-    deadline: Option<std::time::Instant>,
-) -> i32 {
-    let mut buffer = vec![0u8; count];
-    let mut filled = 0;
-    let mut status = 0;
-    while filled < buffer.len() {
-        match read_stdin_interruptibly(&mut buffer[filled..], deadline) {
-            Ok(0) => return 1,
-            Ok(read) => filled += read,
-            Err(READ_TIMEOUT_STATUS) => {
-                status = READ_TIMEOUT_STATUS;
-                buffer.truncate(filled);
-                break;
-            }
-            Err(status) => return status,
-        }
-    }
-
-    let line = String::from_utf8_lossy(&buffer).into_owned();
-    if read_array {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(arr_name) = var_names.first() {
-            state.arrays.insert(
-                arr_name.to_string(),
-                parts.into_iter().map(|s| s.to_string()).collect(),
-            );
-        }
-    } else if var_names.len() == 1 {
-        state.set_var(var_names[0], &line);
-    }
-    status
-}
-
-/// Read only the requested bytes from fd 0. A buffered stdin reader may
-/// prefetch bytes past a delimiter/count, hiding input from the next external
-/// command that inherits the same descriptor.
-fn read_stdin_interruptibly(
+/// Read only the requested bytes from `fd`. A buffered reader may prefetch
+/// bytes past a delimiter/count, hiding input from the next external command
+/// that inherits the same descriptor.
+fn read_fd_interruptibly(
+    fd: std::os::fd::RawFd,
     buffer: &mut [u8],
     deadline: Option<std::time::Instant>,
 ) -> Result<usize, i32> {
@@ -1440,15 +2290,15 @@ fn read_stdin_interruptibly(
             let millis = remaining
                 .as_millis()
                 .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
-            if !poll_read_stdin(millis.min(100) as i32)? {
+            if !poll_read_fd(fd, millis.min(100) as i32)? {
                 continue;
             }
             if std::time::Instant::now() >= deadline {
                 return Err(READ_TIMEOUT_STATUS);
             }
         }
-        let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
-        match nix::unistd::read(stdin, buffer) {
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        match nix::unistd::read(borrowed, buffer) {
             Ok(read) => return Ok(read),
             Err(nix::errno::Errno::EINTR) => {
                 if let Some(status) = crate::signal::pending_status() {
@@ -1460,135 +2310,7 @@ fn read_stdin_interruptibly(
     }
 }
 
-fn read_limited_chars(
-    max_count: usize,
-    delim: char,
-    var_names: &[&str],
-    read_array: bool,
-    state: &mut ShellState,
-    deadline: Option<std::time::Instant>,
-) -> i32 {
-    if max_count == 0 {
-        return 1;
-    }
-    let mut buffer = Vec::new();
-    let mut encoded_delim = [0_u8; 4];
-    let delimiter = delim.encode_utf8(&mut encoded_delim).as_bytes();
-    let mut status = 0;
-    while buffer.len() < max_count {
-        let mut byte = [0_u8; 1];
-        match read_stdin_interruptibly(&mut byte, deadline) {
-            Ok(0) if buffer.is_empty() => return 1,
-            Ok(0) => break,
-            Ok(_) => {
-                buffer.push(byte[0]);
-                if buffer.ends_with(delimiter) {
-                    buffer.truncate(buffer.len() - delimiter.len());
-                    break;
-                }
-            }
-            Err(READ_TIMEOUT_STATUS) => {
-                status = READ_TIMEOUT_STATUS;
-                break;
-            }
-            Err(status) => return status,
-        }
-    }
-    let line = String::from_utf8_lossy(&buffer).into_owned();
-    if read_array {
-        let parts: Vec<&str> = line.split(delim).collect();
-        if let Some(arr_name) = var_names.first() {
-            state.arrays.insert(
-                arr_name.to_string(),
-                parts.into_iter().map(|s| s.to_string()).collect(),
-            );
-        }
-    } else if var_names.len() == 1 {
-        state.set_var(var_names[0], &line);
-    } else {
-        let parts: Vec<&str> = line.split(delim).collect();
-        for (vi, var) in var_names.iter().enumerate() {
-            state.set_var(var, parts.get(vi).unwrap_or(&""));
-        }
-    }
-    status
-}
-
-fn read_line_with_delimiter(
-    delim: char,
-    raw: bool,
-    var_names: &[&str],
-    read_array: bool,
-    state: &mut ShellState,
-    deadline: Option<std::time::Instant>,
-) -> i32 {
-    let mut bytes = Vec::new();
-    let mut encoded_delim = [0_u8; 4];
-    let delimiter = delim.encode_utf8(&mut encoded_delim).as_bytes();
-
-    let read_status = loop {
-        let mut byte = [0_u8; 1];
-        match read_stdin_interruptibly(&mut byte, deadline) {
-            Ok(0) if bytes.is_empty() => break Err(1),
-            Ok(0) => break Ok(()),
-            Ok(_) => {
-                bytes.push(byte[0]);
-                if bytes.ends_with(delimiter) {
-                    bytes.truncate(bytes.len() - delimiter.len());
-                    break Ok(());
-                }
-            }
-            Err(status) => break Err(status),
-        }
-    };
-
-    match read_status {
-        Ok(()) | Err(READ_TIMEOUT_STATUS) => {
-            let line = String::from_utf8_lossy(&bytes);
-            let line = if read_status == Err(READ_TIMEOUT_STATUS) {
-                line.as_ref()
-            } else {
-                line.trim_end_matches('\r')
-            };
-            let line = if !raw {
-                line.replace("\\\n", "")
-            } else {
-                line.to_string()
-            };
-
-            if read_array {
-                // Get IFS for splitting
-                let ifs = state.get_var("IFS").unwrap_or(" \t\n");
-                let parts: Vec<&str> = line
-                    .split(|c: char| ifs.contains(c))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if let Some(arr_name) = var_names.first() {
-                    state.arrays.insert(
-                        arr_name.to_string(),
-                        parts.into_iter().map(|s| s.to_string()).collect(),
-                    );
-                }
-            } else if var_names.len() == 1 {
-                state.set_var(var_names[0], &line);
-            } else {
-                // Get IFS for splitting
-                let ifs = state.get_var("IFS").unwrap_or(" \t\n");
-                let parts: Vec<&str> = line
-                    .split(|c: char| ifs.contains(c))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                for (vi, var) in var_names.iter().enumerate() {
-                    state.set_var(var, parts.get(vi).unwrap_or(&""));
-                }
-            }
-            read_status.err().unwrap_or(0)
-        }
-        Err(status) => status,
-    }
-}
-
-fn builtin_test(name: &str, args: &[String]) -> i32 {
+fn builtin_test(name: &str, args: &[String], state: &mut ShellState) -> i32 {
     // Only `[` has a closing delimiter. A literal `]` remains ordinary data
     // for `test`, and for `[` everywhere except its final argument.
     let args = if name == "[" {
@@ -1603,98 +2325,103 @@ fn builtin_test(name: &str, args: &[String]) -> i32 {
         args
     };
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match evaluate_test(&args) {
+    match evaluate_test(&args, state) {
         TestResult::True => 0,
         TestResult::False => 1,
-        TestResult::Error => {
-            eprintln!("jsh: {name}: invalid expression");
+        TestResult::Error(message) => {
+            eprintln!(
+                "jsh: {name}: {}",
+                message.as_deref().unwrap_or("invalid expression")
+            );
             2
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum TestResult {
     True,
     False,
-    Error,
+    /// A malformed expression. The message, when present, names the
+    /// offending operand the way bash does (`x: integer expression expected`).
+    Error(Option<String>),
 }
 
 impl TestResult {
+    fn from_bool(value: bool) -> Self {
+        if value {
+            Self::True
+        } else {
+            Self::False
+        }
+    }
+
     fn negate(self) -> Self {
         match self {
             Self::True => Self::False,
             Self::False => Self::True,
-            Self::Error => Self::Error,
+            error @ Self::Error(_) => error,
         }
     }
 }
 
-fn evaluate_test(args: &[&str]) -> TestResult {
+fn evaluate_test(args: &[&str], state: &mut ShellState) -> TestResult {
     // Small-argument rules disambiguate strings that happen to be operators:
     // `test !` tests a nonempty string, and `test ! = !` compares strings.
     match args {
         [] => return TestResult::False,
-        [value] => {
-            return if value.is_empty() {
-                TestResult::False
-            } else {
-                TestResult::True
-            };
-        }
-        ["!", rest] => return evaluate_test(&[rest]).negate(),
+        [value] => return TestResult::from_bool(!value.is_empty()),
+        ["!", rest] => return evaluate_test(&[rest], state).negate(),
         [_, op, _] if is_test_binary_op(op) => return parse_test_binary(args, 0).0,
-        [left, "-a", right] => {
-            return if !left.is_empty() && !right.is_empty() {
-                TestResult::True
-            } else {
-                TestResult::False
-            };
-        }
-        [left, "-o", right] => {
-            return if !left.is_empty() || !right.is_empty() {
-                TestResult::True
-            } else {
-                TestResult::False
-            };
-        }
-        ["(", value, ")"] => return evaluate_test(&[value]),
-        ["!", "!", _] => return TestResult::Error,
-        ["!", rest @ ..] if args.len() <= 4 => return evaluate_test(rest).negate(),
-        ["(", inner @ .., ")"] if args.len() == 4 => return evaluate_test(inner),
+        [left, "-a", right] => return TestResult::from_bool(!left.is_empty() && !right.is_empty()),
+        [left, "-o", right] => return TestResult::from_bool(!left.is_empty() || !right.is_empty()),
+        ["(", value, ")"] => return evaluate_test(&[value], state),
+        ["!", "!", _] => return TestResult::Error(None),
+        ["!", rest @ ..] if args.len() <= 4 => return evaluate_test(rest, state).negate(),
+        ["(", inner @ .., ")"] if args.len() == 4 => return evaluate_test(inner, state),
         _ => {}
     }
-    let (result, consumed) = parse_test_expr(args, 0);
-    if consumed == args.len() {
+    let (result, consumed) = parse_test_expr(args, 0, state);
+    if consumed == args.len() || matches!(result, TestResult::Error(_)) {
         result
     } else {
-        TestResult::Error
+        TestResult::Error(None)
     }
 }
 
 fn is_test_binary_op(op: &str) -> bool {
     matches!(
         op,
-        "=" | "==" | "!=" | "<" | ">" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+        "=" | "=="
+            | "!="
+            | "<"
+            | ">"
+            | "-eq"
+            | "-ne"
+            | "-lt"
+            | "-le"
+            | "-gt"
+            | "-ge"
+            | "-nt"
+            | "-ot"
+            | "-ef"
     )
 }
 
-fn parse_test_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
-    let (result, new_idx) = parse_or_expr(args, idx);
-    (result, new_idx)
+fn parse_test_expr(args: &[&str], idx: usize, state: &mut ShellState) -> (TestResult, usize) {
+    parse_or_expr(args, idx, state)
 }
 
-fn parse_or_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
-    let (mut left, mut new_idx) = parse_and_expr(args, idx);
+fn parse_or_expr(args: &[&str], idx: usize, state: &mut ShellState) -> (TestResult, usize) {
+    let (mut left, mut new_idx) = parse_and_expr(args, idx, state);
 
     while new_idx < args.len() && args[new_idx] == "-o" {
         new_idx += 1;
-        let (right, next_idx) = parse_and_expr(args, new_idx);
+        let (right, next_idx) = parse_and_expr(args, new_idx, state);
 
         left = match (left, right) {
-            (TestResult::Error, _) | (_, TestResult::Error) => TestResult::Error,
-            (TestResult::True, _) => TestResult::True,
-            (_, TestResult::True) => TestResult::True,
+            (error @ TestResult::Error(_), _) | (_, error @ TestResult::Error(_)) => error,
+            (TestResult::True, _) | (_, TestResult::True) => TestResult::True,
             (TestResult::False, TestResult::False) => TestResult::False,
         };
         new_idx = next_idx;
@@ -1703,17 +2430,16 @@ fn parse_or_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
     (left, new_idx)
 }
 
-fn parse_and_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
-    let (mut left, mut new_idx) = parse_primary(args, idx);
+fn parse_and_expr(args: &[&str], idx: usize, state: &mut ShellState) -> (TestResult, usize) {
+    let (mut left, mut new_idx) = parse_primary(args, idx, state);
 
     while new_idx < args.len() && args[new_idx] == "-a" {
         new_idx += 1;
-        let (right, next_idx) = parse_primary(args, new_idx);
+        let (right, next_idx) = parse_primary(args, new_idx, state);
 
         left = match (left, right) {
-            (TestResult::Error, _) | (_, TestResult::Error) => TestResult::Error,
-            (TestResult::False, _) => TestResult::False,
-            (_, TestResult::False) => TestResult::False,
+            (error @ TestResult::Error(_), _) | (_, error @ TestResult::Error(_)) => error,
+            (TestResult::False, _) | (_, TestResult::False) => TestResult::False,
             (TestResult::True, TestResult::True) => TestResult::True,
         };
         new_idx = next_idx;
@@ -1722,9 +2448,9 @@ fn parse_and_expr(args: &[&str], idx: usize) -> (TestResult, usize) {
     (left, new_idx)
 }
 
-fn parse_primary(args: &[&str], idx: usize) -> (TestResult, usize) {
+fn parse_primary(args: &[&str], idx: usize, state: &mut ShellState) -> (TestResult, usize) {
     if idx >= args.len() {
-        return (TestResult::Error, idx);
+        return (TestResult::Error(None), idx);
     }
 
     // Binary comparisons take precedence over interpreting the left operand
@@ -1735,356 +2461,234 @@ fn parse_primary(args: &[&str], idx: usize) -> (TestResult, usize) {
 
     // Handle negation
     if args[idx] == "!" {
-        let (result, new_idx) = parse_primary(args, idx + 1);
-        let negated = match result {
-            TestResult::True => TestResult::False,
-            TestResult::False => TestResult::True,
-            TestResult::Error => TestResult::Error,
-        };
-        return (negated, new_idx);
+        let (result, new_idx) = parse_primary(args, idx + 1, state);
+        return (result.negate(), new_idx);
     }
 
     // Handle parentheses
     if args[idx] == "(" {
-        let (result, new_idx) = parse_or_expr(args, idx + 1);
+        let (result, new_idx) = parse_or_expr(args, idx + 1, state);
         if new_idx < args.len() && args[new_idx] == ")" {
             return (result, new_idx + 1);
         }
-        return (TestResult::Error, new_idx);
+        return (TestResult::Error(None), new_idx);
     }
 
-    // Handle unary operators
     if idx + 1 < args.len() {
-        match args[idx] {
-            "-n" => {
-                return (
-                    if !args[idx + 1].is_empty() {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-z" => {
-                return (
-                    if args[idx + 1].is_empty() {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-f" => {
-                return (
-                    if Path::new(args[idx + 1]).is_file() {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-d" => {
-                return (
-                    if Path::new(args[idx + 1]).is_dir() {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-e" => {
-                return (
-                    if Path::new(args[idx + 1]).exists() {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-L" => {
-                return (
-                    if is_symlink(args[idx + 1]) {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-p" => {
-                return (
-                    if is_fifo(args[idx + 1]) {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-S" => {
-                return (
-                    if is_socket(args[idx + 1]) {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-b" => {
-                return (
-                    if is_block_device(args[idx + 1]) {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-c" => {
-                return (
-                    if is_char_device(args[idx + 1]) {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-s" => {
-                let result = if let Ok(m) = std::fs::metadata(args[idx + 1]) {
-                    if m.len() > 0 {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    }
-                } else {
-                    TestResult::False
-                };
-                return (result, idx + 2);
-            }
-            "-r" => {
-                return (
-                    if is_readable(args[idx + 1]) {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-w" => {
-                return (
-                    if is_writable(args[idx + 1]) {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            "-x" => {
-                return (
-                    if is_executable(args[idx + 1]) {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 2,
-                )
-            }
-            _ => {}
+        if let Some(result) = unary_test(args[idx], args[idx + 1], state) {
+            return (TestResult::from_bool(result), idx + 2);
         }
     }
 
     // A bare string may end at a logical operator or closing parenthesis.
     if idx + 1 == args.len() || matches!(args.get(idx + 1), Some(&"-a" | &"-o" | &")")) {
-        return (
-            if !args[idx].is_empty() {
-                TestResult::True
-            } else {
-                TestResult::False
-            },
-            idx + 1,
-        );
+        return (TestResult::from_bool(!args[idx].is_empty()), idx + 1);
     }
 
-    (TestResult::Error, idx)
+    (TestResult::Error(None), idx)
 }
 
 fn parse_test_binary(args: &[&str], idx: usize) -> (TestResult, usize) {
-    if idx + 2 < args.len() {
-        match args[idx + 1] {
-            "=" | "==" => {
-                return (
-                    if args[idx] == args[idx + 2] {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 3,
-                )
+    let (left, op, right) = (args[idx], args[idx + 1], args[idx + 2]);
+    let result = match op {
+        "=" | "==" => TestResult::from_bool(left == right),
+        "!=" => TestResult::from_bool(left != right),
+        "<" => TestResult::from_bool(left < right),
+        ">" => TestResult::from_bool(left > right),
+        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+            match (test_integer(left), test_integer(right)) {
+                (Some(a), Some(b)) => TestResult::from_bool(compare_integers(op, a, b)),
+                (None, _) => {
+                    TestResult::Error(Some(format!("{left}: integer expression expected")))
+                }
+                (_, None) => {
+                    TestResult::Error(Some(format!("{right}: integer expression expected")))
+                }
             }
-            "!=" => {
-                return (
-                    if args[idx] != args[idx + 2] {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 3,
-                )
-            }
-            "<" => {
-                return (
-                    if args[idx] < args[idx + 2] {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 3,
-                )
-            }
-            ">" => {
-                return (
-                    if args[idx] > args[idx + 2] {
-                        TestResult::True
-                    } else {
-                        TestResult::False
-                    },
-                    idx + 3,
-                )
-            }
-            "-eq" => {
-                let result = match (args[idx].parse::<i64>(), args[idx + 2].parse::<i64>()) {
-                    (Ok(a), Ok(b)) => {
-                        if a == b {
-                            TestResult::True
-                        } else {
-                            TestResult::False
-                        }
-                    }
-                    _ => TestResult::Error,
-                };
-                return (result, idx + 3);
-            }
-            "-ne" => {
-                let result = match (args[idx].parse::<i64>(), args[idx + 2].parse::<i64>()) {
-                    (Ok(a), Ok(b)) => {
-                        if a != b {
-                            TestResult::True
-                        } else {
-                            TestResult::False
-                        }
-                    }
-                    _ => TestResult::Error,
-                };
-                return (result, idx + 3);
-            }
-            "-lt" => {
-                let result = match (args[idx].parse::<i64>(), args[idx + 2].parse::<i64>()) {
-                    (Ok(a), Ok(b)) => {
-                        if a < b {
-                            TestResult::True
-                        } else {
-                            TestResult::False
-                        }
-                    }
-                    _ => TestResult::Error,
-                };
-                return (result, idx + 3);
-            }
-            "-le" => {
-                let result = match (args[idx].parse::<i64>(), args[idx + 2].parse::<i64>()) {
-                    (Ok(a), Ok(b)) => {
-                        if a <= b {
-                            TestResult::True
-                        } else {
-                            TestResult::False
-                        }
-                    }
-                    _ => TestResult::Error,
-                };
-                return (result, idx + 3);
-            }
-            "-gt" => {
-                let result = match (args[idx].parse::<i64>(), args[idx + 2].parse::<i64>()) {
-                    (Ok(a), Ok(b)) => {
-                        if a > b {
-                            TestResult::True
-                        } else {
-                            TestResult::False
-                        }
-                    }
-                    _ => TestResult::Error,
-                };
-                return (result, idx + 3);
-            }
-            "-ge" => {
-                let result = match (args[idx].parse::<i64>(), args[idx + 2].parse::<i64>()) {
-                    (Ok(a), Ok(b)) => {
-                        if a >= b {
-                            TestResult::True
-                        } else {
-                            TestResult::False
-                        }
-                    }
-                    _ => TestResult::Error,
-                };
-                return (result, idx + 3);
-            }
-            _ => {}
+        }
+        _ => match binary_file_test(op, left, right) {
+            Some(result) => TestResult::from_bool(result),
+            None => TestResult::Error(None),
+        },
+    };
+    (result, idx + 3)
+}
+
+/// `test`'s integer operand, as bash's `legal_number` reads it: optional
+/// blanks around an optionally signed decimal number that fits in 64 bits.
+/// `010` is ten here; only `[[ ]]` evaluates operands arithmetically.
+fn test_integer(text: &str) -> Option<i64> {
+    text.trim_matches([' ', '\t']).parse::<i64>().ok()
+}
+
+fn compare_integers(op: &str, a: i64, b: i64) -> bool {
+    match op {
+        "-eq" => a == b,
+        "-ne" => a != b,
+        "-lt" => a < b,
+        "-le" => a <= b,
+        "-gt" => a > b,
+        _ => a >= b,
+    }
+}
+
+/// The unary primaries `test`, `[` and `[[ ]]` share. `None` means `op` is
+/// not a unary operator, so the caller can treat it as an ordinary string.
+fn unary_test(op: &str, operand: &str, state: &mut ShellState) -> Option<bool> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    // Everything except -h/-L follows symbolic links, like stat(2).
+    let metadata = || std::fs::metadata(operand).ok();
+    let mode_bit = |bit: u32| metadata().is_some_and(|m| m.permissions().mode() & bit != 0);
+    Some(match op {
+        "-n" => !operand.is_empty(),
+        "-z" => operand.is_empty(),
+        "-a" | "-e" => metadata().is_some(),
+        "-f" => metadata().is_some_and(|m| m.is_file()),
+        "-d" => metadata().is_some_and(|m| m.is_dir()),
+        "-b" => metadata().is_some_and(|m| m.file_type().is_block_device()),
+        "-c" => metadata().is_some_and(|m| m.file_type().is_char_device()),
+        "-p" => metadata().is_some_and(|m| m.file_type().is_fifo()),
+        "-S" => metadata().is_some_and(|m| m.file_type().is_socket()),
+        "-h" | "-L" => is_symlink(operand),
+        "-s" => metadata().is_some_and(|m| m.len() > 0),
+        "-g" => mode_bit(0o2000),
+        "-u" => mode_bit(0o4000),
+        "-k" => mode_bit(0o1000),
+        "-r" => is_readable(operand),
+        "-w" => is_writable(operand),
+        "-x" => is_executable(operand),
+        "-O" => metadata().is_some_and(|m| m.uid() == nix::unistd::geteuid().as_raw()),
+        "-G" => metadata().is_some_and(|m| m.gid() == nix::unistd::getegid().as_raw()),
+        // Modified since it was last read.
+        "-N" => {
+            metadata().is_some_and(|m| (m.mtime(), m.mtime_nsec()) > (m.atime(), m.atime_nsec()))
+        }
+        "-t" => test_integer(operand)
+            .and_then(|fd| i32::try_from(fd).ok())
+            .is_some_and(|fd| {
+                nix::unistd::isatty(unsafe {
+                    // SAFETY: isatty only inspects the descriptor; an invalid one
+                    // reports EBADF, which reads as false.
+                    std::os::fd::BorrowedFd::borrow_raw(fd)
+                })
+                .unwrap_or(false)
+            }),
+        "-o" => set_option_is_known(operand) && shell_option_enabled(state, operand),
+        "-v" => variable_is_set(operand, state),
+        "-R" => is_nameref(operand, state),
+        _ => return None,
+    })
+}
+
+/// `-nt`, `-ot` and `-ef`. A missing file is older than any existing one.
+fn binary_file_test(op: &str, left: &str, right: &str) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let left_meta = std::fs::metadata(left).ok();
+    let right_meta = std::fs::metadata(right).ok();
+    let mtime = |m: &std::fs::Metadata| (m.mtime(), m.mtime_nsec());
+    Some(match op {
+        "-nt" => match (&left_meta, &right_meta) {
+            (Some(l), Some(r)) => mtime(l) > mtime(r),
+            (Some(_), None) => true,
+            _ => false,
+        },
+        "-ot" => match (&left_meta, &right_meta) {
+            (Some(l), Some(r)) => mtime(l) < mtime(r),
+            (None, Some(_)) => true,
+            _ => false,
+        },
+        "-ef" => match (&left_meta, &right_meta) {
+            (Some(l), Some(r)) => l.dev() == r.dev() && l.ino() == r.ino(),
+            _ => false,
+        },
+        _ => return None,
+    })
+}
+
+/// `-v NAME`, `-v NAME[SUBSCRIPT]`: is the variable (or element) set, even to
+/// the empty string? A bare array name asks about element 0, as in bash, and
+/// `NAME[@]` about any element. An indexed subscript is an arithmetic
+/// expression (`arr[i+1]`, `arr[-1]`); an associative one is a key.
+fn variable_is_set(name: &str, state: &mut ShellState) -> bool {
+    let (base, subscript) = match name.find('[') {
+        Some(bracket) if name.ends_with(']') && bracket + 1 < name.len() - 1 => {
+            (&name[..bracket], Some(&name[bracket + 1..name.len() - 1]))
+        }
+        Some(_) => return false,
+        None => (name, None),
+    };
+    if subscript.is_none() && !base.is_empty() && base.bytes().all(|b| b.is_ascii_digit()) {
+        return match base.parse::<usize>() {
+            Ok(0) => true,
+            Ok(n) => n <= state.positional_params.len(),
+            Err(_) => false,
+        };
+    }
+    if !crate::environment::is_valid_identifier(base) {
+        return false;
+    }
+    let is_array = state.is_array(base);
+    let Some(subscript) = subscript else {
+        return if is_array {
+            state.array_keys(base).iter().any(|key| key == "0")
+        } else {
+            state.get_var(base).is_some()
+        };
+    };
+    if subscript == "@" || subscript == "*" {
+        return if is_array {
+            state.array_length(base) > 0
+        } else {
+            state.get_var(base).is_some()
+        };
+    }
+    let keys = if is_array {
+        state.array_keys(base)
+    } else if state.get_var(base).is_some() {
+        // A scalar is a one-element array.
+        vec!["0".to_string()]
+    } else {
+        Vec::new()
+    };
+    if keys.iter().any(|key| key == subscript) {
+        return true;
+    }
+    // Only indexed arrays have purely numeric keys; anything else is
+    // associative, and its subscript is a key that was not found.
+    let mut max_index: Option<i64> = None;
+    for key in &keys {
+        match key.parse::<i64>() {
+            Ok(index) => max_index = Some(max_index.map_or(index, |max| max.max(index))),
+            Err(_) => return false,
         }
     }
+    let saved_error = state.expansion_error.take();
+    let value = crate::expand::expand_arithmetic(subscript, state);
+    // A bad subscript makes the answer "not set", not a failed command.
+    let failed = std::mem::replace(&mut state.expansion_error, saved_error).is_some();
+    let Ok(mut index) = value.parse::<i64>() else {
+        return false;
+    };
+    if failed {
+        return false;
+    }
+    if index < 0 {
+        // Negative subscripts count back from one past the highest index.
+        index = max_index.map_or(index, |max| max.saturating_add(1).saturating_add(index));
+    }
+    keys.iter().any(|key| *key == index.to_string())
+}
 
-    (TestResult::Error, idx)
+/// `-R NAME`: is NAME a nameref? jsh has no namerefs (`declare -n`), so no
+/// variable ever is one.
+fn is_nameref(_name: &str, _state: &ShellState) -> bool {
+    false
 }
 
 fn is_symlink(path: &str) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
-}
-
-fn is_fifo(path: &str) -> bool {
-    use nix::sys::stat;
-    if let Ok(stat) = stat::stat(path) {
-        stat.st_mode & 0o170000 == 0o10000
-    } else {
-        false
-    }
-}
-
-fn is_socket(path: &str) -> bool {
-    use nix::sys::stat;
-    if let Ok(stat) = stat::stat(path) {
-        stat.st_mode & 0o170000 == 0o140000
-    } else {
-        false
-    }
-}
-
-fn is_block_device(path: &str) -> bool {
-    use nix::sys::stat;
-    if let Ok(stat) = stat::stat(path) {
-        stat.st_mode & 0o170000 == 0o60000
-    } else {
-        false
-    }
-}
-
-fn is_char_device(path: &str) -> bool {
-    use nix::sys::stat;
-    if let Ok(stat) = stat::stat(path) {
-        stat.st_mode & 0o170000 == 0o20000
-    } else {
-        false
-    }
 }
 
 /// Permission probe shared by `test`/`[` and `[[ ]]`, so the two can never
@@ -2118,19 +2722,6 @@ fn is_writable(path: &str) -> bool {
 
 fn is_executable(path: &str) -> bool {
     access_ok(path, nix::unistd::AccessFlags::X_OK)
-}
-
-fn cmp_int(a: &str, b: &str, f: fn(i64, i64) -> bool) -> i32 {
-    match (a.parse::<i64>(), b.parse::<i64>()) {
-        (Ok(a), Ok(b)) => {
-            if f(a, b) {
-                0
-            } else {
-                1
-            }
-        }
-        _ => 2,
-    }
 }
 
 /// Every `set -o` name bash knows, in the order bash lists them, paired with
@@ -2400,31 +2991,134 @@ fn builtin_history(_state: &ShellState) -> i32 {
     0
 }
 
-fn builtin_printf(args: &[String]) -> i32 {
-    use std::io::Write;
-    if let Some(option) = args
-        .first()
-        .filter(|arg| arg.starts_with('-') && arg.len() > 1 && *arg != "--")
-    {
-        eprintln!(
-            "jsh: printf: unsupported option {option:?}; use -- before a format beginning with '-'"
-        );
-        return 2;
+/// Upper bound on what `printf -v` collects in memory. Streaming output has
+/// no such limit, but a variable has to hold the whole result at once, and a
+/// format repeated over many arguments with wide fields could otherwise grow
+/// without bound.
+const MAX_PRINTF_VAR_BYTES: usize = 64 * 1024 * 1024;
+
+/// A `Write` sink for `printf -v` that refuses to grow past its limit.
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedBuffer {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(data.len()) > self.limit {
+            return Err(std::io::Error::other(format!(
+                "-v: output exceeds {} bytes",
+                self.limit
+            )));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
     }
-    let args = if args.first().map(String::as_str) == Some("--") {
-        &args[1..]
-    } else {
-        args
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Split `name[subscript]` into its parts; a plain name has no subscript.
+/// `None` when the text is neither a valid name nor a valid element reference.
+fn variable_target(target: &str) -> Option<(&str, Option<&str>)> {
+    let (name, subscript) = match target.find('[') {
+        Some(open) if target.ends_with(']') && open + 1 < target.len() - 1 => {
+            (&target[..open], Some(&target[open + 1..target.len() - 1]))
+        }
+        Some(_) => return None,
+        None => (target, None),
     };
+    crate::environment::is_valid_identifier(name).then_some((name, subscript))
+}
+
+/// Assign to a variable or array element named by a builtin's operand (`read
+/// 'a[1]'`, `printf -v 'a[1]'`), exactly as the assignment `a[1]=value` would.
+fn assign_target(target: &str, value: &str, state: &mut ShellState) -> bool {
+    match variable_target(target) {
+        Some((name, Some(subscript))) => {
+            state.set_array_element(name, subscript, value);
+            true
+        }
+        Some((name, None)) => {
+            state.set_var(name, value);
+            true
+        }
+        None => false,
+    }
+}
+
+fn builtin_printf(args: &[String], state: &mut ShellState) -> i32 {
+    use std::io::Write;
+    let mut target: Option<String> = None;
+    let mut args = args;
+    while let Some(option) = args.first() {
+        if option == "--" {
+            args = &args[1..];
+            break;
+        }
+        if option == "-v" {
+            let Some(name) = args.get(1) else {
+                eprintln!("jsh: printf: -v: option requires an argument");
+                eprintln!("printf: usage: printf [-v var] format [arguments]");
+                return 2;
+            };
+            target = Some(name.clone());
+            args = &args[2..];
+        } else if let Some(name) = option.strip_prefix("-v") {
+            target = Some(name.to_string());
+            args = &args[1..];
+        } else if option.starts_with('-') && option.len() > 1 {
+            eprintln!(
+                "jsh: printf: {option}: invalid option; use -- before a format beginning with '-'"
+            );
+            eprintln!("printf: usage: printf [-v var] format [arguments]");
+            return 2;
+        } else {
+            break;
+        }
+    }
+    if let Some(name) = &target {
+        if variable_target(name).is_none() {
+            eprintln!("jsh: printf: `{name}': not a valid identifier");
+            return 2;
+        }
+    }
     let Some(format) = args.first() else {
-        eprintln!("jsh: printf: usage: printf [--] format [arguments ...]");
+        eprintln!("jsh: printf: usage: printf [-v var] format [arguments]");
         return 2;
     };
+    let context = crate::printf::Context {
+        shell_start: state
+            .builtin_state
+            .start_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64),
+    };
+    let report = |message| eprintln!("jsh: printf: {message}");
+
+    if let Some(name) = target {
+        let mut buffer = BoundedBuffer {
+            bytes: Vec::new(),
+            limit: MAX_PRINTF_VAR_BYTES,
+        };
+        return match crate::printf::write_printf(&mut buffer, format, &args[1..], context, report) {
+            Ok(status) => {
+                let value = String::from_utf8_lossy(&buffer.bytes).into_owned();
+                assign_target(&name, &value, state);
+                status
+            }
+            Err(error) => {
+                eprintln!("jsh: printf: {error}");
+                1
+            }
+        };
+    }
+
     let stdout = std::io::stdout();
     let mut output = std::io::BufWriter::new(stdout.lock());
-    let result = crate::printf::write_printf(&mut output, format, &args[1..], |message| {
-        eprintln!("jsh: printf: {message}");
-    });
+    let result = crate::printf::write_printf(&mut output, format, &args[1..], context, report);
     // Preserve output before a bad conversion and report write failures without
     // a print!/stdout panic (including a closed downstream pipe).
     let flushed = output.flush();
@@ -2603,127 +3297,281 @@ fn builtin_exec(args: &[String], state: &mut ShellState) -> i32 {
     status
 }
 
-fn builtin_pushd(args: &[String], state: &mut ShellState) -> i32 {
-    let mut print_stack = true;
-    let mut args_start = 0;
+// ============================================================
+// Directory stack: pushd, popd, dirs
+// ============================================================
+//
+// Bash's stack is the current directory followed by the saved ones:
+// `dirs` prints entry 0 (the logical cwd) first. `state.dir_stack` keeps the
+// saved entries with the most recent LAST, so stack entry i >= 1 lives at
+// `dir_stack[len - i]`.
 
-    // Parse options
-    for (i, arg) in args.iter().enumerate() {
+/// The whole stack, entry 0 first.
+fn stack_entries(state: &ShellState) -> Vec<String> {
+    let mut entries = vec![logical_cwd(state)];
+    entries.extend(
+        state
+            .dir_stack
+            .iter()
+            .rev()
+            .map(|dir| dir.to_string_lossy().into_owned()),
+    );
+    entries
+}
+
+/// Store entries 1.. back into `dir_stack` (entry 0 is the cwd itself).
+fn store_stack(state: &mut ShellState, entries: &[String]) {
+    state.dir_stack = entries
+        .iter()
+        .skip(1)
+        .rev()
+        .map(std::path::PathBuf::from)
+        .collect();
+}
+
+/// `+N` (from the left, 0 = current directory) or `-N` (from the right).
+#[derive(Clone, Copy)]
+enum StackIndex {
+    FromTop(usize),
+    FromBottom(usize),
+}
+
+fn stack_index(spec: &str) -> Option<StackIndex> {
+    let digits = &spec.get(1..)?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n = digits.parse().ok()?;
+    match spec.as_bytes()[0] {
+        b'+' => Some(StackIndex::FromTop(n)),
+        b'-' => Some(StackIndex::FromBottom(n)),
+        _ => None,
+    }
+}
+
+fn resolve_stack_index(index: StackIndex, len: usize) -> Option<usize> {
+    match index {
+        StackIndex::FromTop(n) => (n < len).then_some(n),
+        StackIndex::FromBottom(n) => len.checked_sub(n + 1),
+    }
+}
+
+/// `~` for `$HOME`, as `dirs` shows directories unless given `-l`.
+fn abbreviate_home(dir: &str, state: &ShellState) -> String {
+    match typed_home(state).filter(|home| !home.is_empty() && home != "/") {
+        Some(home) if dir == home => "~".to_string(),
+        Some(home) => match dir.strip_prefix(home.as_str()) {
+            Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+            _ => dir.to_string(),
+        },
+        None => dir.to_string(),
+    }
+}
+
+fn print_stack(state: &ShellState) {
+    let entries: Vec<String> = stack_entries(state)
+        .iter()
+        .map(|dir| abbreviate_home(dir, state))
+        .collect();
+    println!("{}", entries.join(" "));
+}
+
+/// Parse `[-n] [+N | -N | dir]` for pushd/popd: returns (no_cd, operand).
+fn stack_command_args<'a>(name: &str, args: &'a [String]) -> Result<(bool, Option<&'a str>), i32> {
+    let mut no_change = false;
+    let mut operand = None;
+    for arg in args {
         if arg == "-n" {
-            print_stack = false;
-            args_start = i + 1;
+            no_change = true;
+        } else if arg == "--" {
+            continue;
+        } else if operand.is_none() {
+            operand = Some(arg.as_str());
         } else {
-            break;
+            eprintln!("jsh: {name}: too many arguments");
+            return Err(1);
         }
     }
+    Ok((no_change, operand))
+}
 
-    let remaining_args = &args[args_start..];
-
-    let cwd = env::current_dir().ok();
-    let target = if remaining_args.is_empty() {
-        // pushd with no args swaps top two directories
-        if state.dir_stack.is_empty() {
-            eprintln!("jsh: pushd: no other directory");
-            return 1;
-        }
-        match state.dir_stack.pop() {
-            Some(d) => d.to_string_lossy().to_string(),
-            None => {
+fn builtin_pushd(args: &[String], state: &mut ShellState) -> i32 {
+    let (no_change, operand) = match stack_command_args("pushd", args) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
+    };
+    let mut entries = stack_entries(state);
+    let physical = physical_by_default(state);
+    match operand {
+        // No operand: exchange the top two entries.
+        None => {
+            if entries.len() < 2 {
                 eprintln!("jsh: pushd: no other directory");
                 return 1;
             }
-        }
-    } else if remaining_args[0].starts_with('+') || remaining_args[0].starts_with('-') {
-        // Handle stack navigation: pushd +N or pushd -N
-        if let Ok(idx) = remaining_args[0][1..].parse::<usize>() {
-            if remaining_args[0].starts_with('+') {
-                if idx < state.dir_stack.len() {
-                    state.dir_stack[idx].to_string_lossy().to_string()
-                } else {
-                    eprintln!("jsh: pushd: invalid stack index: +{}", idx);
+            entries.swap(0, 1);
+            if !no_change {
+                if let Err(error) = enter_directory(&entries[0], physical, state) {
+                    eprintln!("jsh: pushd: {}: {}", entries[0], os_error_text(&error));
                     return 1;
                 }
+                entries[0] = logical_cwd(state);
+            }
+            store_stack(state, &entries);
+        }
+        // `+N`/`-N`: rotate the stack so that entry becomes the top.
+        Some(spec) if stack_index(spec).is_some() => {
+            let Some(position) =
+                stack_index(spec).and_then(|index| resolve_stack_index(index, entries.len()))
+            else {
+                eprintln!("jsh: pushd: {spec}: directory stack index out of range");
+                return 1;
+            };
+            entries.rotate_left(position);
+            if !no_change {
+                if let Err(error) = enter_directory(&entries[0], physical, state) {
+                    eprintln!("jsh: pushd: {}: {}", entries[0], os_error_text(&error));
+                    return 1;
+                }
+                entries[0] = logical_cwd(state);
+            }
+            store_stack(state, &entries);
+        }
+        Some(dir) => {
+            if no_change {
+                // -n DIR adds DIR below the current directory.
+                entries.insert(1, dir.to_string());
             } else {
-                if idx > 0 && idx <= state.dir_stack.len() {
-                    state.dir_stack[state.dir_stack.len() - idx]
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    eprintln!("jsh: pushd: invalid stack index: -{}", idx);
-                    return 1;
+                match enter_directory(dir, physical, state) {
+                    Ok(new) => entries.insert(0, new),
+                    Err(error) => {
+                        eprintln!("jsh: pushd: {dir}: {}", os_error_text(&error));
+                        return 1;
+                    }
                 }
             }
-        } else {
-            remaining_args[0].clone()
-        }
-    } else {
-        remaining_args[0].clone()
-    };
-
-    if let Some(cwd) = cwd.as_ref() {
-        state.dir_stack.push(cwd.to_path_buf());
-    }
-
-    match env::set_current_dir(&target) {
-        Ok(()) => {
-            if let Ok(new_dir) = env::current_dir() {
-                if let Some(old_dir) = cwd.as_ref() {
-                    update_directory_vars(Some(old_dir.as_path()), &new_dir, state);
-                } else {
-                    update_directory_vars(None, &new_dir, state);
-                }
-            }
-            if print_stack {
-                builtin_dirs(state);
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("jsh: pushd: {}: {}", target, e);
-            1
+            store_stack(state, &entries);
         }
     }
+    print_stack(state);
+    0
 }
 
-fn builtin_popd(state: &mut ShellState) -> i32 {
-    if state.dir_stack.is_empty() {
+fn builtin_popd(args: &[String], state: &mut ShellState) -> i32 {
+    let (no_change, operand) = match stack_command_args("popd", args) {
+        Ok(parsed) => parsed,
+        Err(status) => return status,
+    };
+    let mut entries = stack_entries(state);
+    if entries.len() < 2 {
         eprintln!("jsh: popd: directory stack empty");
         return 1;
     }
-
-    match state.dir_stack.pop() {
-        Some(dir) => {
-            let old_dir = env::current_dir().ok();
-            match env::set_current_dir(&dir) {
-                Ok(()) => {
-                    if let Ok(new_dir) = env::current_dir() {
-                        update_directory_vars(old_dir.as_deref(), &new_dir, state);
-                    }
-                    builtin_dirs(state);
-                    0
+    let position = match operand {
+        // Plain popd removes the top and changes to the new top; with -n it
+        // removes the entry below the top instead.
+        None => usize::from(no_change),
+        Some(spec) => {
+            match stack_index(spec).and_then(|index| resolve_stack_index(index, entries.len())) {
+                Some(position) => position,
+                None if stack_index(spec).is_some() => {
+                    eprintln!("jsh: popd: {spec}: directory stack index out of range");
+                    return 1;
                 }
-                Err(e) => {
-                    eprintln!("jsh: popd: {}", e);
-                    1
+                None => {
+                    eprintln!("jsh: popd: {spec}: invalid argument");
+                    eprintln!("popd: usage: popd [-n] [+N | -N]");
+                    return 2;
                 }
             }
         }
-        None => {
-            eprintln!("jsh: popd: directory stack empty");
-            1
+    };
+    entries.remove(position);
+    if position == 0 && !no_change {
+        let physical = physical_by_default(state);
+        if let Err(error) = enter_directory(&entries[0], physical, state) {
+            eprintln!("jsh: popd: {}: {}", entries[0], os_error_text(&error));
+            return 1;
         }
+        entries[0] = logical_cwd(state);
     }
+    store_stack(state, &entries);
+    print_stack(state);
+    0
 }
 
-fn builtin_dirs(state: &ShellState) -> i32 {
-    let cwd = env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    print!("{}", cwd);
-    for d in state.dir_stack.iter().rev() {
-        print!(" {}", d.display());
+fn builtin_dirs(args: &[String], state: &mut ShellState) -> i32 {
+    let mut long = false;
+    let mut per_line = false;
+    let mut numbered = false;
+    let mut select: Option<&str> = None;
+    for arg in args {
+        if stack_index(arg).is_some() {
+            select = Some(arg);
+            continue;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            eprintln!("jsh: dirs: {arg}: invalid argument");
+            eprintln!("dirs: usage: dirs [-clpv] [+N] [-N]");
+            return 2;
+        };
+        for flag in flags.chars() {
+            match flag {
+                // `dirs -c` clears the stack and prints nothing.
+                'c' => {
+                    state.dir_stack.clear();
+                    return 0;
+                }
+                'l' => long = true,
+                'p' => per_line = true,
+                'v' => {
+                    per_line = true;
+                    numbered = true;
+                }
+                _ => {
+                    eprintln!("jsh: dirs: -{flag}: invalid option");
+                    eprintln!("dirs: usage: dirs [-clpv] [+N] [-N]");
+                    return 2;
+                }
+            }
+        }
     }
-    println!();
+    let entries: Vec<String> = stack_entries(state)
+        .into_iter()
+        .map(|dir| {
+            if long {
+                dir
+            } else {
+                abbreviate_home(&dir, state)
+            }
+        })
+        .collect();
+    if let Some(spec) = select {
+        return match stack_index(spec).and_then(|index| resolve_stack_index(index, entries.len())) {
+            Some(position) => {
+                println!("{}", entries[position]);
+                0
+            }
+            None => {
+                eprintln!(
+                    "jsh: dirs: {}: directory stack index out of range",
+                    &spec[1..]
+                );
+                1
+            }
+        };
+    }
+    if numbered {
+        for (position, dir) in entries.iter().enumerate() {
+            println!("{position:2}  {dir}");
+        }
+    } else if per_line {
+        for dir in &entries {
+            println!("{dir}");
+        }
+    } else {
+        println!("{}", entries.join(" "));
+    }
     0
 }
 
@@ -2792,162 +3640,202 @@ fn builtin_double_bracket(args: &[String], state: &mut ShellState) -> i32 {
     if args.is_empty() {
         return 1;
     }
-    eval_cond_expr(&args, &mut 0, state)
+    let mut cond = Conditional {
+        args: &args,
+        pos: 0,
+        state,
+    };
+    let status = cond.or(true);
+    if cond.pos < args.len() && status != 2 {
+        eprintln!("jsh: [[: syntax error near `{}'", args[cond.pos]);
+        return 2;
+    }
+    status
 }
 
-fn eval_cond_expr(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i32 {
-    eval_cond_or(args, pos, state)
+/// Evaluator for the expanded operands of `[[ ]]`: 0 true, 1 false, 2 error.
+///
+/// `&&` and `||` short-circuit as in bash: the skipped side is still parsed
+/// (so the position stays right) but not evaluated, because evaluating can
+/// assign (`[[ x -eq y++ ]]`) or fail (`[[ -n $x || 1/0 -eq 0 ]]`).
+struct Conditional<'a, 'b> {
+    args: &'a [&'a str],
+    pos: usize,
+    state: &'b mut ShellState,
 }
 
-fn eval_cond_or(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i32 {
-    let mut left = eval_cond_and(args, pos, state);
-    while *pos < args.len() && args[*pos] == "||" {
-        *pos += 1;
-        let right = eval_cond_and(args, pos, state);
-        left = if left == 0 || right == 0 { 0 } else { 1 };
-    }
-    left
-}
-
-fn eval_cond_and(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i32 {
-    let mut left = eval_cond_primary(args, pos, state);
-    while *pos < args.len() && args[*pos] == "&&" {
-        *pos += 1;
-        let right = eval_cond_primary(args, pos, state);
-        left = if left == 0 && right == 0 { 0 } else { 1 };
-    }
-    left
-}
-
-fn eval_cond_primary(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i32 {
-    if *pos >= args.len() {
-        return 1;
-    }
-
-    if args[*pos] == "!" {
-        *pos += 1;
-        return eval_cond_primary(args, pos, state) ^ 1;
-    }
-
-    if args[*pos] == "(" {
-        *pos += 1;
-        let r = eval_cond_expr(args, pos, state);
-        if *pos < args.len() && args[*pos] == ")" {
-            *pos += 1;
+impl Conditional<'_, '_> {
+    fn or(&mut self, evaluate: bool) -> i32 {
+        let mut result = self.and(evaluate);
+        while self.args.get(self.pos) == Some(&"||") {
+            self.pos += 1;
+            let right = self.and(evaluate && result == 1);
+            if evaluate && result == 1 {
+                result = right;
+            }
         }
-        return r;
+        result
     }
 
-    // Unary operators
-    if args[*pos].starts_with('-') && args[*pos].len() == 2 && *pos + 1 < args.len() {
-        let op = args[*pos];
-        let operand = args[*pos + 1];
-        let result = match op {
-            "-n" => {
-                *pos += 2;
-                if !operand.is_empty() {
-                    0
-                } else {
-                    1
-                }
+    fn and(&mut self, evaluate: bool) -> i32 {
+        let mut result = self.primary(evaluate);
+        while self.args.get(self.pos) == Some(&"&&") {
+            self.pos += 1;
+            let right = self.primary(evaluate && result == 0);
+            if evaluate && result == 0 {
+                result = right;
             }
-            "-z" => {
-                *pos += 2;
-                if operand.is_empty() {
-                    0
-                } else {
-                    1
-                }
-            }
-            "-f" => {
-                *pos += 2;
-                if Path::new(operand).is_file() {
-                    0
-                } else {
-                    1
-                }
-            }
-            "-d" => {
-                *pos += 2;
-                if Path::new(operand).is_dir() {
-                    0
-                } else {
-                    1
-                }
-            }
-            "-e" => {
-                *pos += 2;
-                if Path::new(operand).exists() {
-                    0
-                } else {
-                    1
-                }
-            }
-            "-s" => {
-                *pos += 2;
-                std::fs::metadata(operand)
-                    .map(|m| if m.len() > 0 { 0 } else { 1 })
-                    .unwrap_or(1)
-            }
-            // Permission bits, not mere existence: `[[ -x /etc/passwd ]]` was
-            // true here while `test -x /etc/passwd` was correctly false.
-            "-r" | "-w" | "-x" => {
-                *pos += 2;
-                let ok = match op {
-                    "-r" => is_readable(operand),
-                    "-w" => is_writable(operand),
-                    _ => is_executable(operand),
-                };
-                if ok {
-                    0
-                } else {
-                    1
-                }
-            }
-            _ => {
-                if *pos + 2 < args.len() {
-                    return eval_cond_binary(args, pos, state);
-                }
-                *pos += 2;
-                1
-            }
+        }
+        result
+    }
+
+    fn primary(&mut self, evaluate: bool) -> i32 {
+        let args = self.args;
+        let Some(&word) = args.get(self.pos) else {
+            return 1;
         };
-        return result;
+        if word == "!" && self.pos + 1 < args.len() {
+            self.pos += 1;
+            return match self.primary(evaluate) {
+                0 => 1,
+                1 => 0,
+                error => error,
+            };
+        }
+        if word == "(" {
+            self.pos += 1;
+            let result = self.or(evaluate);
+            if args.get(self.pos) == Some(&")") {
+                self.pos += 1;
+            }
+            return result;
+        }
+        // A binary operator in the middle wins over reading the left operand
+        // as a unary operator: in `[[ $1 == -v ]]` with `$1` = `-n`, the `-n`
+        // is an operand. The operators reach us as expanded strings, so this is
+        // the order that keeps option-like values working.
+        if self.pos + 2 < args.len() && is_cond_binary_op(args[self.pos + 1]) {
+            let (left, op, right) = (word, args[self.pos + 1], args[self.pos + 2]);
+            self.pos += 3;
+            return if evaluate {
+                self.binary(left, op, right)
+            } else {
+                0
+            };
+        }
+        if self.pos + 1 < args.len() && is_unary_test_op(word) {
+            let operand = args[self.pos + 1];
+            self.pos += 2;
+            // Skipped operands are not evaluated: `-v a[i++]` has effects.
+            return if !evaluate || unary_test(word, operand, self.state).unwrap_or(false) {
+                0
+            } else {
+                1
+            };
+        }
+        self.pos += 1;
+        if word.is_empty() {
+            1
+        } else {
+            0
+        }
     }
 
-    // Binary expression or standalone string test
-    if *pos + 1 < args.len() && is_cond_binary_op(args[*pos + 1]) {
-        return eval_cond_binary(args, pos, state);
+    fn binary(&mut self, left: &str, op: &str, right: &str) -> i32 {
+        let status = |value: bool| if value { 0 } else { 1 };
+        match op {
+            // The expander turned quoted characters of the right operand into
+            // literal bracket expressions, so it is always a pattern here.
+            "==" | "=" => status(cond_pattern_match(right, left, self.state)),
+            "!=" => status(!cond_pattern_match(right, left, self.state)),
+            "<" => status(left < right),
+            ">" => status(left > right),
+            "=~" => eval_regex_match(left, right, self.state),
+            "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+                match (self.arithmetic(left), self.arithmetic(right)) {
+                    (Some(a), Some(b)) => status(compare_integers(op, a, b)),
+                    _ => 1,
+                }
+            }
+            _ => status(binary_file_test(op, left, right).unwrap_or(false)),
+        }
     }
 
-    let s = args[*pos];
-    *pos += 1;
-    if s.is_empty() {
-        1
-    } else {
-        0
+    /// Inside `[[ ]]` the operands of `-eq` and friends are arithmetic
+    /// expressions: `[[ 1+1 -eq 2 ]]` is true and `010` is octal. A malformed
+    /// expression is reported and makes the test false, as in bash.
+    fn arithmetic(&mut self, expr: &str) -> Option<i64> {
+        let saved_error = self.state.expansion_error.take();
+        let value = crate::expand::expand_arithmetic(expr, self.state);
+        let error = std::mem::replace(&mut self.state.expansion_error, saved_error);
+        match error {
+            Some(message) => {
+                eprintln!("jsh: [[: {message}");
+                None
+            }
+            None => value.parse().ok(),
+        }
     }
+}
+
+fn is_unary_test_op(op: &str) -> bool {
+    matches!(
+        op,
+        "-n" | "-z"
+            | "-a"
+            | "-e"
+            | "-f"
+            | "-d"
+            | "-b"
+            | "-c"
+            | "-p"
+            | "-S"
+            | "-h"
+            | "-L"
+            | "-s"
+            | "-g"
+            | "-u"
+            | "-k"
+            | "-r"
+            | "-w"
+            | "-x"
+            | "-O"
+            | "-G"
+            | "-N"
+            | "-t"
+            | "-o"
+            | "-v"
+            | "-R"
+    )
 }
 
 fn is_cond_binary_op(op: &str) -> bool {
     matches!(
         op,
-        "==" | "=" | "!=" | "<" | ">" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "=~"
-    ) || op == crate::parser::parse::REGEX_LITERAL_OP
+        "==" | "="
+            | "!="
+            | "<"
+            | ">"
+            | "-eq"
+            | "-ne"
+            | "-lt"
+            | "-le"
+            | "-gt"
+            | "-ge"
+            | "=~"
+            | "-nt"
+            | "-ot"
+            | "-ef"
+    )
 }
 
-/// `[[ left =~ right ]]`. `literal` is set when the operand was quoted, which
-/// bash matches as a plain string instead of a regex.
+/// `[[ left =~ right ]]`. Quoted parts of the operand were already escaped by
+/// the expander, so `right` is always a regex here.
 ///
 /// BASH_REMATCH is populated with the whole match followed by the capture
 /// groups; `=~` is close to useless without it.
-fn eval_regex_match(left: &str, right: &str, literal: bool, state: &mut ShellState) -> i32 {
-    let pattern = if literal {
-        regex::escape(right)
-    } else {
-        right.to_string()
-    };
-    match regex::Regex::new(&pattern) {
+fn eval_regex_match(left: &str, right: &str, state: &mut ShellState) -> i32 {
+    match regex::Regex::new(right) {
         Ok(re) => {
             if let Some(captures) = re.captures(left) {
                 let mut rematch = Vec::new();
@@ -2971,57 +3859,6 @@ fn eval_regex_match(left: &str, right: &str, literal: bool, state: &mut ShellSta
             eprintln!("jsh: [[: {}: invalid regex: {}", right, e);
             2
         }
-    }
-}
-
-fn eval_cond_binary(args: &[&str], pos: &mut usize, state: &mut ShellState) -> i32 {
-    if *pos + 2 > args.len() {
-        return 1;
-    }
-    let left = args[*pos];
-    let op = args[*pos + 1];
-    let right = args[*pos + 2];
-    *pos += 3;
-    match op {
-        "==" | "=" => {
-            if cond_pattern_match(right, left, state) {
-                0
-            } else {
-                1
-            }
-        }
-        "!=" => {
-            if cond_pattern_match(right, left, state) {
-                1
-            } else {
-                0
-            }
-        }
-        "<" => {
-            if left < right {
-                0
-            } else {
-                1
-            }
-        }
-        ">" => {
-            if left > right {
-                0
-            } else {
-                1
-            }
-        }
-        "-eq" => cmp_int(left, right, |a, b| a == b),
-        "-ne" => cmp_int(left, right, |a, b| a != b),
-        "-lt" => cmp_int(left, right, |a, b| a < b),
-        "-le" => cmp_int(left, right, |a, b| a <= b),
-        "-gt" => cmp_int(left, right, |a, b| a > b),
-        "-ge" => cmp_int(left, right, |a, b| a >= b),
-        "=~" => eval_regex_match(left, right, false, state),
-        op if op == crate::parser::parse::REGEX_LITERAL_OP => {
-            eval_regex_match(left, right, true, state)
-        }
-        _ => 1,
     }
 }
 
@@ -3523,6 +4360,12 @@ fn builtin_complete(args: &[String], state: &mut ShellState) -> i32 {
     0
 }
 
+/// Bash's reserved words, in the order `compgen -k` lists them.
+const BASH_KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do",
+    "done", "in", "function", "time", "{", "}", "!", "[[", "]]", "coproc",
+];
+
 fn builtin_compgen(args: &[String], state: &mut ShellState) -> i32 {
     if args.is_empty() {
         return 0;
@@ -3570,13 +4413,25 @@ fn builtin_compgen(args: &[String], state: &mut ShellState) -> i32 {
 
     // One implementation of what each action names, shared with the Tab
     // completer and with `complete -A`: `compgen -A user` and a `complete -A
-    // user` spec must not be able to disagree about what a user is.
+    // user` spec must not be able to disagree about what a user is. Bash lists
+    // keywords in its own table order and everything else sorted.
     if let Some(action) = action {
-        results.extend(
-            crate::completer::action_candidates(action, prefix, state)
+        if action == "keyword" {
+            results.extend(
+                BASH_KEYWORDS
+                    .iter()
+                    .filter(|keyword| keyword.starts_with(prefix))
+                    .map(|keyword| keyword.to_string()),
+            );
+        } else {
+            let mut found: Vec<String> = crate::completer::action_candidates(action, prefix, state)
                 .into_iter()
-                .map(|completion| completion.text),
-        );
+                .map(|completion| completion.text)
+                .collect();
+            found.sort();
+            found.dedup();
+            results.extend(found);
+        }
     }
 
     if let Some(pat) = glob_pattern {
@@ -3591,14 +4446,13 @@ fn builtin_compgen(args: &[String], state: &mut ShellState) -> i32 {
         }
     }
 
+    // `-W` words keep their order (and repeats), as in bash.
     for word in &word_list {
         if word.starts_with(prefix) {
             results.push(word.clone());
         }
     }
 
-    results.sort();
-    results.dedup();
     for r in &results {
         println!("{}", r);
     }
@@ -3641,63 +4495,234 @@ fn builtin_disown(args: &[String], state: &mut ShellState) -> i32 {
     last_status
 }
 
-fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
+/// How many reaped background statuses `wait` remembers, so that waiting
+/// again for a PID that already finished still reports its status (bash keeps
+/// a similar bounded list).
+const MAX_REMEMBERED_STATUSES: usize = 1024;
 
-    if args.is_empty() {
-        while let Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) =
-            waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
-        {
-            state.jobs.jobs.retain(|j| j.pid != pid);
-        }
-        return state.last_exit_code;
+fn remember_status(state: &mut ShellState, pid: i32, status: i32) {
+    let remembered = &mut state.builtin_state.reaped;
+    remembered.retain(|(known, _)| *known != pid);
+    if remembered.len() == MAX_REMEMBERED_STATUSES {
+        remembered.pop_front();
     }
+    remembered.push_back((pid, status));
+}
 
-    let mut last_status = 0;
-    for arg in args {
-        let pid_raw = if arg.starts_with('%') {
-            match state.jobs.resolve_spec(arg) {
-                Some(id) => match state.jobs.get_by_id(id) {
-                    Some(job) => job.pid.as_raw(),
+/// Shell-style status of a finished child, or `None` if it has not finished.
+fn exit_status(status: nix::sys::wait::WaitStatus) -> Option<(i32, i32)> {
+    use nix::sys::wait::WaitStatus;
+    match status {
+        WaitStatus::Exited(pid, code) => Some((pid.as_raw(), code)),
+        WaitStatus::Signaled(pid, signal, _) => Some((pid.as_raw(), 128 + signal as i32)),
+        _ => None,
+    }
+}
+
+/// Block until `pid` finishes and return its status. A job the shell already
+/// reaped (an interactive shell polls its background jobs) answers from the
+/// job table or from the remembered statuses.
+fn wait_for_pid(pid: i32, state: &mut ShellState) -> Result<i32, i32> {
+    use nix::sys::wait::waitpid;
+    if let Some(job) = state.jobs.jobs.iter().find(|job| job.pid.as_raw() == pid) {
+        if let crate::job::JobStatus::Done(code) = job.status {
+            state.jobs.jobs.retain(|job| job.pid.as_raw() != pid);
+            remember_status(state, pid, code);
+            return Ok(code);
+        }
+    }
+    loop {
+        match waitpid(nix::unistd::Pid::from_raw(pid), None) {
+            Ok(status) => {
+                if let Some((_, code)) = exit_status(status) {
+                    state.jobs.jobs.retain(|job| job.pid.as_raw() != pid);
+                    remember_status(state, pid, code);
+                    return Ok(code);
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => {
+                if let Some(status) = crate::signal::pending_status() {
+                    return Err(status);
+                }
+            }
+            Err(_) => {
+                return match state
+                    .builtin_state
+                    .reaped
+                    .iter()
+                    .find(|(known, _)| *known == pid)
+                {
+                    Some(&(_, code)) => Ok(code),
+                    None => Err(127),
+                };
+            }
+        }
+    }
+}
+
+/// `wait -n`: the status of the next job (among `pids`, or any job) to finish.
+fn wait_for_next(pids: Option<Vec<i32>>, state: &mut ShellState) -> Result<(i32, i32), i32> {
+    use nix::sys::wait::waitpid;
+    let candidates: Vec<i32> = match pids {
+        Some(pids) => pids,
+        None => state.jobs.jobs.iter().map(|job| job.pid.as_raw()).collect(),
+    };
+    if candidates.is_empty() {
+        return Err(127);
+    }
+    // A job that an interactive shell already reaped counts as finished.
+    if let Some(job) = state.jobs.jobs.iter().find(|job| {
+        candidates.contains(&job.pid.as_raw())
+            && matches!(job.status, crate::job::JobStatus::Done(_))
+    }) {
+        let pid = job.pid.as_raw();
+        let crate::job::JobStatus::Done(code) = job.status else {
+            unreachable!()
+        };
+        state.jobs.jobs.retain(|job| job.pid.as_raw() != pid);
+        remember_status(state, pid, code);
+        return Ok((pid, code));
+    }
+    loop {
+        match waitpid(nix::unistd::Pid::from_raw(-1), None) {
+            Ok(status) => {
+                let Some((pid, code)) = exit_status(status) else {
+                    continue;
+                };
+                state.jobs.jobs.retain(|job| job.pid.as_raw() != pid);
+                remember_status(state, pid, code);
+                if candidates.contains(&pid) {
+                    return Ok((pid, code));
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => {
+                if let Some(status) = crate::signal::pending_status() {
+                    return Err(status);
+                }
+            }
+            Err(_) => return Err(127),
+        }
+    }
+}
+
+fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
+    let mut next = false;
+    let mut pid_variable: Option<String> = None;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            break;
+        };
+        // A negative number is not an option list.
+        if flags.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        index += 1;
+        for flag in flags.chars() {
+            match flag {
+                'n' => next = true,
+                // Waiting until termination is what jsh always does.
+                'f' => {}
+                'p' => match args.get(index) {
+                    Some(name) => {
+                        pid_variable = Some(name.clone());
+                        index += 1;
+                    }
                     None => {
-                        eprintln!("jsh: wait: {}: no such job", arg);
-                        last_status = 127;
-                        continue;
+                        eprintln!("jsh: wait: -p: option requires an argument");
+                        return 2;
                     }
                 },
+                _ => {
+                    eprintln!("jsh: wait: -{flag}: invalid option");
+                    eprintln!("wait: usage: wait [-fn] [-p var] [id ...]");
+                    return 2;
+                }
+            }
+        }
+    }
+    if let Some(name) = &pid_variable {
+        if !crate::environment::is_valid_identifier(name) {
+            eprintln!("jsh: wait: `{name}': not a valid identifier");
+            return 2;
+        }
+        state.unset_var(name);
+    }
+
+    // Resolve every operand to a PID first, reporting bad ones as bash does.
+    let mut pids = Vec::new();
+    let mut status = 0;
+    for arg in &args[index..] {
+        if arg.starts_with('%') {
+            match state
+                .jobs
+                .resolve_spec(arg)
+                .and_then(|id| state.jobs.get_by_id(id).map(|job| job.pid.as_raw()))
+            {
+                Some(pid) => pids.push(pid),
                 None => {
-                    eprintln!("jsh: wait: {}: no such job", arg);
-                    last_status = 127;
-                    continue;
+                    eprintln!("jsh: wait: {arg}: no such job");
+                    status = 127;
                 }
             }
         } else {
             match arg.parse::<i32>() {
-                Ok(p) => p,
-                Err(_) => {
-                    eprintln!("jsh: wait: {}: not a pid or valid job spec", arg);
-                    last_status = 127;
-                    continue;
+                Ok(pid) if pid > 0 => pids.push(pid),
+                _ => {
+                    eprintln!("jsh: wait: `{arg}': not a pid or valid job spec");
+                    status = 1;
                 }
-            }
-        };
-
-        match waitpid(Pid::from_raw(pid_raw), None) {
-            Ok(WaitStatus::Exited(pid, code)) => {
-                state.jobs.jobs.retain(|j| j.pid != pid);
-                last_status = code;
-            }
-            Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                state.jobs.jobs.retain(|j| j.pid != pid);
-                last_status = 128 + sig as i32;
-            }
-            _ => {
-                last_status = 127;
             }
         }
     }
-    last_status
+
+    if next {
+        let operands = (index < args.len()).then_some(pids);
+        if operands.as_ref().is_some_and(Vec::is_empty) {
+            return status;
+        }
+        return match wait_for_next(operands, state) {
+            Ok((pid, code)) => {
+                if let Some(name) = &pid_variable {
+                    state.set_var(name, &pid.to_string());
+                }
+                code
+            }
+            Err(code) => code,
+        };
+    }
+
+    if index == args.len() {
+        // `wait` alone waits for every job and returns 0.
+        let jobs: Vec<i32> = state.jobs.jobs.iter().map(|job| job.pid.as_raw()).collect();
+        for pid in jobs {
+            if let Err(code) = wait_for_pid(pid, state) {
+                if code != 127 {
+                    return code;
+                }
+            }
+        }
+        return 0;
+    }
+
+    for pid in pids {
+        status = match wait_for_pid(pid, state) {
+            Ok(code) => code,
+            Err(127) => {
+                eprintln!("jsh: wait: pid {pid} is not a child of this shell");
+                127
+            }
+            Err(code) => return code,
+        };
+        if let Some(name) = &pid_variable {
+            state.set_var(name, &pid.to_string());
+        }
+    }
+    status
 }
 
 // ============================================================

@@ -1,5 +1,7 @@
 //! Streaming shell printf formatting. Only validated numeric conversions reach
-//! libc; shell text is always written as data, never as a C format string.
+//! libc's printf family; shell text is always written as data, never as a C
+//! printf format. (`%(fmt)T` hands `fmt` to strftime, which has no varargs and
+//! so cannot read or write memory it was not given.)
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::iter::Peekable;
@@ -33,6 +35,15 @@ struct Spec {
     flags: String,
     width: usize,
     precision: Option<usize>,
+    /// The strftime format of a `%(fmt)T` conversion.
+    time_format: Option<String>,
+}
+
+/// What a printf call needs from the shell beyond its arguments.
+#[derive(Clone, Copy)]
+pub(crate) struct Context {
+    /// Seconds since the epoch when the shell started: `%(fmt)T` with `-2`.
+    pub(crate) shell_start: i64,
 }
 
 fn argument<'a>(args: &'a [String], index: &mut usize) -> &'a str {
@@ -96,12 +107,46 @@ fn parse_spec(
             Some(field(chars)?)
         };
     }
+    if chars.peek() == Some(&'(') {
+        // `%(fmt)T`: the strftime format runs to the first `)`, as in bash.
+        chars.next();
+        let mut time_format = String::new();
+        loop {
+            match chars.next() {
+                Some(')') => break,
+                Some(c) if time_format.len() < MAX_FIELD => time_format.push(c),
+                Some(_) => return Err(Error::Format("time format exceeds 1048576 bytes".into())),
+                None => return Err(Error::Format("missing `)' in time format".into())),
+            }
+        }
+        if chars.next() != Some('T') {
+            return Err(Error::Format(
+                "`(' must introduce a %(...)T conversion".into(),
+            ));
+        }
+        spec.time_format = Some(time_format);
+        return Ok((spec, 'T'));
+    }
     let conversion = chars
         .next()
         .ok_or_else(|| Error::Format("incomplete format conversion".into()))?;
     if !matches!(
         conversion,
-        's' | 'b' | 'c' | 'd' | 'i' | 'u' | 'o' | 'x' | 'X' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
+        's' | 'b'
+            | 'c'
+            | 'q'
+            | 'd'
+            | 'i'
+            | 'u'
+            | 'o'
+            | 'x'
+            | 'X'
+            | 'f'
+            | 'F'
+            | 'e'
+            | 'E'
+            | 'g'
+            | 'G'
     ) {
         return Err(Error::Format(format!(
             "invalid format conversion: %{conversion}"
@@ -337,10 +382,132 @@ pub(crate) fn escaped(output: &mut impl Write, value: &str, mode: EscapeMode) ->
     Ok(false)
 }
 
+/// Bash's `printf %q` (and `${var@Q}`-style) quoting: the shortest form that
+/// reads back as `text`. Empty is `''`; text with a non-printable character
+/// uses `$'...'` with C escapes; anything else gets a backslash before each
+/// character the shell treats specially.
+pub(crate) fn shell_quote(text: &str) -> String {
+    if text.is_empty() {
+        return "''".to_string();
+    }
+    if text.chars().any(char::is_control) {
+        let mut out = String::from("$'");
+        for c in text.chars() {
+            match c {
+                '\u{1b}' => out.push_str("\\E"),
+                '\u{07}' => out.push_str("\\a"),
+                '\u{0b}' => out.push_str("\\v"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0c}' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                c if c.is_control() => {
+                    // Each byte of the character as a three-digit octal escape.
+                    for byte in c.encode_utf8(&mut [0u8; 4]).bytes() {
+                        out.push_str(&format!("\\{byte:03o}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('\'');
+        return out;
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut previous: Option<char> = None;
+    for c in text.chars() {
+        let special = matches!(
+            c,
+            ' ' | '!'
+                | '"'
+                | '$'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | ','
+                | ';'
+                | '<'
+                | '>'
+                | '?'
+                | '['
+                | '\\'
+                | ']'
+                | '^'
+                | '`'
+                | '{'
+                | '|'
+                | '}'
+        ) || (c == '#' && previous.is_none())
+            // A tilde expands at the start of a word and after `:` or `=`.
+            || (c == '~' && matches!(previous, None | Some(':' | '=')));
+        if special {
+            out.push('\\');
+        }
+        out.push(c);
+        previous = Some(c);
+    }
+    out
+}
+
+/// strftime `format` for the local time at `seconds` since the epoch, as bash's
+/// `%(fmt)T` does (an empty format means `%X`). TZ is re-read first so a
+/// `TZ=... printf` prefix assignment takes effect.
+fn format_time(format: &str, seconds: i64) -> Result<Vec<u8>, Error> {
+    let format = if format.is_empty() { "%X" } else { format };
+    let c_format = CString::new(format)
+        .map_err(|_| Error::Format("time format contains a NUL byte".into()))?;
+    let time = nix::libc::time_t::try_from(seconds)
+        .map_err(|_| Error::Format(format!("time out of range: {seconds}")))?;
+    // SAFETY: tm is plain old data; localtime_r fills it in completely.
+    let mut broken_down: nix::libc::tm = unsafe { std::mem::zeroed() };
+    extern "C" {
+        // POSIX; not exported by the libc crate. localtime_r (unlike
+        // localtime) need not re-read TZ, so call it explicitly.
+        fn tzset();
+    }
+    // SAFETY: tzset only reads the environment; localtime_r writes to the
+    // valid `broken_down` and reports failure (an unrepresentable year) as NULL.
+    let converted = unsafe {
+        tzset();
+        nix::libc::localtime_r(&time, &mut broken_down)
+    };
+    if converted.is_null() {
+        return Err(Error::Format(format!("time out of range: {seconds}")));
+    }
+    // strftime returns 0 both for an empty result and for a buffer that was
+    // too small, so grow the buffer (up to the field limit) before accepting
+    // an empty answer.
+    let mut size = 256usize.max(format.len().saturating_mul(4));
+    loop {
+        let mut buffer = vec![0u8; size.min(MAX_FIELD)];
+        // SAFETY: strftime writes at most buffer.len() bytes into buffer and
+        // reads only the NUL-terminated format and the tm filled in above.
+        let written = unsafe {
+            nix::libc::strftime(
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                c_format.as_ptr(),
+                &broken_down,
+            )
+        };
+        if written > 0 || buffer.len() >= MAX_FIELD {
+            buffer.truncate(written);
+            return Ok(buffer);
+        }
+        size = size.saturating_mul(4);
+    }
+}
+
 pub(crate) fn write_printf(
     output: &mut impl Write,
     format: &str,
     args: &[String],
+    context: Context,
     mut diagnostic: impl FnMut(String),
 ) -> Result<i32, Error> {
     let mut index = 0;
@@ -361,9 +528,39 @@ pub(crate) fn write_printf(
                 }
                 '%' => {
                     let (spec, conversion) = parse_spec(&mut chars, args, &mut index)?;
+                    let missing = index >= args.len();
                     let value = argument(args, &mut index);
                     match conversion {
                         's' => text(output, value.as_bytes(), &spec)?,
+                        'q' => text(output, shell_quote(value).as_bytes(), &spec)?,
+                        'T' => {
+                            // -1 (or no argument) is now; -2 is when the shell
+                            // started.
+                            let seconds = if missing {
+                                -1
+                            } else {
+                                match parse_number(value, 'd') {
+                                    (Numeric::Signed(n), NumberStatus::Valid) => n,
+                                    _ => {
+                                        status = 1;
+                                        diagnostic(format!("{value}: invalid number"));
+                                        0
+                                    }
+                                }
+                            };
+                            let seconds = match seconds {
+                                -1 => std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |elapsed| elapsed.as_secs() as i64),
+                                -2 => context.shell_start,
+                                other => other,
+                            };
+                            let formatted =
+                                format_time(spec.time_format.as_deref().unwrap_or(""), seconds)?;
+                            // Like %s: width pads, precision truncates; the `0`
+                            // flag does not zero-pad.
+                            text(output, &formatted, &spec)?;
+                        }
                         'c' => {
                             let mut bytes = [0u8; 4];
                             let first =
@@ -428,13 +625,84 @@ mod tests {
         }
     }
 
+    const CONTEXT: Context = Context { shell_start: 0 };
+
     #[test]
     fn output_errors_are_propagated_for_text_numbers_and_escapes() {
         for format in ["text", "%d", "%b", r"\n"] {
-            let result = write_printf(&mut BrokenWriter, format, &["1".into()], |_| {});
+            let result = write_printf(&mut BrokenWriter, format, &["1".into()], CONTEXT, |_| {});
             assert!(
                 matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
             );
         }
+    }
+
+    fn render(format: &str, args: &[&str]) -> (String, i32) {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut out = Vec::new();
+        let status = write_printf(&mut out, format, &args, CONTEXT, |_| {}).unwrap();
+        (String::from_utf8(out).unwrap(), status)
+    }
+
+    /// Expected values are bash 5.2's `printf %q` output (UTF-8 locale).
+    #[test]
+    fn q_quotes_like_bash() {
+        let cases = [
+            ("a b", "a\\ b"),
+            ("it's", "it\\'s"),
+            ("$x", "\\$x"),
+            ("", "''"),
+            ("plain", "plain"),
+            ("tab\there", "$'tab\\there'"),
+            ("é", "é"),
+            ("a,b", "a\\,b"),
+            ("~x", "\\~x"),
+            ("x~y", "x~y"),
+            ("a=~b", "a=\\~b"),
+            ("a:~b", "a:\\~b"),
+            ("#c", "\\#c"),
+            ("c#", "c#"),
+            ("!x", "\\!x"),
+            ("%^_+-./:=@", "%\\^_+-./:=@"),
+            ("\u{1}\u{7f}", "$'\\001\\177'"),
+            ("nl\n", "$'nl\\n'"),
+            ("a'b c", "a\\'b\\ c"),
+            (
+                "[]{}|&;<>()*?\\`\"",
+                "\\[\\]\\{\\}\\|\\&\\;\\<\\>\\(\\)\\*\\?\\\\\\`\\\"",
+            ),
+            ("\u{1b}\u{7}\u{b}\u{8}\u{c}\r", "$'\\E\\a\\v\\b\\f\\r'"),
+            ("日本", "日本"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(shell_quote(input), expected, "{input:?}");
+        }
+        assert_eq!(
+            render("[%10q][%-6q][%.3q]", &["a b", "x", "abcdef"]).0,
+            "[      a\\ b][x     ][abc]"
+        );
+    }
+
+    #[test]
+    fn time_conversion_formats_epoch_seconds() {
+        // Every test that reads the local time zone sets it to UTC.
+        std::env::set_var("TZ", "UTC");
+        assert_eq!(
+            render("%(%Y-%m-%d %H:%M:%S)T", &["86400"]).0,
+            "1970-01-02 00:00:00"
+        );
+        assert_eq!(
+            render("[%12(%H:%M)T][%-8(%H)T][%.2(%Y)T]", &["3600", "3600", "0"]).0,
+            "[       01:00][01      ][19]"
+        );
+        assert_eq!(render("%()T", &["0"]).0, "00:00:00");
+        assert_eq!(render("%(%s)T", &["-2"]).0, "0");
+        assert_eq!(render("%(%Y)T", &["abc"]), ("1970".to_string(), 1));
+        let (now, _) = render("%(%Y)T", &[]);
+        assert!(now.parse::<u32>().unwrap() >= 2024, "{now}");
+        assert!(matches!(
+            write_printf(&mut Vec::new(), "%(%Y", &[], CONTEXT, |_| {}),
+            Err(Error::Format(_))
+        ));
     }
 }
