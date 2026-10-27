@@ -1,0 +1,126 @@
+{
+  "profile": "release builds, rustc 1.97.0, same 4-core Linux host; medians over fresh `jsh --norc -c` processes; peak RSS from wait4",
+  "baseline": "7ac5feaab346deaad27a01015e8b190a54ea37e0",
+  "cases": {
+    "startup (-c true)": {
+      "script": "true",
+      "runs": 30,
+      "baseline": {
+        "median_ms": 5.8,
+        "median_max_rss_kib": 12380
+      },
+      "upgraded": {
+        "median_ms": 2.79,
+        "median_max_rss_kib": 12380
+      }
+    },
+    "arithmetic for, 50k": {
+      "script": "for ((i=0;i<50000;i++)); do :; done",
+      "runs": 7,
+      "baseline": {
+        "median_ms": 98.79,
+        "median_max_rss_kib": 12380
+      },
+      "upgraded": {
+        "median_ms": 61.36,
+        "median_max_rss_kib": 12380
+      }
+    },
+    "assignment in loop, 50k": {
+      "script": "for ((i=0;i<50000;i++)); do x=$i; done",
+      "runs": 7,
+      "baseline": {
+        "median_ms": 140.57,
+        "median_max_rss_kib": 12980
+      },
+      "upgraded": {
+        "median_ms": 78.16,
+        "median_max_rss_kib": 12380
+      }
+    },
+    "test-based while, 50k": {
+      "script": "i=0; while [ $i -lt 50000 ]; do i=$((i+1)); done",
+      "runs": 7,
+      "baseline": {
+        "median_ms": 171.56,
+        "median_max_rss_kib": 12508
+      },
+      "upgraded": {
+        "median_ms": 164.35,
+        "median_max_rss_kib": 12508
+      }
+    },
+    "empty function call, 50k": {
+      "script": "f(){ :; }; for ((i=0;i<50000;i++)); do f; done",
+      "runs": 7,
+      "baseline": {
+        "median_ms": 139.83,
+        "median_max_rss_kib": 12508
+      },
+      "upgraded": {
+        "median_ms": 138.42,
+        "median_max_rss_kib": 12508
+      }
+    },
+    "function with local, 50k": {
+      "script": "f(){ local v=$1; }; for ((i=0;i<50000;i++)); do f $i; done",
+      "runs": 7,
+      "baseline": {
+        "median_ms": 207.32,
+        "median_max_rss_kib": 12508
+      },
+      "upgraded": {
+        "median_ms": 205.0,
+        "median_max_rss_kib": 12508
+      }
+    },
+    "parameter operators, 5k": {
+      "script": "v=/usr/local/share/doc/file.tar.gz; for ((i=0;i<5000;i++)); do x=${v##*/}; y=${v%.*}; z=${v//\\//_}; done",
+      "runs": 7,
+      "baseline": {
+        "median_ms": 331.53,
+        "median_max_rss_kib": 12508
+      },
+      "upgraded": {
+        "median_ms": 32.74,
+        "median_max_rss_kib": 12508
+      }
+    },
+    "pattern substitution on 5,000 chars": {
+      "script": "v=$(printf \"%5000s\" \"\"); w=${v// /_}; echo ${#w}",
+      "runs": 7,
+      "baseline": {
+        "median_ms": 14343.16,
+        "median_max_rss_kib": 12508
+      },
+      "upgraded": {
+        "median_ms": 5.05,
+        "median_max_rss_kib": 12508
+      }
+    },
+    "value pipeline: 100k where+sum": {
+      "script": "range 1..100000 | where {|n| $n % 3 == 0} | math sum",
+      "runs": 7,
+      "baseline": {
+        "median_ms": 23.38,
+        "median_max_rss_kib": 16692
+      },
+      "upgraded": {
+        "median_ms": 11.3,
+        "median_max_rss_kib": 12508
+      }
+    },
+    "value pipeline: 10M where+take 3": {
+      "script": "range 0..10000000 | where {|n| $n % 7 == 0} | take 3 | to-json",
+      "runs": 5,
+      "baseline": {
+        "median_ms": 1550.54,
+        "median_max_rss_kib": 810912
+      },
+      "upgraded": {
+        "median_ms": 3.69,
+        "median_max_rss_kib": 12508
+      }
+    }
+  }
+}

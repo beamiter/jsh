@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### 2026-10-27 — Bash parity, value pipelines, and startup
+
+- Bash compatibility is now measured with an opt-in differential test that
+  runs 1,114 small scripts under bash 5.2 and jsh and compares stdout and exit
+  status (`cargo test --test bash_differential_tests -- --ignored`); 1,110
+  match and the four others are listed with reasons.
+- Arithmetic follows bash: `((...))` text is read verbatim (no stray
+  redirections), `**`, compound assignments, `base#digits`, recursive values,
+  array operands, the `let` builtin, and bounded nesting. Brace expansion
+  splits on top-level commas and leaves invalid sequences literal.
+- Variables use one model with bash's dynamic scoping, attributes
+  (`-i -l -u -c -r -n -x -a -A`), sparse indexed and ordered associative
+  arrays, namerefs, RANDOM/SECONDS and other specials, and full
+  `${...}` operators including `@` transformations. `declare`, `local`,
+  `export`, `readonly` and `unset` are rewritten to match.
+- New builtins: getopts, mapfile/readarray, umask, ulimit, times, kill,
+  enable and a real `hash`; `printf -v`, `%q`, `%(fmt)T`; `read` follows
+  bash's splitting and option rules; `type`, `command`, `test`/`[[ ]]`,
+  `wait`, `cd`/`pwd`, and `pushd`/`popd`/`dirs` match bash. `type` and
+  `declare -f` print function definitions through a new AST printer.
+- Traps run on real signals at safe points; ERR, DEBUG and RETURN follow
+  bash's inheritance rules; LINENO, FUNCNAME, BASH_SOURCE, BASH_LINENO,
+  `caller` and BASH_COMMAND come from a call stack. Added `break/continue N`,
+  `time`, `{name}` and `N>&M-` redirections, `select`, named coprocesses,
+  `local -` and `command_not_found_handle`.
+- An error that stops a command now skips only the rest of its line, as in
+  bash, instead of ending the script; `eval`, `source` and trap actions
+  recover inside their own text, and subshells exit. `set -u` and `${x:?}`
+  end a `-c` string with status 127 and a script file with 1. Empty compound bodies (`while do done`) are
+  syntax errors. Non-interactive shells no longer announce background jobs.
+- Builtins that share a name with a system program (`sort`, `date`, `uniq`,
+  `sum`, ...) run the program unless used in jsh's own form or fed typed
+  input; `command NAME` always runs the program.
+- Value pipelines honor Ctrl-C and SIGTERM, leave stdin alone when their
+  first command is a source such as `range`, and end a single scalar result
+  with a newline. Closure `where`/`each` stream lazily over streams;
+  `from-ndjson --strict` fails at the first malformed line. `math product`
+  and `math avg` keep integers exact.
+- A signal sent right after a command is forked (`sleep 5 & kill $!`) is no
+  longer lost.
+- Performance (release build, medians): startup 5.8 → 2.8 ms (no more
+  `tput` spawns), `${v// /_}` on 5,000 characters 14.3 s → 5 ms, parameter
+  operators 10× faster, assignment loops about 1.8× faster, and
+  `range 0..10000000 | where ... | take 3` 1.55 s / 792 MiB → 3.7 ms / 12 MiB.
+
 ### 2026-10-26 — execution, interactive completion, shared state, and data streams
 
 - Propagate the first unhandled errexit through nested loops and compounds,

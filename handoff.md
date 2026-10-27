@@ -1,5 +1,35 @@
 # Engineering handoff
 
+## 2026-10-27 — Bash parity, value pipelines, and startup
+
+Based on `7ac5feaab346deaad27a01015e8b190a54ea37e0`. Details, validation and
+performance tables are in [the upgrade report](docs/UPGRADE_2026-10-27.md).
+
+- Bash mode was rebuilt against differential probes: arithmetic and `let`,
+  brace expansion, a single variable model (dynamic scoping, attributes,
+  sparse/associative arrays, namerefs, specials, all `${...}` operators),
+  missing builtins (getopts, mapfile, umask, ulimit, times, kill, enable,
+  hash) and bash-identical `read`, `printf`, `type`, `test`/`[[ ]]`, `wait`,
+  `cd`, `pushd`. Traps, the call stack and LINENO/FUNCNAME/BASH_* follow bash.
+- Errors that stop a command now skip only the rest of the line, as in bash;
+  `set -u`/`${x:?}` end a `-c` string with 127. Empty compound bodies are
+  syntax errors.
+- Builtins that shadow system programs (`sort`, `date`, `uniq`, ...) defer to
+  the program unless used in jsh's own form (`src/shadowing.rs`).
+- Value pipelines: lazy closure `where`/`each`, `from-ndjson --strict`,
+  Ctrl-C/SIGTERM handling, no stray stdin reads, scalar newline, exact
+  integer `math product`/`avg`.
+- Signals sent right after fork are no longer lost; startup no longer spawns
+  `tput`; function calls and assignments avoid the environment path.
+- `tests/data/bash_probes/` holds 1,114 bash-verified probes; run them with
+  `cargo test --test bash_differential_tests -- --ignored` (1,110 match, four
+  listed in `known_differences.txt`).
+- Suites: all-feature 1,665 passed, 0 failed, 8 ignored; core-only 1,564
+  passed, 0 failed, 4 ignored. Clippy (both configurations), fmt, docs,
+  release build, 78 benchmark smoke cases and the PTY checks pass. As root,
+  run the suite under `setpriv` without `CAP_DAC_OVERRIDE` (see the report)
+  or the unreadable-file tests fail.
+
 ## 2026-10-26 — execution, completion, persistence, and streaming
 
 Based on `1f0d5dab6501448870c9a884b3d2d4f7de10138d`. The current validation and
