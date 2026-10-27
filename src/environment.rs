@@ -217,6 +217,18 @@ fn remove_env_checked(name: &str) {
     }
 }
 
+/// The controlling terminal's `(columns, rows)`, or `None` without one.
+///
+/// This deliberately avoids `crossterm::terminal::size()`: when the ioctl
+/// fails — every `jsh -c`, script, or pipeline without a terminal — that call
+/// falls back to running `tput cols` and `tput lines` through `PATH`. That put
+/// two process spawns on every shell start and resolved a helper through
+/// mutable shell state, which jsh never does for its other helpers.
+pub(crate) fn query_terminal_size() -> Option<(u16, u16)> {
+    let size = crossterm::terminal::window_size().ok()?;
+    (size.columns > 0 && size.rows > 0).then_some((size.columns, size.rows))
+}
+
 /// Hook lists for shell events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShellHooks {
@@ -571,10 +583,8 @@ impl ShellState {
         // Query the terminal directly; resolving an external `stty` through a
         // user-controlled PATH made shell construction an unnecessary process
         // and unbounded-output boundary.
-        if let Ok((columns, _)) = crossterm::terminal::size() {
-            if columns > 0 {
-                return columns as usize;
-            }
+        if let Some((columns, _)) = query_terminal_size() {
+            return columns as usize;
         }
 
         // Default fallback

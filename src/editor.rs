@@ -126,7 +126,7 @@ impl Default for Editor {
 
 impl Editor {
     pub fn new() -> Self {
-        let (w, h) = terminal::size().unwrap_or((80, 24));
+        let (w, h) = crate::environment::query_terminal_size().unwrap_or((80, 24));
         let ai_config = AiConfig::from_env();
         let ai_include_extended_context = ai_config
             .as_ref()
@@ -1910,8 +1910,8 @@ impl Editor {
     /// editor on the size it happened to see at startup.
     fn refresh_terminal_size(&mut self) -> bool {
         SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst);
-        match crossterm::terminal::size() {
-            Ok((w, h)) if (w, h) != (self.terminal_width, self.terminal_height) => {
+        match crate::environment::query_terminal_size() {
+            Some((w, h)) if (w, h) != (self.terminal_width, self.terminal_height) => {
                 self.terminal_width = w;
                 self.terminal_height = h;
                 true
