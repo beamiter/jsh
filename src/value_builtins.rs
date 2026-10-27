@@ -697,9 +697,14 @@ fn vb_math(
         eprintln!("math: no numeric values");
         return Err(1);
     }
-    if matches!(op, "sum" | "min" | "max") {
-        let result = if op == "sum" {
-            numeric_sum(nums).map_err(|message| {
+    if matches!(op, "sum" | "min" | "max" | "product" | "avg" | "mean") {
+        let result = if !matches!(op, "min" | "max") {
+            let exact = match op {
+                "sum" => numeric_sum(nums),
+                "product" => numeric_product(nums),
+                _ => Ok(numeric_mean(nums)),
+            };
+            exact.map_err(|message| {
                 eprintln!("{message}");
                 state.set_error(message.to_owned(), 1);
                 1
@@ -731,13 +736,6 @@ fn vb_math(
     // algorithms. Exact summation/extrema above do not force that projection.
     let nums = nums.map(NumericValue::as_f64);
     let r = match op {
-        "avg" | "mean" => {
-            let (sum, count) = nums.fold((0.0, 0usize), |(sum, count), value| {
-                (sum + value, count + 1)
-            });
-            sum / count as f64
-        }
-        "product" => nums.product::<f64>(),
         "median" => {
             let mut sorted: Vec<f64> = nums.collect();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -795,6 +793,90 @@ fn numeric_sum(values: impl Iterator<Item = NumericValue>) -> Result<NumericValu
             .map(NumericValue::Int)
             .map_err(|_| "math sum: integer result is outside the i64 range"),
     }
+}
+
+/// Multiply exactly while every input is an integer, like `numeric_sum`.
+///
+/// The f64 fold this replaces rounded every intermediate product, so
+/// `[9007199254740993, 1]` came back as 9007199254740992 and an out-of-range
+/// product printed as an inexact number. An integer result must fit i64;
+/// a zero anywhere makes it exactly 0, even after an intermediate product
+/// has left the i128 accumulator. A float switches to f64 for the rest.
+fn numeric_product(
+    values: impl Iterator<Item = NumericValue>,
+) -> Result<NumericValue, &'static str> {
+    // None once the exact integer product no longer fits in i128.
+    let mut integer_product = Some(1_i128);
+    let mut saw_zero = false;
+    // Rounded shadow of the integer prefix, used only if a float appears
+    // after the exact accumulator overflowed.
+    let mut rounded_prefix = 1.0_f64;
+    let mut float_product = None;
+    for value in values {
+        if let Some(product) = &mut float_product {
+            *product *= value.as_f64();
+            continue;
+        }
+        match value {
+            NumericValue::Int(number) => {
+                saw_zero |= number == 0;
+                rounded_prefix *= number as f64;
+                integer_product =
+                    integer_product.and_then(|product| product.checked_mul(i128::from(number)));
+            }
+            NumericValue::Float(number) => {
+                let prefix = if saw_zero {
+                    0.0
+                } else {
+                    integer_product.map_or(rounded_prefix, |product| product as f64)
+                };
+                float_product = Some(prefix * number);
+            }
+        }
+    }
+    if let Some(product) = float_product {
+        return Ok(NumericValue::Float(product));
+    }
+    if saw_zero {
+        return Ok(NumericValue::Int(0));
+    }
+    integer_product
+        .and_then(|product| i64::try_from(product).ok())
+        .map(NumericValue::Int)
+        .ok_or("math product: integer result is outside the i64 range")
+}
+
+/// Average with an exact integer total: one rounding at the final division
+/// instead of one per addition, and an exact integer when the mean is whole.
+/// Mixed input keeps the established floating-point accumulation.
+fn numeric_mean(values: impl Iterator<Item = NumericValue>) -> NumericValue {
+    let mut integer_total = Some(0_i128);
+    let mut float_total = 0.0_f64;
+    let mut all_integers = true;
+    let mut count = 0_u64;
+    for value in values {
+        count += 1;
+        float_total += value.as_f64();
+        match value {
+            NumericValue::Int(number) if all_integers => {
+                integer_total = integer_total.and_then(|total| total.checked_add(number.into()));
+            }
+            _ => all_integers = false,
+        }
+    }
+    if all_integers {
+        if let Some(total) = integer_total {
+            let divisor = i128::from(count.max(1));
+            if total % divisor == 0 {
+                if let Ok(mean) = i64::try_from(total / divisor) {
+                    return NumericValue::Int(mean);
+                }
+            }
+            let (quotient, remainder) = (total / divisor, total % divisor);
+            return NumericValue::Float(quotient as f64 + remainder as f64 / divisor as f64);
+        }
+    }
+    NumericValue::Float(float_total / count.max(1) as f64)
 }
 
 fn numeric_math_result(value: NumericValue) -> Value {
