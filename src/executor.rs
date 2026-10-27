@@ -651,7 +651,8 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
 
     // If our own stdin is a pipe (not a tty), the user is feeding bytes into
     // the first value-aware stage. Read them eagerly. (Phase 5a is non-streaming.)
-    // Skip when the first command is a source (open / ls / ps) that ignores stdin.
+    // Skip when the first command is a source that ignores stdin (see
+    // value_builtins::ignores_input).
     let first_is_source = matches!(
         cmds.first()
             .and_then(|c| match c {
@@ -663,7 +664,7 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
                 WordPart::Literal(s) => Some(s.as_str()),
                 _ => None,
             }),
-        Some("open" | "ls" | "ps")
+        Some(name) if crate::value_builtins::ignores_input(name)
     );
     let mut data = if first_is_source || std::io::stdin().is_terminal() {
         PipelineData::Empty
@@ -715,7 +716,7 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
             }
         }
         match f(data, args, state) {
-            Ok(out) => data = out,
+            Ok(out) => data = out.interruptible(),
             Err(code) => {
                 // A lazy upstream stage that failed explains why this stage
                 // saw a truncated input; nothing else has reported it.
@@ -729,6 +730,11 @@ fn execute_value_pipeline(cmds: &[Command], state: &mut ShellState) -> i32 {
         // Last command should print to stdout
         if i == cmds.len() - 1 {
             if let Err(e) = data.write_to_stdout() {
+                // An interrupt or termination request cut the output short;
+                // the executor reports the signal's status, not an error.
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    return crate::signal::pending_status().unwrap_or(1);
+                }
                 eprintln!("jsh: {}", e);
                 return 1;
             }
@@ -1299,6 +1305,14 @@ pub fn apply_closure(
     use crate::pipeline_data::PipelineData;
     use crate::value::Value;
     use std::collections::HashMap;
+
+    // Every closure-driven builtin (each, where, reduce, sort-by, ...) calls
+    // this once per row, inside the shell process: stop at the next row once
+    // Ctrl-C or a termination request is pending instead of finishing a
+    // potentially unbounded loop.
+    if let Some(status) = crate::signal::pending_status() {
+        return Err(status);
+    }
 
     // Literal values and pure expressions never need to install a local shell
     // scope. Their parsed expression and borrowed bindings are reusable across

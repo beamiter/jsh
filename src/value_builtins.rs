@@ -147,6 +147,30 @@ pub fn is_value_aware_in_pipeline(name: &str) -> bool {
     VALUE_BUILTINS.contains_key(name)
 }
 
+/// Value builtins that produce output without reading pipeline input.
+///
+/// When one starts an in-process value pipeline, the shell must leave its own
+/// stdin alone. Reading it anyway made `range 1..5 | math sum` wait for EOF on
+/// an idle terminal-less stdin (an ssh session, a pipe held open by a parent)
+/// and, inside `... | while read line; do range 1..3 | count; done`, swallow
+/// the loop's remaining input on the first iteration.
+pub fn ignores_input(name: &str) -> bool {
+    matches!(
+        name,
+        "open"
+            | "ls"
+            | "ps"
+            | "range"
+            | "char"
+            | "ansi"
+            | "error"
+            | "use"
+            | "def"
+            | "help"
+            | "http"
+    )
+}
+
 fn is_context_only(name: &str) -> bool {
     matches!(name, "ls" | "ps")
 }
@@ -456,6 +480,10 @@ impl Iterator for ClosureStage {
             return None;
         }
         loop {
+            if crate::signal::pending_status().is_some() {
+                self.finished = true;
+                return None;
+            }
             let row = self.source.next()?;
             let closure = &self.closure;
             let result = self

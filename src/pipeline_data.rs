@@ -85,6 +85,9 @@ impl PipelineData {
                 if stream_failure_pending() {
                     return Err(1);
                 }
+                if let Some(status) = crate::signal::pending_status() {
+                    return Err(status);
+                }
                 Ok(values)
             }
             PipelineData::Bytes(b) => {
@@ -159,6 +162,24 @@ impl PipelineData {
         }
     }
 
+    /// End a lazy stream as soon as the shell has a pending interrupt or
+    /// termination request.
+    ///
+    /// A value pipeline runs inside the shell process, so nothing else stops
+    /// `range 0..100000000 | count` when Ctrl-C or SIGTERM arrives: the signal
+    /// handlers only latch a flag for the executor to act on between commands.
+    /// Pipeline runners wrap every stage's output in this check (an atomic load
+    /// per row); sinks then see the latched signal and report the interruption
+    /// instead of a result computed from part of the input.
+    pub fn interruptible(self) -> Self {
+        match self {
+            Self::Stream(values) => Self::Stream(Box::new(
+                values.take_while(|_| crate::signal::pending_status().is_none()),
+            )),
+            other => other,
+        }
+    }
+
     /// Whether the variant is a lazy Stream (useful for short-circuit ops).
     pub fn is_stream(&self) -> bool {
         matches!(self, PipelineData::Stream(_))
@@ -189,6 +210,9 @@ impl PipelineData {
         // rendered table) must not be presented as the pipeline's answer.
         if let Some(message) = take_stream_failure() {
             return Err(io::Error::other(message));
+        }
+        if crate::signal::pending_status().is_some() {
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
         }
         if matches!(&self, PipelineData::Empty)
             || matches!(&self, PipelineData::Values(values) if values.is_empty())
@@ -235,6 +259,10 @@ impl PipelineData {
                 if let Some(message) = take_stream_failure() {
                     output.flush()?;
                     return Err(io::Error::other(message));
+                }
+                if crate::signal::pending_status().is_some() {
+                    output.flush()?;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
                 }
             }
         }

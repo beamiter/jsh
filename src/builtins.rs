@@ -432,7 +432,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
             // to stdout. Used when a value-aware builtin runs inside a forked
             // pipeline child (mixed with non-value-aware commands).
             if let Some(vfn) = crate::value_builtins::VALUE_BUILTINS.get(name) {
-                return run_value_builtin_in_fork(*vfn, args, state);
+                return run_value_builtin_in_fork(name, *vfn, args, state);
             }
             eprintln!("jsh: {}: builtin not yet implemented", name);
             1
@@ -441,6 +441,7 @@ pub fn run_builtin(name: &str, args: &[String], state: &mut ShellState) -> i32 {
 }
 
 fn run_value_builtin_in_fork(
+    name: &str,
     vfn: crate::value_builtins::ValueBuiltin,
     args: &[String],
     state: &mut ShellState,
@@ -450,7 +451,9 @@ fn run_value_builtin_in_fork(
     const MAX_VALUE_PIPE_INPUT_BYTES: usize = 64 * 1024 * 1024;
     crate::pipeline_data::clear_stream_failure();
     let mut buf = Vec::new();
-    if !std::io::stdin().is_terminal() {
+    // A source such as `range` must leave the shell's stdin to whatever
+    // reads it next (see value_builtins::ignores_input).
+    if !crate::value_builtins::ignores_input(name) && !std::io::stdin().is_terminal() {
         buf = match crate::io_guard::read_to_end_bounded(
             std::io::stdin().lock(),
             MAX_VALUE_PIPE_INPUT_BYTES,
@@ -489,13 +492,18 @@ fn run_value_builtin_in_fork(
         Ok(out) => {
             let mut sink: Vec<u8> = Vec::new();
             // Normalize Stream to Values for the legacy render path.
-            let out = match out {
+            let out = match out.interruptible() {
                 PipelineData::Stream(it) => PipelineData::Values(it.collect()),
                 other => other,
             };
             if let Some(message) = crate::pipeline_data::take_stream_failure() {
                 eprintln!("jsh: {message}");
                 return 1;
+            }
+            // Ctrl-C or a termination request ended the stream early; report
+            // the signal rather than print a partial result.
+            if let Some(status) = crate::signal::pending_status() {
+                return status;
             }
             match out {
                 PipelineData::Empty => {}
