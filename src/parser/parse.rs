@@ -868,7 +868,7 @@ impl<'a> Parser<'a> {
     fn parse_subshell(&mut self) -> Result<Command, ParseError> {
         self.advance(); // consume (
         self.skip_newlines();
-        let body = self.parse_command_list()?;
+        let body = self.parse_nonempty_list()?;
         if self.current.token != Token::RParen {
             return Err(if self.current.token == Token::Eof {
                 ParseError::Incomplete
@@ -887,7 +887,7 @@ impl<'a> Parser<'a> {
     fn parse_brace_group(&mut self) -> Result<Command, ParseError> {
         self.advance(); // consume {
         self.skip_newlines();
-        let body = self.parse_command_list()?;
+        let body = self.parse_nonempty_list()?;
         if self.current.token != Token::RBrace {
             return Err(if self.current.token == Token::Eof {
                 ParseError::Incomplete
@@ -907,10 +907,10 @@ impl<'a> Parser<'a> {
         self.advance(); // consume "if"
         self.skip_newlines();
         let mut conditions = Vec::new();
-        let condition = self.parse_command_list()?;
+        let condition = self.parse_nonempty_list()?;
         self.expect_keyword("then")?;
         self.skip_newlines();
-        let body = self.parse_command_list()?;
+        let body = self.parse_nonempty_list()?;
         conditions.push((condition, body));
 
         let mut else_branch = None;
@@ -918,15 +918,15 @@ impl<'a> Parser<'a> {
             if self.is_keyword("elif") {
                 self.advance();
                 self.skip_newlines();
-                let cond = self.parse_command_list()?;
+                let cond = self.parse_nonempty_list()?;
                 self.expect_keyword("then")?;
                 self.skip_newlines();
-                let body = self.parse_command_list()?;
+                let body = self.parse_nonempty_list()?;
                 conditions.push((cond, body));
             } else if self.is_keyword("else") {
                 self.advance();
                 self.skip_newlines();
-                else_branch = Some(self.parse_command_list()?);
+                else_branch = Some(self.parse_nonempty_list()?);
                 break;
             } else {
                 break;
@@ -961,7 +961,7 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         self.expect_keyword("do")?;
         self.skip_newlines();
-        let body = self.parse_command_list()?;
+        let body = self.parse_nonempty_list()?;
         self.expect_keyword("done")?;
         let redirects = self.parse_optional_redirects()?;
         Ok(Command::Compound(CompoundCommand::For {
@@ -1022,7 +1022,7 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         self.expect_keyword("do")?;
         self.skip_newlines();
-        let body = self.parse_command_list()?;
+        let body = self.parse_nonempty_list()?;
         self.expect_keyword("done")?;
         let redirects = self.parse_optional_redirects()?;
 
@@ -1038,10 +1038,10 @@ impl<'a> Parser<'a> {
     fn parse_while(&mut self) -> Result<Command, ParseError> {
         self.advance(); // consume "while"
         self.skip_newlines();
-        let condition = self.parse_command_list()?;
+        let condition = self.parse_nonempty_list()?;
         self.expect_keyword("do")?;
         self.skip_newlines();
-        let body = self.parse_command_list()?;
+        let body = self.parse_nonempty_list()?;
         self.expect_keyword("done")?;
         let redirects = self.parse_optional_redirects()?;
         Ok(Command::Compound(CompoundCommand::While {
@@ -1054,10 +1054,10 @@ impl<'a> Parser<'a> {
     fn parse_until(&mut self) -> Result<Command, ParseError> {
         self.advance(); // consume "until"
         self.skip_newlines();
-        let condition = self.parse_command_list()?;
+        let condition = self.parse_nonempty_list()?;
         self.expect_keyword("do")?;
         self.skip_newlines();
-        let body = self.parse_command_list()?;
+        let body = self.parse_nonempty_list()?;
         self.expect_keyword("done")?;
         let redirects = self.parse_optional_redirects()?;
         Ok(Command::Compound(CompoundCommand::Until {
@@ -1199,7 +1199,7 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         self.expect_keyword("do")?;
         self.skip_newlines();
-        let body = self.parse_command_list()?;
+        let body = self.parse_nonempty_list()?;
         self.expect_keyword("done")?;
         let redirects = self.parse_optional_redirects()?;
         Ok(Command::Compound(CompoundCommand::Select {
@@ -1443,6 +1443,24 @@ impl<'a> Parser<'a> {
             background,
             disown,
         })
+    }
+
+    /// A compound command's condition or body. Bash's grammar requires at
+    /// least one command there: `while do done` and `{ }` are syntax errors,
+    /// not an always-true condition and an empty group. At the end of the
+    /// input more lines may still follow, so that case stays incomplete.
+    fn parse_nonempty_list(&mut self) -> Result<Vec<CompleteCommand>, ParseError> {
+        let commands = self.parse_command_list()?;
+        if commands.is_empty() {
+            if self.current.token == Token::Eof || self.lexer.has_incomplete_construct() {
+                return Err(ParseError::Incomplete);
+            }
+            return Err(ParseError::Unexpected(format!(
+                "unexpected token {:?}",
+                self.current.token
+            )));
+        }
+        Ok(commands)
     }
 
     fn parse_command_list(&mut self) -> Result<Vec<CompleteCommand>, ParseError> {

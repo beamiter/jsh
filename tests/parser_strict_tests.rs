@@ -80,3 +80,41 @@ fn command_mode_returns_syntax_status_two() {
         );
     }
 }
+
+#[test]
+fn empty_compound_bodies_are_syntax_errors() {
+    // bash rejects an empty body with status 2; `while do done` used to parse
+    // as an endless loop with no condition.
+    for source in [
+        "while do done",
+        "until do done",
+        "{ }",
+        "f() { }",
+        "( )",
+        "if then fi",
+        "if true; then fi",
+        "if true; then :; else fi",
+        "if true; then :; elif then :; fi",
+        "for i in a; do done",
+        "for ((;;)); do done",
+        "select x in a; do done",
+    ] {
+        assert!(!is_incomplete(source), "input was incomplete: {source:?}");
+        assert!(parse(source).is_err(), "parser accepted {source:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_jsh"))
+            .args(["--norc", "-c", source])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run jsh");
+        assert_eq!(output.status.code(), Some(2), "source: {source:?}");
+    }
+}
+
+#[test]
+fn unfinished_compound_bodies_stay_incomplete() {
+    for source in ["while true; do", "if true; then", "{", "(", "f() {"] {
+        assert_incomplete(source);
+    }
+    // An empty case arm is still valid.
+    parse("case x in a) ;; esac").expect("empty case arm");
+}
