@@ -127,6 +127,18 @@ cap on requested output, not measured usage, input-token accounting or billing.
 On normal completion time is reconciled to elapsed time; crashes retain the full
 reservation. Timeouts are cooperative/polled, not OS resource guarantees.
 
+Each running attempt has one monotonic deadline spanning preparation, model IO,
+candidate creation, admission and evaluation. Its window is bounded by both the
+reservation and the remaining persistent controller-time budget. Native helpers,
+Git calls and HTTP requests use the smaller of their own timeout and the time
+remaining; later stages never reset the deadline. A complete frozen evaluation
+window must still fit before a queued trial can start. If time runs out, the loop
+returns `auto_budget_exhausted`, retains its stage-specific failure category and
+evidence, and starts no further work. An admitted but unevaluated candidate remains queued
+for explicit inspection/execution. Stop requests take priority over a concurrent
+budget timeout. Blocking filesystem operations and cleanup can still overshoot a
+cooperative deadline; their measured elapsed time is charged rather than hidden.
+
 An attempt's identity and reservation are persisted before its evidence directory
 is created. A failed reservation write leaves no directory blocking a retry.
 Directory-allocation failures become recorded preparation failures, and a crash

@@ -72,6 +72,12 @@ screen evidence before confirmation. These are host-record validation guarantees
 remote attestation or proof of scientific improvement. Observations remain
 untrusted user-role data; the model cannot supply promotion scores.
 
+V2 feedback must also match the status and stage scores of the same trial when
+it is visible in the supplied context. Numeric spellings such as `8` and `8.0`
+compare equally, and a missing context stage corresponds to a null feedback
+stage. A complete history cannot refer to a nonexistent feedback trial; a bounded
+window may still refer to omitted history. V1 category-only feedback is unchanged.
+
 ## Optional no-improvement policy
 
 Add `"max_no_improvement": 3` to a new auto configuration before `auto-init` to

@@ -34,6 +34,12 @@ FAILURE_CODES = {'prepare': 'preparation_failed', 'model_request': 'transport_fa
                  'validate_plan': 'plan_rejected', 'commit_candidate': 'candidate_rejected',
                  'submit': 'admission_rejected', 'evaluate': 'evaluation_unresolved'}
 DEFAULT_SAMPLING = {'temperature': 1.0, 'top_p': 0.95, 'top_k': 20}
+
+
+class AttemptExpired(Exception):
+    """A bounded attempt has no remaining controller time for its next phase."""
+
+
 HTTP_CLIENT = r'''
 import json, os, sys, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -110,6 +116,19 @@ class AutoLoop:
         self.lock_store = engine.Store(self.directory)
         self.state_path = self.directory / 'auto.json'
         self.binary = str(Path(native_binary).absolute()) if native_binary else None
+        self._attempt_deadline = None
+
+    def remaining(self, maximum=None, minimum=0):
+        """Cooperative attempt boundary; never extend a budget at a later phase."""
+        deadline = self._attempt_deadline
+        if deadline is None:
+            return maximum
+        if self.campaign.stopped():
+            raise self.r.Stopped('campaign stopped')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or remaining < minimum:
+            raise AttemptExpired('auto attempt time budget exhausted')
+        return remaining if maximum is None else min(maximum, remaining)
 
     def view(self):
         # Unlike bridge.snapshot(), inspection must never recreate an identity.
@@ -383,7 +402,8 @@ class AutoLoop:
                       not any(r.within(path, prefix) for prefix in manifest['protected_paths']), 'source is not editable')
         # ls-tree -l supplies object sizes before any blob is read. Batch both
         # metadata and content instead of launching three Git processes per file.
-        listing = r.git(repo, '--literal-pathspecs', 'ls-tree', '-l', '-z', base, '--', *config['source_paths'])
+        listing = r.git(repo, '--literal-pathspecs', 'ls-tree', '-l', '-z', base, '--', *config['source_paths'],
+                        timeout=self.remaining(30))
         entries = {}
         for record in listing.split('\0'):
             if not record:
@@ -400,7 +420,8 @@ class AutoLoop:
         r.require(set(entries) == set(config['source_paths']), 'source must name exactly one tracked file')
         queries = ''.join(entries[path][0] + '\n' for path in config['source_paths']).encode('ascii')
         content = subprocess.run(['git', '-C', str(repo), 'cat-file', '--batch'], input=queries,
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=True).stdout
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 timeout=self.remaining(15), check=True).stdout
         offset = 0
         for path in config['source_paths']:
             blob, size = entries[path]
@@ -419,11 +440,13 @@ class AutoLoop:
         self.r.require(self.binary is not None, 'compiled jsh binary required for shared jagent validation')
         result = subprocess.run([self.binary, 'research', command, *map(str, paths)],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                timeout=20, check=False)
+                                timeout=self.remaining(20), check=False)
+        self.remaining()
         self.r.require(result.returncode == 0 and len(result.stdout) <= 2 * MAX_INPUT, 'jagent authoring validation failed')
         return json.loads(result.stdout, object_pairs_hook=self.r.unique_object, parse_constant=self.r.invalid_constant)
 
     def check_live(self, context):
+        self.remaining()
         if self.campaign.stopped():
             raise self.r.Stopped('campaign stopped')
         _, live = self.view()
@@ -444,11 +467,12 @@ class AutoLoop:
             body['response_format'] = {'type': 'json_object'}
             body['messages'] = body['messages'] + [{'role': 'user', 'content': json.dumps({'required_response_schema': prepared['response_schema']})}]
         spec = {'endpoint': config['endpoint'], 'key_env': config['api_key_env'],
-                'timeout': config['request_timeout_seconds'], 'body': body}
+                'timeout': self.remaining(config['request_timeout_seconds']), 'body': body}
         spec_path, response_path = directory / 'http-request.json', directory / 'http-response.json'
         r.atomic_json(spec_path, spec)
         attempt['stage'] = 'model_request'
         self.save(state)
+        self.remaining()
         if self.campaign.stopped():
             raise r.Stopped('stop requested before model call')
         started = time.monotonic()
@@ -462,12 +486,14 @@ class AutoLoop:
             attempt['active_process_group'] = process.pid
             self.save(state)
             while process.poll() is None:
+                self.remaining()
                 if self.campaign.stopped():
                     raise r.Stopped('stop requested during model call')
                 r.require(time.monotonic() - started <= config['request_timeout_seconds'], 'model request timed out')
                 time.sleep(0.05)
             if self.campaign.stopped():
                 raise r.Stopped('stop requested during model call')
+            self.remaining()
             r.require(time.monotonic() - started <= config['request_timeout_seconds'], 'model request timed out')
             r.require(process.returncode == 0, 'model request failed; no automatic HTTP retry')
         finally:
@@ -483,10 +509,12 @@ class AutoLoop:
         r.require(sum(len(replacements.get(item['path'], item['content']).encode('utf-8'))
                       for item in files) <= 65536, 'replacement exceeds next-round source budget')
         worktree = directory / 'candidate'
-        r.git(Path(manifest['repo']), 'worktree', 'add', '--detach', str(worktree), context['best']['commit'])
+        r.git(Path(manifest['repo']), 'worktree', 'add', '--detach', str(worktree), context['best']['commit'],
+              timeout=self.remaining(30))
         sources = {item['path']: item for item in files}
         changed = []
         for edit in plan['edits']:
+            self.remaining()
             source = sources[edit['path']]
             r.require(edit['before_blob'] == source['blob'], 'source blob mismatch')
             target = worktree / edit['path']
@@ -502,20 +530,23 @@ class AutoLoop:
                 stream.flush()
                 os.fsync(stream.fileno())
             changed.append(edit['path'])
-        r.git(worktree, '--literal-pathspecs', 'add', '--', *changed)
-        diff = r.git(worktree, 'diff', '--cached', '--no-ext-diff', '--name-only', '-z', '--')
+        r.git(worktree, '--literal-pathspecs', 'add', '--', *changed, timeout=self.remaining(30))
+        diff = r.git(worktree, 'diff', '--cached', '--no-ext-diff', '--name-only', '-z', '--', timeout=self.remaining(30))
         paths = {p for p in diff.split('\0') if p}
         r.require(bool(paths) and paths <= set(changed), 'empty change or unexpected staged paths')
         r.git(worktree, '-c', 'user.name=JSH Research', '-c', 'user.email=research@jsh.invalid',
-              '-c', 'commit.gpgsign=false', 'commit', '-m', 'research(auto): ' + request_id)
-        sha = r.commit_id(worktree, 'HEAD')
-        r.check_candidate(manifest, sha)
+              '-c', 'commit.gpgsign=false', 'commit', '-m', 'research(auto): ' + request_id,
+              timeout=self.remaining(30))
+        sha = r.commit_id(worktree, 'HEAD', deadline=self._attempt_deadline)
+        r.check_candidate(manifest, sha, deadline=self._attempt_deadline)
+        self.remaining()
         return sha
 
     def evaluate(self, trial_id, config):
+        self.remaining()
         key = os.environ.pop(config['api_key_env'], None)
         try:
-            return self.r.step(self.campaign, expected_trial_id=trial_id)
+            return self.r.step(self.campaign, expected_trial_id=trial_id, deadline=self._attempt_deadline)
         finally:
             if key is not None:
                 os.environ[config['api_key_env']] = key
@@ -536,6 +567,8 @@ class AutoLoop:
                     stop_reason = action
                     break
                 reservation = self.reservation(config, context)
+                started = time.monotonic()
+                deadline = started + min(reservation, config['max_seconds'] - state['charged_seconds'])
                 index = len(state['attempts']) + 1
                 request_id = 'auto-' + state['loop_id'] + '-' + str(index)
                 directory = self.directory / ('attempt-%06d' % index)
@@ -548,46 +581,68 @@ class AutoLoop:
                 # Persist identity/budget before allocating its evidence path.
                 # A failed write must not strand the next attempt's directory.
                 self.save(state)
-                started = time.monotonic()
+                # Assign only after the first durable write. If that write fails,
+                # no in-memory deadline leaks into a subsequent invocation.
+                self._attempt_deadline = deadline
                 try:
+                    self.remaining()
                     directory.mkdir(mode=0o700, exist_ok=False)
                     files = self.sources(context, config)
+                    self.remaining()
                     input_path = directory / 'author-input.json'
                     r.atomic_json(input_path, self.author_input(state, context, files, campaign))
+                    self.remaining()
                     prepared = self.native('author-prepare', input_path)
                     self.check_live(context)
                     response_path = self.model_call(state, attempt, directory, prepared)
+                    self.remaining()
                     attempt['stage'] = 'validate_plan'
                     self.save(state)
+                    self.remaining()
                     plan = self.native('author-decode', input_path, response_path)
+                    self.remaining()
                     r.atomic_json(directory / 'plan.json', plan)
                     attempt['stage'] = 'commit_candidate'
                     self.save(state)
+                    self.remaining(minimum=context['budget']['trial_reservation_seconds'])
                     sha = self.commit_plan(directory, context, files, plan, request_id)
                     attempt['candidate_commit'] = sha
                     attempt['stage'] = 'submit'
                     self.save(state)
+                    self.remaining(minimum=context['budget']['trial_reservation_seconds'])
                     proposal = {'schema_version': 2, 'campaign_id': context['campaign_id'], 'manifest_digest': context['manifest_digest'],
                                 'expected_revision': context['revision'], 'expected_best_commit': context['best']['commit'],
                                 'request_id': request_id, 'commit': sha, 'hypothesis': plan['hypothesis'], 'parents': [context['best']['id']]}
                     r.atomic_json(directory / 'proposal.json', proposal)
-                    trial = self.bridge.submit(proposal)
+                    self.remaining(minimum=context['budget']['trial_reservation_seconds'])
+                    trial = self.bridge.submit(proposal, deadline=self._attempt_deadline)
                     attempt['trial_id'] = trial['id']
                     attempt['stage'] = 'evaluate'
                     self.save(state)
+                    self.remaining()
                     live = self.campaign.load()
                     outcome = next(item for item in live['trials'] if item['id'] == trial['id'])
                     if outcome['status'] == 'queued':
+                        self.remaining(minimum=context['budget']['trial_reservation_seconds'])
                         outcome = self.evaluate(trial['id'], config)
+                    self.remaining()
                     r.require(outcome['status'] in r.TERMINAL, 'trial is owned by another controller; inspect before recovery')
                     attempt['status'] = outcome['status']
                     attempt['stage'] = 'finished'
                 except (KeyboardInterrupt, r.Stopped):
                     attempt['status'] = 'interrupted'
                     stop_reason = 'interrupted'
+                except AttemptExpired:
+                    attempt['status'] = 'author_failed'
+                    stop_reason = 'auto_budget_exhausted'
                 except (r.ResearchError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
                     attempt['status'] = 'author_failed'
-                    if attempt['stage'] == 'model_request':
+                    if self.campaign.stopped():
+                        attempt['status'] = 'interrupted'
+                        stop_reason = 'interrupted'
+                    elif time.monotonic() >= deadline:
+                        stop_reason = 'auto_budget_exhausted'
+                    elif attempt['stage'] == 'model_request':
                         stop_reason = 'transport_error'
                 finally:
                     elapsed = time.monotonic() - started
@@ -596,8 +651,13 @@ class AutoLoop:
                     attempt['failure_code'] = diagnostic_code(attempt)
                     attempt.pop('active_process_group', None)
                     state['failure_streak'] = streaks(state['attempts'])[0]
-                    self.save(state)
-                if stop_reason in ('interrupted', 'transport_error'):
+                    try:
+                        self.save(state)
+                        if stop_reason != 'interrupted' and time.monotonic() >= deadline:
+                            stop_reason = 'auto_budget_exhausted'
+                    finally:
+                        self._attempt_deadline = None
+                if stop_reason in ('interrupted', 'transport_error', 'auto_budget_exhausted'):
                     break
             return {**self.summary(state), 'stop_reason': stop_reason}
 

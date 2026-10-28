@@ -126,11 +126,19 @@ def fields(obj: Any, required: set[str], optional: set[str], name: str) -> None:
             f"unknown {name} fields: {sorted(obj.keys() - required - optional)}")
 
 
-def git(repo: Path, *args: str, timeout: float = 30) -> str:
+def remaining_timeout(timeout: float, deadline: float | None = None) -> float:
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    require(remaining > 0, "operation deadline reached")
+    return min(timeout, remaining)
+
+
+def git(repo: Path, *args: str, timeout: float = 30, deadline: float | None = None) -> str:
     result = subprocess.run(
         ["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *args],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=timeout, check=False,
+        timeout=remaining_timeout(timeout, deadline), check=False,
     )
     require(result.returncode == 0,
             f"git {args[0]} failed: {result.stderr.decode('utf-8', 'replace')[:2000].strip()}")
@@ -138,10 +146,10 @@ def git(repo: Path, *args: str, timeout: float = 30) -> str:
     return output if "-z" in args else output.rstrip("\n")
 
 
-def commit_id(repo: Path, ref: Any) -> str:
+def commit_id(repo: Path, ref: Any, deadline: float | None = None) -> str:
     ref = text(ref, "commit", 256)
     require(not ref.startswith("-"), "commit must not start with '-' ")
-    sha = git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
+    sha = git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}", deadline=deadline)
     require(re.fullmatch(r"[0-9a-f]{40,64}", sha) is not None, "unexpected Git commit ID")
     return sha
 
@@ -393,18 +401,18 @@ def retry(store: Store, trial_id: str, request_id: str) -> dict[str, Any]:
         return trial
 
 
-def check_candidate(manifest: dict[str, Any], sha: str) -> None:
+def check_candidate(manifest: dict[str, Any], sha: str, deadline: float | None = None) -> None:
     repo, base = Path(manifest["repo"]), manifest["baseline"]
     # No shell, globs, external diff drivers or rename heuristics.
-    changes = git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", base, sha, "--")
+    changes = git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", base, sha, "--", deadline=deadline)
     for path in changes.split("\x00"):
         if not path:
             continue
         require(any(within(path, allowed) for allowed in manifest["editable_paths"]),
                 f"candidate changes a non-editable path: {path}")
     for path in manifest["protected_paths"]:
-        original = git(repo, "rev-parse", "--verify", base + ":" + path)
-        proposed = git(repo, "rev-parse", "--verify", sha + ":" + path)
+        original = git(repo, "rev-parse", "--verify", base + ":" + path, deadline=deadline)
+        proposed = git(repo, "rev-parse", "--verify", sha + ":" + path, deadline=deadline)
         require(original == proposed, f"candidate changes protected evaluator/data: {path}")
 
 
@@ -515,9 +523,11 @@ def run_seed(store: Store, state: dict[str, Any], trial: dict[str, Any], stage: 
             # Burst writers may overshoot the polling limit; cap retained logs.
             stdout.truncate(min(os.fstat(stdout.fileno()).st_size, MAX_LOG))
             stderr.truncate(min(os.fstat(stderr.fileno()).st_size, MAX_LOG))
+    validation_deadline = min(deadline, started + request["timeout_seconds"])
     try:
-        require(commit_id(worktree, "HEAD") == trial["commit"], "evaluation changed HEAD")
-        require(not git(worktree, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", trial["commit"], "--"),
+        require(commit_id(worktree, "HEAD", deadline=validation_deadline) == trial["commit"], "evaluation changed HEAD")
+        require(not git(worktree, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", trial["commit"], "--",
+                        deadline=validation_deadline),
                 "evaluation modified tracked source or evaluator files")
         metrics = validate_metrics(read_json(result_path), manifest)
     except (ResearchError, OSError) as error:
@@ -532,7 +542,7 @@ def run_seed(store: Store, state: dict[str, Any], trial: dict[str, Any], stage: 
     return result
 
 
-def step(store: Store, expected_trial_id: str | None = None) -> dict[str, Any]:
+def step(store: Store, expected_trial_id: str | None = None, deadline: float | None = None) -> dict[str, Any]:
     with store.lock():
         state = store.load()
         require(not store.stopped(), "campaign is stopped; use resume")
@@ -553,25 +563,28 @@ def step(store: Store, expected_trial_id: str | None = None) -> dict[str, Any]:
             require(incumbent is not None and incumbent["status"] in ("baseline", "kept") and
                     set(stage_scores(incumbent, manifest)) == {"screen", "confirm"},
                     "incumbent lacks complete valid evidence")
-        check_candidate(manifest, trial["commit"])
+        check_candidate(manifest, trial["commit"], deadline=deadline)
         reservation = sum(len(manifest[stage]["seeds"]) for stage in ("screen", "confirm")) * manifest["budget"]["timeout_seconds"]
         require(state["charged_seconds"] + reservation <= manifest["budget"]["max_seconds"],
                 "time budget cannot cover the next trial's timeout reservation")
+        require(remaining_timeout(reservation, deadline) >= reservation,
+                "operation deadline cannot cover the next trial's timeout reservation")
         trial.update(status="running", charged_seconds=reservation, started_unix=time.time())
         state["charged_seconds"] += reservation
         store.save(state)  # Charge before launching; crashes cannot reset the budget.
         started = time.monotonic()
+        trial_deadline = started + reservation if deadline is None else min(started + reservation, deadline)
         interrupted = False
         try:
             trial["compared_to"] = state["best_id"]
             for stage in ("screen", "confirm"):
                 trial["results"][stage] = []
                 for seed in manifest[stage]["seeds"]:
-                    trial["results"][stage].append(run_seed(store, state, trial, stage, seed, started + reservation))
+                    trial["results"][stage].append(run_seed(store, state, trial, stage, seed, trial_deadline))
                     store.save(state)
                 if store.stopped():
                     raise Stopped("stop requested before selection")
-                require(time.monotonic() <= started + reservation, "trial deadline reached before selection")
+                require(time.monotonic() <= trial_deadline, "trial deadline reached before selection")
                 if incumbent and not improves(trial["results"][stage], incumbent["results"][stage], manifest["objective"]):
                     trial["status"] = "screened_out" if stage == "screen" else "archived"
                     trial["reason"] = f"no {stage} mean improvement beyond min_delta"

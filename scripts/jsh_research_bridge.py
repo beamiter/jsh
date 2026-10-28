@@ -161,7 +161,7 @@ class Bridge:
                       for parent in parents), "invalid parent IDs")
         r.require(len(set(parents)) == len(parents), "duplicate parent IDs")
 
-    def submit(self, proposal):
+    def submit(self, proposal, deadline=None):
         r, store = self.r, self.store
         self.validate_shape(proposal)
         request_digest = r.digest(proposal)
@@ -186,9 +186,10 @@ class Bridge:
             known = {trial["id"] for trial in context["recent_trials"] if trial["status"] in r.TERMINAL}
             known.add(context["best"]["id"])
             r.require(set(proposal["parents"]) <= known, "parents are not visible completed research trials")
-            sha = r.commit_id(Path(state["manifest"]["repo"]), proposal["commit"])
+            sha = r.commit_id(Path(state["manifest"]["repo"]), proposal["commit"], deadline=deadline)
             r.require(sha == proposal["commit"], "commit must be an exact full object ID")
-            r.check_candidate(state["manifest"], sha)
+            r.check_candidate(state["manifest"], sha, deadline=deadline)
+            r.remaining_timeout(30, deadline)
             trial = {"id": f"e{len(state['trials']):06d}", "request_id": proposal["request_id"],
                      "request_digest": request_digest, "proposal_schema": 2,
                      "bridge_binding": {key: proposal[key] for key in

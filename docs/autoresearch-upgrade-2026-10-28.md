@@ -126,3 +126,18 @@ best trial, and that a visible baseline matches the frozen baseline commit.
 Omitted history retains its existing semantics. Two protocol regressions cover
 these checks. jsh pins the published jagent commit
 `c3d08d0a13dfefb11cb6287ddd54792fdfd74b14` for this round.
+
+## Further follow-up: whole-attempt time and evidence consistency
+
+One monotonic deadline now spans author preparation, HTTP, candidate creation,
+admission and evaluation. It is bounded by the precharged attempt window and
+remaining total controller time. Child-operation timeouts cannot reset that
+clock, and evaluation only starts with a complete frozen trial window available.
+Stop still takes priority; late work retains its evidence and actual elapsed
+charge. These are cooperative checks, not OS resource quotas.
+
+V2 author feedback is now checked against visible context trial outcomes and
+scores, including numeric equivalence and omitted-history behavior. jsh pins
+published jagent `5513d173932656f44ee5132c8dc060aacd930e48` for these checks.
+Eight deterministic controller cases and six protocol cases cover deadline,
+stop, recovery, identity and score boundaries.

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### 2026-10-28 — end-to-end auto-attempt deadlines
+
+- Keep one monotonic deadline across preparation, model IO, candidate admission
+  and evaluation, bounded by the attempt reservation and remaining total time.
+- Cap Git/native/HTTP operations to remaining time and require a complete frozen
+  evaluation window before launch. Preserve evidence and measured charges when
+  a deadline stops the attempt; stop requests retain priority.
+- Pin jagent's cross-checks between typed feedback and visible trial evidence.
+
 ### 2026-10-28 — durable auto-attempt allocation
 
 - Persist auto-attempt identity and budget before creating its evidence directory.
