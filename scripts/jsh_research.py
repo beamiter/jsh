@@ -385,6 +385,27 @@ def mean_score(results: list[dict[str, Any]], metric: str) -> float:
     return math.fsum(result["metrics"][metric] / len(results) for result in results)
 
 
+def stage_scores(trial: dict[str, Any] | None, manifest: dict[str, Any]) -> dict[str, float]:
+    """Project only complete, validated, ordered seed sets into observations."""
+    if trial is None or trial["status"] not in TERMINAL:
+        return {}
+    scores = {}
+    for stage in ("screen", "confirm"):
+        if stage == "confirm" and "screen" not in scores:
+            continue
+        results = trial["results"].get(stage, [])
+        require(isinstance(results, list), "invalid stage evidence")
+        seeds = manifest[stage]["seeds"]
+        if (len(results) != len(seeds) or
+            any(not isinstance(item, dict) or type(item.get("seed")) is not int for item in results) or
+            [item["seed"] for item in results] != seeds):
+            continue
+        for item in results:
+            validate_metrics({"valid": True, "metrics": item.get("metrics")}, manifest)
+        scores[stage] = mean_score(results, manifest["objective"]["metric"])
+    return scores
+
+
 def improves(candidate: list[dict[str, Any]], incumbent: list[dict[str, Any]], objective: dict[str, Any]) -> bool:
     require([item["seed"] for item in candidate] == [item["seed"] for item in incumbent],
             "cannot compare different seed sets")
@@ -423,6 +444,9 @@ def run_seed(store: Store, state: dict[str, Any], trial: dict[str, Any], stage: 
                "timeout_seconds": min(manifest["budget"]["timeout_seconds"], deadline - time.monotonic())}
     require(request["timeout_seconds"] > 0, "trial deadline reached during checkout")
     atomic_json(directory / "request.json", request)
+    if store.stopped():
+        raise Stopped("stop requested before evaluation launch")
+    require(time.monotonic() < deadline, "trial deadline reached before evaluation launch")
     started = time.monotonic()
     with (directory / "stdout.log").open("xb") as stdout, (directory / "stderr.log").open("xb") as stderr:
         process = subprocess.Popen(request["argv"], cwd=worktree, env=env, stdin=subprocess.DEVNULL,
@@ -456,6 +480,9 @@ def run_seed(store: Store, state: dict[str, Any], trial: dict[str, Any], stage: 
         metrics = validate_metrics(read_json(result_path), manifest)
     except (ResearchError, OSError) as error:
         raise InvalidResult(str(error)) from error
+    if store.stopped():
+        raise Stopped("stop requested during result validation")
+    require(time.monotonic() - started <= request["timeout_seconds"], "evaluation validation timed out")
     result = {"seed": seed, "metrics": metrics, "elapsed_seconds": time.monotonic() - started,
               "evidence": str(directory.relative_to(store.root)),
               "result_sha256": hashlib.sha256(canonical({"valid": True, "metrics": metrics})).hexdigest()}
@@ -479,6 +506,11 @@ def step(store: Store, expected_trial_id: str | None = None) -> dict[str, Any]:
             return {"protocol": VERSION, "status": "needs_proposal", "best_id": state["best_id"]}
         manifest = state["manifest"]
         require(trial["kind"] == "baseline" or state["best_id"] is not None, "no valid baseline")
+        incumbent = next((item for item in state["trials"] if item["id"] == state["best_id"]), None)
+        if state["best_id"] is not None:
+            require(incumbent is not None and incumbent["status"] in ("baseline", "kept") and
+                    set(stage_scores(incumbent, manifest)) == {"screen", "confirm"},
+                    "incumbent lacks complete valid evidence")
         check_candidate(manifest, trial["commit"])
         reservation = sum(len(manifest[stage]["seeds"]) for stage in ("screen", "confirm")) * manifest["budget"]["timeout_seconds"]
         require(state["charged_seconds"] + reservation <= manifest["budget"]["max_seconds"],
@@ -489,13 +521,15 @@ def step(store: Store, expected_trial_id: str | None = None) -> dict[str, Any]:
         started = time.monotonic()
         interrupted = False
         try:
-            incumbent = next((item for item in state["trials"] if item["id"] == state["best_id"]), None)
             trial["compared_to"] = state["best_id"]
             for stage in ("screen", "confirm"):
                 trial["results"][stage] = []
                 for seed in manifest[stage]["seeds"]:
                     trial["results"][stage].append(run_seed(store, state, trial, stage, seed, started + reservation))
                     store.save(state)
+                if store.stopped():
+                    raise Stopped("stop requested before selection")
+                require(time.monotonic() <= started + reservation, "trial deadline reached before selection")
                 if incumbent and not improves(trial["results"][stage], incumbent["results"][stage], manifest["objective"]):
                     trial["status"] = "screened_out" if stage == "screen" else "archived"
                     trial["reason"] = f"no {stage} mean improvement beyond min_delta"

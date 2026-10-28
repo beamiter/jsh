@@ -30,6 +30,16 @@ logs. They still contain research identities and measured scores: review them
 before sharing. They are lock-free, read-only advisory snapshots, not an execution
 lease. Inspection does not recreate a deleted campaign identity.
 
+Each recent attempt also has a `comparison` object, or null when no comparison
+was recorded. It names the actual `compared_to` trial and commit, even if a
+different candidate is best today. Complete stages include sample count,
+candidate/reference means, signed improvement (positive always means better),
+min/max per-seed improvement, number of improved seeds and the strict
+`min_delta` decision. Incomplete/mismatched stages are omitted. These are
+descriptive measurements, not confidence intervals or a significance test.
+Report comparisons do not expand the model's typed-feedback schema or change
+promotion decisions.
+
 Execution, reports and preflight use one admission policy for stopped campaigns,
 pending work/recovery, context readiness, persistent budgets, failure ceilings and
 no-improvement limits. A queued candidate still requires explicit execution.
@@ -52,9 +62,13 @@ apparently valid edit choices.
 
 Scores are joined from the campaign by request ID, with stored trial/commit
 bindings checked. Only full stage results with the exact ordered seed set become
-means. Missing, partial or mismatched stages remain null, not zero. jagent rejects
+means. The bridge and auto reports use the same projector, including numeric and
+guardrail checks; confirmation is not projected without complete screening.
+Missing, partial or mismatched stages remain null, not zero. jagent rejects
 unbound scores, unknown fields, inconsistent outcome/evidence combinations and
-out-of-order attempt indices. These are host-record validation guarantees, not
+out-of-order attempt indices. Its updated validator also checks stage-specific
+failure codes, unique trial bindings, admission before bound observations, and
+screen evidence before confirmation. These are host-record validation guarantees, not
 remote attestation or proof of scientific improvement. Observations remain
 untrusted user-role data; the model cannot supply promotion scores.
 

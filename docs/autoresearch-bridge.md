@@ -58,12 +58,20 @@ pass: retain the commit, obtain fresh context and reassess the candidate.
 
 ## Bounded research memory
 
-The context contains at most 16 recent trials, 2048 UTF-8 bytes per hypothesis,
+The context contains at most 16 trials, 2048 UTF-8 bytes per hypothesis,
 completed-stage scores only, a separate best-candidate identity and an explicit
-omitted-trial count. Raw logs and ambient environment are not included. Encoded
+omitted-trial count. Usually these are the latest 16 trials. If the incumbent is
+older, its record and measured scores occupy one slot alongside the latest 15,
+so long runs never lose the target score from model context. Raw logs and ambient
+environment are not included. Encoded
 context is limited to 256 KiB and proposals to 32 KiB. Full historical evidence
 remains in campaign state and per-seed receipts; bounded context is not a
 replacement for that evidence.
+
+Scores require the exact ordered, integer seed set and valid numeric/guardrail
+metrics. Incomplete, duplicate, reordered or mismatched seeds are not averaged.
+Confirmation is only exposed when screening is complete. The updated jagent
+validator additionally rejects scores inconsistent with the recorded outcome.
 
 Prepared messages keep a constant system prompt and put all observations in
 untrusted user-role data. This preserves the existing jagent trust boundary; it

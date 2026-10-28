@@ -10,5 +10,7 @@
   "max_seconds": 14400,
   "max_failures": 3,
   "api_key_env": "JSH_RESEARCH_API_KEY",
-  "response_format": "json_schema"
+  "response_format": "json_schema",
+  "token_limit_field": "max_tokens",
+  "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
 }

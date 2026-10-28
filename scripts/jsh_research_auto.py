@@ -33,6 +33,7 @@ STAGES = {'prepare', 'model_request', 'validate_plan', 'commit_candidate', 'subm
 FAILURE_CODES = {'prepare': 'preparation_failed', 'model_request': 'transport_failed',
                  'validate_plan': 'plan_rejected', 'commit_candidate': 'candidate_rejected',
                  'submit': 'admission_rejected', 'evaluate': 'evaluation_unresolved'}
+DEFAULT_SAMPLING = {'temperature': 1.0, 'top_p': 0.95, 'top_k': 20}
 HTTP_CLIENT = r'''
 import json, os, sys, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -150,11 +151,26 @@ class AutoLoop:
     def save(self, state):
         self.r.atomic_json(self.state_path, state)
 
+    def sampling(self, raw):
+        r = self.r
+        r.fields(raw, set(), {'temperature', 'top_p', 'top_k', 'seed'}, 'sampling')
+        sampling = {**DEFAULT_SAMPLING, **raw}
+        for key, maximum in (('temperature', 2.0), ('top_p', 1.0)):
+            if sampling[key] is None:
+                continue
+            sampling[key] = r.number(sampling[key], 'sampling.' + key, 0)
+            r.require(sampling[key] <= maximum and (key != 'top_p' or sampling[key] > 0),
+                      'invalid sampling.' + key)
+        top_k, seed = sampling['top_k'], sampling.get('seed')
+        r.require(top_k is None or (type(top_k) is int and 1 <= top_k <= 1000000), 'invalid sampling.top_k')
+        r.require(seed is None or (type(seed) is int and 0 <= seed < 2**32), 'invalid sampling.seed')
+        return sampling
+
     def initialize(self, raw, allow_remote=False):
         r = self.r
         r.fields(raw, {'schema_version', 'endpoint', 'model', 'source_paths', 'max_attempts', 'max_output_tokens',
                        'max_tokens_per_call', 'request_timeout_seconds', 'max_seconds', 'max_failures'},
-                 {'api_key_env', 'response_format', 'max_no_improvement'}, 'auto config')
+                 {'api_key_env', 'response_format', 'max_no_improvement', 'sampling', 'token_limit_field'}, 'auto config')
         r.require(type(raw['schema_version']) is int and raw['schema_version'] == 1, 'unsupported auto config version')
         endpoint = r.text(raw['endpoint'], 'endpoint', 2048)
         r.require(not any(ord(ch) <= 32 or ord(ch) == 127 for ch in endpoint), 'invalid endpoint characters')
@@ -171,6 +187,9 @@ class AutoLoop:
         r.require(parsed.port is None or 1 <= parsed.port <= 65535, 'invalid endpoint port')
         model = r.text(raw['model'], 'model', 256)
         r.require(model.strip() and not any(ord(ch) < 32 for ch in model), 'invalid model name')
+        sampling = self.sampling(raw.get('sampling', {}))
+        token_limit_field = raw.get('token_limit_field', 'max_tokens')
+        r.require(token_limit_field in ('max_tokens', 'max_completion_tokens'), 'invalid token_limit_field')
         paths = raw['source_paths']
         r.require(isinstance(paths, list) and 1 <= len(paths) <= 8, 'choose 1..8 tracked UTF-8 source files')
         paths = [r.path_prefix(path) for path in paths]
@@ -195,7 +214,8 @@ class AutoLoop:
         context = self.bridge.snapshot()
         r.require(context['next_action'] == 'needs_proposal', 'run a valid baseline and clear pending work before auto-init')
         config = {'schema_version': 1, 'endpoint': endpoint, 'model': model, 'source_paths': paths,
-                  'allow_remote': bool(allow_remote), 'api_key_env': key_env, 'response_format': response_format, **limits}
+                  'allow_remote': bool(allow_remote), 'api_key_env': key_env, 'response_format': response_format,
+                  'sampling': sampling, 'token_limit_field': token_limit_field, **limits}
         r.require(self.reservation(config, context) <= config['max_seconds'], 'time budget cannot cover one reserved attempt')
         self.sources(context, config)
         with self.lock_store.lock(create=True):
@@ -246,18 +266,31 @@ class AutoLoop:
         return 'needs_proposal'
 
     def scores(self, trial, manifest):
-        scores = {'screen': None, 'confirm': None}
-        if trial is None or trial['status'] not in self.r.TERMINAL:
-            return scores
+        return {'screen': None, 'confirm': None, **self.r.stage_scores(trial, manifest)}
+
+    def comparison(self, trial, trials, manifest):
+        """Descriptive paired-seed evidence against the actual trial incumbent."""
+        if trial is None or trial['status'] not in self.r.TERMINAL or trial.get('compared_to') is None:
+            return None
+        reference = trials.get(trial['compared_to'])
+        self.r.require(reference is not None and reference['id'] != trial['id'] and
+                       reference['status'] in ('baseline', 'kept'), 'invalid comparison incumbent')
+        scores, reference_scores = self.scores(trial, manifest), self.scores(reference, manifest)
         metric = manifest['objective']['metric']
-        for stage in scores:
-            results = trial['results'].get(stage, [])
-            seeds = manifest[stage]['seeds']
-            if len(results) == len(seeds) and [item['seed'] for item in results] == seeds:
-                for item in results:
-                    self.r.number(item['metrics'][metric], 'feedback metric')
-                scores[stage] = self.r.number(self.r.mean_score(results, metric), 'feedback mean')
-        return scores
+        sign = 1 if manifest['objective']['direction'] == 'max' else -1
+        stages = {}
+        for stage in ('screen', 'confirm'):
+            if scores[stage] is None or reference_scores[stage] is None:
+                continue
+            deltas = [sign * (item['metrics'][metric] - base['metrics'][metric])
+                      for item, base in zip(trial['results'][stage], reference['results'][stage])]
+            improvement = sign * (scores[stage] - reference_scores[stage])
+            stages[stage] = {'samples': len(deltas), 'candidate_mean': scores[stage],
+                             'reference_mean': reference_scores[stage], 'mean_improvement': improvement,
+                             'min_improvement': min(deltas), 'max_improvement': max(deltas),
+                             'improved_seeds': sum(delta > 0 for delta in deltas),
+                             'meets_min_delta': improvement > manifest['objective']['min_delta']}
+        return {'reference': {'id': reference['id'], 'commit': reference['commit']}, 'stages': stages}
 
     def observations(self, state, campaign, recent=4, include_running=False):
         trials = {item['request_id']: item for item in campaign['trials']}
@@ -291,6 +324,12 @@ class AutoLoop:
         for item in state['attempts']:
             counts[item['status']] += 1
         best = next((item for item in campaign['trials'] if item['id'] == campaign['best_id']), None)
+        trials = {item['id']: item for item in campaign['trials']}
+        attempts = self.observations(state, campaign, recent, include_running=True)
+        by_request = {item['request_id']: item for item in campaign['trials']}
+        for item in attempts:
+            trial = by_request.get(state['attempts'][item['attempt'] - 1]['id'])
+            item['comparison'] = self.comparison(trial, trials, campaign['manifest'])
         failures, plateau = streaks(state['attempts'], best['commit'] if best else None)
         action = self.decision(state, campaign, context)
         return {'protocol': 'jsh.research.auto.report/v1', 'campaign_id': state['campaign_id'],
@@ -305,7 +344,7 @@ class AutoLoop:
                               'controller_seconds': max(0.0, config['max_seconds'] - state['charged_seconds']),
                               'campaign_trials': context['budget']['max_trials'] - context['budget']['trials_used']},
                 'next_attempt_reservation_seconds': self.reservation(config, context),
-                'recent_attempts': self.observations(state, campaign, recent, include_running=True),
+                'recent_attempts': attempts,
                 'omitted_attempts': max(0, len(state['attempts']) - recent)}
 
     def preflight(self):
@@ -342,19 +381,38 @@ class AutoLoop:
         for path in config['source_paths']:
             r.require(any(r.within(path, prefix) for prefix in manifest['editable_paths']) and
                       not any(r.within(path, prefix) for prefix in manifest['protected_paths']), 'source is not editable')
-            entry = r.git(repo, '--literal-pathspecs', 'ls-tree', '-z', base, '--', path)
-            records = entry.split('\0')
-            r.require(len(records) == 2 and records[-1] == '', 'source must name exactly one tracked file')
-            header, actual = records[0].split('\t', 1)
-            mode, kind, blob = header.split()
-            r.require(actual == path and mode in ('100644', '100755') and kind == 'blob', 'source must be a regular tracked file, not a link/submodule')
-            size = int(r.git(repo, 'cat-file', '-s', blob))
+        # ls-tree -l supplies object sizes before any blob is read. Batch both
+        # metadata and content instead of launching three Git processes per file.
+        listing = r.git(repo, '--literal-pathspecs', 'ls-tree', '-l', '-z', base, '--', *config['source_paths'])
+        entries = {}
+        for record in listing.split('\0'):
+            if not record:
+                continue
+            header, path = record.split('\t', 1)
+            mode, kind, blob, size_text = header.split()
+            r.require(path in config['source_paths'] and path not in entries and
+                      mode in ('100644', '100755') and kind == 'blob',
+                      'source must be a regular tracked file, not a link/submodule')
+            size = int(size_text)
             total += size
-            r.require(total <= 65536, 'selected source exceeds 64 KiB')
-            data = subprocess.run(['git', '-C', str(repo), 'cat-file', 'blob', blob], stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=True).stdout
-            r.require(len(data) == size and b'\0' not in data, 'invalid source bytes')
+            r.require(size >= 0 and total <= 65536, 'selected source exceeds 64 KiB')
+            entries[path] = (blob, size)
+        r.require(set(entries) == set(config['source_paths']), 'source must name exactly one tracked file')
+        queries = ''.join(entries[path][0] + '\n' for path in config['source_paths']).encode('ascii')
+        content = subprocess.run(['git', '-C', str(repo), 'cat-file', '--batch'], input=queries,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=True).stdout
+        offset = 0
+        for path in config['source_paths']:
+            blob, size = entries[path]
+            header = (blob + ' blob ' + str(size) + '\n').encode('ascii')
+            r.require(content[offset:offset + len(header)] == header, 'source batch object mismatch')
+            offset += len(header)
+            data = content[offset:offset + size]
+            offset += size
+            r.require(len(data) == size and b'\0' not in data and content[offset:offset + 1] == b'\n', 'invalid source bytes')
+            offset += 1
             files.append({'path': path, 'blob': blob, 'content': data.decode('utf-8', 'strict')})
+        r.require(offset == len(content), 'unexpected source batch content')
         return files
 
     def native(self, command, *paths):
@@ -374,8 +432,11 @@ class AutoLoop:
 
     def model_call(self, state, attempt, directory, prepared):
         r, config = self.r, state['config']
+        token_limit_field = config.get('token_limit_field', 'max_tokens')
+        r.require(token_limit_field in ('max_tokens', 'max_completion_tokens'), 'invalid token_limit_field')
         body = {'model': config['model'], 'messages': prepared['messages'], 'stream': False, 'n': 1,
-                'max_tokens': config['max_tokens_per_call'], 'temperature': 1.0, 'top_p': 0.95, 'top_k': 20}
+                token_limit_field: config['max_tokens_per_call'],
+                **{key: value for key, value in self.sampling(config.get('sampling', {})).items() if value is not None}}
         if config['response_format'] == 'json_schema':
             body['response_format'] = {'type': 'json_schema', 'json_schema': {
                 'name': 'research_edit', 'strict': True, 'schema': prepared['response_schema']}}

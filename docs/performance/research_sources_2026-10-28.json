@@ -1,0 +1,12 @@
+{
+  "scope": "local source-snapshot microbenchmark; not end-to-end model/evaluator throughput",
+  "command": "python3 scripts/bench_research_sources.py --before-ref 4ca2639 --samples 20",
+  "before_ref": "4ca2639",
+  "files": 8,
+  "source_bytes": 20576,
+  "warmups": 4,
+  "samples": 20,
+  "median_ms": {"before": 124.202, "after": 11.847},
+  "speedup": 10.48,
+  "git_processes": {"before": 24, "after": 2}
+}

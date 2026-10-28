@@ -144,6 +144,7 @@ class BridgeTests(BridgeFixture):
             trial = copy.deepcopy(state["trials"][0])
             trial.update(id=f"e{i:06d}", request_id=f"legacy-{i}", kind="candidate",
                          status="screened_out", hypothesis="研" * 4000, parents=["baseline"])
+            trial["results"].pop("confirm")
             state["trials"].append(trial)
         self.store.save(state)
         context = self.bridge.snapshot()

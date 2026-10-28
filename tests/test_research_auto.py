@@ -32,6 +32,11 @@ class ModelHandler(BaseHTTPRequestHandler):
         self.server.auth.append(self.headers.get('Authorization'))
         if self.server.callback:
             self.server.callback()
+        if any(key in body for key in getattr(self.server, 'reject_fields', ())):
+            self.send_response(400)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         mode = self.server.mode
         if mode == 'delay':
             time.sleep(2)

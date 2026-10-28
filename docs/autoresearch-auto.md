@@ -52,7 +52,28 @@ research history to that endpoint: review privacy before opting in. Userinfo,
 query/fragment credentials, port zero and ambiguous paths are rejected.
 
 The non-streaming request uses messages, `max_tokens`, temperature=1, top_p=0.95
-and top_k=20. `response_format` can be `json_schema` (default) or `json_object`.
+and top_k=20 by default. New configurations can select bounded sampling values
+and the server's output-token parameter explicitly:
+
+```json
+{
+  "token_limit_field": "max_completion_tokens",
+  "sampling": {"temperature": 0.5, "top_p": 0.9, "top_k": null, "seed": 42}
+}
+```
+
+These are optional fields in the `auto-init` configuration. `token_limit_field`
+accepts only `max_tokens` (default) or `max_completion_tokens`; either sends the
+same budgeted `max_tokens_per_call` value. Sampling accepts temperature in 0..2,
+top_p in (0,1], top_k in 1..1,000,000 and an integer seed in 0..2^32-1. A null
+value omits that field from the HTTP body, useful for servers without top_k or
+models with fixed sampling. Omitted sampling fields retain historical defaults;
+seed has no default and is not sent unless configured. Unknown fields and invalid
+types fail during offline initialization. These settings are frozen with the loop;
+existing loops retain their original request defaults. A configured seed requests
+server behavior; it does not guarantee deterministic generation.
+
+`response_format` can be `json_schema` (default) or `json_object`.
 The latter appends the required schema as data but never relaxes native response
 validation. Real server support for these fields must be checked on your chosen
 Flint serving build; this implementation does not claim live-model compatibility
@@ -72,6 +93,10 @@ The remote server may continue generation after the client disconnects.
 
 The host reads the selected files at the current best commit, including original
 Git blob IDs, and jagent accepts only complete replacements for those files.
+Source snapshots use two Git processes for all 1..8 files: one bounded metadata
+query and one blob batch. Sizes are checked before fetching content, and each
+batch header, byte count, UTF-8 payload and separator is checked. Configured file
+order, executable modes and exact line endings are preserved.
 No arbitrary commands, fabricated commits, supplied scores, new/deleted files,
 symlinks or submodules are accepted. The auto loop keeps total selected source
 at most 64 KiB after editing so the next round can read it again. The shared

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### 2026-10-28 — autoresearch evidence, model configuration and source snapshots
+
+- Share complete ordered-seed, numeric and guardrail validation across bridge
+  context and auto reports; retain incumbent scores within bounded model memory.
+- Add frozen sampling/seed configuration and selectable output-token field,
+  including explicit omission for unsupported sampling parameters.
+- Read up to eight selected files with two Git processes, preserving exact source
+  bytes and rejecting oversize content before blob reads.
+- Report per-seed improvement summaries against the actual historical incumbent;
+  honor stop/deadline during preparation and result validation.
+- See the [upgrade notes](docs/autoresearch-upgrade-2026-10-28.md) for configuration,
+  benchmark measurements and cross-repository validation.
+
 ### 2026-10-27 — Bash parity, value pipelines, and startup
 
 - Bash compatibility is now measured with an opt-in differential test that

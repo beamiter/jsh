@@ -192,6 +192,10 @@ PID**, which could have been reused. Inspect/stop orphaned processes yourself
 before recovery. There remains a small crash window between process creation
 and recording its group; inspect the host after an unclean shutdown.
 
+Stop and deadline checks also run after worktree preparation, before launching
+the evaluator, and after result validation. Validation time counts toward the
+per-seed timeout; a stop observed while validating cannot promote the result.
+
 Per-stream logs are monitored at 8 MiB and truncated to that retention limit on
 cleanup; a burst writer can transiently exceed it. Worktrees and artifacts are
 retained for diagnosis and **are not automatically garbage-collected**. Apply

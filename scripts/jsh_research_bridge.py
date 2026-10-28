@@ -102,7 +102,12 @@ class Bridge:
             action = "needs_proposal"
         recent = []
         ids = set()
-        for trial in trials[-RECENT_TRIALS:]:
+        selected = trials[-RECENT_TRIALS:]
+        # Keep the incumbent's measured scores visible even after many losses.
+        # Identity alone cannot tell the author what it needs to improve upon.
+        if best is not None and all(trial["id"] != best["id"] for trial in selected):
+            selected = [best, *trials[-(RECENT_TRIALS - 1):]]
+        for trial in selected:
             trial_id = trial["id"]
             r.require(isinstance(trial_id, str) and
                       re.fullmatch(r"baseline|e[0-9]{6,15}", trial_id) is not None and trial_id not in ids,
@@ -113,9 +118,7 @@ class Bridge:
             hypothesis = hypothesis.encode("utf-8")[:2048].decode("utf-8", "ignore")
             if not hypothesis.strip():
                 hypothesis = "(empty hypothesis in legacy record)"
-            scores = {stage: r.mean_score(results, manifest["objective"]["metric"])
-                      for stage, results in trial["results"].items()
-                      if stage in ("screen", "confirm") and len(results) == len(manifest[stage]["seeds"])}
+            scores = r.stage_scores(trial, manifest)
             recent.append({"id": trial_id, "commit": trial["commit"], "hypothesis": hypothesis,
                            "status": trial["status"], "parents": trial["parents"], "scores": scores})
         for key in ("editable_paths", "protected_paths"):
