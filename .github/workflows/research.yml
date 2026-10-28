@@ -1,49 +1,39 @@
 name: Research controller
-
 on:
   push:
-    paths:
-      - '.github/workflows/research.yml'
-      - 'scripts/jsh_research.py'
-      - 'tests/test_research.py'
-      - 'tests/research_cli.rs'
-      - 'src/research.rs'
-      - 'src/main.rs'
-      - 'src/lib.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+    branches: [master, 'agent/autoresearch-bridge-verify-20261028']
+    paths: ['scripts/jsh_research*.py', 'tests/test_research*.py', 'tests/research*.rs', 'src/**', 'Cargo.*', '.github/workflows/research.yml']
   pull_request:
-    paths:
-      - '.github/workflows/research.yml'
-      - 'scripts/jsh_research.py'
-      - 'tests/test_research.py'
-      - 'tests/research_cli.rs'
-      - 'src/research.rs'
-      - 'src/main.rs'
-      - 'src/lib.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+    paths: ['scripts/jsh_research*.py', 'tests/test_research*.py', 'tests/research*.rs', 'src/**', 'Cargo.*', '.github/workflows/research.yml']
   workflow_dispatch:
-
 permissions:
   contents: read
-
+env:
+  CARGO_INCREMENTAL: '0'
 jobs:
-  research:
+  controller:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - run: python3 -m unittest discover -s tests -p 'test_research*.py' -v
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ['--no-default-features', '--all-features']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          components: rustfmt
-      - name: Test controller without models, credentials or GPUs
-        run: python3 -m unittest discover -s tests -p test_research.py -v
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
-      - name: Test embedded CLI without AI
-        run: cargo test --locked --no-default-features --test research_cli
-      - name: Test embedded CLI with AI
-        run: cargo test --locked --all-features --test research_cli
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test --locked ${{ matrix.features }} --no-fail-fast
