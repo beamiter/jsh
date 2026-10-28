@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### 2026-10-28 — campaign ledger and repeatable recovery
+
+- Validate total time against the per-trial ledger, unique trial/request IDs,
+  parent references, outcome states and the best-candidate pointer on load.
+- Keep revision and prepared proposals unchanged when recovery has no work.
+- Use the same complete-seed evidence projection for status/export and agent
+  context; pin jagent's additional readiness consistency validation.
+- Repair macOS compilation by using the platform random device outside
+  Linux/Android and making platform-specific signal table entries conditional.
+
 ### 2026-10-28 — autoresearch evidence, model configuration and source snapshots
 
 - Share complete ordered-seed, numeric and guardrail validation across bridge

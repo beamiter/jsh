@@ -159,6 +159,11 @@ trials/e000001/screen-11/
 
 Writes use exclusive temporary files, fsync and atomic replacement. A single
 writer lock prevents competing controllers from launching the same trial.
+Loading checks that total charged time agrees with the per-trial ledger within
+floating-point tolerance. Duplicate trial/request IDs, invalid parent references,
+unknown statuses and invalid best pointers fail before execution or mutation.
+Legacy optional metadata is preserved; running snapshots do not require a process
+group before a child has been launched.
 `status`, `export` and `stop` remain available while a run holds the writer lock.
 Newly created campaign directories are private (0700), and state files are 0600.
 Use an already-private parent directory and do not share state/logs casually.
@@ -184,6 +189,12 @@ jsh research --root /absolute/path/research-campaign recover
 jsh research --root /absolute/path/research-campaign retry e000001 --request-id retry-0001
 jsh research --root /absolute/path/research-campaign run --execute
 ```
+
+Recovery with no running trial is read-only: it does not advance revision or
+invalidate a prepared proposal. After a real recovery, repeating the command
+also leaves revision and time charges unchanged. Status/export use the same
+complete ordered-seed evidence projection as agent context; partial or mismatched
+stages are not reported as measured means.
 
 The executor terminates the process group it created on completion, timeout,
 stop, Ctrl-C or SIGTERM. A SIGKILL/power loss can leave children behind. Recovery

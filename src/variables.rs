@@ -608,13 +608,26 @@ impl Default for DynamicVars {
 /// 32 bits from the operating system's random source, for `SRANDOM`.
 fn os_random_u32() -> u32 {
     let mut buf = [0u8; 4];
-    // SAFETY: getrandom writes at most `buf.len()` bytes into `buf`.
-    let n = unsafe { nix::libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
-    if n == buf.len() as isize {
-        return u32::from_ne_bytes(buf);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: getrandom writes at most `buf.len()` bytes into `buf`.
+        let n = unsafe { nix::libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n == buf.len() as isize {
+            return u32::from_ne_bytes(buf);
+        }
     }
-    // getrandom is unavailable only on ancient kernels; fall back to a
-    // time-derived value rather than failing an expansion.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        use std::io::Read;
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut buf))
+            .is_ok()
+        {
+            return u32::from_ne_bytes(buf);
+        }
+    }
+    // If the OS random source is unavailable, preserve the existing fallback
+    // rather than failing a shell expansion.
     let now = now_epoch();
     now.subsec_nanos() ^ (now.as_secs() as u32) ^ std::process::id()
 }

@@ -227,6 +227,49 @@ def normalize_manifest(raw: Any, relative_to: Path) -> dict[str, Any]:
             "dataset_id": dataset, **prefixes}
 
 
+def validate_ledger(state: dict[str, Any]) -> None:
+    """Validate durable identities and charges without reinterpreting old results."""
+    manifest, trials = state["manifest"], state["trials"]
+    require(isinstance(manifest, dict) and isinstance(manifest.get("budget"), dict), "invalid frozen budget")
+    maximum = manifest["budget"].get("max_trials")
+    require(type(maximum) is int and 1 <= maximum <= 10000, "invalid trial budget")
+    require(isinstance(trials, list) and 1 <= len(trials) <= maximum, "invalid trial accounting")
+    total = number(state["charged_seconds"], "charged_seconds", 0)
+    ids, requests, charges = {}, set(), []
+    for trial in trials:
+        require(isinstance(trial, dict), "invalid trial record")
+        required = {"id", "request_id", "commit", "hypothesis", "kind", "parents", "status", "results", "charged_seconds"}
+        require(required <= trial.keys(), "missing trial fields")
+        identifier = text(trial["id"], "trial ID", 16)
+        require(re.fullmatch(r"baseline|e[0-9]{6,15}", identifier) is not None and identifier not in ids,
+                "invalid or duplicate trial ID")
+        request = text(trial["request_id"], "request ID", 128)
+        require(request not in requests, "duplicate trial request ID")
+        requests.add(request)
+        require(trial["kind"] in ("baseline", "candidate"), "invalid trial kind")
+        require(isinstance(trial["status"], str) and trial["status"] in TERMINAL | {"queued", "running"},
+                "invalid trial status")
+        require(isinstance(trial["commit"], str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", trial["commit"]) is not None,
+                "invalid trial commit")
+        text(trial["hypothesis"], "hypothesis", 8192)
+        parents = trial["parents"]
+        require(isinstance(parents, list) and len(parents) <= 8 and all(isinstance(parent, str) for parent in parents),
+                "invalid trial parents")
+        require(len(set(parents)) == len(parents) and all(parent in ids for parent in parents),
+                "trial parents must reference earlier trials")
+        results = trial["results"]
+        require(isinstance(results, dict) and results.keys() <= {"screen", "confirm"} and
+                all(isinstance(items, list) for items in results.values()), "invalid trial results")
+        charges.append(number(trial["charged_seconds"], "trial charge", 0))
+        ids[identifier] = trial
+    best = state["best_id"]
+    require(best is None or (isinstance(best, str) and best in ids and ids[best]["status"] in ("baseline", "kept")),
+            "invalid best-candidate pointer")
+    require(sum(trial["status"] == "running" for trial in trials) <= 1, "multiple running trials")
+    require(math.isclose(math.fsum(charges), total, rel_tol=1e-9, abs_tol=1e-6),
+            "campaign time charges do not match trial ledger")
+
+
 class Store:
     def __init__(self, root: Path):
         # Do not silently follow an existing campaign-directory symlink.
@@ -257,9 +300,8 @@ class Store:
                        "charged_seconds", "trials"}, set(), "state")
         require(state["protocol"] == VERSION, "unsupported campaign state")
         require(type(state["revision"]) is int and state["revision"] >= 1, "invalid state revision")
-        number(state["charged_seconds"], "charged_seconds", 0)
-        require(isinstance(state["trials"], list) and state["trials"], "missing trial records")
         require(digest(state["manifest"]) == state["manifest_digest"], "frozen manifest digest mismatch")
+        validate_ledger(state)
         return state
 
     def save(self, state: dict[str, Any]) -> None:
@@ -559,6 +601,7 @@ def step(store: Store, expected_trial_id: str | None = None) -> dict[str, Any]:
 def recover(store: Store) -> dict[str, Any]:
     with store.lock():
         state = store.load()
+        changed = False
         for trial in state["trials"]:
             if trial["status"] != "running":
                 continue
@@ -572,7 +615,9 @@ def recover(store: Store) -> dict[str, Any]:
                     raise ResearchError(f"process group {group} may still be alive; inspect/stop it before recovery")
             trial.update(status="interrupted", reason="controller recovery; full timeout reservation retained")
             trial.pop("active_process_group", None)
-        store.save(state)
+            changed = True
+        if changed:
+            store.save(state)
         return summary(store, state)
 
 
@@ -581,10 +626,8 @@ def summary(store: Store, state: dict[str, Any]) -> dict[str, Any]:
     trials = []
     for trial in state["trials"]:
         item = {key: trial[key] for key in ("id", "request_id", "kind", "commit", "hypothesis", "parents", "status")}
-        item["scores"] = {stage: mean_score(results, manifest["objective"]["metric"])
-                          for stage, results in trial["results"].items() if results}
-        item["complete_stages"] = [stage for stage, results in trial["results"].items()
-                                   if len(results) == len(manifest[stage]["seeds"])]
+        item["scores"] = stage_scores(trial, manifest)
+        item["complete_stages"] = list(item["scores"])
         if "reason" in trial:
             item["reason"] = trial["reason"]
         trials.append(item)

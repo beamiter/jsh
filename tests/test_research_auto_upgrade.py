@@ -41,6 +41,7 @@ class EvidenceUpgradeTests(BridgeFixture):
                          parents=['baseline'], kind='candidate')
             trial['results'].pop('confirm')
             state['trials'].append(trial)
+        state['charged_seconds'] = sum(trial['charged_seconds'] for trial in state['trials'])
         self.store.save(state)
         context = self.bridge.snapshot()
         self.assertEqual(len(context['recent_trials']), 16)

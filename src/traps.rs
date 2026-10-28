@@ -54,7 +54,7 @@ impl TrapTarget {
 
 /// The fixed (non-real-time) signals, numbered as on this platform.
 fn named_signals() -> Vec<(i32, &'static str)> {
-    let mut table = vec![
+    vec![
         (libc::SIGHUP, "HUP"),
         (libc::SIGINT, "INT"),
         (libc::SIGQUIT, "QUIT"),
@@ -84,13 +84,11 @@ fn named_signals() -> Vec<(i32, &'static str)> {
         (libc::SIGWINCH, "WINCH"),
         (libc::SIGIO, "IO"),
         (libc::SIGSYS, "SYS"),
-    ];
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        table.push((libc::SIGSTKFLT, "STKFLT"));
-        table.push((libc::SIGPWR, "PWR"));
-    }
-    table
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        (libc::SIGSTKFLT, "STKFLT"),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        (libc::SIGPWR, "PWR"),
+    ]
 }
 
 /// The real-time signal range, when the platform has one.

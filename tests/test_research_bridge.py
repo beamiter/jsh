@@ -132,6 +132,7 @@ class BridgeTests(BridgeFixture):
         proposal = self.bound(self.candidate())
         state = self.store.load()
         state["charged_seconds"] = 199
+        state["trials"][0]["charged_seconds"] = 199
         self.store.save(state)
         self.assertEqual(self.bridge.snapshot()["next_action"], "budget_exhausted")
         with self.assertRaises(r.ResearchError):
@@ -146,6 +147,7 @@ class BridgeTests(BridgeFixture):
                          status="screened_out", hypothesis="研" * 4000, parents=["baseline"])
             trial["results"].pop("confirm")
             state["trials"].append(trial)
+        state["charged_seconds"] = sum(trial["charged_seconds"] for trial in state["trials"])
         self.store.save(state)
         context = self.bridge.snapshot()
         self.assertEqual(len(context["recent_trials"]), 16)

@@ -332,6 +332,7 @@ class QueueAndRecoveryTests(Fixture):
         with self.store.lock():
             state = self.store.load()
             state["charged_seconds"] = 199
+            state["trials"][0]["charged_seconds"] = 199
             self.store.save(state)
         with self.assertRaisesRegex(r.ResearchError, "budget"):
             r.step(self.store)

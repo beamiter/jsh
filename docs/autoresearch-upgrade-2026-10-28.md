@@ -84,4 +84,30 @@ cargo +1.86.0 test --locked --test research --test research_author --test resear
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-The release dependency is pinned to jagent `9fd9eab99ab21a1d88ac786b063ce40508429c9f`, published through the GitHub Git Data API. The earlier local-override validation is followed by a normal locked build against that published revision. No path patch is required for consumers.
+The first round was published through the GitHub Git Data API and validated with
+a normal locked build. The follow-up pins jagent
+`46a519dc40988ca727f61924989aa7a93a1aaad6`; no local path patch is required.
+
+## Follow-up: ledger consistency and idempotent recovery
+
+The next round validates campaign identities, parent references, status/best
+consistency and total time against the complete per-trial ledger on every load.
+A controller cannot discard a charge by changing only the campaign total.
+Malformed state fails before execution and remains available for inspection.
+This is consistency validation, not protection against rewriting the entire
+ledger as the same OS user.
+
+No-op recovery now preserves revision, existing proposal bindings and budget.
+Status/export share the same complete-seed score projection as bridge/report.
+The shared jagent validator rejects a ready-for-proposal context containing
+visible queued/running work while retaining bounded-window behavior.
+
+Additional regression coverage exercises these rules both directly and through
+the compiled embedded controller, including unchanged state on rejected runs.
+The follow-up adds 13 ledger/recovery cases and two shared-context cases; ledger
+integration is checked in both core-only and AI-enabled builds.
+
+Publication CI also exposed an existing macOS build failure in the shell's
+`SRANDOM` implementation. The follow-up keeps Linux/Android `getrandom` and uses
+`/dev/urandom` on other platforms, preserving the previous failure fallback.
+Conditional signal entries no longer require a platform-dependent mutable vector.
