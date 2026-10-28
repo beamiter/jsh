@@ -130,7 +130,7 @@ class Bridge:
                               "trials_used": len(trials), "charged_seconds": state["charged_seconds"],
                               "trial_reservation_seconds": reservation},
                    "recent_trials": recent, "omitted_trials": len(trials) - len(recent)}
-        r.require(len(r.canonical(context)) <= MAX_CONTEXT, "bridge context exceeds 256 KiB")
+        r.require(len(r.canonical(context)) + 1 <= MAX_CONTEXT, "bridge context exceeds 256 KiB")
         return context
 
     def validate_shape(self, proposal):
@@ -197,12 +197,12 @@ class Bridge:
             return trial
 
     def resume(self):
-        # Resuming an idle stopped campaign must invalidate pre-stop snapshots
-        # too; the legacy engine's resume did not advance its state revision.
+        # Persist the new epoch BEFORE clearing STOP. A failed write/crash must
+        # not reopen the campaign with its old, still-valid proposal bindings.
         with self.store.lock():
             state = self.store.load()
-            (self.store.root / "STOP").unlink(missing_ok=True)
             self.store.save(state)
+            (self.store.root / "STOP").unlink(missing_ok=True)
         return {"protocol": self.r.VERSION, "stopped": False, "revision": state["revision"]}
 
 
