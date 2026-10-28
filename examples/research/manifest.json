@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "my-research-campaign",
+  "repo": "REPLACE_WITH_ABSOLUTE_REPOSITORY_PATH",
+  "baseline": "HEAD",
+  "dataset_id": "REPLACE_WITH_FROZEN_DATASET_MANIFEST_DIGEST",
+  "objective": {"metric": "loss", "direction": "min", "min_delta": 0.001},
+  "screen": {"argv": ["python3", "evaluate.py"], "seeds": [11, 23]},
+  "confirm": {"argv": ["python3", "evaluate.py"], "seeds": [101, 211, 307]},
+  "protected_paths": ["evaluate.py", "data/manifest.json"],
+  "editable_paths": ["candidate.py"],
+  "guardrails": {"constraint_violations": {"max": 0}},
+  "budget": {"max_trials": 30, "max_seconds": 18000, "timeout_seconds": 60}
+}

@@ -37,6 +37,7 @@ pub mod pipeline_data;
 mod printf;
 pub mod probe;
 pub mod prompt;
+pub mod research;
 pub mod session;
 pub mod shadowing;
 pub mod shell;

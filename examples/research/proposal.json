@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "request_id": "experiment-0001",
+  "commit": "REPLACE_WITH_EXISTING_CANDIDATE_COMMIT",
+  "hypothesis": "A specific, falsifiable change should improve loss without increasing constraint violations.",
+  "parents": ["baseline"]
+}
