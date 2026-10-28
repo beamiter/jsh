@@ -463,13 +463,18 @@ def run_seed(store: Store, state: dict[str, Any], trial: dict[str, Any], stage: 
     return result
 
 
-def step(store: Store) -> dict[str, Any]:
+def step(store: Store, expected_trial_id: str | None = None) -> dict[str, Any]:
     with store.lock():
         state = store.load()
         require(not store.stopped(), "campaign is stopped; use resume")
         require(not any(trial["status"] == "running" for trial in state["trials"]),
                 "interrupted controller detected; use recover before running again")
         trial = next((trial for trial in state["trials"] if trial["status"] == "queued"), None)
+        # Check identity under the same writer lock as budget reservation/launch.
+        # A concurrent manual controller must not redirect an auto attempt.
+        if expected_trial_id is not None:
+            require(trial is not None and trial["id"] == expected_trial_id,
+                    "queue head changed; refusing unrelated trial")
         if trial is None:
             return {"protocol": VERSION, "status": "needs_proposal", "best_id": state["best_id"]}
         manifest = state["manifest"]

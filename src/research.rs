@@ -15,6 +15,27 @@ use std::process::Command;
 const ENGINE: &str = include_str!("../scripts/jsh_research.py");
 const BRIDGE: &str = include_str!("../scripts/jsh_research_bridge.py");
 const AUTO: &str = include_str!("../scripts/jsh_research_auto.py");
+const HELP: &str = concat!(
+    "jsh research — bounded research orchestration\n\n",
+    "Controller: jsh research [--root DIR] COMMAND [OPTIONS]\n",
+    "  init MANIFEST                  Freeze a contract and queue the baseline\n",
+    "  run --execute [--limit N]       Evaluate queued experiments\n",
+    "  status | export | bridge       Inspect state or bounded agent context\n",
+    "  enqueue PROPOSAL | submit PROPOSAL\n",
+    "  stop | resume | recover        Stop or explicitly recover the controller\n",
+    "  retry TRIAL --request-id ID     Queue a new, explicit attempt\n\n",
+    "Model loop: jsh research [--root DIR] COMMAND [OPTIONS]\n",
+    "  auto-init CONFIG [--allow-remote]  Freeze model, selected files and budgets\n",
+    "  auto-run --execute [--limit N]     Author, commit and evaluate candidates\n",
+    "  auto-status | auto-recover        Inspect or recover without HTTP replay\n\n",
+    "Native jagent helpers (no network IO or execution authorization):\n",
+    "  jsh research prepare-request CONTEXT\n",
+    "  jsh research validate-proposal CONTEXT PROPOSAL\n",
+    "  jsh research author-prepare INPUT\n",
+    "  jsh research author-decode INPUT RESPONSE\n\n",
+    "Use COMMAND --help for controller/model-loop options. Local execution is\n",
+    "not a security sandbox. Review docs/autoresearch-auto.md before --execute.\n",
+);
 
 fn read_json_file(path: &Path, limit: usize) -> Result<Vec<u8>, &'static str> {
     let mut options = std::fs::OpenOptions::new();
@@ -24,14 +45,22 @@ fn read_json_file(path: &Path, limit: usize) -> Result<Vec<u8>, &'static str> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
     }
-    let file = options.open(path).map_err(|_| "cannot open research JSON file")?;
-    let metadata = file.metadata().map_err(|_| "cannot inspect research JSON file")?;
+    let file = options
+        .open(path)
+        .map_err(|_| "cannot open research JSON file")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "cannot inspect research JSON file")?;
     if !metadata.is_file() || metadata.len() > limit as u64 {
         return Err("research JSON must be a bounded regular file");
     }
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes).map_err(|_| "cannot read research JSON")?;
-    if bytes.len() > limit { return Err("research JSON byte limit exceeded"); }
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cannot read research JSON")?;
+    if bytes.len() > limit {
+        return Err("research JSON byte limit exceeded");
+    }
     Ok(bytes)
 }
 
@@ -43,7 +72,10 @@ fn native(args: &[OsString]) -> Result<serde_json::Value, String> {
             return request.prepare().map_err(|error| error.to_string());
         }
         let response = read_json_file(Path::new(&args[2]), MAX_EDIT_RESPONSE_BYTES)?;
-        return request.parse_response(&response).map(|plan| plan.as_json().clone()).map_err(|error| error.to_string());
+        return request
+            .parse_response(&response)
+            .map(|plan| plan.as_json().clone())
+            .map_err(|error| error.to_string());
     }
     let context_bytes = read_json_file(Path::new(&args[1]), MAX_RESEARCH_CONTEXT_BYTES)?;
     let context = ResearchContext::from_json(&context_bytes).map_err(|error| error.to_string())?;
@@ -51,35 +83,54 @@ fn native(args: &[OsString]) -> Result<serde_json::Value, String> {
         context.prepare_request().map_err(|error| error.to_string())
     } else {
         let proposal_bytes = read_json_file(Path::new(&args[2]), MAX_RESEARCH_PROPOSAL_BYTES)?;
-        let proposal = ResearchProposal::from_json(&proposal_bytes, &context).map_err(|error| error.to_string())?;
+        let proposal = ResearchProposal::from_json(&proposal_bytes, &context)
+            .map_err(|error| error.to_string())?;
         Ok(proposal.as_json().clone())
     }
 }
 
-fn write_json(value: &serde_json::Value) -> i32 {
-    let mut bytes = match serde_json::to_vec(value) { Ok(bytes) => bytes, Err(_) => return 74 };
-    bytes.push(b'\n');
-    match std::io::stdout().lock().write_all(&bytes) {
+fn write_bytes(bytes: &[u8]) -> i32 {
+    match std::io::stdout().lock().write_all(bytes) {
         Ok(()) => 0,
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => 0,
         Err(_) => 74,
     }
 }
 
+fn write_json(value: &serde_json::Value) -> i32 {
+    let mut bytes = match serde_json::to_vec(value) {
+        Ok(bytes) => bytes,
+        Err(_) => return 74,
+    };
+    bytes.push(b'\n');
+    write_bytes(&bytes)
+}
+
 /// Dispatch research commands, without implicit shell evaluation or execution.
 pub fn entrypoint() -> i32 {
     let args: Vec<OsString> = std::env::args_os().skip(2).collect();
     let helper = args.first().and_then(|arg| arg.to_str());
-    if matches!(helper, Some("prepare-request" | "validate-proposal" | "author-prepare" | "author-decode")) {
-        let expected = if matches!(helper, Some("prepare-request" | "author-prepare")) { 2 } else { 3 };
+    if matches!(helper, Some("--help" | "-h")) && args.len() == 1 {
+        return write_bytes(HELP.as_bytes());
+    }
+    if matches!(
+        helper,
+        Some("prepare-request" | "validate-proposal" | "author-prepare" | "author-decode")
+    ) {
+        let expected = if matches!(helper, Some("prepare-request" | "author-prepare")) {
+            2
+        } else {
+            3
+        };
         if args.len() != expected {
-            eprintln!("jsh research: prepare-request CONTEXT | validate-proposal CONTEXT PROPOSAL | author-prepare INPUT | author-decode INPUT RESPONSE");
+            eprintln!("jsh research: see 'jsh research --help' for native helper arguments");
             return 2;
         }
         return match native(&args) {
             Ok(value) => write_json(&value),
             Err(error) => {
-                let error = serde_json::json!({"protocol": "jagent.research.request/v1", "error": error});
+                let error =
+                    serde_json::json!({"protocol": "jagent.research.request/v1", "error": error});
                 eprintln!("{error}");
                 2
             }
@@ -87,16 +138,26 @@ pub fn entrypoint() -> i32 {
     }
     let binary = match std::env::current_exe() {
         Ok(binary) => binary,
-        Err(_) => { eprintln!("jsh research: cannot resolve native validator executable"); return 126; }
+        Err(_) => {
+            eprintln!("jsh research: cannot resolve native validator executable");
+            return 126;
+        }
     };
     let mut command = Command::new("python3");
-    command.args(["-I", "-X", "utf8", "-c", AUTO, "--embedded", ENGINE, BRIDGE]).arg(binary).args(args);
+    command
+        .args(["-I", "-X", "utf8", "-c", AUTO, "--embedded", ENGINE, BRIDGE])
+        .arg(binary)
+        .args(args);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let error = command.exec();
         eprintln!("jsh research: cannot start python3 (requires Python 3.10+): {error}");
-        if error.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 }
+        if error.kind() == std::io::ErrorKind::NotFound {
+            127
+        } else {
+            126
+        }
     }
     #[cfg(not(unix))]
     {

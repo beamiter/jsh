@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 PROTOCOL = "jsh.research.auto/v1"
 MAX_RESPONSE = 1024 * 1024
 MAX_INPUT = 512 * 1024
+SUCCESS = {'kept', 'archived', 'screened_out'}
 HTTP_CLIENT = r'''
 import json, os, sys, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -36,7 +37,7 @@ try:
     headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
     key = os.environ.get(spec['key_env'], '')
     if key:
-        if len(key) > 8192 or '\r' in key or '\n' in key: sys.exit(65)
+        if len(key) > 8192 or any(ord(ch) < 33 or ord(ch) > 126 for ch in key): sys.exit(65)
         headers['Authorization'] = 'Bearer ' + key
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     request = urllib.request.Request(spec['endpoint'], data=json.dumps(spec['body'], ensure_ascii=False).encode(), headers=headers, method='POST')
@@ -82,6 +83,10 @@ class AutoLoop:
         r.number(value['charged_seconds'], 'charged_seconds', 0)
         for field in ('reserved_output_tokens', 'failure_streak'):
             r.require(type(value[field]) is int and value[field] >= 0, 'invalid auto budget accounting')
+        r.require(value['reserved_output_tokens'] == len(value['attempts']) * value['config']['max_tokens_per_call'],
+                  'output-token reservations do not match attempt count')
+        r.require(value['reserved_output_tokens'] <= value['config']['max_output_tokens'], 'output-token budget exceeded')
+        r.require(value['failure_streak'] <= len(value['attempts']), 'invalid consecutive failure count')
         context = self.bridge.snapshot()
         r.require(context['campaign_id'] == value['campaign_id'] and context['manifest_digest'] == value['manifest_digest'], 'auto loop belongs to another campaign')
         return value
@@ -96,7 +101,7 @@ class AutoLoop:
                  {'api_key_env', 'response_format'}, 'auto config')
         r.require(type(raw['schema_version']) is int and raw['schema_version'] == 1, 'unsupported auto config version')
         endpoint = r.text(raw['endpoint'], 'endpoint', 2048)
-        r.require(not any(ord(ch) <= 32 for ch in endpoint), 'invalid endpoint characters')
+        r.require(not any(ord(ch) <= 32 or ord(ch) == 127 for ch in endpoint), 'invalid endpoint characters')
         parsed = urlsplit(endpoint)
         r.require(parsed.scheme in ('http', 'https') and parsed.hostname and not parsed.username and not parsed.password
                   and not parsed.query and not parsed.fragment and parsed.path == '/v1/chat/completions',
@@ -107,8 +112,7 @@ class AutoLoop:
             local = False
         r.require(local or (allow_remote and parsed.scheme == 'https'),
                   'use a literal loopback IP; remote HTTPS requires explicit --allow-remote at initialization')
-        # Trigger validation of malformed port syntax before persisting config.
-        _ = parsed.port
+        r.require(parsed.port is None or 1 <= parsed.port <= 65535, 'invalid endpoint port')
         model = r.text(raw['model'], 'model', 256)
         r.require(model.strip() and not any(ord(ch) < 32 for ch in model), 'invalid model name')
         paths = raw['source_paths']
@@ -134,10 +138,10 @@ class AutoLoop:
         config = {'schema_version': 1, 'endpoint': endpoint, 'model': model, 'source_paths': paths,
                   'allow_remote': bool(allow_remote), 'api_key_env': key_env, 'response_format': response_format, **limits}
         r.require(self.reservation(config, context) <= config['max_seconds'], 'time budget cannot cover one reserved attempt')
-        # Validate selected files without sending them anywhere.
-        self.sources(context, config)
+        self.sources(context, config)  # Offline inspection; no source transmission.
         with self.lock_store.lock(create=True):
             r.require(not os.path.lexists(self.state_path), 'auto loop already initialized; never resets budgets')
+            self.check_live(context)
             state = {'protocol': PROTOCOL, 'loop_id': uuid.uuid4().hex, 'campaign_id': context['campaign_id'],
                      'manifest_digest': context['manifest_digest'], 'config': config, 'config_digest': r.digest(config),
                      'charged_seconds': 0.0, 'reserved_output_tokens': 0, 'failure_streak': 0, 'attempts': []}
@@ -146,8 +150,7 @@ class AutoLoop:
 
     @staticmethod
     def reservation(config, context):
-        # Include fixed setup allowance; actual elapsed time is charged normally.
-        # This is conservative admission, not a kernel-enforced realtime quota.
+        # Conservative admission, not a kernel-enforced realtime quota.
         return config['request_timeout_seconds'] + context['budget']['trial_reservation_seconds'] + 120.0
 
     def summary(self, state=None):
@@ -192,7 +195,8 @@ class AutoLoop:
         return json.loads(result.stdout, object_pairs_hook=self.r.unique_object, parse_constant=self.r.invalid_constant)
 
     def check_live(self, context):
-        self.r.require(not self.campaign.stopped(), 'campaign stopped')
+        if self.campaign.stopped():
+            raise self.r.Stopped('campaign stopped')
         live = self.bridge.snapshot()
         self.r.require(live['next_action'] == 'needs_proposal' and all(live[key] == context[key]
                        for key in ('campaign_id', 'manifest_digest', 'revision', 'best')), 'research context changed during authoring')
@@ -206,19 +210,23 @@ class AutoLoop:
                 'name': 'research_edit', 'strict': True, 'schema': prepared['response_schema']}}
         else:
             body['response_format'] = {'type': 'json_object'}
-            # Even when server grammar support is disabled, the model sees the
-            # schema and the exact same strict jagent validator remains mandatory.
             body['messages'] = body['messages'] + [{'role': 'user', 'content': json.dumps({'required_response_schema': prepared['response_schema']})}]
         spec = {'endpoint': config['endpoint'], 'key_env': config['api_key_env'],
                 'timeout': config['request_timeout_seconds'], 'body': body}
         spec_path, response_path = directory / 'http-request.json', directory / 'http-response.json'
         r.atomic_json(spec_path, spec)
         attempt['stage'] = 'model_request'
-        self.save(state)  # Attempt/token/time reservations already persisted.
+        self.save(state)
+        if self.campaign.stopped():
+            raise r.Stopped('stop requested before model call')
         started = time.monotonic()
+        # The transport gets only its own credential, not the whole agent environment.
+        env = {key: os.environ[key] for key in ('PATH', 'LANG', 'LC_ALL', 'SSL_CERT_FILE', 'SSL_CERT_DIR') if key in os.environ}
+        if config['api_key_env'] in os.environ:
+            env[config['api_key_env']] = os.environ[config['api_key_env']]
         process = subprocess.Popen([sys.executable, '-I', '-X', 'utf8', '-c', HTTP_CLIENT, str(spec_path), str(response_path)],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   start_new_session=True)
+                                   start_new_session=True, env=env)
         try:
             attempt['active_process_group'] = process.pid
             self.save(state)
@@ -240,6 +248,10 @@ class AutoLoop:
         r = self.r
         self.check_live(context)
         manifest = self.campaign.load()['manifest']
+        # Keep the next round readable within the same selected-source budget.
+        replacements = {item['path']: item['content'] for item in plan['edits']}
+        r.require(sum(len(replacements.get(item['path'], item['content']).encode('utf-8'))
+                      for item in files) <= 65536, 'replacement exceeds next-round source budget')
         worktree = directory / 'candidate'
         r.git(Path(manifest['repo']), 'worktree', 'add', '--detach', str(worktree), context['best']['commit'])
         sources = {item['path']: item for item in files}
@@ -269,6 +281,16 @@ class AutoLoop:
         sha = r.commit_id(worktree, 'HEAD')
         r.check_candidate(manifest, sha)
         return sha
+
+    def evaluate(self, trial_id, config):
+        # This serial runner temporarily masks its model key for the evaluator.
+        # It is not a sandbox: other host secrets/files must be isolated externally.
+        key = os.environ.pop(config['api_key_env'], None)
+        try:
+            return self.r.step(self.campaign, expected_trial_id=trial_id)
+        finally:
+            if key is not None:
+                os.environ[config['api_key_env']] = key
 
     def run(self, limit=1, execute=False):
         r = self.r
@@ -313,7 +335,10 @@ class AutoLoop:
                     r.require(len(r.canonical(author_input)) + 1 <= MAX_INPUT, 'author input is too large')
                     r.atomic_json(input_path, author_input)
                     prepared = self.native('author-prepare', input_path)
+                    self.check_live(context)
                     response_path = self.model_call(state, attempt, directory, prepared)
+                    attempt['stage'] = 'validate_plan'
+                    self.save(state)
                     plan = self.native('author-decode', input_path, response_path)
                     r.atomic_json(directory / 'plan.json', plan)
                     attempt['stage'] = 'commit_candidate'
@@ -330,16 +355,14 @@ class AutoLoop:
                     attempt['trial_id'] = trial['id']
                     attempt['stage'] = 'evaluate'
                     self.save(state)
-                    # Never accidentally evaluate a different queue head after a
-                    # competing controller has already processed our candidate.
                     live = self.campaign.load()
                     outcome = next(item for item in live['trials'] if item['id'] == trial['id'])
                     if outcome['status'] == 'queued':
-                        outcome = r.step(self.campaign, expected_trial_id=trial['id'])
+                        outcome = self.evaluate(trial['id'], config)
                     r.require(outcome['status'] in r.TERMINAL, 'trial is owned by another controller; inspect before recovery')
                     attempt['status'] = outcome['status']
                     attempt['stage'] = 'finished'
-                    if outcome['status'] in ('kept', 'archived', 'screened_out'):
+                    if outcome['status'] in SUCCESS:
                         state['failure_streak'] = 0
                     else:
                         state['failure_streak'] += 1
@@ -348,17 +371,20 @@ class AutoLoop:
                     state['failure_streak'] += 1
                     stop_reason = 'interrupted'
                 except (r.ResearchError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
-                    # Source, model replies and remote error bodies can contain
-                    # credentials. Persist a stage/category, not arbitrary text.
+                    # Persist only a stage/category, never arbitrary remote text.
                     attempt['status'] = 'author_failed'
                     state['failure_streak'] += 1
+                    if attempt['stage'] == 'model_request':
+                        # A lost response may still be generating on the server.
+                        # Stop this invocation instead of automatically sending again.
+                        stop_reason = 'transport_error'
                 finally:
                     elapsed = time.monotonic() - started
                     state['charged_seconds'] += elapsed - reservation
                     attempt['charged_seconds'] = elapsed
                     attempt.pop('active_process_group', None)
                     self.save(state)
-                if stop_reason == 'interrupted':
+                if stop_reason in ('interrupted', 'transport_error'):
                     break
             return {**self.summary(state), 'stop_reason': stop_reason}
 
@@ -387,15 +413,16 @@ class AutoLoop:
                     attempt['status'] = 'interrupted'
                 attempt['stage'] = 'recovered_without_replay'
                 attempt.pop('active_process_group', None)
-                state['failure_streak'] += 1
-                # Keep full reservation. A lost response may have consumed all
-                # output tokens/time; never resend unknown work automatically.
+                if attempt['status'] in SUCCESS:
+                    state['failure_streak'] = 0
+                else:
+                    state['failure_streak'] += 1
+                # Keep crash reservations; never resend unknown work automatically.
             self.save(state)
             return self.summary(state)
 
 
 def main(argv, engine, bridge_module, binary):
-    # Recognize only new commands; preserve all existing bridge/engine parsing.
     probe = argparse.ArgumentParser(add_help=False)
     probe.add_argument('--root', type=Path, default=Path('.jsh-research'))
     probe.add_argument('command', nargs='?')
@@ -428,7 +455,7 @@ def main(argv, engine, bridge_module, binary):
         sys.stdout.write(engine.canonical(result).decode() + '\n')
         if result.get('stop_reason') == 'interrupted':
             return 130
-        if args.command == 'auto-run' and (result.get('stop_reason') in ('failure_limit', 'needs_recovery', 'needs_baseline_retry') or
+        if args.command == 'auto-run' and (result.get('stop_reason') in ('failure_limit', 'needs_recovery', 'needs_baseline_retry', 'transport_error') or
                                          (result['attempts'] and result['attempts'][-1]['status'] in ('author_failed', 'failed', 'invalid', 'interrupted'))):
             return 1
         return 0

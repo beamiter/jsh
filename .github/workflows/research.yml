@@ -1,7 +1,7 @@
 name: Research controller
 on:
   push:
-    branches: [master, 'agent/autoresearch-bridge-verify-20261028']
+    branches: [master, 'agent/research-evolution-20261028']
     paths: ['scripts/jsh_research*.py', 'tests/test_research*.py', 'tests/research*.rs', 'src/**', 'Cargo.*', '.github/workflows/research.yml']
   pull_request:
     paths: ['scripts/jsh_research*.py', 'tests/test_research*.py', 'tests/research*.rs', 'src/**', 'Cargo.*', '.github/workflows/research.yml']
@@ -37,3 +37,5 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
       - run: cargo test --locked ${{ matrix.features }} --no-fail-fast
+      - name: Run all research cases against the actual binary
+        run: JSH_RESEARCH_BINARY="$PWD/target/debug/jsh" python3 -m unittest discover -s tests -p 'test_research*.py' -v

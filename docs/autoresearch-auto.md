@@ -1,124 +1,143 @@
-# Bounded model-driven research
+# Model-driven research loop
 
-This phase implements a real local loop: fresh research context + selected source
--> HTTP chat completion -> strict jagent edit validation -> detached Git commit
--> context-bound admission -> frozen screening/confirmation -> next model call.
-It does not install a model, start a server, submit DLC jobs or merge/push code.
+`jsh research auto-*` connects the shared `jagent::research::author` validator to
+an explicitly configured chat-completion HTTP endpoint and the existing frozen
+local evaluator. Unlike the earlier proposal bridge, it can request source edits,
+create a real detached Git commit, submit the bound candidate, evaluate it and
+feed the measured outcome into the next round. jagent remains sans-IO.
 
-## Start
+This is an opt-in, bounded prototype, not a claim of scientific improvement or
+of complete Flint/DLC deployment. Only local evaluation is implemented. The test
+server is deterministic; it is not a real language model.
 
-Build the updated jsh binary. Prepare a trusted evaluator and a frozen campaign
-as described in autoresearch.md, then run its baseline. Use a disposable VM or
-container for generated code; worktrees are not a security sandbox.
+## Setup and commands
+
+Run the normal research `init` and baseline `run --execute` first. The campaign
+must have a valid baseline and no queued/running trials before `auto-init`.
+Select 1..8 small tracked UTF-8 files that are already allowed by the frozen
+manifest. Copy `examples/research/auto.json` and edit it for your model server.
 
 ```sh
-jsh research --root ~/research/pilot init manifest.json
-jsh research --root ~/research/pilot run --execute
-# Edit examples/research/auto.json for your endpoint, model alias and source files.
 jsh research --root ~/research/pilot auto-init auto.json
-jsh research --root ~/research/pilot auto-run --execute --limit 10
+jsh research --root ~/research/pilot auto-run --execute --limit 2
 jsh research --root ~/research/pilot auto-status
+jsh research --root ~/research/pilot stop
 ```
 
-`auto-init` is offline and refuses to overwrite an existing loop or reset its
-budget. It requires a valid baseline, no pending work and 1..8 explicitly selected
-editable files. Source is read from the current best Git commit, not uncommitted
-working-directory changes. Only regular tracked UTF-8 files are supported;
-new files, deletion, binary edits, symlinks and submodules are deliberately not
-supported in this first authoring backend. Total input source is at most 64 KiB;
-replacement contents are at most 128 KiB. Refactor large tasks into focused campaigns.
+Initialization is offline. It freezes the endpoint, model, selected paths and
+budgets, validates the sources and creates private loop state. It never resets
+an existing loop. `auto-run --execute` explicitly authorizes transmitting those
+selected sources and evaluating generated candidate code. `--limit` caps attempts
+in this invocation; the persistent configuration caps all invocations together.
+The runner is foreground and serial, not a daemon or a scheduled task.
 
-The model returns a hypothesis and replacements bound to source blobs and the
-exact campaign/revision/incumbent. It cannot return commands, scores or a claimed
-candidate commit. jagent validates the response; jsh creates the real detached
-commit, rechecks protected paths and submits it under the live campaign lock.
-The original checkout/branch is unchanged. No commits are automatically pushed
-or merged. A stale response is rejected, never silently rebound.
+Native helpers are also available without network access:
+
+```sh
+jsh research author-prepare author-input.json
+jsh research author-decode author-input.json http-response.json
+```
+
+The binary embeds the controllers; installation does not require a source checkout.
+Python 3.10+, Git and Unix are required. Both AI-enabled and core-only builds use
+the same shared jagent validation. Native helpers grant no execution authority.
 
 ## Model transport
 
-The endpoint is an explicit `/v1/chat/completions` URL. The default accepts only
-literal loopback IPs, not DNS names. To transmit selected source to a remote
-HTTPS endpoint, explicitly pass `--allow-remote` to `auto-init`. The decision is
-frozen with the configuration. This is a deliberate source-disclosure boundary.
-HTTP redirects and environment proxies are disabled. There are no automatic HTTP
-retries, so a timeout cannot silently duplicate a potentially charged request.
+Default scope is a literal loopback IP such as
+`http://127.0.0.1:8080/v1/chat/completions`; the configured model name must match
+your running server. A non-loopback endpoint must be HTTPS and requires explicit
+`auto-init CONFIG --allow-remote`. This transmits selected source and bounded
+research history to that endpoint: review privacy before opting in. Userinfo,
+query/fragment credentials, port zero and ambiguous paths are rejected.
 
-An optional API key is read from the named environment variable at call time and
-sent only in the Authorization header. Its value is never written to configuration,
-request artifacts or errors. Source/context and raw model responses ARE private
-artifacts under the campaign; they may contain source-code secrets. Do not select
-credential files. Generated evaluator processes still inherit the host environment:
-run the campaign without production credentials or a forwarded SSH agent.
+The non-streaming request uses messages, `max_tokens`, temperature=1, top_p=0.95
+and top_k=20. `response_format` can be `json_schema` (default) or `json_object`.
+The latter appends the required schema as data but never relaxes native response
+validation. Real server support for these fields must be checked on your chosen
+Flint serving build; this implementation does not claim live-model compatibility
+or performance measurements.
 
-Sampling uses temperature 1.0, top_p 0.95 and top_k 20, matching the Flint model
-card. Each round is a fresh non-streaming request. A separate reasoning_content
-field is not carried into subsequent turns; experiment evidence is the memory.
-Only one normal stop completion with a valid JSON edit object is accepted.
-Truncation, refusals, tool calls, duplicate JSON members and oversized responses
-fail closed. The chat-completion response limit is 1 MiB.
+The key is read from `api_key_env` (default `JSH_RESEARCH_API_KEY`) at runtime and
+sent only in the Authorization header. Its value is not written into requests,
+state or diagnostic output. The HTTP child receives only its configured key and
+a small runtime environment. Ambient HTTP proxies are ignored; redirects and
+implicit retries are disabled. Response size is capped at 1 MiB, including any
+reasoning metadata; truncated, refused or tool-calling responses fail validation.
+A transport failure/timeout stops the invocation, even with `--limit > 1`.
+An explicit later invocation may create a new budgeted attempt; it is not a replay.
+The remote server may continue generation after the client disconnects.
 
-By default `response_format=json_schema` requests grammar-constrained output.
-For servers without this schema subset, select `json_object` BEFORE initialization;
-the model still receives the schema and the same strict native validator remains
-mandatory. Compatibility with a mock OpenAI-style endpoint is tested. Actual
-Flint quality, speed, tokenizer/template settings and server-build compatibility
-must be measured on the user's model service; no live Flint benchmark is claimed.
+## Candidate and evaluation boundary
 
-Primary compatibility references:
-https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
-https://huggingface.co/RecursiveSI/flint
+The host reads the selected files at the current best commit, including original
+Git blob IDs, and jagent accepts only complete replacements for those files.
+No arbitrary commands, fabricated commits, supplied scores, new/deleted files,
+symlinks or submodules are accepted. The auto loop keeps total selected source
+at most 64 KiB after editing so the next round can read it again. The shared
+protocol separately supports up to 128 KiB replacement text.
 
-## Persistent budgets and recovery
+Candidates are committed in private detached worktrees with hooks disabled.
+Original HEAD, working files and branches are not reset or merged. The ordinary
+bridge admission rechecks campaign/revision/incumbent binding and protected
+paths. The evaluator then checks the expected queue ID under its writer lock,
+so another controller cannot redirect this attempt onto unrelated queued work.
+Scores come from the existing screen/confirm evaluator, not model claims.
 
-Limits cover total author attempts, conservative reserved completion tokens,
-model-request timeout, cumulative loop elapsed time and consecutive failures.
-The original campaign's trial/time budgets still independently gate evaluations.
-`--limit` bounds only this invocation; restarting does not reset any lifetime cap.
-Input tokens and monetary/GPU costs are NOT metered by the completion-token cap.
-Providers may ignore max_tokens: enforce cost/rate quotas on the model server too.
+The selected model-key variable is removed from the evaluation environment and
+restored in the serial controller afterwards. **This is not credential isolation
+or an OS sandbox.** Other ambient variables, files, Git configuration, build tools
+and same-user processes remain accessible. Run generated code in a disposable,
+nonprivileged VM/container without personal credentials or network access, with
+read-only evaluator/data and host-enforced quotas. Worktrees and path checks do
+not prevent a hostile same-user program from forging its result or reading files.
 
-Each attempt reserves its full max_tokens before any model IO, including failed
-attempts. It reserves request timeout + evaluation timeout reservation + a fixed
-setup allowance before execution. Normal completion charges measured elapsed
-time; a crash keeps the full reservation. This is conservative admission, not a
-kernel-enforced realtime deadline. Evaluations keep their existing per-seed timeouts.
-Infrastructure/invalid-output failures stop at a persistent failure streak;
-valid kept/archived/screened-out results reset that streak.
+## Budgets, evidence and recovery
+
+`max_attempts`, total reserved output tokens, elapsed controller time and a
+consecutive-failure limit persist in `autoloop/auto.json`. A worst-case time and
+full per-call output-token reservation is charged **before** a model call. Failed
+or truncated calls still consume tokens/attempts. Token reservations are a local
+cap on requested output, not measured usage, input-token accounting or billing.
+On normal completion time is reconciled to elapsed time; crashes retain the full
+reservation. Timeouts are cooperative/polled, not OS resource guarantees.
+
+Each attempt retains source/context, model-request body (no key), response, parsed
+plan, candidate commit/proposal, outcome stage and evidence directory. These
+files can contain proprietary code or model text; keep the directory private.
+Full source/worktree evidence is retained, not automatically garbage-collected.
+The next request receives bounded research scores and recent outcome categories,
+not unlimited logs or a claim of long-term semantic research memory.
+
+After an unclean shutdown, inspect processes and both state files first:
 
 ```sh
-# Works during model calls as well as local evaluation.
-jsh research --root ~/research/pilot stop
-# Inspect the host/processes after a crash; never kill persisted PIDs blindly.
+jsh research --root ~/research/pilot status
 jsh research --root ~/research/pilot auto-status
-jsh research --root ~/research/pilot recover       # only if evaluator recovery is needed
+# Recover a crashed evaluator first, when applicable and no process remains alive.
+jsh research --root ~/research/pilot recover
 jsh research --root ~/research/pilot auto-recover
 jsh research --root ~/research/pilot resume
-jsh research --root ~/research/pilot auto-run --execute --limit 3
 ```
 
-Recovery refuses recorded live process groups, reconciles already-completed
-trials, and never automatically resends a model request or reruns an unknown
-experiment. A submitted but still queued candidate after a crash must be inspected
-and evaluated explicitly with `run --execute`; auto-run will not take unrelated
-queued work. A small process-start/persist crash window remains; inspect the host
-following SIGKILL/power loss. Worktrees/evidence are retained, not garbage-collected.
+Recovery never sends another HTTP request or kills an arbitrary persisted PID.
+It can reconcile a completed trial back to the interrupted author attempt, but
+unknown attempts retain their reservation and become interrupted. Live recorded
+process groups block recovery. A queued admitted candidate is not automatically
+executed by recovery; inspect it and explicitly use `run --execute` when appropriate.
+There is a small process-spawn/record crash window; inspect the host after SIGKILL.
+Successful outcome reconciliation does not incorrectly consume a failure streak.
 
-Two auto loops cannot own the same campaign loop lock. Model IO does not hold the
-campaign writer lock, so status/stop remain usable. A competing manual operation
-can invalidate the snapshot; the candidate is then archived without admission.
-The executor checks an expected trial ID under its lock, so races cannot make the
-auto loop execute another controller's queue head accidentally.
+## Validation and remaining work
 
-Artifacts include author-input.json, http-request.json, http-response.json,
-plan.json, proposal.json and the detached candidate worktree. The atomic auto.json
-journal records attempt stage, source/candidate commits, trial identity and budgets.
-Error summaries contain only stage/category, not raw remote error bodies.
+The read-only CI uses a local HTTP fixture with the actual Rust/jagent validator,
+Git commits/worktrees and frozen evaluator. It exercises successive improvements,
+malformed/truncated responses, stale snapshots, budget persistence, interruption,
+transport failures, proxy/redirect handling, secret scope and crash recovery.
+It uses no model credentials, no real Flint weights and no DLC resources.
 
-## DLC boundary
-
-The authoring loop already hands a real candidate to the same context-bound local
-controller. A future DLC adapter belongs below evaluation, not in model-generated
-commands. It still needs authenticated submit/poll/cancel, attempt leases,
-idempotency, artifact fingerprints, remote result validation and GPU-hour budgets.
-This implementation intentionally cannot submit paid cluster work.
+Not implemented: DLC submit/poll/cancel/artifact adapters, authenticated remote
+callbacks, GPU-hour budgets, parallel research workers, an adversarially isolated
+judge, automatic publication/merge, or a scientific significance criterion.
+The current loop improves a single objective via repeated frozen evaluations;
+a truly untouched final test set and independent review are still required.
