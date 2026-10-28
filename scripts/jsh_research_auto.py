@@ -539,16 +539,18 @@ class AutoLoop:
                 index = len(state['attempts']) + 1
                 request_id = 'auto-' + state['loop_id'] + '-' + str(index)
                 directory = self.directory / ('attempt-%06d' % index)
-                directory.mkdir(mode=0o700, exist_ok=False)
                 attempt = {'id': request_id, 'status': 'running', 'stage': 'prepare', 'context_revision': context['revision'],
                            'base_commit': context['best']['commit'], 'reserved_output_tokens': config['max_tokens_per_call'],
                            'charged_seconds': reservation, 'evidence': str(directory.relative_to(self.campaign.root))}
                 state['attempts'].append(attempt)
                 state['reserved_output_tokens'] += config['max_tokens_per_call']
                 state['charged_seconds'] += reservation
+                # Persist identity/budget before allocating its evidence path.
+                # A failed write must not strand the next attempt's directory.
                 self.save(state)
                 started = time.monotonic()
                 try:
+                    directory.mkdir(mode=0o700, exist_ok=False)
                     files = self.sources(context, config)
                     input_path = directory / 'author-input.json'
                     r.atomic_json(input_path, self.author_input(state, context, files, campaign))

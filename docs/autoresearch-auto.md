@@ -127,8 +127,16 @@ cap on requested output, not measured usage, input-token accounting or billing.
 On normal completion time is reconciled to elapsed time; crashes retain the full
 reservation. Timeouts are cooperative/polled, not OS resource guarantees.
 
-Each attempt retains source/context, model-request body (no key), response, parsed
-plan, candidate commit/proposal, outcome stage and evidence directory. These
+An attempt's identity and reservation are persisted before its evidence directory
+is created. A failed reservation write leaves no directory blocking a retry.
+Directory-allocation failures become recorded preparation failures, and a crash
+after reservation is handled by `auto-recover` without replaying the model call.
+Existing evidence directories are never overwritten or deleted on admission.
+An attempt that cannot allocate its directory has a ledger record only; later
+attempts use their own indices subject to the existing failure and budget limits.
+
+Completed stages retain source/context, model-request body (no key), response,
+parsed plan and candidate commit/proposal alongside the ledger outcome. These
 files can contain proprietary code or model text; keep the directory private.
 Full source/worktree evidence is retained, not automatically garbage-collected.
 The next request receives bounded research scores and recent outcome categories,

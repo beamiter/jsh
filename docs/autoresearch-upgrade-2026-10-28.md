@@ -111,3 +111,18 @@ Publication CI also exposed an existing macOS build failure in the shell's
 `SRANDOM` implementation. The follow-up keeps Linux/Android `getrandom` and uses
 `/dev/urandom` on other platforms, preserving the previous failure fallback.
 Conditional signal entries no longer require a platform-dependent mutable vector.
+
+## Further follow-up: durable attempt allocation
+
+Auto-attempt reservations now reach durable state before an evidence directory
+is created. Failure before that write cannot leave a directory blocking the next
+attempt. Allocation failures after reservation are recorded as preparation
+failures, while interrupted reservations remain recoverable without replaying
+HTTP requests or losing their charges. Three fault-injection regressions cover
+these transitions.
+
+The shared validator also checks that a complete history contains its declared
+best trial, and that a visible baseline matches the frozen baseline commit.
+Omitted history retains its existing semantics. Two protocol regressions cover
+these checks. jsh pins the published jagent commit
+`c3d08d0a13dfefb11cb6287ddd54792fdfd74b14` for this round.

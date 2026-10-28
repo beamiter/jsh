@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### 2026-10-28 — durable auto-attempt allocation
+
+- Persist auto-attempt identity and budget before creating its evidence directory.
+  Failed writes no longer strand the next attempt; directory failures are recorded
+  and reserved-but-unallocated attempts recover without replaying a model call.
+- Pin jagent's complete-history best/baseline identity checks.
+
 ### 2026-10-28 — campaign ledger and repeatable recovery
 
 - Validate total time against the per-trial ledger, unique trial/request IDs,

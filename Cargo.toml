@@ -33,7 +33,7 @@ ureq = { version = "3", optional = true }
 # Pin the shared policy/wire validator so a branch move cannot silently change
 # journal uniqueness semantics. This remains baseline even without AI; its
 # normal dependencies (regex, serde, serde_json) are already always present.
-jagent = { git = "https://github.com/beamiter/jagent.git", rev = "46a519dc40988ca727f61924989aa7a93a1aaad6" }
+jagent = { git = "https://github.com/beamiter/jagent.git", rev = "c3d08d0a13dfefb11cb6287ddd54792fdfd74b14" }
 # serde_yaml_ng still depends on the unmaintained unsafe-libyaml parser
 # (RUSTSEC-2024-0449). Keep YAML on the maintained Rust implementation and
 # enable only data conversion, without optional include/property expansion.
