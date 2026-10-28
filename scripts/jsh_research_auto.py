@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Bounded model-driven research loop. Explicit opt-in, local executor only.
+"""Bounded model-driven research loop; explicit opt-in, local executor only.
 
-Model output is data validated by jagent, never a shell command. The host writes
-only preselected tracked files and creates detached candidate commits. This is
-not a sandbox: use a disposable, credential-free environment for generated code.
+Model output is data validated by jagent, never a shell command. Worktrees are
+not a sandbox: generated code requires an externally isolated environment.
 """
 from __future__ import annotations
 
 import argparse
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,6 +17,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import types
 import uuid
@@ -26,6 +27,12 @@ PROTOCOL = "jsh.research.auto/v1"
 MAX_RESPONSE = 1024 * 1024
 MAX_INPUT = 512 * 1024
 SUCCESS = {'kept', 'archived', 'screened_out'}
+STATUSES = SUCCESS | {'running', 'invalid', 'failed', 'interrupted', 'author_failed'}
+STAGES = {'prepare', 'model_request', 'validate_plan', 'commit_candidate', 'submit',
+          'evaluate', 'finished', 'recovered_without_replay'}
+FAILURE_CODES = {'prepare': 'preparation_failed', 'model_request': 'transport_failed',
+                 'validate_plan': 'plan_rejected', 'commit_candidate': 'candidate_rejected',
+                 'submit': 'admission_rejected', 'evaluate': 'evaluation_unresolved'}
 HTTP_CLIENT = r'''
 import json, os, sys, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -63,6 +70,36 @@ def load_module(name, source):
     return module
 
 
+def diagnostic_code(attempt):
+    """Only fixed categories, never persisted/provider exception strings."""
+    status = attempt['status']
+    if status in SUCCESS or status == 'running':
+        return None
+    if status in ('failed', 'invalid'):
+        return 'evaluation_' + status
+    if status == 'interrupted':
+        return 'interrupted'
+    return FAILURE_CODES.get(attempt.get('stage'), 'legacy_unknown')
+
+
+def streaks(attempts, best_commit=None):
+    failures, no_improvement = 0, 0
+    for attempt in attempts:
+        status = attempt['status']
+        if status == 'running':
+            continue
+        failures = 0 if status in SUCCESS else failures + 1
+        if status == 'kept':
+            no_improvement = 0
+        elif status in ('archived', 'screened_out'):
+            # A new incumbent installed by a human also starts a new plateau.
+            if best_commit is None or attempt.get('base_commit') == best_commit:
+                no_improvement += 1
+            else:
+                no_improvement = 0
+    return failures, no_improvement
+
+
 class AutoLoop:
     def __init__(self, engine, bridge_module, root, native_binary):
         self.r, self.b = engine, bridge_module
@@ -72,6 +109,11 @@ class AutoLoop:
         self.lock_store = engine.Store(self.directory)
         self.state_path = self.directory / 'auto.json'
         self.binary = str(Path(native_binary).absolute()) if native_binary else None
+
+    def view(self):
+        # Unlike bridge.snapshot(), inspection must never recreate an identity.
+        campaign = self.campaign.load()
+        return campaign, self.bridge.context(campaign, self.bridge.identity(campaign))
 
     def load(self):
         r = self.r
@@ -87,7 +129,21 @@ class AutoLoop:
                   'output-token reservations do not match attempt count')
         r.require(value['reserved_output_tokens'] <= value['config']['max_output_tokens'], 'output-token budget exceeded')
         r.require(value['failure_streak'] <= len(value['attempts']), 'invalid consecutive failure count')
-        context = self.bridge.snapshot()
+        patience = value['config'].get('max_no_improvement', 0)
+        r.require(type(patience) is int and 0 <= patience <= 1000, 'invalid no-improvement limit')
+        ids, charges = set(), []
+        for attempt in value['attempts']:
+            r.require(isinstance(attempt, dict) and attempt.get('status') in STATUSES, 'invalid attempt status')
+            identifier = r.text(attempt.get('id'), 'attempt ID', 128)
+            r.require(identifier not in ids, 'duplicate attempt ID')
+            ids.add(identifier)
+            r.require(attempt.get('stage', 'prepare') in STAGES, 'invalid attempt stage')
+            charges.append(r.number(attempt.get('charged_seconds', 0), 'attempt charge', 0))
+            if 'failure_code' in attempt:
+                r.require(attempt['failure_code'] == diagnostic_code(attempt), 'inconsistent failure category')
+        r.require(math.isclose(math.fsum(charges), value['charged_seconds'], rel_tol=1e-9, abs_tol=1e-6),
+                  'time charges do not match attempt ledger')
+        _, context = self.view()
         r.require(context['campaign_id'] == value['campaign_id'] and context['manifest_digest'] == value['manifest_digest'], 'auto loop belongs to another campaign')
         return value
 
@@ -98,7 +154,7 @@ class AutoLoop:
         r = self.r
         r.fields(raw, {'schema_version', 'endpoint', 'model', 'source_paths', 'max_attempts', 'max_output_tokens',
                        'max_tokens_per_call', 'request_timeout_seconds', 'max_seconds', 'max_failures'},
-                 {'api_key_env', 'response_format'}, 'auto config')
+                 {'api_key_env', 'response_format', 'max_no_improvement'}, 'auto config')
         r.require(type(raw['schema_version']) is int and raw['schema_version'] == 1, 'unsupported auto config version')
         endpoint = r.text(raw['endpoint'], 'endpoint', 2048)
         r.require(not any(ord(ch) <= 32 or ord(ch) == 127 for ch in endpoint), 'invalid endpoint characters')
@@ -125,6 +181,9 @@ class AutoLoop:
             value = raw[key]
             r.require(type(value) is int and minimum <= value <= maximum, 'invalid ' + key)
             limits[key] = value
+        patience = raw.get('max_no_improvement', 0)
+        r.require(type(patience) is int and 0 <= patience <= 1000, 'invalid max_no_improvement')
+        limits['max_no_improvement'] = patience
         r.require(limits['max_output_tokens'] >= limits['max_tokens_per_call'], 'output-token budget cannot cover one call')
         limits['request_timeout_seconds'] = r.number(raw['request_timeout_seconds'], 'request_timeout_seconds', 0.1)
         r.require(limits['request_timeout_seconds'] <= 3600, 'request timeout exceeds one hour')
@@ -138,7 +197,7 @@ class AutoLoop:
         config = {'schema_version': 1, 'endpoint': endpoint, 'model': model, 'source_paths': paths,
                   'allow_remote': bool(allow_remote), 'api_key_env': key_env, 'response_format': response_format, **limits}
         r.require(self.reservation(config, context) <= config['max_seconds'], 'time budget cannot cover one reserved attempt')
-        self.sources(context, config)  # Offline inspection; no source transmission.
+        self.sources(context, config)
         with self.lock_store.lock(create=True):
             r.require(not os.path.lexists(self.state_path), 'auto loop already initialized; never resets budgets')
             self.check_live(context)
@@ -150,7 +209,6 @@ class AutoLoop:
 
     @staticmethod
     def reservation(config, context):
-        # Conservative admission, not a kernel-enforced realtime quota.
         return config['request_timeout_seconds'] + context['budget']['trial_reservation_seconds'] + 120.0
 
     def summary(self, state=None):
@@ -160,6 +218,120 @@ class AutoLoop:
                 'failure_streak': state['failure_streak'], 'stopped': self.campaign.stopped(),
                 'limits': {key: state['config'][key] for key in ('max_attempts', 'max_output_tokens', 'max_seconds', 'max_failures')},
                 'attempts': state['attempts']}
+
+    def decision(self, state, campaign, context):
+        """One admission policy shared by execution, report and offline preflight."""
+        if context['next_action'] == 'stopped':
+            return 'stopped'
+        if any(item['status'] == 'running' for item in state['attempts']):
+            return 'needs_recovery'
+        if context['next_action'] != 'needs_proposal':
+            return context['next_action']
+        trials = {item['request_id']: item for item in campaign['trials']}
+        for item in state['attempts']:
+            trial = trials.get(item['id'])
+            if item['status'] in ('interrupted', 'author_failed') and trial and trial['status'] in self.r.TERMINAL:
+                if item.get('trial_id') != trial['id'] or item['status'] != trial['status']:
+                    return 'needs_reconciliation'
+        config = state['config']
+        if (len(state['attempts']) >= config['max_attempts'] or
+            state['reserved_output_tokens'] + config['max_tokens_per_call'] > config['max_output_tokens'] or
+            state['charged_seconds'] + self.reservation(config, context) > config['max_seconds']):
+            return 'auto_budget_exhausted'
+        failures, plateau = streaks(state['attempts'], context['best']['commit'])
+        if max(failures, state['failure_streak']) >= config['max_failures']:
+            return 'failure_limit'
+        if config.get('max_no_improvement', 0) and plateau >= config['max_no_improvement']:
+            return 'no_improvement_limit'
+        return 'needs_proposal'
+
+    def scores(self, trial, manifest):
+        scores = {'screen': None, 'confirm': None}
+        if trial is None or trial['status'] not in self.r.TERMINAL:
+            return scores
+        metric = manifest['objective']['metric']
+        for stage in scores:
+            results = trial['results'].get(stage, [])
+            seeds = manifest[stage]['seeds']
+            if len(results) == len(seeds) and [item['seed'] for item in results] == seeds:
+                for item in results:
+                    self.r.number(item['metrics'][metric], 'feedback metric')
+                scores[stage] = self.r.number(self.r.mean_score(results, metric), 'feedback mean')
+        return scores
+
+    def observations(self, state, campaign, recent=4, include_running=False):
+        trials = {item['request_id']: item for item in campaign['trials']}
+        indexed = [(i, item) for i, item in enumerate(state['attempts'], 1)
+                   if include_running or item['status'] != 'running']
+        observations = []
+        for index, item in indexed[-recent:]:
+            trial = trials.get(item['id'])
+            if trial is not None:
+                self.r.require(item.get('candidate_commit', trial['commit']) == trial['commit'] and
+                               item.get('trial_id', trial['id']) == trial['id'], 'attempt/trial identity mismatch')
+            if item['status'] in SUCCESS | {'failed', 'invalid'}:
+                self.r.require(trial is not None and trial['status'] == item['status'], 'outcome requires campaign evidence')
+            observations.append({'attempt': index, 'status': item['status'], 'stage': item.get('stage', 'prepare'),
+                                 'failure_code': diagnostic_code(item), 'trial_id': trial['id'] if trial else None,
+                                 'scores': self.scores(trial, campaign['manifest'])})
+        return observations
+
+    def author_input(self, state, context, files, campaign):
+        value = {'schema_version': 2, 'context': context, 'files': files,
+                 'feedback': self.observations(state, campaign)}
+        self.r.require(len(self.r.canonical(value)) + 1 <= MAX_INPUT, 'author input is too large')
+        return value
+
+    def report(self, recent=16):
+        self.r.require(type(recent) is int and 1 <= recent <= 64, 'recent must be 1..64')
+        state = self.load()
+        campaign, context = self.view()
+        config = state['config']
+        counts = {status: 0 for status in sorted(STATUSES)}
+        for item in state['attempts']:
+            counts[item['status']] += 1
+        best = next((item for item in campaign['trials'] if item['id'] == campaign['best_id']), None)
+        failures, plateau = streaks(state['attempts'], best['commit'] if best else None)
+        action = self.decision(state, campaign, context)
+        return {'protocol': 'jsh.research.auto.report/v1', 'campaign_id': state['campaign_id'],
+                'loop_id': state['loop_id'], 'revision': context['revision'], 'snapshot_only': True,
+                'next_action': action, 'can_run': action == 'needs_proposal', 'counts': counts,
+                'failure_streak': max(failures, state['failure_streak']), 'no_improvement_streak': plateau,
+                'max_no_improvement': config.get('max_no_improvement', 0),
+                'objective': context['objective'],
+                'best': {**context['best'], 'scores': self.scores(best, campaign['manifest'])} if best else None,
+                'remaining': {'attempts': config['max_attempts'] - len(state['attempts']),
+                              'reserved_output_tokens': config['max_output_tokens'] - state['reserved_output_tokens'],
+                              'controller_seconds': max(0.0, config['max_seconds'] - state['charged_seconds']),
+                              'campaign_trials': context['budget']['max_trials'] - context['budget']['trials_used']},
+                'next_attempt_reservation_seconds': self.reservation(config, context),
+                'recent_attempts': self.observations(state, campaign, recent, include_running=True),
+                'omitted_attempts': max(0, len(state['attempts']) - recent)}
+
+    def preflight(self):
+        state = self.load()
+        campaign, context = self.view()
+        result = {'protocol': 'jsh.research.auto.preflight/v1', 'revision': context['revision'],
+                  'ready': False, 'network_checked': False, 'execution_authorized': False,
+                  'sandbox_verified': False, 'reason': self.decision(state, campaign, context)}
+        if result['reason'] != 'needs_proposal':
+            return result
+        stage = 'sources'
+        try:
+            files = self.sources(context, state['config'])
+            stage = 'validator'
+            # Private temporary scratch only; no campaign writes or reservations.
+            with tempfile.TemporaryDirectory(prefix='jsh-research-preflight-') as temporary:
+                path = Path(temporary) / 'input.json'
+                self.r.atomic_json(path, self.author_input(state, context, files, campaign))
+                self.native('author-prepare', path)
+            stage = 'freshness'
+            self.check_live(context)
+            result.update(ready=True, reason='ready_offline', source_files=len(files),
+                          source_bytes=sum(len(item['content'].encode('utf-8')) for item in files))
+        except (self.r.ResearchError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            result['reason'] = stage + '_check_failed'
+        return result
 
     def sources(self, context, config):
         r = self.r
@@ -182,8 +354,7 @@ class AutoLoop:
             data = subprocess.run(['git', '-C', str(repo), 'cat-file', 'blob', blob], stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=True).stdout
             r.require(len(data) == size and b'\0' not in data, 'invalid source bytes')
-            content = data.decode('utf-8', 'strict')
-            files.append({'path': path, 'blob': blob, 'content': content})
+            files.append({'path': path, 'blob': blob, 'content': data.decode('utf-8', 'strict')})
         return files
 
     def native(self, command, *paths):
@@ -197,7 +368,7 @@ class AutoLoop:
     def check_live(self, context):
         if self.campaign.stopped():
             raise self.r.Stopped('campaign stopped')
-        live = self.bridge.snapshot()
+        _, live = self.view()
         self.r.require(live['next_action'] == 'needs_proposal' and all(live[key] == context[key]
                        for key in ('campaign_id', 'manifest_digest', 'revision', 'best')), 'research context changed during authoring')
 
@@ -220,7 +391,6 @@ class AutoLoop:
         if self.campaign.stopped():
             raise r.Stopped('stop requested before model call')
         started = time.monotonic()
-        # The transport gets only its own credential, not the whole agent environment.
         env = {key: os.environ[key] for key in ('PATH', 'LANG', 'LC_ALL', 'SSL_CERT_FILE', 'SSL_CERT_DIR') if key in os.environ}
         if config['api_key_env'] in os.environ:
             env[config['api_key_env']] = os.environ[config['api_key_env']]
@@ -248,7 +418,6 @@ class AutoLoop:
         r = self.r
         self.check_live(context)
         manifest = self.campaign.load()['manifest']
-        # Keep the next round readable within the same selected-source budget.
         replacements = {item['path']: item['content'] for item in plan['edits']}
         r.require(sum(len(replacements.get(item['path'], item['content']).encode('utf-8'))
                       for item in files) <= 65536, 'replacement exceeds next-round source budget')
@@ -283,8 +452,6 @@ class AutoLoop:
         return sha
 
     def evaluate(self, trial_id, config):
-        # This serial runner temporarily masks its model key for the evaluator.
-        # It is not a sandbox: other host secrets/files must be isolated externally.
         key = os.environ.pop(config['api_key_env'], None)
         try:
             return self.r.step(self.campaign, expected_trial_id=trial_id)
@@ -301,20 +468,13 @@ class AutoLoop:
             r.require(not any(a['status'] == 'running' for a in state['attempts']), 'interrupted auto attempt: inspect and use auto-recover')
             stop_reason = 'invocation_limit'
             for _ in range(limit):
-                context = self.bridge.snapshot()
+                campaign, context = self.view()
                 config = state['config']
-                if context['next_action'] != 'needs_proposal':
-                    stop_reason = context['next_action']
+                action = self.decision(state, campaign, context)
+                if action != 'needs_proposal':
+                    stop_reason = action
                     break
                 reservation = self.reservation(config, context)
-                if (len(state['attempts']) >= config['max_attempts'] or
-                    state['reserved_output_tokens'] + config['max_tokens_per_call'] > config['max_output_tokens'] or
-                    state['charged_seconds'] + reservation > config['max_seconds']):
-                    stop_reason = 'auto_budget_exhausted'
-                    break
-                if state['failure_streak'] >= config['max_failures']:
-                    stop_reason = 'failure_limit'
-                    break
                 index = len(state['attempts']) + 1
                 request_id = 'auto-' + state['loop_id'] + '-' + str(index)
                 directory = self.directory / ('attempt-%06d' % index)
@@ -329,11 +489,8 @@ class AutoLoop:
                 started = time.monotonic()
                 try:
                     files = self.sources(context, config)
-                    feedback = [item['status'] for item in state['attempts'][:-1][-4:]]
-                    author_input = {'schema_version': 1, 'context': context, 'files': files, 'feedback': feedback}
                     input_path = directory / 'author-input.json'
-                    r.require(len(r.canonical(author_input)) + 1 <= MAX_INPUT, 'author input is too large')
-                    r.atomic_json(input_path, author_input)
+                    r.atomic_json(input_path, self.author_input(state, context, files, campaign))
                     prepared = self.native('author-prepare', input_path)
                     self.check_live(context)
                     response_path = self.model_call(state, attempt, directory, prepared)
@@ -362,27 +519,20 @@ class AutoLoop:
                     r.require(outcome['status'] in r.TERMINAL, 'trial is owned by another controller; inspect before recovery')
                     attempt['status'] = outcome['status']
                     attempt['stage'] = 'finished'
-                    if outcome['status'] in SUCCESS:
-                        state['failure_streak'] = 0
-                    else:
-                        state['failure_streak'] += 1
                 except (KeyboardInterrupt, r.Stopped):
                     attempt['status'] = 'interrupted'
-                    state['failure_streak'] += 1
                     stop_reason = 'interrupted'
                 except (r.ResearchError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
-                    # Persist only a stage/category, never arbitrary remote text.
                     attempt['status'] = 'author_failed'
-                    state['failure_streak'] += 1
                     if attempt['stage'] == 'model_request':
-                        # A lost response may still be generating on the server.
-                        # Stop this invocation instead of automatically sending again.
                         stop_reason = 'transport_error'
                 finally:
                     elapsed = time.monotonic() - started
                     state['charged_seconds'] += elapsed - reservation
                     attempt['charged_seconds'] = elapsed
+                    attempt['failure_code'] = diagnostic_code(attempt)
                     attempt.pop('active_process_group', None)
+                    state['failure_streak'] = streaks(state['attempts'])[0]
                     self.save(state)
                 if stop_reason in ('interrupted', 'transport_error'):
                     break
@@ -390,35 +540,42 @@ class AutoLoop:
 
     def recover(self):
         r = self.r
-        with self.lock_store.lock():
+        # Same lock order as run: loop first, then campaign. Reject an active
+        # evaluator before changing any attempt; never replay or kill stored PIDs.
+        with self.lock_store.lock(), self.campaign.lock():
             state = self.load()
             campaign = self.campaign.load()
+            trials = {item['request_id']: item for item in campaign['trials']}
+            before = r.canonical(state)
             for attempt in state['attempts']:
-                if attempt['status'] != 'running':
+                if attempt['status'] not in ('running', 'interrupted', 'author_failed'):
                     continue
                 group = attempt.get('active_process_group')
-                if group:
+                if group is not None:
+                    r.require(type(group) is int and group > 1, 'invalid recorded process group')
                     try:
                         os.killpg(group, 0)
                     except ProcessLookupError:
                         pass
                     else:
                         raise r.ResearchError('model process group may still be alive; inspect before recovery')
-                trial = next((item for item in campaign['trials'] if item['request_id'] == attempt['id']), None)
-                r.require(trial is None or trial['status'] != 'running', 'evaluation still running or interrupted: inspect campaign recovery first')
-                if trial is not None and trial['status'] in r.TERMINAL:
-                    attempt['status'] = trial['status']
+                trial = trials.get(attempt['id'])
+                r.require(trial is None or trial['status'] != 'running', 'inspect campaign recovery first')
+                if trial is not None:
+                    r.require(attempt.get('candidate_commit', trial['commit']) == trial['commit'] and
+                              attempt.get('trial_id', trial['id']) == trial['id'], 'attempt/trial identity mismatch')
                     attempt['trial_id'] = trial['id']
+                    attempt['status'] = trial['status'] if trial['status'] in r.TERMINAL else 'interrupted'
+                elif attempt['status'] != 'running':
+                    continue
                 else:
                     attempt['status'] = 'interrupted'
                 attempt['stage'] = 'recovered_without_replay'
+                attempt['failure_code'] = diagnostic_code(attempt)
                 attempt.pop('active_process_group', None)
-                if attempt['status'] in SUCCESS:
-                    state['failure_streak'] = 0
-                else:
-                    state['failure_streak'] += 1
-                # Keep crash reservations; never resend unknown work automatically.
-            self.save(state)
+            state['failure_streak'] = streaks(state['attempts'])[0]
+            if r.canonical(state) != before:
+                self.save(state)
             return self.summary(state)
 
 
@@ -427,7 +584,7 @@ def main(argv, engine, bridge_module, binary):
     probe.add_argument('--root', type=Path, default=Path('.jsh-research'))
     probe.add_argument('command', nargs='?')
     known, _ = probe.parse_known_args(argv)
-    commands = {'auto-init', 'auto-run', 'auto-status', 'auto-recover'}
+    commands = {'auto-init', 'auto-run', 'auto-status', 'auto-recover', 'auto-report', 'auto-preflight'}
     if known.command not in commands:
         return bridge_module.main(argv, engine)
     cli = argparse.ArgumentParser(prog='jsh research')
@@ -435,12 +592,15 @@ def main(argv, engine, bridge_module, binary):
     subs = cli.add_subparsers(dest='command', required=True)
     init = subs.add_parser('auto-init', help='freeze model/source/budget configuration; no network request')
     init.add_argument('config', type=Path)
-    init.add_argument('--allow-remote', action='store_true', help='authorize transmitting selected source to this configured HTTPS endpoint')
+    init.add_argument('--allow-remote', action='store_true', help='authorize selected source transmission to configured HTTPS endpoint')
     run = subs.add_parser('auto-run', help='bounded model -> edit -> commit -> evaluate loop')
     run.add_argument('--execute', action='store_true')
     run.add_argument('--limit', type=int, default=1)
     subs.add_parser('auto-status')
     subs.add_parser('auto-recover')
+    report = subs.add_parser('auto-report', help='bounded read-only outcomes, budgets and next action; no source/logs')
+    report.add_argument('--recent', type=int, default=16)
+    subs.add_parser('auto-preflight', help='offline source/validator/readiness checks; no model or evaluation')
     args = cli.parse_args(argv)
     try:
         loop = AutoLoop(engine, bridge_module, args.root, binary)
@@ -450,12 +610,18 @@ def main(argv, engine, bridge_module, binary):
             result = loop.run(args.limit, args.execute)
         elif args.command == 'auto-recover':
             result = loop.recover()
+        elif args.command == 'auto-report':
+            result = loop.report(args.recent)
+        elif args.command == 'auto-preflight':
+            result = loop.preflight()
         else:
             result = loop.summary()
         sys.stdout.write(engine.canonical(result).decode() + '\n')
+        if args.command == 'auto-preflight':
+            return 0 if result['ready'] else 1
         if result.get('stop_reason') == 'interrupted':
             return 130
-        if args.command == 'auto-run' and (result.get('stop_reason') in ('failure_limit', 'needs_recovery', 'needs_baseline_retry', 'transport_error') or
+        if args.command == 'auto-run' and (result.get('stop_reason') in ('failure_limit', 'needs_recovery', 'needs_reconciliation', 'needs_baseline_retry', 'transport_error') or
                                          (result['attempts'] and result['attempts'][-1]['status'] in ('author_failed', 'failed', 'invalid', 'interrupted'))):
             return 1
         return 0

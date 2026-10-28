@@ -1,7 +1,7 @@
 name: Research controller
 on:
   push:
-    branches: [master, 'agent/research-evolution-20261028']
+    branches: [master, 'agent/research-*']
     paths: ['scripts/jsh_research*.py', 'tests/test_research*.py', 'tests/research*.rs', 'src/**', 'Cargo.*', '.github/workflows/research.yml']
   pull_request:
     paths: ['scripts/jsh_research*.py', 'tests/test_research*.py', 'tests/research*.rs', 'src/**', 'Cargo.*', '.github/workflows/research.yml']

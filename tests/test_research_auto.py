@@ -178,7 +178,8 @@ class AutoNativeTests(AutoFixture):
         self.assertEqual((self.repo / 'candidate.py').read_text(), 'SCORE = 10\n')
         second = json.loads(self.server.calls[1]['messages'][1]['content'])['untrusted_authoring_input']
         self.assertEqual(second['files'][0]['content'], 'SCORE = 9.0\n')
-        self.assertEqual(second['feedback'], ['kept'])
+        self.assertEqual(second['schema_version'], 2)
+        self.assertEqual([item['status'] for item in second['feedback']], ['kept'])
         self.assertEqual(report['reserved_output_tokens'], 512)
         self.assertEqual(len(self.store.load()['trials']), 3)
         self.assertNotEqual(report['attempts'][0]['candidate_commit'], report['attempts'][1]['candidate_commit'])
