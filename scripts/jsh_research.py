@@ -340,6 +340,9 @@ def retry(store: Store, trial_id: str, request_id: str) -> dict[str, Any]:
                 "only failed, invalid or interrupted trials can be retried")
         require(len(state["trials"]) < state["manifest"]["budget"]["max_trials"], "trial budget exhausted")
         require(source["kind"] != "baseline" or state["best_id"] is None, "a valid baseline already exists")
+        require(source["kind"] != "baseline" or not any(
+            item["kind"] == "baseline" and item["status"] in ("queued", "running")
+            for item in state["trials"]), "baseline attempt already pending")
         trial = {key: source[key] for key in ("commit", "hypothesis", "kind")}
         trial.update(id=f"e{len(state['trials']):06d}", request_id=request_id, request_digest=request_hash,
                      parents=[source["id"]], retry_of=source["id"], status="queued", results={}, charged_seconds=0.0)
@@ -434,6 +437,9 @@ def run_seed(store: Store, state: dict[str, Any], trial: dict[str, Any], stage: 
                 require(os.fstat(stdout.fileno()).st_size <= MAX_LOG and os.fstat(stderr.fileno()).st_size <= MAX_LOG,
                         "evaluation log limit exceeded")
                 time.sleep(0.05)
+            if store.stopped():
+                raise Stopped("stop requested")
+            require(time.monotonic() - started <= request["timeout_seconds"], "evaluation timed out")
             require(process.returncode == 0, f"evaluation exited with status {process.returncode}")
             require(os.fstat(stdout.fileno()).st_size <= MAX_LOG and os.fstat(stderr.fileno()).st_size <= MAX_LOG,
                     "evaluation log limit exceeded")

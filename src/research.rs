@@ -22,13 +22,19 @@ fn read_json_file(path: &Path, limit: usize) -> Result<Vec<u8>, &'static str> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
     }
-    let file = options.open(path).map_err(|_| "cannot open research JSON file")?;
-    let metadata = file.metadata().map_err(|_| "cannot inspect research JSON file")?;
+    let file = options
+        .open(path)
+        .map_err(|_| "cannot open research JSON file")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "cannot inspect research JSON file")?;
     if !metadata.is_file() || metadata.len() > limit as u64 {
         return Err("research JSON must be a bounded regular file");
     }
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes).map_err(|_| "cannot read research JSON")?;
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cannot read research JSON")?;
     if bytes.len() > limit {
         return Err("research JSON byte limit exceeded");
     }
@@ -66,7 +72,11 @@ pub fn entrypoint() -> i32 {
     let args: Vec<OsString> = std::env::args_os().skip(2).collect();
     let helper = args.first().and_then(|arg| arg.to_str());
     if matches!(helper, Some("prepare-request" | "validate-proposal")) {
-        let expected = if helper == Some("prepare-request") { 2 } else { 3 };
+        let expected = if helper == Some("prepare-request") {
+            2
+        } else {
+            3
+        };
         if args.len() != expected {
             eprintln!("jsh research: prepare-request CONTEXT | validate-proposal CONTEXT PROPOSAL");
             return 2;
@@ -74,7 +84,8 @@ pub fn entrypoint() -> i32 {
         return match native(&args) {
             Ok(value) => write_json(&value),
             Err(error) => {
-                let error = serde_json::json!({"protocol": "jagent.research.request/v1", "error": error});
+                let error =
+                    serde_json::json!({"protocol": "jagent.research.request/v1", "error": error});
                 eprintln!("{error}");
                 2
             }
@@ -83,14 +94,26 @@ pub fn entrypoint() -> i32 {
 
     let mut command = Command::new("python3");
     command
-        .args(["-I", "-X", "utf8", "-c", BRIDGE, "--embedded-engine", ENGINE])
+        .args([
+            "-I",
+            "-X",
+            "utf8",
+            "-c",
+            BRIDGE,
+            "--embedded-engine",
+            ENGINE,
+        ])
         .args(args);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let error = command.exec();
         eprintln!("jsh research: cannot start python3 (requires Python 3.10+): {error}");
-        if error.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 }
+        if error.kind() == std::io::ErrorKind::NotFound {
+            127
+        } else {
+            126
+        }
     }
     #[cfg(not(unix))]
     {

@@ -1,5 +1,7 @@
 # jsh research: bounded automated-experiment control plane
 
+For the context-bound jagent integration, see [autoresearch-bridge.md](autoresearch-bridge.md).
+
 `jsh research` adds an opt-in research subsystem without replacing the normal
 shell. It is inspired by the *publicly described ideas* of Recursive's Eureka
 Machine: propose, implement, evaluate, validate, retain useful branches and build
