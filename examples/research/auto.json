@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+  "model": "flint",
+  "source_paths": ["candidate.py"],
+  "max_attempts": 10,
+  "max_output_tokens": 40960,
+  "max_tokens_per_call": 4096,
+  "request_timeout_seconds": 120,
+  "max_seconds": 7200,
+  "max_failures": 3,
+  "api_key_env": "JSH_RESEARCH_API_KEY",
+  "response_format": "json_schema"
+}
