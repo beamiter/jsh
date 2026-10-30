@@ -107,3 +107,11 @@ runs the real Rust jagent validator and Python controller together, comparing
 invalid-input rejection and executing a full baseline/candidate/promote/replay
 cycle without a model or GPU. Core tests also cover late stop/deadline checks
 and refusal to queue multiple baseline retries.
+
+## Remote staging extension
+
+[Remote execution v1](autoresearch-remote.md) adds a separate opt-in gateway
+client and evidence ledger. Its task identity extends the campaign/manifest
+binding with exact trial, commit, stage, seed, attempt, resources and lease.
+This does not change proposal admission or the existing local evaluator, and
+does not yet authorize remote results to become the local incumbent.

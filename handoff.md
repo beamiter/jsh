@@ -1093,3 +1093,26 @@ check passed. Rust 1.86 is blocked by pre-existing lockfile dependencies:
 serde-saphyr 2.0 requires 1.89; annotate-snippets/encoding_rs require 1.88.
 The shared consumer lifecycle suite covers delayed, duplicate, cross-session,
 restored and concurrent-retry callbacks. No live-provider requests were made.
+
+## 2026-10-30: remote experiment staging foundation
+
+Added embedded `remote-*` commands and a replaceable signed HTTPS gateway client.
+The fsynced remote ledger binds campaign/manifest/config/trial/commit/stage/seed,
+reserves full GPU-seconds before IO, records cancel intent, and recovers by lookup
+without a second submit. Signed nonce-bound responses, stable JobId, metric hash,
+lease and frozen guardrails are checked before evidence is stored. Unknown remote
+outcomes never release budget. Production Alibaba gateway/watchdog/SDK integration
+is NOT included or validated. No DLC credentials/resource allocation were available.
+
+Remote evidence is staged separately: existing local `run`/`auto-run`, incumbent
+selection and jagent dependency pin are unchanged. This explicitly avoids mixing
+local and remote evaluator populations. New protocol tests use a real local HTTP
+mock, not real GPUs. See docs/autoresearch-remote.md for commands, limits, failure
+semantics, official API mapping and remaining deployment requirements.
+
+Validation: 16 remote HTTP/embedded tests passed; all seven targeted native
+research integration tests passed (auto, bridge, CLI, ledger, remote). Existing
+Python research discovery passed 161 tests with 30 binary-only skips before the
+last three additional remote cases; the native suites subsequently exercised
+binary paths. Strict all-target no-default-features Clippy, cargo check, formatting
+and whitespace checks passed. No Rust 1.86 rerun or real DLC integration was done.

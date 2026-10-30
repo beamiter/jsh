@@ -1,0 +1,12 @@
+{
+  "endpoint": "https://research-gateway.example.invalid",
+  "workspace": "REPLACE_WITH_AUTHORIZED_WORKSPACE",
+  "resource_pool": "REPLACE_WITH_AUTHORIZED_POOL",
+  "image_digest": "registry.example.invalid/trusted-evaluator@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "gpus": 8,
+  "lease_seconds": 3600,
+  "max_gpu_seconds": 57600,
+  "max_jobs": 2,
+  "token_env": "JSH_REMOTE_TOKEN",
+  "signing_key_env": "JSH_REMOTE_SIGNING_KEY"
+}

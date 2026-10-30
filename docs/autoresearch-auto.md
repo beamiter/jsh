@@ -186,3 +186,12 @@ callbacks, GPU-hour budgets, parallel research workers, an adversarially isolate
 judge, automatic publication/merge, or a scientific significance criterion.
 The current loop improves a single objective via repeated frozen evaluations;
 a truly untouched final test set and independent review are still required.
+
+## Optional remote staging foundation
+
+The local loop above remains serial/local. The separate
+[remote execution client](autoresearch-remote.md) now supports authenticated
+submit/status/result/cancel/recover, durable GPU reservations and fault-tested
+recovery through a configurable gateway. It does not switch `auto-run` to DLC,
+promote remote measurements, or deploy an Alibaba Cloud gateway. Real GPU
+integration has not been validated.

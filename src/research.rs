@@ -14,6 +14,7 @@ use std::process::Command;
 
 const ENGINE: &str = include_str!("../scripts/jsh_research.py");
 const BRIDGE: &str = include_str!("../scripts/jsh_research_bridge.py");
+const REMOTE: &str = include_str!("../scripts/jsh_research_remote.py");
 const AUTO: &str = include_str!("../scripts/jsh_research_auto.py");
 const HELP: &str = concat!(
     "jsh research — bounded research orchestration\n\n",
@@ -30,6 +31,9 @@ const HELP: &str = concat!(
     "  auto-status | auto-recover        Inspect or recover without HTTP replay\n",
     "  auto-preflight                    Check sources/validator offline\n",
     "  auto-report [--recent N]          Inspect budgets and paired-seed outcomes\n\n",
+    "Remote staging: remote-init CONFIG | remote-ledger\n",
+    "  remote-submit TASK TRIAL --stage STAGE --seed N --execute\n",
+    "  remote-status | remote-result | remote-cancel | remote-recover TASK\n\n",
     "Native jagent helpers (no network IO or execution authorization):\n",
     "  jsh research prepare-request CONTEXT\n",
     "  jsh research validate-proposal CONTEXT PROPOSAL\n",
@@ -146,10 +150,37 @@ pub fn entrypoint() -> i32 {
         }
     };
     let mut command = Command::new("python3");
-    command
-        .args(["-I", "-X", "utf8", "-c", AUTO, "--embedded", ENGINE, BRIDGE])
-        .arg(binary)
-        .args(args);
+    let controller = if args.first().is_some_and(|arg| arg == "--root") {
+        args.get(2)
+    } else if args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| arg.starts_with("--root="))
+    {
+        args.get(1)
+    } else {
+        args.first()
+    };
+    let remote = controller
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| arg.starts_with("remote-"));
+    if remote {
+        command.args([
+            "-I",
+            "-X",
+            "utf8",
+            "-c",
+            REMOTE,
+            "--embedded",
+            ENGINE,
+            BRIDGE,
+        ]);
+    } else {
+        command
+            .args(["-I", "-X", "utf8", "-c", AUTO, "--embedded", ENGINE, BRIDGE])
+            .arg(binary);
+    }
+    command.args(args);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
