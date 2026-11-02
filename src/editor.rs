@@ -2743,13 +2743,8 @@ impl Editor {
             }
         }
 
-        let go_up = rendered_lines.saturating_sub(cursor_row);
-        if go_up > 0 {
-            out.queue(MoveUp(go_up))?;
-        }
-        out.queue(MoveToColumn(cursor_col))?;
-
-        self.last_rendered_lines = rendered_lines;
+        self.last_rendered_lines =
+            position_repaint_cursor(&mut out, rendered_lines, cursor_row, cursor_col)?;
         self.last_cursor_row = cursor_row;
         out.flush()?;
         Ok(())
@@ -3266,6 +3261,28 @@ fn rows_consumed(text: &str, term_width: u16) -> u16 {
         rows = rows.saturating_add(wrap_extra_rows(display_width(line), term_width));
     }
     rows
+}
+
+/// Materialize the caret's row before cancelling delayed terminal autowrap.
+/// At an exactly full last line the final glyph leaves wrap pending; CHA alone
+/// cancels that wrap on the previous row. Recording the next row in that case
+/// makes the following repaint move up past the prompt.
+fn position_repaint_cursor(
+    out: &mut impl Write,
+    rendered_lines: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+) -> io::Result<u16> {
+    for _ in rendered_lines..cursor_row {
+        out.queue(Print("\r\n"))?;
+    }
+    let rendered_lines = rendered_lines.max(cursor_row);
+    let go_up = rendered_lines - cursor_row;
+    if go_up > 0 {
+        out.queue(MoveUp(go_up))?;
+    }
+    out.queue(MoveToColumn(cursor_col))?;
+    Ok(rendered_lines)
 }
 
 /// The input area's visual geometry, soft-wrap aware, relative to the row the
@@ -4393,6 +4410,49 @@ mod tests {
         // Colour codes are painted zero-wide.
         let coloured = format!("\x1b[38;5;11m{}\x1b[0m", "x".repeat(20));
         assert_eq!(rows_consumed(&coloured, 28), 0);
+    }
+
+    #[test]
+    fn repaint_materializes_the_caret_row_at_exact_wrap_boundaries() {
+        for columns in [28, 80, 160] {
+            for wraps in [1, 2, 4] {
+                let buffer = "l".repeat(columns as usize * wraps - 2);
+                let geometry = input_geometry(2, 2, &buffer, buffer.len(), 0, columns);
+                let mut bytes = Vec::new();
+                let rendered = position_repaint_cursor(
+                    &mut bytes,
+                    1 + geometry.extra_rows,
+                    1 + geometry.cursor_row,
+                    geometry.cursor_col,
+                )
+                .unwrap();
+                assert_eq!(bytes, b"\r\n\x1b[1G");
+                assert_eq!(rendered, 1 + geometry.cursor_row);
+            }
+        }
+    }
+
+    #[test]
+    fn repaint_keeps_real_wrapped_rows_and_completion_tail_above_the_caret() {
+        // A ghost or completion menu already materializes the next row. Moving
+        // back to the caret must not insert an additional line in that case.
+        let buffer = "l".repeat(26);
+        let geometry = input_geometry(2, 2, &buffer, buffer.len(), 5, 28);
+        let mut bytes = Vec::new();
+        assert_eq!(
+            position_repaint_cursor(
+                &mut bytes,
+                1 + geometry.extra_rows,
+                1 + geometry.cursor_row,
+                geometry.cursor_col,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(bytes, b"\x1b[1G");
+        bytes.clear();
+        assert_eq!(position_repaint_cursor(&mut bytes, 5, 2, 3).unwrap(), 5);
+        assert_eq!(bytes, b"\x1b[3A\x1b[4G");
     }
 
     #[test]
