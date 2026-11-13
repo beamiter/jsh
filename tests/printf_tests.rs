@@ -82,7 +82,6 @@ fn numeric_bases_and_character_constants_match_bash() {
     );
     matches_bash("printf", &["[%*s]", "0x5", "x"]);
     matches_bash("printf", &["%d:%f", "12x", "1.2abc"]);
-    matches_bash("printf", &["%d", "18446744073709551615"]);
 }
 
 #[test]
@@ -151,4 +150,19 @@ fn character_conversion_preserves_a_complete_unicode_character() {
     );
     assert!(output.status.success());
     assert_eq!(output.stdout, "中:🙂".as_bytes());
+}
+
+// jsh targets Bash 5.2: newer host Bash releases may make range warnings
+// fatal. Keep this version-sensitive contract explicit rather than changing
+// jsh semantics according to the runner's /bin/bash.
+#[test]
+fn numeric_overflow_preserves_bash_52_warning_contract() {
+    let actual = run(
+        env!("CARGO_BIN_EXE_jsh"),
+        "printf",
+        &["%d", "18446744073709551615"],
+    );
+    assert_eq!(actual.status.code(), Some(0));
+    assert_eq!(actual.stdout, b"9223372036854775807");
+    assert!(!actual.stderr.is_empty());
 }

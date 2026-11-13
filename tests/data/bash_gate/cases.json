@@ -62,5 +62,10 @@
     "name": "glob",
     "script": "touch z.txt a.txt; printf \"%s\\n\" *.txt",
     "files": []
+  },
+  {
+    "name": "printf_overflow_bash52",
+    "script": "printf \"%d\" 18446744073709551615 2>warning; rc=$?; printf \":status=%s\\n\" \"$rc\"; if test -s warning; then printf \"warning\\n\"; fi",
+    "files": []
   }
 ]

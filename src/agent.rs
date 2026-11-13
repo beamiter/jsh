@@ -3311,6 +3311,11 @@ mod tests {
                 Ok(())
             }
         }
+        // A 1 MiB producer can finish before cancellation on hosts with a
+        // 1 MiB capture pipe. That measures buffered-tail draining, not signal
+        // forwarding. Keep the producer far larger than the pipe, but finite
+        // so a regression terminates rather than hanging the suite forever.
+        const PRODUCER_BYTES: usize = 64 * 1024 * 1024;
         for terminate in [false, true] {
             let mut state = ShellState::new(false);
             let mut cwd = std::env::current_dir().unwrap();
@@ -3319,16 +3324,18 @@ mod tests {
                 terminate,
             };
             let execution = run_captured_to(
-                "/usr/bin/head -c 1048576 /dev/zero",
+                &format!("/usr/bin/head -c {PRODUCER_BYTES} /dev/zero"),
                 &mut state,
                 &mut cwd,
                 &mut terminal,
             );
             crate::signal::reset_pending_signals();
             assert!(terminal.bytes > 0);
+            // Allow the already-buffered tail of a 1 MiB pipe, but require
+            // cancellation long before the 64 MiB producer completes.
             assert!(
-                terminal.bytes < 1048576,
-                "cancellation was postponed until all output drained"
+                terminal.bytes < 2 * 1024 * 1024,
+                "cancellation failed to stop the producer before 2 MiB drained"
             );
             let expected_signal = if terminate {
                 nix::libc::SIGTERM

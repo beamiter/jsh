@@ -1795,10 +1795,7 @@ impl Editor {
         let mut ctx = self.build_ai_context(state, history);
         ctx.last_error = None;
         let command = self.buffer.clone();
-        if !self.begin_ai_request(AiRequestKind::Explain, command, ctx) {
-            return false;
-        }
-        true
+        self.begin_ai_request(AiRequestKind::Explain, command, ctx)
     }
 
     /// Apply only the response currently authorized by both ID and operation
