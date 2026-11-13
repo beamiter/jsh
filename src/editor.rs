@@ -26,6 +26,7 @@ use crossterm::{
 use std::io::{self, stdout, Write};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 const MAX_AI_EXECUTION_OUTPUT_BYTES: usize = 32 * 1024;
@@ -689,9 +690,7 @@ impl Editor {
             }
             (KeyCode::Backspace, _) => {
                 if self.cursor > 0 {
-                    let prev = self.prev_char_boundary();
-                    self.buffer.drain(prev..self.cursor);
-                    self.cursor = prev;
+                    self.delete_previous_grapheme();
                 }
             }
             (KeyCode::Delete, _) => {
@@ -857,7 +856,7 @@ impl Editor {
                 // In normal mode, cursor sits ON the last char, not past it
                 let end = self.current_line_end();
                 if end > self.last_line_start() {
-                    self.cursor = self.prev_char_boundary_from(end);
+                    self.cursor = self.prev_grapheme_boundary_from(end);
                 }
             }
             (KeyCode::Char('^'), KeyModifiers::SHIFT) | (KeyCode::Home, _) => {
@@ -888,9 +887,7 @@ impl Editor {
             }
             (KeyCode::Char('X'), KeyModifiers::SHIFT) => {
                 if self.cursor > self.last_line_start() {
-                    let prev = self.prev_char_boundary();
-                    self.buffer.drain(prev..self.cursor);
-                    self.cursor = prev;
+                    self.delete_previous_grapheme();
                 }
             }
             (KeyCode::Char('d'), KeyModifiers::NONE) => {
@@ -2776,34 +2773,39 @@ impl Editor {
     }
 
     /// Normal-mode commands address a character, not the insertion position
-    /// past a nonempty line. Derive the endpoint from UTF-8 boundaries rather
+    /// past a nonempty line. Derive the endpoint from grapheme boundaries rather
     /// than subtracting one byte after a deletion or a history replacement.
     fn clamp_vi_normal_cursor(&mut self) {
         let end = self.current_line_end();
         if self.cursor == end && end > self.last_line_start() {
-            self.cursor = self.prev_char_boundary_from(end);
+            self.cursor = self.prev_grapheme_boundary_from(end);
         }
     }
 
     fn move_right(&mut self) {
         if self.cursor < self.buffer.len() {
-            let c = self.buffer[self.cursor..].chars().next().unwrap();
-            self.cursor += c.len_utf8();
+            self.cursor = self.next_grapheme_boundary();
         }
     }
 
     fn move_left(&mut self) {
         if self.cursor > 0 {
-            self.cursor = self.prev_char_boundary();
+            self.cursor = self.prev_grapheme_boundary();
         }
     }
 
-    fn prev_char_boundary(&self) -> usize {
-        let mut pos = self.cursor - 1;
-        while pos > 0 && !self.buffer.is_char_boundary(pos) {
-            pos -= 1;
-        }
-        pos
+    fn prev_grapheme_boundary(&self) -> usize {
+        self.prev_grapheme_boundary_from(self.cursor)
+    }
+
+    // Segment the complete buffer, not the suffix at the caret: regional
+    // indicator pairs and combining sequences depend on preceding context.
+    fn next_grapheme_boundary(&self) -> usize {
+        self.buffer
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .find(|&offset| offset > self.cursor)
+            .unwrap_or(self.buffer.len())
     }
 
     fn last_line_start(&self) -> usize {
@@ -2847,9 +2849,39 @@ impl Editor {
 
     fn delete_char(&mut self) {
         if self.cursor < self.buffer.len() {
-            let c = self.buffer[self.cursor..].chars().next().unwrap();
-            self.buffer.drain(self.cursor..self.cursor + c.len_utf8());
+            let start = self.grapheme_start_at_cursor();
+            let end = self.next_grapheme_boundary();
+            self.buffer.drain(start..end);
+            self.cursor = start;
+            self.cursor = self.grapheme_start_at_cursor();
         }
+    }
+
+    fn grapheme_start_at_cursor(&self) -> usize {
+        if self.cursor == self.buffer.len() {
+            return self.cursor;
+        }
+        self.buffer
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .take_while(|&offset| offset <= self.cursor)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn delete_previous_grapheme(&mut self) {
+        let start = self.prev_grapheme_boundary();
+        // Insertion or completion can join neighboring graphemes and leave
+        // the byte caret inside one (notably regional indicators). Never
+        // delete just the prefix of that newly formed grapheme.
+        let end = if self.grapheme_start_at_cursor() == self.cursor {
+            self.cursor
+        } else {
+            self.next_grapheme_boundary()
+        };
+        self.buffer.drain(start..end);
+        self.cursor = start;
+        self.cursor = self.grapheme_start_at_cursor();
     }
 
     // Multiline cursor movement
@@ -2873,15 +2905,15 @@ impl Editor {
             .unwrap_or(0);
         let prev_line = &self.buffer[prev_nl..line_start - 1];
         let target_col = col.min(display_width_raw(prev_line));
-        // Walk chars until we reach target display column
+        // Walk whole graphemes; retain the editor's existing width policy.
         let mut current_col = 0;
         let mut byte_offset = 0;
-        for c in prev_line.chars() {
+        for grapheme in prev_line.graphemes(true) {
             if current_col >= target_col {
                 break;
             }
-            current_col += char_width(c);
-            byte_offset += c.len_utf8();
+            current_col += display_width_raw(grapheme);
+            byte_offset += grapheme.len();
         }
         self.cursor = prev_nl + byte_offset;
     }
@@ -2901,12 +2933,12 @@ impl Editor {
         let target_col = col.min(display_width_raw(next_line));
         let mut current_col = 0;
         let mut byte_offset = 0;
-        for c in next_line.chars() {
+        for grapheme in next_line.graphemes(true) {
             if current_col >= target_col {
                 break;
             }
-            current_col += char_width(c);
-            byte_offset += c.len_utf8();
+            current_col += display_width_raw(grapheme);
+            byte_offset += grapheme.len();
         }
         self.cursor = next_line_start + byte_offset;
     }
@@ -2962,14 +2994,10 @@ impl Editor {
         if self.cursor >= self.buffer.len() {
             return;
         }
-        let start = self.cursor
-            + self.buffer[self.cursor..]
-                .chars()
-                .next()
-                .map_or(0, |c| c.len_utf8());
-        let mut chars = self.buffer[start..].char_indices().peekable();
+        let start = self.next_grapheme_boundary();
+        let mut chars = self.buffer[start..].grapheme_indices(true).peekable();
         while let Some(&(offset, ch)) = chars.peek() {
-            if !ch.is_whitespace() {
+            if !ch.chars().all(char::is_whitespace) {
                 break;
             }
             // If no word remains, `e` still reaches the final character
@@ -2980,7 +3008,7 @@ impl Editor {
         // Keep the start of the final character. A byte count after it is an
         // insertion point and made `e` followed by `x` delete the next space.
         while let Some(&(offset, ch)) = chars.peek() {
-            if ch.is_whitespace() {
+            if ch.chars().all(char::is_whitespace) {
                 break;
             }
             self.cursor = start + offset;
@@ -2988,15 +3016,13 @@ impl Editor {
         }
     }
 
-    fn prev_char_boundary_from(&self, pos: usize) -> usize {
-        if pos == 0 {
-            return 0;
-        }
-        let mut p = pos - 1;
-        while p > 0 && !self.buffer.is_char_boundary(p) {
-            p -= 1;
-        }
-        p
+    fn prev_grapheme_boundary_from(&self, pos: usize) -> usize {
+        self.buffer
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .take_while(|&offset| offset < pos)
+            .last()
+            .unwrap_or(0)
     }
 
     fn is_terminal_dead() -> bool {
@@ -3393,6 +3419,114 @@ mod tests {
         editor.cursor = cursor;
         editor.vi_mode = ViMode::Normal;
         (directory, editor, ShellState::new(false), history)
+    }
+
+    #[test]
+    fn grapheme_horizontal_movement_and_delete_are_atomic() {
+        for cluster in ["e\u{301}", "👩🏽‍💻", "🇨🇳", "中", "a"] {
+            let mut editor = Editor::new();
+            editor.buffer = format!("x{cluster}y");
+            editor.cursor = 1;
+            editor.move_right();
+            assert_eq!(editor.cursor, 1 + cluster.len(), "{cluster}");
+            editor.move_left();
+            assert_eq!(editor.cursor, 1);
+            editor.delete_char();
+            assert_eq!(editor.buffer, "xy");
+        }
+    }
+
+    #[test]
+    fn grapheme_movement_uses_regional_indicator_pairing_context() {
+        let mut editor = Editor::new();
+        editor.buffer = "🇨🇳🇺🇸".into();
+        editor.move_right();
+        assert_eq!(editor.cursor, "🇨🇳".len());
+        editor.move_right();
+        assert_eq!(editor.cursor, editor.buffer.len());
+        editor.move_left();
+        editor.delete_char();
+        assert_eq!(editor.buffer, "🇨🇳");
+        editor.move_left();
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn grapheme_delete_after_insertion_does_not_split_new_flag_pair() {
+        for key in [KeyCode::Delete, KeyCode::Backspace] {
+            let (_dir, mut editor, mut state, mut history) = vi_test_editor("🇨🇳", 0);
+            editor
+                .handle_emacs_key(
+                    KeyEvent::new(KeyCode::Char('🇺'), KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.cursor, "🇺".len());
+            editor
+                .handle_emacs_key(
+                    KeyEvent::new(key, KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.buffer, "🇳");
+            assert_eq!(editor.cursor, 0);
+        }
+    }
+
+    #[test]
+    fn grapheme_delete_newline_normalizes_new_combining_cluster() {
+        let mut editor = Editor::new();
+        editor.buffer = "a\n\u{301}b".into();
+        editor.cursor = 1;
+        editor.delete_char();
+        assert_eq!(editor.buffer, "a\u{301}b");
+        assert_eq!(editor.cursor, 0);
+        editor.delete_char();
+        assert_eq!(editor.buffer, "b");
+    }
+
+    #[test]
+    fn grapheme_backspace_and_vi_end_delete_preserve_neighbors() {
+        for cluster in ["e\u{301}", "👩🏽‍💻", "🇨🇳"] {
+            let (dir, mut editor, mut state, mut history) =
+                vi_test_editor(&format!("x{cluster}y"), 1 + cluster.len());
+            editor
+                .handle_emacs_key(
+                    KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.buffer, "xy");
+            assert_eq!(editor.cursor, 1);
+            editor.buffer = format!("ab{cluster} tail");
+            editor.cursor = 0;
+            editor.vi_word_end();
+            assert_eq!(editor.cursor, 2);
+            editor.delete_char();
+            assert_eq!(editor.buffer, "ab tail");
+            editor.buffer = format!("x{cluster}");
+            editor.cursor = editor.buffer.len();
+            editor.clamp_vi_normal_cursor();
+            assert_eq!(editor.cursor, 1);
+            drop(dir);
+        }
+    }
+
+    #[test]
+    fn grapheme_vertical_motion_does_not_split_combining_or_emoji() {
+        for cluster in ["e\u{301}", "👩🏽‍💻", "🇨🇳"] {
+            let mut editor = Editor::new();
+            editor.buffer = format!("x\n{cluster}z\nx");
+            editor.cursor = 1;
+            editor.move_cursor_down();
+            assert_eq!(editor.cursor, 2 + cluster.len());
+            editor.cursor = editor.buffer.len();
+            editor.move_cursor_up();
+            assert_eq!(editor.cursor, 2 + cluster.len());
+        }
     }
 
     #[test]

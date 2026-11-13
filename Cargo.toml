@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 indexmap = { version = "2", features = ["serde"] }
 once_cell = "1"
 unicode-width = "0.2"
+unicode-segmentation = "1.12"
 crossterm = "0.29.0"
 dirs = "7.0.0"
 nix = { version = "0.31.3", features = ["process", "fs", "signal", "term", "user"] }
