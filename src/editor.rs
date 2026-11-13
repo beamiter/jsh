@@ -26,7 +26,7 @@ use crossterm::{
 use std::io::{self, stdout, Write};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 use unicode_width::UnicodeWidthChar;
 
 const MAX_AI_EXECUTION_OUTPUT_BYTES: usize = 32 * 1024;
@@ -2798,13 +2798,14 @@ impl Editor {
         self.prev_grapheme_boundary_from(self.cursor)
     }
 
-    // Segment the complete buffer, not the suffix at the caret: regional
-    // indicator pairs and combining sequences depend on preceding context.
+    // Supply complete context without iterating from byte zero on every key.
+    // GraphemeCursor starts at the caret and only examines the context required
+    // by Unicode (e.g. preceding regional indicators or an emoji ZWJ chain).
+    // The caret is a UTF-8 boundary; a complete buffer cannot need another chunk.
     fn next_grapheme_boundary(&self) -> usize {
-        self.buffer
-            .grapheme_indices(true)
-            .map(|(offset, _)| offset)
-            .find(|&offset| offset > self.cursor)
+        GraphemeCursor::new(self.cursor, self.buffer.len(), true)
+            .next_boundary(&self.buffer, 0)
+            .expect("complete editor buffer at a UTF-8 boundary")
             .unwrap_or(self.buffer.len())
     }
 
@@ -2858,15 +2859,18 @@ impl Editor {
     }
 
     fn grapheme_start_at_cursor(&self) -> usize {
-        if self.cursor == self.buffer.len() {
-            return self.cursor;
+        let mut cursor = GraphemeCursor::new(self.cursor, self.buffer.len(), true);
+        if cursor
+            .is_boundary(&self.buffer, 0)
+            .expect("complete editor buffer at a UTF-8 boundary")
+        {
+            self.cursor
+        } else {
+            cursor
+                .prev_boundary(&self.buffer, 0)
+                .expect("complete editor buffer at a UTF-8 boundary")
+                .unwrap_or(0)
         }
-        self.buffer
-            .grapheme_indices(true)
-            .map(|(offset, _)| offset)
-            .take_while(|&offset| offset <= self.cursor)
-            .last()
-            .unwrap_or(0)
     }
 
     fn delete_previous_grapheme(&mut self) {
@@ -3017,11 +3021,9 @@ impl Editor {
     }
 
     fn prev_grapheme_boundary_from(&self, pos: usize) -> usize {
-        self.buffer
-            .grapheme_indices(true)
-            .map(|(offset, _)| offset)
-            .take_while(|&offset| offset < pos)
-            .last()
+        GraphemeCursor::new(pos, self.buffer.len(), true)
+            .prev_boundary(&self.buffer, 0)
+            .expect("complete editor buffer at a UTF-8 boundary")
             .unwrap_or(0)
     }
 
@@ -3419,6 +3421,93 @@ mod tests {
         editor.cursor = cursor;
         editor.vi_mode = ViMode::Normal;
         (directory, editor, ShellState::new(false), history)
+    }
+
+    #[test]
+    fn grapheme_cursor_matches_full_segmentation_at_every_scalar_boundary() {
+        // Check inside clusters as well as between them: edits can join the
+        // neighbors around the caret. Mixed pairs exercise context across seams.
+        let fragments = [
+            "",
+            "abc",
+            "e\u{301}",
+            "\r\n",
+            "\u{301}",
+            "👩🏽‍💻",
+            "🇨🇳🇺🇸🇦",
+            "\u{600}a",
+            "각",
+            "क्‍ष",
+            "\n",
+            "中",
+        ];
+        for left in fragments {
+            for right in fragments {
+                let mut editor = Editor::new();
+                editor.buffer = format!("{left}{right}");
+                let mut boundaries: Vec<_> = editor
+                    .buffer
+                    .grapheme_indices(true)
+                    .map(|(offset, _)| offset)
+                    .collect();
+                boundaries.push(editor.buffer.len());
+                let positions: Vec<_> = editor
+                    .buffer
+                    .char_indices()
+                    .map(|(p, _)| p)
+                    .chain(std::iter::once(editor.buffer.len()))
+                    .collect();
+                for pos in positions {
+                    editor.cursor = pos;
+                    let prev = boundaries.iter().copied().rfind(|&p| p < pos).unwrap_or(0);
+                    let next = boundaries
+                        .iter()
+                        .copied()
+                        .find(|&p| p > pos)
+                        .unwrap_or(editor.buffer.len());
+                    let floor = boundaries.iter().copied().rfind(|&p| p <= pos).unwrap();
+                    assert_eq!(
+                        editor.prev_grapheme_boundary(),
+                        prev,
+                        "prev {:?}@{pos}",
+                        editor.buffer
+                    );
+                    assert_eq!(
+                        editor.next_grapheme_boundary(),
+                        next,
+                        "next {:?}@{pos}",
+                        editor.buffer
+                    );
+                    assert_eq!(
+                        editor.grapheme_start_at_cursor(),
+                        floor,
+                        "floor {:?}@{pos}",
+                        editor.buffer
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grapheme_cursor_keeps_context_after_a_long_ascii_prefix() {
+        let mut editor = Editor::new();
+        editor.buffer = "a".repeat(100_000) + "🇨🇳🇺🇸👩🏽‍💻e\u{301}";
+        let boundaries: Vec<_> = editor
+            .buffer
+            .grapheme_indices(true)
+            .map(|(p, _)| p)
+            .chain(std::iter::once(editor.buffer.len()))
+            .collect();
+        editor.cursor = editor.buffer.len();
+        for &expected in boundaries.iter().rev().skip(1).take(10) {
+            editor.move_left();
+            assert_eq!(editor.cursor, expected);
+        }
+        for _ in 0..10 {
+            editor.move_right();
+        }
+        assert_eq!(editor.cursor, editor.buffer.len());
     }
 
     #[test]
