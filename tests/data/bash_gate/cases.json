@@ -1,0 +1,66 @@
+[
+  {
+    "name": "quoted_words",
+    "script": "x=\"a b\"; printf \"<%s>\\n\" \"$x\"",
+    "files": []
+  },
+  {
+    "name": "status",
+    "script": "false; printf \"%s\\n\" \"$?\"; exit 7",
+    "files": []
+  },
+  {
+    "name": "pipeline",
+    "script": "printf \"b\\na\\n\" | sort",
+    "files": []
+  },
+  {
+    "name": "stderr",
+    "script": "printf \"out\\n\"; printf \"err\\n\" >&2",
+    "files": []
+  },
+  {
+    "name": "redirection_order",
+    "script": "{ printf \"out\\n\"; printf \"err\\n\" >&2; } >result 2>&1",
+    "files": [
+      "result"
+    ]
+  },
+  {
+    "name": "append",
+    "script": "printf \"one\\n\" >result; printf \"two\\n\" >>result; cat result",
+    "files": [
+      "result"
+    ]
+  },
+  {
+    "name": "subshell",
+    "script": "x=outer; (x=inner; printf \"%s\\n\" \"$x\"); printf \"%s\\n\" \"$x\"",
+    "files": []
+  },
+  {
+    "name": "substitution",
+    "script": "x=$(printf \"a\\nb\\n\\n\"); printf \"<%s>\\n\" \"$x\"",
+    "files": []
+  },
+  {
+    "name": "loop",
+    "script": "for x in a \"b c\"; do printf \"<%s>\\n\" \"$x\"; done",
+    "files": []
+  },
+  {
+    "name": "condition",
+    "script": "false && printf no; true || printf no; if true; then printf yes; fi",
+    "files": []
+  },
+  {
+    "name": "function",
+    "script": "f() { printf \"%s:%s\\n\" \"$1\" \"$#\"; }; f \"a b\" c",
+    "files": []
+  },
+  {
+    "name": "glob",
+    "script": "touch z.txt a.txt; printf \"%s\\n\" *.txt",
+    "files": []
+  }
+]
