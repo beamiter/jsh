@@ -2831,25 +2831,41 @@ impl Editor {
     }
 
     fn prev_word_boundary(&self) -> usize {
-        let buf = &self.buffer[..self.cursor];
-        let trimmed = buf.trim_end();
-        match trimmed.rfind([' ', '\t', '/']) {
-            Some(pos) => pos + 1,
-            None => 0,
+        // Include complete context if insertion left the caret inside a cluster.
+        let end = if self.grapheme_start_at_cursor() == self.cursor {
+            self.cursor
+        } else {
+            self.next_grapheme_boundary()
+        };
+        let mut graphemes = self.buffer[..end].grapheme_indices(true).rev().peekable();
+        while graphemes
+            .peek()
+            .is_some_and(|(_, g)| g.chars().next().is_some_and(char::is_whitespace))
+        {
+            graphemes.next();
         }
+        for (offset, g) in graphemes {
+            if g.starts_with([' ', '\t', '/']) {
+                return if offset + g.len() > self.cursor {
+                    offset
+                } else {
+                    offset + g.len()
+                };
+            }
+        }
+        0
     }
 
     fn next_word_boundary(&self) -> usize {
-        let after = &self.buffer[self.cursor..];
-        // Skip current word characters, then skip separators
-        let mut chars = after.char_indices();
-        // Skip non-separator chars first
+        let start = self.grapheme_start_at_cursor();
+        // A delimiter and its combining marks move as one unit. Classify by
+        // the base character to preserve path/whitespace word semantics.
         let mut found_sep = false;
-        for (i, c) in &mut chars {
-            if c == ' ' || c == '\t' || c == '/' {
+        for (offset, g) in self.buffer[start..].grapheme_indices(true) {
+            if g.starts_with([' ', '\t', '/']) {
                 found_sep = true;
             } else if found_sep {
-                return self.cursor + i;
+                return start + offset;
             }
         }
         self.buffer.len()
@@ -3603,12 +3619,68 @@ mod tests {
     }
 
     #[test]
+    fn emacs_word_motion_keeps_decorated_delimiters_atomic() {
+        for delimiter in [" \u{301}", "/\u{301}", " ", "/"] {
+            let buffer = format!("a{delimiter}word tail");
+            let word_start = 1 + delimiter.len();
+            let (_dir, mut editor, mut state, mut history) = vi_test_editor(&buffer, 0);
+            editor
+                .handle_emacs_key(
+                    KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.cursor, word_start);
+            editor
+                .handle_emacs_key(
+                    KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.cursor, word_start + 5);
+            editor
+                .handle_emacs_key(
+                    KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.cursor, word_start);
+            assert_eq!(editor.cursor, editor.grapheme_start_at_cursor());
+        }
+    }
+
+    #[test]
+    fn emacs_word_motion_handles_interior_caret_and_empty_buffer() {
+        for cluster in ["e\u{301}", "👩‍💻", "🇨🇳"] {
+            let mut editor = Editor::new();
+            editor.buffer = format!("x {cluster} y");
+            for offset in cluster.char_indices().map(|(offset, _)| offset).skip(1) {
+                editor.cursor = 2 + offset;
+                assert_eq!(editor.prev_word_boundary(), 2);
+                assert_eq!(editor.next_word_boundary(), 3 + cluster.len());
+            }
+        }
+        let mut editor = Editor::new();
+        editor.buffer = "a/\u{301}word".into();
+        editor.cursor = 2;
+        assert_eq!(editor.prev_word_boundary(), 1);
+        assert_eq!(editor.next_word_boundary(), 4);
+        let editor = Editor::new();
+        assert_eq!(editor.prev_word_boundary(), 0);
+        assert_eq!(editor.next_word_boundary(), 0);
+    }
+
+    #[test]
     fn emacs_kill_commands_preserve_grapheme_boundaries() {
         for (buffer, cursor, key, expected, expected_cursor) in [
             ("e\u{301}tail", 1, 'k', "", 0),
             ("e\u{301}tail", 1, 'u', "tail", 0),
             ("e\u{301}tail", 1, 'w', "tail", 0),
-            ("a/\u{301}word", 8, 'w', "a", 1),
+            ("a/\u{301}word", 8, 'w', "a/\u{301}", 4),
+            ("a/\u{301}word", 2, 'w', "aword", 1),
             ("🇨x🇳", 5, 'w', "🇳", 0),
             ("keep\nabc tail", 8, 'u', "keep\n tail", 5),
             ("keep\nabc tail", 8, 'k', "keep\nabc", 8),
