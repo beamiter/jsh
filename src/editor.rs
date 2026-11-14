@@ -2952,48 +2952,50 @@ impl Editor {
     // Vi word movement helpers
 
     fn vi_word_forward(&mut self) {
-        let buf = &self.buffer[self.cursor..];
-        let mut chars = buf.chars();
-        let mut moved = 0;
-        // Skip current word (non-whitespace)
-        for c in chars.by_ref() {
-            moved += c.len_utf8();
-            if c.is_whitespace() {
-                break;
-            }
+        let start = self.grapheme_start_at_cursor();
+        let mut graphemes = self.buffer[start..].grapheme_indices(true).peekable();
+        // Match `e`: a cluster with non-whitespace content is a word unit.
+        // In particular, never stop between a space and its combining marks.
+        while graphemes
+            .peek()
+            .is_some_and(|(_, g)| !g.chars().all(char::is_whitespace))
+        {
+            graphemes.next();
         }
-        // Skip whitespace
-        for c in chars {
-            if !c.is_whitespace() {
-                break;
-            }
-            moved += c.len_utf8();
+        while graphemes
+            .peek()
+            .is_some_and(|(_, g)| g.chars().all(char::is_whitespace))
+        {
+            graphemes.next();
         }
-        self.cursor = (self.cursor + moved).min(self.buffer.len());
+        self.cursor = graphemes
+            .next()
+            .map_or(self.buffer.len(), |(offset, _)| start + offset);
     }
 
     fn vi_word_backward(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let buf = &self.buffer[..self.cursor];
-        let mut pos = self.cursor;
-        // Skip trailing whitespace
-        for c in buf.chars().rev() {
-            if !c.is_whitespace() {
+        // Include the whole cluster if insertion left an interior caret, but
+        // do not scan the unrelated suffix after the caret on every `b`.
+        let end = if self.grapheme_start_at_cursor() == self.cursor {
+            self.cursor
+        } else {
+            self.next_grapheme_boundary()
+        };
+        let mut graphemes = self.buffer[..end].grapheme_indices(true).rev().peekable();
+        while let Some(&(offset, g)) = graphemes.peek() {
+            if !g.chars().all(char::is_whitespace) {
                 break;
             }
-            pos -= c.len_utf8();
+            self.cursor = offset;
+            graphemes.next();
         }
-        // Skip word chars
-        let buf = &self.buffer[..pos];
-        for c in buf.chars().rev() {
-            if c.is_whitespace() {
+        while let Some(&(offset, g)) = graphemes.peek() {
+            if g.chars().all(char::is_whitespace) {
                 break;
             }
-            pos -= c.len_utf8();
+            self.cursor = offset;
+            graphemes.next();
         }
-        self.cursor = pos;
     }
 
     fn vi_word_end(&mut self) {
@@ -3790,6 +3792,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn vi_word_motions_normalize_interior_carets() {
+        for cluster in ["e\u{301}", "👩‍💻", "🇺🇸", " \u{301}"] {
+            let mut editor = Editor::new();
+            editor.buffer = format!("x {cluster} y");
+            for offset in cluster.char_indices().map(|(offset, _)| offset).skip(1) {
+                editor.cursor = 2 + offset;
+                editor.vi_word_forward();
+                assert_eq!(editor.cursor, 3 + cluster.len());
+                editor.cursor = 2 + offset;
+                editor.vi_word_backward();
+                assert_eq!(editor.cursor, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn vi_word_motions_keep_combining_whitespace_clusters_atomic() {
+        // A combining mark on a space is one non-whitespace cluster, as for e.
+        let buffer = "a \u{301} b 👩‍💻 z";
+        let (_directory, mut editor, mut state, mut history) = vi_test_editor(buffer, 0);
+        for (key, expected) in [('w', 5), ('w', 7), ('b', 5), ('b', 0)] {
+            editor
+                .handle_vi_key(
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.cursor, expected, "{key}");
+            assert_eq!(editor.cursor, editor.grapheme_start_at_cursor());
+        }
+        // Backward movement from the following word must not land on the mark.
+        editor.cursor = 5;
+        editor
+            .handle_vi_key(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                &mut state,
+                &mut history,
+            )
+            .unwrap();
+        editor
+            .handle_vi_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &mut state,
+                &mut history,
+            )
+            .unwrap();
+        assert_eq!(editor.buffer, " \u{301} b 👩‍💻 z");
     }
 
     #[test]
