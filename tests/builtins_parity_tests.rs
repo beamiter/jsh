@@ -20,6 +20,8 @@ fn run_in(dir: &Path, path: &str, script: &str) -> (String, i32) {
         .env("LANG", "C.UTF-8")
         .env("LC_ALL", "C.UTF-8")
         .env("TERM", "dumb")
+        // Epoch-zero printf fixtures must not depend on the runner timezone.
+        .env("TZ", "UTC")
         .stdin(Stdio::null())
         .output()
         .expect("spawn jsh");
@@ -72,6 +74,17 @@ fn getopts_match_bash() {
         ("OPTERR=0; set -- -z; getopts a o; echo \"$o\"", "?\n", 0),
         // getopts_reset_and_reuse
         ("set -- -a -b; while getopts ab o; do echo $o; done; OPTIND=1; set -- -b; while getopts ab o; do echo again $o; done; echo $OPTIND", "a\nb\nagain b\n2\n", 0),
+        // Explicit same-value assignments restart a partially read cluster.
+        ("set -- -ab; getopts ab o; echo $o:$OPTIND; OPTIND=1; getopts ab o; echo $o:$OPTIND; getopts ab o; echo $o:$OPTIND", "a:1\na:1\nb:2\n", 0),
+        ("set -- -abc; getopts abc o; OPTIND=$OPTIND; getopts abc o; echo $o:$OPTIND", "a:1\n", 0),
+        ("set -- -ab; getopts ab o; declare OPTIND=1; getopts ab o; echo $o:$OPTIND", "a:1\n", 0),
+        ("set -- -ab; getopts ab o; declare -n ref=OPTIND; ref=1; getopts ab o; echo $o:$OPTIND", "a:1\n", 0),
+        ("set -- -ab; getopts ab o; let OPTIND=1; getopts ab o; echo $o:$OPTIND", "a:1\n", 0),
+        // Unlike 1, an unchanged larger index does not restart a cluster.
+        ("set -- -x -ab; getopts xab o; getopts xab o; echo $o:$OPTIND; OPTIND=2; getopts xab o; echo $o:$OPTIND", "a:2\nb:3\n", 0),
+        ("set -- -ab; getopts ab o; OPTIND[0]=1; getopts ab o; echo $o:$OPTIND", "a:1\n", 0),
+        ("set -- -ab; getopts ab o; declare -n ref='OPTIND[0]'; ref=1; getopts ab o; echo $o:$OPTIND", "a:1\n", 0),
+        ("set -- -ab; getopts ab o; OPTIND[1]=1; getopts ab o; echo $o:$OPTIND", "a:1\n", 0),
         // getopts_usage_errors
         ("getopts; echo st=$?; getopts a; echo st=$?; getopts a 1x 2>/dev/null; echo st=$?", "st=2\nst=2\nst=1\n", 0),
         // getopts_no_options

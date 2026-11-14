@@ -25,6 +25,13 @@ pub struct BuiltinState {
     pub(crate) start_time: std::time::SystemTime,
 }
 
+impl BuiltinState {
+    /// An explicit reset must restart getopts even if OPTIND's text did not change.
+    pub(crate) fn optind_assigned(&mut self, value: &str) {
+        self.getopts.optind_assigned(value);
+    }
+}
+
 impl Default for BuiltinState {
     fn default() -> Self {
         Self {

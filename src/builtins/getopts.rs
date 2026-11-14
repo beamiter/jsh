@@ -4,8 +4,8 @@
 //! argument to examine, which scripts read (`shift $((OPTIND-1))`) and reset
 //! (`OPTIND=1`, `local OPTIND`). The position *inside* a cluster such as
 //! `-abc` is private to getopts, as in bash, and survives between calls only
-//! while `OPTIND` still holds the value getopts itself stored. Any other value
-//! means the script assigned it, which restarts the scan at that index.
+//! while `OPTIND` still holds the value getopts itself stored and the script
+//! has not explicitly reset it to 0 or 1. Assigning 1 restarts even if unchanged.
 
 use crate::environment::ShellState;
 
@@ -20,6 +20,16 @@ pub struct GetoptsState {
     /// What getopts last stored in `OPTIND`, to tell its own value apart from
     /// one the script assigned.
     stored_optind: Option<String>,
+}
+
+impl GetoptsState {
+    pub(super) fn optind_assigned(&mut self, value: &str) {
+        // Bash only treats an explicit 0/1 as a reset. Reassigning an
+        // unchanged larger index must retain the current cluster offset.
+        if leading_integer(value) <= 1 {
+            self.stored_optind = None;
+        }
+    }
 }
 
 enum Outcome {
@@ -59,10 +69,12 @@ pub(super) fn builtin_getopts(args: &[String], state: &mut ShellState) -> i32 {
     }
     let outcome = next_option(scan, &argv, optstring);
     let optind = scan.optind.to_string();
-    scan.stored_optind = Some(optind.clone());
-
     let script = state.arg0.clone();
     state.set_var("OPTIND", &optind);
+    // The variable layer observes every successful write, including this one.
+    // Mark only our own publication as internal after it has completed, so
+    // clustered options keep their private position on the next call.
+    state.builtin_state.getopts.stored_optind = Some(optind);
     let (value, optarg, status) = match outcome {
         Outcome::End => ("?".to_string(), None, 1),
         Outcome::Option(c, optarg) => (c.to_string(), optarg, 0),

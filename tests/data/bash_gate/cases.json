@@ -67,5 +67,10 @@
     "name": "printf_overflow_bash52",
     "script": "printf \"%d\" 18446744073709551615 2>warning; rc=$?; printf \":status=%s\\n\" \"$rc\"; if test -s warning; then printf \"warning\\n\"; fi",
     "files": []
+  },
+  {
+    "name": "getopts_explicit_same_index_reset",
+    "script": "set -- -ab; getopts ab o; printf \"%s:%s\\n\" \"$o\" \"$OPTIND\"; OPTIND=1; getopts ab o; printf \"%s:%s\\n\" \"$o\" \"$OPTIND\"; getopts ab o; printf \"%s:%s\\n\" \"$o\" \"$OPTIND\"",
+    "files": []
   }
 ]

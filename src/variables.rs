@@ -1227,6 +1227,9 @@ impl ShellState {
     /// Side effects of assigning `name`: special variables and the
     /// environment.
     fn after_assign(&mut self, name: &str, slot: Slot, value: &str) {
+        if name == "OPTIND" {
+            self.builtin_state.optind_assigned(value);
+        }
         if slot == Slot::Global && self.dynamic.is_active(name) {
             match name {
                 "RANDOM" => {
@@ -1377,6 +1380,10 @@ impl ShellState {
             if let VarValue::Assoc(m) = &mut var.value {
                 m.insert(subscript.to_string(), stored);
             }
+            if name == "OPTIND" {
+                let scalar = self.get_var(&name).unwrap_or("").to_string();
+                self.builtin_state.optind_assigned(&scalar);
+            }
             self.sync_env(&name);
             return true;
         }
@@ -1422,6 +1429,10 @@ impl ShellState {
         var.value = VarValue::Indexed(array);
         if allexport {
             var.attrs.insert(VarAttrs::EXPORT);
+        }
+        if name == "OPTIND" {
+            let scalar = self.get_var(&name).unwrap_or("").to_string();
+            self.builtin_state.optind_assigned(&scalar);
         }
         self.sync_env(&name);
         true
