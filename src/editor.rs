@@ -595,18 +595,23 @@ impl Editor {
                 self.cursor = self.current_line_end();
             }
             (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                let end = self.current_line_end();
-                self.buffer.drain(self.cursor..end);
+                let mut end = self.current_line_end();
+                // Preserve the complete line break if pasted text has CRLF.
+                if end < self.buffer.len()
+                    && end > self.cursor
+                    && self.buffer.as_bytes()[end - 1] == b'\r'
+                {
+                    end -= 1;
+                }
+                self.delete_grapheme_range(self.cursor, end);
             }
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 let start = self.last_line_start();
-                self.buffer.drain(start..self.cursor);
-                self.cursor = start;
+                self.delete_grapheme_range(start, self.cursor);
             }
             (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
                 let new_pos = self.prev_word_boundary();
-                self.buffer.drain(new_pos..self.cursor);
-                self.cursor = new_pos;
+                self.delete_grapheme_range(new_pos, self.cursor);
             }
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                 self.search_mode = Some(SearchMode {
@@ -2875,6 +2880,26 @@ impl Editor {
         }
     }
 
+    /// Kill commands must not leave fragments when completion/insertion left
+    /// the caret inside a cluster, or a word delimiter belongs to a cluster.
+    fn delete_grapheme_range(&mut self, start: usize, end: usize) {
+        if start == end {
+            return;
+        }
+        self.cursor = start;
+        let start = self.grapheme_start_at_cursor();
+        self.cursor = end;
+        let end = if self.grapheme_start_at_cursor() == end {
+            end
+        } else {
+            self.next_grapheme_boundary()
+        };
+        self.buffer.drain(start..end);
+        self.cursor = start;
+        // Removing a separator can join the surviving neighbors into a cluster.
+        self.cursor = self.grapheme_start_at_cursor();
+    }
+
     fn delete_previous_grapheme(&mut self) {
         let start = self.prev_grapheme_boundary();
         // Insertion or completion can join neighboring graphemes and leave
@@ -3575,6 +3600,72 @@ mod tests {
             assert_eq!(editor.buffer, "z\nnext");
             assert_eq!(editor.cursor, cursor);
         }
+    }
+
+    #[test]
+    fn emacs_kill_commands_preserve_grapheme_boundaries() {
+        for (buffer, cursor, key, expected, expected_cursor) in [
+            ("e\u{301}tail", 1, 'k', "", 0),
+            ("e\u{301}tail", 1, 'u', "tail", 0),
+            ("e\u{301}tail", 1, 'w', "tail", 0),
+            ("a/\u{301}word", 8, 'w', "a", 1),
+            ("🇨x🇳", 5, 'w', "🇳", 0),
+            ("keep\nabc tail", 8, 'u', "keep\n tail", 5),
+            ("keep\nabc tail", 8, 'k', "keep\nabc", 8),
+            ("one two", 7, 'w', "one ", 4),
+            ("ab\r\nnext", 1, 'k', "a\r\nnext", 1),
+            ("ab\r\nnext", 2, 'k', "ab\r\nnext", 2),
+            ("ab\r\nnext", 4, 'u', "ab\r\nnext", 4),
+        ] {
+            let (_dir, mut editor, mut state, mut history) = vi_test_editor(buffer, cursor);
+            editor
+                .handle_emacs_key(
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+            assert_eq!(editor.buffer, expected, "{key}: {buffer:?}");
+            assert_eq!(editor.cursor, expected_cursor);
+            assert_eq!(editor.cursor, editor.grapheme_start_at_cursor());
+        }
+    }
+
+    #[test]
+    fn kill_commands_remove_whole_clusters_from_interior_carets() {
+        for cluster in ["e\u{301}", "👩🏽‍💻", "🇨🇳"] {
+            for offset in cluster.char_indices().map(|(offset, _)| offset).skip(1) {
+                for (key, expected, cursor) in
+                    [('k', "p ", 2), ('u', " tail", 0), ('w', "p  tail", 2)]
+                {
+                    let buffer = format!("p {cluster} tail");
+                    let (_dir, mut editor, mut state, mut history) =
+                        vi_test_editor(&buffer, 2 + offset);
+                    editor
+                        .handle_emacs_key(
+                            KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                            &mut state,
+                            &mut history,
+                        )
+                        .unwrap();
+                    assert_eq!(editor.buffer, expected, "{key}: {buffer:?}@{offset}");
+                    assert_eq!(editor.cursor, cursor);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grapheme_range_deletion_normalizes_new_seam_and_keeps_empty_range() {
+        let mut editor = Editor::new();
+        editor.buffer = "🇨x🇳".into();
+        editor.delete_grapheme_range(4, 5);
+        assert_eq!(editor.buffer, "🇨🇳");
+        assert_eq!(editor.cursor, 0);
+        editor.cursor = 4;
+        editor.delete_grapheme_range(4, 4);
+        assert_eq!(editor.buffer, "🇨🇳");
+        assert_eq!(editor.cursor, 4);
     }
 
     #[test]
