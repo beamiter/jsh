@@ -1067,11 +1067,13 @@ impl Editor {
                     if self.cursor < self.current_line_end()
                         && !crate::terminal_text::is_terminal_ambiguous(c)
                     {
-                        let old_char = self.buffer[self.cursor..].chars().next().unwrap();
-                        self.buffer.replace_range(
-                            self.cursor..self.cursor + old_char.len_utf8(),
-                            &c.to_string(),
-                        );
+                        // Replace the display character atomically, including
+                        // a cluster joined around the caret by an earlier edit.
+                        let start = self.grapheme_start_at_cursor();
+                        let end = self.next_grapheme_boundary();
+                        self.buffer.replace_range(start..end, &c.to_string());
+                        self.cursor = start;
+                        self.cursor = self.grapheme_start_at_cursor();
                     }
                 }
             }
@@ -3508,6 +3510,69 @@ mod tests {
             editor.move_right();
         }
         assert_eq!(editor.cursor, editor.buffer.len());
+    }
+
+    #[test]
+    fn vi_replace_replaces_whole_graphemes() {
+        for cluster in ["e\u{301}", "👩🏽‍💻", "🇨🇳", "中", "a"] {
+            for offset in cluster.char_indices().map(|(i, _)| i) {
+                let (_dir, mut editor, _, _) = vi_test_editor(&format!("x{cluster}y"), 1 + offset);
+                editor
+                    .handle_vi_pending('r', KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE))
+                    .unwrap();
+                assert_eq!(editor.buffer, "xZy", "{cluster} at {offset}");
+                assert_eq!(editor.cursor, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn vi_replace_dispatch_preserves_pending_and_regional_indicator_pairing() {
+        let (_dir, mut editor, mut state, mut history) = vi_test_editor("🇨x🇳z", "🇨".len());
+        for character in ['r', '🇺'] {
+            editor
+                .handle_vi_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    &mut state,
+                    &mut history,
+                )
+                .unwrap();
+        }
+        assert_eq!(editor.buffer, "🇨🇺🇳z");
+        assert_eq!(editor.cursor, 0);
+        assert_eq!(editor.vi_pending, None);
+        editor
+            .handle_vi_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &mut state,
+                &mut history,
+            )
+            .unwrap();
+        assert_eq!(editor.buffer, "🇳z");
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn vi_replace_normalizes_new_cluster_and_preserves_line_boundary() {
+        let (_dir, mut editor, _, _) = vi_test_editor("axz\nnext", 1);
+        editor
+            .handle_vi_pending(
+                'r',
+                KeyEvent::new(KeyCode::Char('\u{301}'), KeyModifiers::NONE),
+            )
+            .unwrap();
+        assert_eq!(editor.buffer, "a\u{301}z\nnext");
+        assert_eq!(editor.cursor, 0);
+        editor.delete_char();
+        assert_eq!(editor.buffer, "z\nnext");
+        for cursor in [1, editor.buffer.len()] {
+            editor.cursor = cursor;
+            editor
+                .handle_vi_pending('r', KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE))
+                .unwrap();
+            assert_eq!(editor.buffer, "z\nnext");
+            assert_eq!(editor.cursor, cursor);
+        }
     }
 
     #[test]
