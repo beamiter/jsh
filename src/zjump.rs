@@ -63,10 +63,16 @@ impl ZDatabase {
     }
 
     pub fn add(&mut self, path: &str) {
-        if !valid_z_path(path) {
-            return;
+        if let Err(error) = self.try_add(path) {
+            warn_z_io("save", &self.file_path, &error);
         }
-        let result = self.update_entries(|entries| {
+    }
+
+    fn try_add(&mut self, path: &str) -> io::Result<()> {
+        if !valid_z_path(path) {
+            return Ok(());
+        }
+        self.update_entries(|entries| {
             let now = Self::now();
             if let Some(entry) = entries.iter_mut().find(|e| e.path == path) {
                 entry.rank += 1.0;
@@ -87,10 +93,7 @@ impl ZDatabase {
                 });
                 entries.truncate(100);
             }
-        });
-        if let Err(error) = result {
-            warn_z_io("save", &self.file_path, &error);
-        }
+        })
     }
 
     fn update_entries(&mut self, update: impl FnOnce(&mut Vec<ZEntry>)) -> io::Result<()> {
@@ -297,12 +300,45 @@ mod tests {
                     let mut db = database(path);
                     barrier.wait();
                     for _ in 0..8 {
-                        db.add("/shared");
+                        // The interactive API deliberately refuses a lock
+                        // after two seconds. A busy CI filesystem may hit
+                        // that admission deadline; count committed visits,
+                        // not calls whose errors add() reports as warnings.
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        loop {
+                            match db.try_add("/shared") {
+                                Ok(()) => break,
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                    assert!(std::time::Instant::now() < deadline, "{error}");
+                                }
+                                Err(error) => panic!("directory visit failed: {error}"),
+                            }
+                        }
                     }
                 });
             }
         });
         assert_eq!(rank(&database(&path), "/shared"), Some(32.0));
+    }
+
+    #[test]
+    fn refused_visit_is_not_committed_and_can_be_retried_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("z");
+        let mut db = database(&path);
+        db.try_add("/shared").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let lock = crate::io_guard::lock_private_file(&path).unwrap();
+        assert_eq!(
+            db.try_add("/shared").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(rank(&db, "/shared"), Some(1.0));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(lock);
+        db.try_add("/shared").unwrap();
+        assert_eq!(rank(&database(&path), "/shared"), Some(2.0));
     }
 
     #[test]
