@@ -957,3 +957,37 @@ fn nocasematch_and_nameref_tests_match_bash() {
         ("x=1; declare -n r=x; [[ -R r ]] && echo nameref; [[ -R x ]] || echo not-ref; test -R r && echo test-R; [ -R nosuch ]; echo $?", "nameref\nnot-ref\ntest-R\n1\n", 0),
     ]);
 }
+
+#[test]
+fn terminal_test_invalid_descriptors_do_not_abort_shell() {
+    // These are non-PTY subprocess checks: even an invalid descriptor is a
+    // normal false condition, and execution must continue after the probe.
+    for operand in [
+        "-1",
+        "-2",
+        "-2147483648",
+        "2147483647",
+        "2147483648",
+        "9223372036854775808",
+        "not-a-fd",
+        "",
+        "0",
+        "1",
+        "2",
+    ] {
+        let script = format!(
+            "test -t '{operand}'; echo test:$?; \
+             [ -t '{operand}' ]; echo bracket:$?; \
+             [[ -t '{operand}' ]]; echo conditional:$?"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (stdout, status) = run_in(dir.path(), "/usr/bin:/bin", &script);
+        assert_eq!(status, 0, "shell failed for {operand:?}: {stdout:?}");
+        assert_eq!(stdout, "test:1\nbracket:1\nconditional:1\n", "{operand:?}");
+    }
+    check(&[(
+        "exec 9</dev/null; test -t 9; echo open:$?; exec 9<&-; test -t 9; echo closed:$?",
+        "open:1\nclosed:1\n",
+        0,
+    )]);
+}

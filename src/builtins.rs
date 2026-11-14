@@ -2585,12 +2585,11 @@ fn unary_test(op: &str, operand: &str, state: &mut ShellState) -> Option<bool> {
         "-t" => test_integer(operand)
             .and_then(|fd| i32::try_from(fd).ok())
             .is_some_and(|fd| {
-                nix::unistd::isatty(unsafe {
-                    // SAFETY: isatty only inspects the descriptor; an invalid one
-                    // reports EBADF, which reads as false.
-                    std::os::fd::BorrowedFd::borrow_raw(fd)
-                })
-                .unwrap_or(false)
+                // SAFETY: libc's isatty accepts any integer descriptor and
+                // returns 0 for invalid/closed ones. Do not construct a
+                // BorrowedFd: user input need not name an open descriptor,
+                // and -1 would panic before isatty could report EBADF.
+                unsafe { nix::libc::isatty(fd) == 1 }
             }),
         "-o" => set_option_is_known(operand) && shell_option_enabled(state, operand),
         "-v" => variable_is_set(operand, state),
