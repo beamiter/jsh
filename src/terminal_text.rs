@@ -81,8 +81,8 @@ mod tests {
     use super::{escape_inline, is_safe_inline, is_terminal_ambiguous};
 
     #[test]
-    fn width_tables_track_unicode_17() {
-        assert_eq!(unicode_width::UNICODE_VERSION, (17, 0, 0));
+    fn width_tables_track_unicode_18() {
+        assert_eq!(unicode_width::UNICODE_VERSION, (18, 0, 0));
     }
 
     #[test]

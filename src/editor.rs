@@ -4957,6 +4957,31 @@ mod tests {
     }
 
     #[test]
+    fn halfwidth_katakana_marks_use_independent_display_columns() {
+        assert_eq!(char_width('\u{ff9e}'), 1);
+        assert_eq!(char_width('\u{ff9f}'), 1);
+        assert_eq!(display_width("ﾊﾟｸﾞ"), 4);
+        assert_eq!(display_width_raw("ﾊﾟｸﾞ"), 4);
+        assert_eq!(display_width("\x1b[31mﾊﾟｸﾞ\x1b[0m"), 4);
+        // Grapheme editing boundaries and terminal columns are different units.
+        assert_eq!("ﾊﾟｸﾞ".graphemes(true).count(), 2);
+    }
+
+    #[test]
+    fn halfwidth_katakana_caret_geometry_counts_sound_marks() {
+        let text = "ﾊﾟｸﾞ";
+        let first = input_geometry(1, 1, text, "ﾊﾟ".len(), 0, 4);
+        assert_eq!((first.cursor_row, first.cursor_col), (0, 3));
+        let end = input_geometry(1, 1, text, text.len(), 0, 4);
+        assert_eq!((end.extra_rows, end.cursor_row, end.cursor_col), (1, 1, 1));
+        let exact = input_geometry(0, 0, text, text.len(), 0, 4);
+        assert_eq!(
+            (exact.extra_rows, exact.cursor_row, exact.cursor_col),
+            (0, 1, 0)
+        );
+    }
+
+    #[test]
     fn input_geometry_follows_the_caret_across_wraps() {
         // "❯ " (2 cols) plus 30 typed columns on 28: the line wraps once and
         // the caret ends on the second row.
