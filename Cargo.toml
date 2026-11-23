@@ -29,7 +29,7 @@ unicode-width = "0.2.3"
 unicode-segmentation = "1.12"
 crossterm = "0.29.0"
 dirs = "7.0.0"
-nix = { version = "0.31.3", features = ["process", "fs", "signal", "term", "user"] }
+nix = { version = "0.32.0", features = ["process", "fs", "signal", "term", "user"] }
 ureq = { version = "3", optional = true }
 # Pin the shared policy/wire validator so a branch move cannot silently change
 # journal uniqueness semantics. This remains baseline even without AI; its
