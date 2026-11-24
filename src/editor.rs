@@ -15,7 +15,7 @@ use crate::workflows;
 use nix::libc;
 
 use crossterm::{
-    cursor::{self, MoveToColumn, MoveUp},
+    cursor::{self, MoveDown, MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -51,6 +51,7 @@ pub struct Editor {
     workflow_mode: Option<WorkflowMode>,
     last_rendered_lines: u16,
     last_cursor_row: u16,
+    prompt_origin_saved: bool,
     vi_mode: ViMode,
     vi_pending: Option<char>,
     ai_worker: Option<AiWorker>,
@@ -145,6 +146,7 @@ impl Editor {
             workflow_mode: None,
             last_rendered_lines: 0,
             last_cursor_row: 0,
+            prompt_origin_saved: false,
             vi_mode: ViMode::Insert,
             vi_pending: None,
             ai_worker,
@@ -218,11 +220,28 @@ impl Editor {
         // Visual rows, not hard newlines: an info line wider than the
         // terminal soft-wraps, and the first repaint must know how far up
         // the prompt really starts.
-        let prompt_rows = rows_consumed(&self.cached_prompt, self.terminal_width);
+        let mut prompt_rows = rows_consumed(&self.cached_prompt, self.terminal_width);
+        let last_line = self.cached_prompt.rsplit('\n').next().unwrap_or_default();
+        let line_width = display_width(last_line);
+        let columns = usize::from(self.terminal_width.max(1));
+        let cursor_col = (line_width % columns) as u16;
+        let mut out = stdout();
+        out.queue(Print(&self.cached_prompt))?;
+        // Make an exactly full last line reach the same caret row as a repaint.
+        if line_width > 0 && cursor_col == 0 {
+            out.queue(Print("\r\n"))?;
+            prompt_rows = prompt_rows.saturating_add(1);
+        }
         self.last_rendered_lines = prompt_rows;
         self.last_cursor_row = prompt_rows;
-        print!("{}", self.cached_prompt);
-        io::stdout().flush()?;
+        self.prompt_origin_saved = save_prompt_origin(
+            &mut out,
+            self.last_rendered_lines,
+            self.last_cursor_row,
+            cursor_col,
+            self.terminal_height,
+        )?;
+        out.flush()?;
 
         // OSC 133;B — prompt end / command input start marker
         if state.interactive {
@@ -299,9 +318,7 @@ impl Editor {
             // be trusted for this — the shell and crossterm each install a
             // handler and whichever registers last wins — so the size is
             // re-read at every wakeup rather than only when a flag fires.
-            if self.refresh_terminal_size() {
-                self.repaint(state)?;
-            }
+            self.repaint_on_resize(state)?;
 
             // Check if terminal is dead more frequently to avoid CPU spin on deleted ptys
             if Self::is_terminal_dead() {
@@ -441,11 +458,7 @@ impl Editor {
                         self.update_suggestion(history, state);
                         self.repaint(state)?;
                     }
-                    Event::Resize(w, h) => {
-                        self.terminal_width = w;
-                        self.terminal_height = h;
-                        self.repaint(state)?;
-                    }
+                    Event::Resize(..) => self.repaint_on_resize(state)?,
                     _ => {}
                 }
             }
@@ -1922,17 +1935,26 @@ impl Editor {
     }
 
     fn repaint(&mut self, state: &mut ShellState) -> io::Result<()> {
-        self.repaint_with_options(state, true)
+        self.repaint_with_options(state, true, false)
     }
 
     fn repaint_for_submit(&mut self, state: &mut ShellState) -> io::Result<()> {
-        self.repaint_with_options(state, false)
+        self.repaint_with_options(state, false, false)
+    }
+
+    fn repaint_on_resize(&mut self, state: &mut ShellState) -> io::Result<()> {
+        let old_width = self.terminal_width;
+        if self.refresh_terminal_size() {
+            self.repaint_with_options(state, true, self.terminal_width != old_width)?;
+        }
+        Ok(())
     }
 
     fn repaint_with_options(
         &mut self,
         state: &mut ShellState,
         show_signature_hint: bool,
+        width_changed: bool,
     ) -> io::Result<()> {
         let menu_sel = self.completion_menu.as_ref().map(|m| m.selected);
         let cursor_only = self.search_mode.is_none()
@@ -1966,7 +1988,7 @@ impl Editor {
         // Fast path: only cursor moved, skip full redraw. A wrapped input
         // line changes the caret's row, so this only fires while the whole
         // line still fits on the prompt's own row.
-        if cursor_only && !self.buffer.contains('\n') {
+        if !width_changed && cursor_only && !self.buffer.contains('\n') {
             let prompt_last = self
                 .cached_prompt
                 .rsplit('\n')
@@ -1982,9 +2004,17 @@ impl Editor {
             }
         }
 
+        let rows_to_prompt = if width_changed && self.prompt_origin_saved {
+            // The terminal has already reflowed the rows the editor painted.
+            // Its saved cursor follows the prompt origin through that resize.
+            out.queue(cursor::RestorePosition)?;
+            0
+        } else {
+            self.last_cursor_row
+        };
         out.queue(MoveToColumn(0))?;
-        if self.last_cursor_row > 0 {
-            out.queue(MoveUp(self.last_cursor_row))?;
+        if rows_to_prompt > 0 {
+            out.queue(MoveUp(rows_to_prompt))?;
         }
         out.queue(Clear(ClearType::FromCursorDown))?;
 
@@ -2747,6 +2777,13 @@ impl Editor {
         self.last_rendered_lines =
             position_repaint_cursor(&mut out, rendered_lines, cursor_row, cursor_col)?;
         self.last_cursor_row = cursor_row;
+        self.prompt_origin_saved = save_prompt_origin(
+            &mut out,
+            self.last_rendered_lines,
+            self.last_cursor_row,
+            cursor_col,
+            self.terminal_height,
+        )?;
         out.flush()?;
         Ok(())
     }
@@ -3353,6 +3390,34 @@ fn position_repaint_cursor(
     }
     out.queue(MoveToColumn(cursor_col))?;
     Ok(rendered_lines)
+}
+
+/// Save the start of the editor after painting so scrolling caused by the
+/// paint itself has already moved the prompt into its resulting row.
+fn save_prompt_origin(
+    out: &mut impl Write,
+    last_rendered_line: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    terminal_height: u16,
+) -> io::Result<bool> {
+    if last_rendered_line >= terminal_height {
+        return Ok(false);
+    }
+    if cursor_col != 0 {
+        out.queue(MoveToColumn(0))?;
+    }
+    if cursor_row != 0 {
+        out.queue(MoveUp(cursor_row))?;
+    }
+    out.queue(cursor::SavePosition)?;
+    if cursor_row != 0 {
+        out.queue(MoveDown(cursor_row))?;
+    }
+    if cursor_col != 0 {
+        out.queue(MoveToColumn(cursor_col))?;
+    }
+    Ok(true)
 }
 
 /// The input area's visual geometry, soft-wrap aware, relative to the row the
@@ -4954,6 +5019,20 @@ mod tests {
         bytes.clear();
         assert_eq!(position_repaint_cursor(&mut bytes, 5, 2, 3).unwrap(), 5);
         assert_eq!(bytes, b"\x1b[3A\x1b[4G");
+    }
+
+    #[test]
+    fn repaint_saves_the_visible_prompt_origin_and_returns_to_the_caret() {
+        let mut bytes = Vec::new();
+        assert!(save_prompt_origin(&mut bytes, 8, 4, 9, 24).unwrap());
+        assert_eq!(bytes, b"\x1b[1G\x1b[4A\x1b7\x1b[4B\x1b[10G");
+
+        bytes.clear();
+        assert!(!save_prompt_origin(&mut bytes, 24, 4, 9, 24).unwrap());
+        assert!(
+            bytes.is_empty(),
+            "a scrolled-off prompt has no visible origin"
+        );
     }
 
     #[test]
